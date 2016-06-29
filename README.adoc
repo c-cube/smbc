@@ -1,0 +1,3 @@
+= Narrow
+
+Experimental model finder/SMT solver for functional programming
