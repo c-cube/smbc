@@ -18,5 +18,5 @@ end
 
 module type PRINT = sig
   type t
-  val print : t CCFormat.printer
+  val pp : t CCFormat.printer
 end

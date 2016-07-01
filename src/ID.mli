@@ -15,7 +15,7 @@ include Intf.EQ with type t := t
 include Intf.ORD with type t := t
 include Intf.PRINT with type t := t
 
-val print_name : t CCFormat.printer
+val pp_name : t CCFormat.printer
 
 module Map : CCMap.S with type key = t
 module Set : CCSet.S with type elt = t

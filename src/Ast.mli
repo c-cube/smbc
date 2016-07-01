@@ -20,7 +20,7 @@ module Var : sig
   val ty : 'a t -> 'a
 
   val equal : 'a t -> 'a t -> bool
-  val print : _ t CCFormat.printer
+  val pp : _ t CCFormat.printer
   val to_sexp : 'ty to_sexp -> 'ty t to_sexp
 end
 
@@ -62,6 +62,8 @@ and term_cell =
   | Eq of term * term
   | Not of term
   | Binop of binop * term * term
+  | True
+  | False
 
 (** Mutually recursive datatypes *)
 type data = private {
@@ -71,6 +73,8 @@ type data = private {
 
 type statement =
   | Data of data list
+  | TyDecl of ID.t (* new atomic cstor *)
+  | Decl of ID.t * Ty.t
   | Define of ID.t * term
   | Assert of term
   | Goal of var list * term
@@ -92,16 +96,29 @@ val binop : binop -> term -> term
 val and_ : term -> term -> term
 val or_ : term -> term -> term
 val imply : term -> term -> term
+val true_ : term
+val false_ : term
 
 (** {2 Printing} *)
 
 val term_to_sexp : term to_sexp
 val statement_to_sexp : statement to_sexp
 
-val print_term : term CCFormat.printer
-val print_statement : statement CCFormat.printer
+val pp_term : term CCFormat.printer
+val pp_statement : statement CCFormat.printer
 
-(** {2 Parsing} *)
+(** {2 Parsing and Typing} *)
 
-val term_of_sexp : sexp -> term or_error
-val statement_of_sexp : sexp -> statement or_error
+module Ctx : sig
+  type t
+  val empty : t
+  include Intf.PRINT with type t := t
+end
+
+val term_of_sexp : Ctx.t -> sexp -> term or_error
+
+val statement_of_sexp : Ctx.t -> sexp -> (Ctx.t * statement) or_error
+
+val statements_of_sexps :
+  ?init:Ctx.t -> sexp list -> (Ctx.t * statement list) or_error
+
