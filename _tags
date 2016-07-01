@@ -1,4 +1,4 @@
 <src/>: include
-<src/**/*.*>: package(containers), package(msat), package(containers.sexp)
+<src/**/*.*>: package(containers), package(msat), package(containers.sexp), package(sequence)
 
 true: safe_string, annot, color(always), optimize(3)
