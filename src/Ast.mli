@@ -24,23 +24,6 @@ module Var : sig
   val to_sexp : 'ty to_sexp -> 'ty t to_sexp
 end
 
-module Ty : sig
-  type t =
-    | Prop
-    | Const of ID.t
-    | Arrow of t * t
-
-  val prop : t
-  val const : ID.t -> t
-  val arrow : t -> t -> t
-  val arrow_l : t list -> t -> t
-
-  include Intf.EQ with type t := t
-  include Intf.ORD with type t := t
-  include Intf.PRINT with type t := t
-  val to_sexp : t to_sexp
-end
-
 type var = Ty.t Var.t
 
 type binop =
@@ -65,14 +48,8 @@ and term_cell =
   | True
   | False
 
-(** Mutually recursive datatypes *)
-type data = private {
-  data_id: ID.t;
-  data_cstors: Ty.t ID.Map.t;
-}
-
 type statement =
-  | Data of data list
+  | Data of Ty.data list
   | TyDecl of ID.t (* new atomic cstor *)
   | Decl of ID.t * Ty.t
   | Define of ID.t * term

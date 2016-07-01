@@ -28,41 +28,6 @@ module Var = struct
   let to_sexp f v = S.of_list [ID.to_sexp v.id; f v.ty]
 end
 
-module Ty = struct
-  type t =
-    | Prop
-    | Const of ID.t
-    | Arrow of t * t
-
-  let prop = Prop
-  let const id = Const id
-  let arrow a b = Arrow (a,b)
-  let arrow_l = List.fold_right arrow
-
-  let rec to_sexp = function
-    | Prop -> S.atom "prop"
-    | Const id -> S.atom (ID.to_string id)
-    | Arrow (a,b) -> S.of_list [S.atom "->"; to_sexp a; to_sexp b]
-
-  let pp out t = CCSexpM.print out (to_sexp t)
-
-  let to_int_ = function
-    | Prop -> 0
-    | Const _ -> 1
-    | Arrow _ -> 2
-
-  let rec compare a b = match a, b with
-    | Prop, Prop -> 0
-    | Const a, Const b -> ID.compare a b
-    | Arrow (a1,a2), Arrow (b1,b2) ->
-      compare a1 b1 <?> (compare, a2,b2)
-    | Prop, _
-    | Const _, _
-    | Arrow _, _ -> CCOrd.int_ (to_int_ a) (to_int_ b)
-
-  let equal a b = compare a b = 0
-end
-
 type var = Ty.t Var.t
 
 type binop =
@@ -87,13 +52,8 @@ and term_cell =
   | True
   | False
 
-type data = {
-  data_id: ID.t;
-  data_cstors: Ty.t ID.Map.t;
-}
-
 type statement =
-  | Data of data list
+  | Data of Ty.data list
   | TyDecl of ID.t (* new atomic cstor *)
   | Decl of ID.t * Ty.t
   | Define of ID.t * term
@@ -145,19 +105,11 @@ let rec term_to_sexp t = match t.term with
   | True -> S.atom "true"
   | False -> S.atom "false"
 
-let data_to_sexp d =
-  let cstors =
-    ID.Map.fold
-      (fun c ty acc -> S.of_list [ID.to_sexp c; Ty.to_sexp ty] :: acc)
-      d.data_cstors []
-  in
-  S.of_list (ID.to_sexp d.data_id :: cstors)
-
 let statement_to_sexp st = match st with
   | Data l ->
     S.of_list
       [ S.atom "data";
-        S.of_list (List.map data_to_sexp l)]
+        S.of_list (List.map Ty.data_to_sexp l)]
   | TyDecl id ->
     S.of_list [S.atom "type"; ID.to_sexp id]
   | Decl (id,ty) ->
@@ -251,9 +203,9 @@ let errorf msg = CCFormat.ksprintf ~f:(fun e -> raise (Error e)) msg
 module Ctx = struct
   type kind =
     | Ty
-    | Data of data
+    | Data of Ty.data
     | Fun of Ty.t
-    | Cstor of Ty.t * data
+    | Cstor of Ty.t * Ty.data
 
   type t = {
     names: ID.t StrMap.t;
@@ -280,12 +232,12 @@ module Ctx = struct
 
   let pp_kind out = function
     | Ty -> Format.fprintf out "type"
-    | Cstor d ->
-      Format.fprintf out "(@[cstor %a@])" CCSexpM.print (data_to_sexp d)
+    | Cstor (ty,_) ->
+      Format.fprintf out "(@[cstor : %a@])" Ty.pp ty
     | Data d ->
-      Format.fprintf out "(@[data %a@])" CCSexpM.print (data_to_sexp d)
+      Format.fprintf out "(@[data %a@])" CCSexpM.print (Ty.data_to_sexp d)
     | Fun ty ->
-      Format.fprintf out "(@[fun %a@])" Ty.pp ty
+      Format.fprintf out "(@[fun : %a@])" Ty.pp ty
 end
 
 let find_id_ ctx (s:string): ID.t =
