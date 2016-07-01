@@ -38,6 +38,8 @@ let rec compare a b = match a, b with
 
 let equal a b = compare a b = 0
 
+let hash _ = 0 (* TODO *)
+
 module S = CCSexp
 
 let rec to_sexp = function
