@@ -48,6 +48,8 @@ and term_cell =
   | True
   | False
 
+(* TODO: records? *)
+
 type statement =
   | Data of Ty.data list
   | TyDecl of ID.t (* new atomic cstor *)
