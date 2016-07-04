@@ -3,7 +3,7 @@
 
 open Ast
 open Hash
-open CC
+open Reduce
 
 
 let () =

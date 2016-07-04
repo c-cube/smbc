@@ -3,33 +3,6 @@
 
 (** {1 Functional Congruence Closure} *)
 
-(** {2 Typed Constant} *)
-
-module TypedConst : sig
-  type kind =
-    | Const of Ty.t
-    | Cstor of Ty.t * Ty.data
-    (* TODO: defined function (how? terms are not defined here) *)
-
-  type t = private {
-    id: ID.t;
-    kind: kind;
-  }
-
-  (* TODO: also, pointer to the definition/declaration/datatype
-     to get rid of environment *)
-
-  val make : ID.t -> kind -> t
-  val make_const : ID.t -> Ty.t -> t
-  val make_cstor : ID.t -> Ty.t -> Ty.data -> t
-
-  val ty : t -> Ty.t
-
-  include Intf.EQ with type t := t
-  include Intf.ORD with type t := t
-  include Intf.PRINT with type t := t
-end
-
 (** {2 Typed De Bruijn indices} *)
 module DB : sig
   type t
@@ -49,7 +22,7 @@ module Make(Dummy : sig end) : sig
     type t
 
     val db : DB.t -> t
-    val const : TypedConst.t -> t
+    val const : Typed_cst.t -> t
     val app : t -> t list -> t
     val fun_ : Ty.t -> t -> t
     val match_ : t -> (Ty.t list * t) ID.Map.t -> t
@@ -57,6 +30,10 @@ module Make(Dummy : sig end) : sig
     val true_ : t
     val false_ : t
     val not_ : t -> t
+    val and_ : t -> t -> t
+    val or_ : t -> t -> t
+    val imply : t -> t -> t
+    val eq : t -> t -> t
 
     (* TODO: meta-variables? *)
 
@@ -72,27 +49,6 @@ module Make(Dummy : sig end) : sig
 
   type term = Term.t
 
-  (** {2 Equivalence Classes} *)
-
-  module Equiv_class : sig
-    type t
-    (** An equivalence class *)
-
-    val of_term : term -> t
-    (** Intern the term in the congruence closure structure, obtaining its
-        equivalence class *)
-
-    val representative : t -> term
-    (** Current representative of the class *)
-
-    val true_ : t
-    val false_ : t
-
-    val to_seq : t -> term Sequence.t
-    (** [equiv_class_seq ec] iterates on all terms in this equivalence
-        class *)
-  end
-
   exception Inconsistent of term * term * term * term
   (** Exception raised when equality and inequality constraints are
       inconsistent. [Inconsistent (a, b, a', b')] means
@@ -105,29 +61,37 @@ module Make(Dummy : sig end) : sig
   val cur_level : unit -> level
   (** Current level *)
 
+  val push_level : unit -> level
+  (** Push a new level and return the old one *)
+
   val backtrack : level -> unit
   (** Return to given level *)
+
+  val normal_form : term -> term
+  (** Current normal form of a term *)
 
   val check_eq : term -> term -> bool
   (** Check whether the two terms are equal *)
 
-  val assert_eq : term -> term -> level
-  (** Assert that the two terms are equal
-      @return the new level
-      @raise Inconsistent if it makes the state inconsistent *)
+  val assert_choice : Typed_cst.t -> term -> unit
+  (** [assert_choice c t] makes [c = t] valid in the current normalisation state,
+      propagating equalities and reducing some terms along the way
+      @raise Invalid_argument if the constant is already set
+      @raise Inconsistent if this makes the state inconsistent because two
+        terms have become equal, that should not *)
 
-  val assert_neq : term -> term -> level
+  val assert_neq : term -> term -> unit
   (** Assert that the two given terms are distinct
-      @return the new level
       @raise Inconsistent if this makes the state inconsistent *)
 
+  (* explain why the normal form in terms of choices *)
   type explanation =
-    | Exp_congruence of term * term (* direct congruence of terms *)
-    | Exp_merge of term * term (* user merge of terms *)
-  (* TODO: rules on beta-reduction, datatypes, ite, match... *)
+    | By_choice of Typed_cst.t * term (* assertion [c --> t] *)
+
+  val pp_explanation : explanation CCFormat.printer
 
   val explain : term -> term -> explanation list
   (** Explain why those two terms are equal (assuming they are),
       by returning a list of atomic operations.
-      @raise Invalid_argument if the terms are not equal modulo CC *)
+      @raise Invalid_argument if the terms are not equal modulo reduction *)
 end
