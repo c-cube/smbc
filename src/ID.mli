@@ -13,6 +13,7 @@ val to_sexp : t -> CCSexp.t
 
 include Intf.EQ with type t := t
 include Intf.ORD with type t := t
+include Intf.HASH with type t := t
 include Intf.PRINT with type t := t
 
 val pp_name : t CCFormat.printer

@@ -58,8 +58,6 @@ type statement =
   | Assert of term
   | Goal of var list * term
 
-exception Ill_typed of string
-
 (** {2 Constructors} *)
 
 val var : var -> term
@@ -71,7 +69,7 @@ val fun_ : var -> term -> term
 val fun_l : var list -> term -> term
 val eq : term -> term -> term
 val not_ : term -> term
-val binop : binop -> term -> term
+val binop : binop -> term -> term -> term
 val and_ : term -> term -> term
 val or_ : term -> term -> term
 val imply : term -> term -> term

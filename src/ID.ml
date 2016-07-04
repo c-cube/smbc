@@ -20,6 +20,7 @@ let to_sexp id = CCSexp.atom id.name
 
 let equal a b = a.id=b.id
 let compare a b = CCOrd.int_ a.id b.id
+let hash a = Hash.int a.id
 let pp out a = Format.fprintf out "%s/%d" a.name a.id
 let pp_name out a = CCFormat.string out a.name
 

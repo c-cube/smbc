@@ -64,3 +64,10 @@ let data_to_sexp d =
       d.data_cstors []
   in
   S.of_list (ID.to_sexp d.data_id :: cstors)
+
+exception Ill_typed of string
+
+let ill_typed fmt =
+  CCFormat.ksprintf
+    ~f:(fun s -> raise (Ill_typed s))
+    fmt

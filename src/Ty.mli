@@ -34,3 +34,9 @@ type data = {
 }
 
 val data_to_sexp : data -> sexp
+
+(** {2 Error Handling} *)
+
+exception Ill_typed of string
+
+val ill_typed : ('a, Format.formatter, unit, 'b) format4 -> 'a

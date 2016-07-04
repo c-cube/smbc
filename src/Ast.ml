@@ -60,19 +60,6 @@ type statement =
   | Assert of term
   | Goal of var list * term
 
-exception Ill_typed of string
-
-let ill_typed fmt =
-  CCFormat.ksprintf
-    ~f:(fun s -> raise (Ill_typed s))
-    fmt
-
-let mk_ term ty = {term;ty}
-let var v = mk_ (Var v) (Var.ty v)
-let const id ty = mk_ (Const id) ty
-let true_ = mk_ True Ty.prop
-let false_ = mk_ False Ty.prop
-
 (** {2 Printing} *)
 
 let var_sexp_ v = ID.to_sexp v.Var.id
@@ -134,12 +121,15 @@ let rec app_ty_ ty l : Ty.t = match ty, l with
   | Ty.Arrow (ty_a,ty_rest), a::tail ->
     if Ty.equal ty_a a.ty
     then app_ty_ ty_rest tail
-    else ill_typed "expected `@[%a@]`,@ got `@[%a : %a@]`"
+    else Ty.ill_typed "expected `@[%a@]`,@ got `@[%a : %a@]`"
         Ty.pp ty_a pp_term a Ty.pp a.ty
   | (Ty.Prop | Ty.Const _), a::_ ->
-    ill_typed "cannot apply ty `@[%a@]`@ to `@[%a@]`" Ty.pp ty pp_term a
+    Ty.ill_typed "cannot apply ty `@[%a@]`@ to `@[%a@]`" Ty.pp ty pp_term a
 
 let mk_ term ty = {term; ty}
+
+let true_ = mk_ True Ty.prop
+let false_ = mk_ False Ty.prop
 
 let var v = mk_ (Var v) (Var.ty v)
 
@@ -156,9 +146,9 @@ let app f l = match f.term, l with
 
 let if_ a b c =
   if a.ty <> Ty.Prop
-  then ill_typed "if: test  must have type prop, not `@[%a@]`" Ty.pp a.ty;
+  then Ty.ill_typed "if: test  must have type prop, not `@[%a@]`" Ty.pp a.ty;
   if not (Ty.equal b.ty c.ty)
-  then ill_typed
+  then Ty.ill_typed
       "if: both branches must have same type,@ not `@[%a@]` and `@[%a@]`"
       Ty.pp b.ty Ty.pp c.ty;
   mk_ (If (a,b,c)) b.ty
@@ -176,21 +166,25 @@ let fun_l = List.fold_right fun_
 
 let eq a b =
   if not (Ty.equal a.ty b.ty)
-  then ill_typed "eq: `@[%a@]` and `@[%a@]` do not have the same type"
+  then Ty.ill_typed "eq: `@[%a@]` and `@[%a@]` do not have the same type"
       pp_term a pp_term b;
   mk_ (Eq (a,b)) Ty.prop
 
 let check_prop_ t =
   if not (Ty.equal t.ty Ty.prop)
-  then ill_typed "expected prop, got `@[%a : %a@]`" pp_term t Ty.pp t.ty
+  then Ty.ill_typed "expected prop, got `@[%a : %a@]`" pp_term t Ty.pp t.ty
 
 let binop op a b =
   check_prop_ a; check_prop_ b;
-  mk_ (Binop (op, a, b))
+  mk_ (Binop (op, a, b)) Ty.prop
 
 let and_ = binop And
 let or_ = binop Or
 let imply = binop Imply
+
+let not_ t =
+  check_prop_ t;
+  mk_ (Not t) Ty.prop
 
 (** {2 Parsing} *)
 
@@ -238,6 +232,10 @@ module Ctx = struct
       Format.fprintf out "(@[data %a@])" CCSexpM.print (Ty.data_to_sexp d)
     | Fun ty ->
       Format.fprintf out "(@[fun : %a@])" Ty.pp ty
+
+  let pp out t =
+    Format.fprintf out "ctx {@[%a@]}"
+      (ID.Map.print ID.pp pp_kind) t.kinds
 end
 
 let find_id_ ctx (s:string): ID.t =
