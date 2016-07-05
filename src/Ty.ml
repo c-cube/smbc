@@ -52,7 +52,9 @@ module S = CCSexp
 let rec to_sexp = function
   | Prop -> S.atom "prop"
   | Const id -> S.atom (ID.to_string id)
-  | Arrow (a,b) -> S.of_list [S.atom "->"; to_sexp a; to_sexp b]
+  | Arrow _ as ty ->
+    let args, ret = unfold ty in
+    S.of_list (S.atom "->":: List.map to_sexp args @ [to_sexp ret])
 
 let pp out t = CCSexpM.print out (to_sexp t)
 
