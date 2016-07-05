@@ -22,7 +22,7 @@ module Make(Dummy : sig end) : sig
     type t
 
     val db : DB.t -> t
-    val const : Typed_cst.t -> t
+    val const : t Typed_cst.t -> t
     val app : t -> t list -> t
     val fun_ : Ty.t -> t -> t
     val match_ : t -> (Ty.t list * t) ID.Map.t -> t
@@ -73,7 +73,7 @@ module Make(Dummy : sig end) : sig
   val check_eq : term -> term -> bool
   (** Check whether the two terms are equal *)
 
-  val assert_choice : Typed_cst.t -> term -> unit
+  val assert_choice : term Typed_cst.t -> term -> unit
   (** [assert_choice c t] makes [c = t] valid in the current normalisation state,
       propagating equalities and reducing some terms along the way
       @raise Invalid_argument if the constant is already set
@@ -86,7 +86,7 @@ module Make(Dummy : sig end) : sig
 
   (* explain why the normal form in terms of choices *)
   type explanation =
-    | By_choice of Typed_cst.t * term (* assertion [c --> t] *)
+    | By_choice of term Typed_cst.t * term (* assertion [c --> t] *)
 
   val pp_explanation : explanation CCFormat.printer
 

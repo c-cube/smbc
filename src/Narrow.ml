@@ -1,6 +1,8 @@
 
 (* This file is free software. See file "license" for more details. *)
 
+open! Reduce (* TODO: really use it *)
+
 let parse_file file =
   let res = CCSexpM.parse_file_list file in
   match res with

@@ -3,28 +3,41 @@
 
 (** {1 Typed Constant} *)
 
-type kind =
-  | Const of Ty.t
-  | Cstor of Ty.t * Ty.data
-  (* TODO: defined function (how? terms are not defined here) *)
-
-type t = private {
+type 'term t = private {
   id: ID.t;
-  kind: kind;
+  kind: 'term kind;
 }
 
-(* TODO: also, pointer to the definition/declaration/datatype
-   to get rid of environment *)
+(** The various kinds of constants *)
+and 'term kind =
+  | Const of Ty.t * 'term const_info
+  | Cstor of Ty.t * Ty.data
+  | Defined of Ty.t * 'term
 
-val make : ID.t -> kind -> t
-val make_const : ID.t -> Ty.t -> t
-val make_cstor : ID.t -> Ty.t -> Ty.data -> t
+and 'term const_info = {
+  const_depth: int;
+    (* refinement depth, used for iterative deepening *)
+  const_parent: 'term t option;
+    (* if const was created as argument of another const *)
+  mutable const_cases : 'term list option;
+    (* cover set (lazily evaluated) *)
+}
 
-val id : t -> ID.t
-val kind : t -> kind
-val ty : t -> Ty.t
+(* TODO: replace Ty.data with something using Typed_cst so that
+   there is no global environment *)
 
-include Intf.EQ with type t := t
-include Intf.ORD with type t := t
-include Intf.HASH with type t := t
-include Intf.PRINT with type t := t
+val make : ID.t -> 'term kind -> 'term t
+val make_const : ?parent:'term t -> ID.t -> Ty.t -> 'term t
+val make_cstor : ID.t -> Ty.t -> Ty.data -> _ t
+val make_defined: ID.t -> Ty.t -> 'term -> 'term t
+
+val id : _ t -> ID.t
+val kind : 'term t -> 'term kind
+val ty : _ t -> Ty.t
+
+val ty_of_kind : _ kind -> Ty.t
+
+val equal : _ t -> _ t -> bool
+val compare : _ t -> _ t -> int
+val hash : _ t -> int
+val pp : _ t CCFormat.printer

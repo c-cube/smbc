@@ -51,7 +51,7 @@ module Make(Dummy : sig end) = struct
     | True
     | False
     | DB of DB.t (* de bruijn indice *)
-    | Const of Typed_cst.t
+    | Const of term Typed_cst.t
     | App of term * term list
     | Fun of Ty.t * term
     | If of term * term * term
@@ -71,7 +71,7 @@ module Make(Dummy : sig end) = struct
     | E_beta of term * term (* beta-reduct (fun/arg) *)
     | E_if of term * term * term (* if-reduction (full term/test/branch) *)
     | E_match of term * term * term (* match-reduction (full term/matched/branch) *)
-    | E_choice of Typed_cst.t * term (* assertion [c --> t] *)
+    | E_choice of term Typed_cst.t * term (* assertion [c --> t] *)
 
   type level = int
 
@@ -513,7 +513,7 @@ module Make(Dummy : sig end) = struct
     )
 
   type explanation =
-    | By_choice of Typed_cst.t * term (* assertion [c --> t] *)
+    | By_choice of term Typed_cst.t * term (* assertion [c --> t] *)
 
   let pp_explanation out = function
     | By_choice (c,t) ->
