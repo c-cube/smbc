@@ -23,6 +23,10 @@ include Intf.ORD with type t := t
 include Intf.HASH with type t := t
 include Intf.PRINT with type t := t
 
+val unfold : t -> t list * t
+(** [unfold ty] will get the list of arguments, and the return type
+    of any function. An atomic type is just a function with no arguments *)
+
 val to_sexp : t to_sexp
 
 (** {2 Datatypes} *)

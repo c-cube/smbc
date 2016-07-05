@@ -54,7 +54,7 @@ type statement =
   | Data of Ty.data list
   | TyDecl of ID.t (* new atomic cstor *)
   | Decl of ID.t * Ty.t
-  | Define of ID.t * term
+  | Define of ID.t * Ty.t * term
   | Assert of term
   | Goal of var list * term
 
@@ -71,7 +71,9 @@ val eq : term -> term -> term
 val not_ : term -> term
 val binop : binop -> term -> term -> term
 val and_ : term -> term -> term
+val and_l : term list -> term
 val or_ : term -> term -> term
+val or_l : term list -> term
 val imply : term -> term -> term
 val true_ : term
 val false_ : term
@@ -88,14 +90,14 @@ val pp_statement : statement CCFormat.printer
 
 module Ctx : sig
   type t
-  val empty : t
+  val create: unit -> t
   include Intf.PRINT with type t := t
 end
 
 val term_of_sexp : Ctx.t -> sexp -> term or_error
 
-val statement_of_sexp : Ctx.t -> sexp -> (Ctx.t * statement) or_error
+val statement_of_sexp : Ctx.t -> sexp -> statement or_error
 
 val statements_of_sexps :
-  ?init:Ctx.t -> sexp list -> (Ctx.t * statement list) or_error
+  ?init:Ctx.t -> sexp list -> statement list or_error
 

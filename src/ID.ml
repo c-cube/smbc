@@ -29,7 +29,9 @@ module AsKey = struct
   type t = t_
   let equal = equal
   let compare = compare
+  let hash = hash
 end
 
 module Map = CCMap.Make(AsKey)
 module Set = CCSet.Make(AsKey)
+module Tbl = CCHashtbl.Make(AsKey)

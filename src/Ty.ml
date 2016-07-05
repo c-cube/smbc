@@ -40,6 +40,13 @@ let equal a b = compare a b = 0
 
 let hash _ = 0 (* TODO *)
 
+let unfold ty =
+  let rec aux acc ty = match ty with
+    | Arrow (a,b) -> aux (a::acc) b
+    | _ -> List.rev acc, ty
+  in
+  aux [] ty
+
 module S = CCSexp
 
 let rec to_sexp = function
@@ -56,11 +63,16 @@ type data = {
   data_cstors: t ID.Map.t;
 }
 
-
 let data_to_sexp d =
   let cstors =
     ID.Map.fold
-      (fun c ty acc -> S.of_list [ID.to_sexp c; to_sexp ty] :: acc)
+      (fun c ty acc ->
+         let ty_args, _ = unfold ty in
+         let c_sexp = match ty_args with
+           | [] -> ID.to_sexp c
+           | _::_ -> S.of_list (ID.to_sexp c :: List.map to_sexp ty_args)
+         in
+         c_sexp :: acc)
       d.data_cstors []
   in
   S.of_list (ID.to_sexp d.data_id :: cstors)

@@ -20,3 +20,4 @@ val pp_name : t CCFormat.printer
 
 module Map : CCMap.S with type key = t
 module Set : CCSet.S with type elt = t
+module Tbl : CCHashtbl.S with type key = t
