@@ -50,11 +50,13 @@ and term_cell =
 
 (* TODO: records? *)
 
+type definition = ID.t * Ty.t * term
+
 type statement =
   | Data of Ty.data list
   | TyDecl of ID.t (* new atomic cstor *)
   | Decl of ID.t * Ty.t
-  | Define of ID.t * Ty.t * term
+  | Define of definition list
   | Assert of term
   | Goal of var list * term
 

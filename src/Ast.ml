@@ -52,11 +52,13 @@ and term_cell =
   | True
   | False
 
+type definition = ID.t * Ty.t * term
+
 type statement =
   | Data of Ty.data list
   | TyDecl of ID.t (* new atomic cstor *)
   | Decl of ID.t * Ty.t
-  | Define of ID.t * Ty.t * term
+  | Define of definition list
   | Assert of term
   | Goal of var list * term
 
@@ -103,9 +105,11 @@ let statement_to_sexp st = match st with
     S.of_list [S.atom "type"; ID.to_sexp id]
   | Decl (id,ty) ->
     S.of_list [S.atom "decl"; ID.to_sexp id; Ty.to_sexp ty]
-  | Define (id,ty,t) ->
-    S.of_list
-      [S.atom "define"; S.of_list [ID.to_sexp id; Ty.to_sexp ty]; term_to_sexp t]
+  | Define defs ->
+    let def_to_sexp (id,ty,t) =
+      S.of_list [ID.to_sexp id; Ty.to_sexp ty; term_to_sexp t]
+    in
+    S.of_list (S.atom "define" :: List.map def_to_sexp defs)
   | Assert t ->
     S.of_list [S.atom "assert"; term_to_sexp t]
   | Goal (vars,t) ->
@@ -412,12 +416,29 @@ let conv_statement ctx s : statement = match s with
         l
     in
     Data l
-  | `List [`Atom "define"; `List [`Atom name; ty]; rhs] ->
-    let ty = conv_ty ctx ty in
-    let id = Ctx.add_id ctx name (Ctx.K_fun ty) in
-    let rhs = conv_term ctx rhs in
-    Define (id, ty, rhs)
-  | `List [`Atom "goal"; `List vars; rhs] ->
+  | `List (`Atom "define" :: defs) ->
+    (* parse id,ty and declare them before parsing the function bodies *)
+    let preparse = function
+      | `List [`Atom name; ty; rhs] ->
+        let ty = conv_ty ctx ty in
+        let id = Ctx.add_id ctx name (Ctx.K_fun ty) in
+        id, ty, rhs
+      | s -> errorf "expected definition,@ got `@[%a@]`" CCSexpM.print s
+    in
+    let defs = List.map preparse defs in
+    let defs =
+      List.map
+        (fun (id,ty,rhs) ->
+           let rhs = conv_term ctx rhs in
+           id,ty,rhs)
+        defs
+    in
+    Define defs
+  | `List [`Atom "assert"; t] ->
+    let t = conv_term ctx t in
+    check_prop_ t;
+    Assert t
+  | `List [`Atom "goal"; `List vars; t] ->
     let vars =
       List.map
         (function
@@ -428,8 +449,8 @@ let conv_statement ctx s : statement = match s with
     in
     Ctx.with_vars ctx vars
       (fun vars ->
-         let rhs = conv_term ctx rhs in
-         Goal (vars, rhs))
+         let t = conv_term ctx t in
+         Goal (vars, t))
   | _ -> errorf "expected statement,@ got `@[%a@]`" CCSexpM.print s
 
 let term_of_sexp ctx s =
