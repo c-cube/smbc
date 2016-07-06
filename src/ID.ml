@@ -13,6 +13,8 @@ let make =
     incr n;
     x
 
+let makef fmt = CCFormat.ksprintf ~f:make fmt
+
 let copy {name;_} = make name
 
 let to_string id = id.name

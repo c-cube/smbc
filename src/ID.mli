@@ -6,6 +6,7 @@
 type t
 
 val make : string -> t
+val makef : ('a, Format.formatter, unit, t) format4 -> 'a
 val copy : t -> t
 
 val to_string : t -> string

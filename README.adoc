@@ -5,7 +5,7 @@ Experimental model finder/SMT solver for functional programming.
 == Build
 
 ----
-opam pin add e3 'https://github.com/c-cube/e3.git#HEAD'`
+opam pin add e3 'https://github.com/c-cube/e3.git#HEAD'
 opam install e3
 ----
 
