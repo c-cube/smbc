@@ -1,6 +1,6 @@
 
 OCAMLBUILD=ocamlbuild -use-ocamlfind
-TARGETS=src/Narrow.native
+TARGETS=src/e3.native
 
 all: build
 

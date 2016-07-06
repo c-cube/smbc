@@ -1,3 +1,23 @@
-= Narrow
+= e³
 
-Experimental model finder/SMT solver for functional programming
+Experimental model finder/SMT solver for functional programming.
+
+== Build
+
+----
+opam pin add e3 'https://github.com/c-cube/e3.git#HEAD'`
+opam install e3
+----
+
+Or manually using
+
+----
+opam install msat containers sequence
+make
+----
+
+== Name
+
+- "Experimental Evaluating Explorator"
+- "é3" -> "étroit", "narrow" in french
+
