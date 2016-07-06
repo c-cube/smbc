@@ -3,6 +3,8 @@
 
 type 'a t = 'a -> int
 
+let bool b = if b then 1 else 2
+
 let int i = i land max_int
 
 let string (s:string) = Hashtbl.hash s

@@ -3,6 +3,7 @@
 
 type 'a t = 'a -> int
 
+val bool : bool t
 val int : int t
 val string : string t
 val combine : 'a t -> int -> 'a -> int
