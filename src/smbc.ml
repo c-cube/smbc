@@ -10,12 +10,13 @@ let parse_file file =
         | Result.Error msg -> print_endline msg; exit 1
         | Result.Ok ast -> ast
 
-let solve (ast:Ast.statement list) : unit =
-  let module S = Solver.Make(struct end) in
-  (* add statements *)
-  S.add_statement_l ast;
+let solve ~max_depth (ast:Ast.statement list) : unit =
+  let module Conf = struct
+    let max_depth = max_depth
+  end in
+  let module S = Solver.Make(Conf)(struct end) in
   (* solve *)
-  match S.check () with
+  match S.check ast with
     | S.Sat m ->
       Format.printf "result: @{<Green>SAT@}@, model @[%a@]@." S.pp_model m
     | S.Unsat ->
@@ -28,6 +29,7 @@ let solve (ast:Ast.statement list) : unit =
 let print_input_ = ref false
 let color_ = ref true
 let file = ref ""
+let max_depth_ = ref 60
 let set_file s =
   if !file = "" then file := s
   else failwith "provide at most one file"
@@ -35,6 +37,7 @@ let set_file s =
 let options =
   Arg.align [
     "--print-input", Arg.Set print_input_, " print input";
+    "--max-depth", Arg.Set_int max_depth_, " set max depth";
     "-nc", Arg.Clear color_, " do not use colors";
     "--debug", Arg.Int Log.set_debug, " set debug level";
     "--backtrace", Arg.Unit (fun () -> Printexc.record_backtrace true), " enable backtrace";
@@ -51,4 +54,4 @@ let () =
     Format.printf "@[parsed:@ @[<v>%a@]@]@."
       (CCFormat.list ~start:"" ~stop:"" ~sep:"" Ast.pp_statement) ast;
   (* solve *)
-  solve ast
+  solve ~max_depth:!max_depth_ ast

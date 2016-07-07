@@ -5,22 +5,16 @@
 
     The solving algorithm, based on MCSat *)
 
-module Make(Dummy : sig end) : sig
+module type CONFIG = sig
+  val max_depth: int
+end
+
+module Make(C:CONFIG)(Dummy : sig end) : sig
   type term
   type cst
   type ty_h (** types *)
 
-  type cst_info = {
-    cst_depth: int lazy_t;
-    (* refinement depth, used for iterative deepening *)
-    cst_parent: (cst * term) lazy_t option;
-    (* if const was created as argument of another const in
-       a given case *)
-    mutable cst_cases : term list option;
-    (* cover set (lazily evaluated) *)
-    mutable cst_cases_blocked: term list;
-    (* parts of cover set forbidden in current branch *)
-  }
+  type cst_info
 
   (** The various kinds of constants *)
   type cst_kind =
@@ -124,7 +118,7 @@ module Make(Dummy : sig end) : sig
   module Lit : sig
     type t
 
-    val not_ : t -> t
+    val neg : t -> t
     val eq : term -> term -> t
     val neq : term -> term -> t
     val atom : ?sign:bool -> term -> t
@@ -136,10 +130,6 @@ module Make(Dummy : sig end) : sig
   end
 
   (** {2 Main} *)
-
-  val add_statement : Ast.statement -> unit
-
-  val add_statement_l : Ast.statement list -> unit
 
   type model = term Typed_cst.Map.t
   (** Map from constants to their value *)
@@ -155,7 +145,7 @@ module Make(Dummy : sig end) : sig
     | Unsat (* TODO: proof *)
     | Unknown of unknown
 
-  val check : unit -> res
-  (** [check ()] checks the satisfiability of the
-      current set of statements *)
+  val check : Ast.statement list -> res
+  (** [check l] checks the satisfiability of the
+      given set of statements *)
 end

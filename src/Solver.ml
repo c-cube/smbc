@@ -3,9 +3,13 @@
 
 (** {1 Solver} *)
 
+module type CONFIG = sig
+  val max_depth: int
+end
+
 (** {2 The Main Solver} *)
 
-module Make(Dummy : sig end) = struct
+module Make(Config : CONFIG)(Dummy : sig end) = struct
   exception Error of string
 
   let errorf msg = CCFormat.ksprintf msg ~f:(fun s -> raise (Error s))
@@ -43,13 +47,10 @@ module Make(Dummy : sig end) = struct
     | B_or of term * term
     | B_imply of term * term
 
-  (* TODO: function [explanation -> level], using max *)
-
-  (* FIXME: add a level in there *)
   (* explain why the normal form *)
   and explanation_atom =
-    | E_choice of cst * term * level (* assertion [c --> t] *)
-    | E_lit of term * bool * level (* decision [lit =/!= true] *)
+    | E_choice of cst * term (* assertion [c --> t] *)
+    | E_lit of term * bool (* decision [lit =/!= true] *)
 
   (* bag of atomic explanations. It is optimized for traversal
      and fast cons/snoc/append *)
@@ -77,8 +78,6 @@ module Make(Dummy : sig end) = struct
        a given case *)
     mutable cst_cases : term list option;
     (* cover set (lazily evaluated) *)
-    mutable cst_cases_blocked: term list;
-    (* parts of cover set forbidden in current branch *)
   }
 
   (* Hashconsed type *)
@@ -229,8 +228,7 @@ module Make(Dummy : sig end) = struct
             invalid_arg "make_const: parent should be a constant"
           | None -> 0
         ) in
-        { cst_depth; cst_parent=parent;
-          cst_cases=None; cst_cases_blocked=[]; }
+        { cst_depth; cst_parent=parent; cst_cases=None; }
       in
       make id (Cst_undef (ty, info))
 
@@ -259,7 +257,6 @@ module Make(Dummy : sig end) = struct
           (* t1.nf <- t2 *)
       | S_set_watcher of term * term list * stack_cell
           (* t1.watchers <- l2 *)
-      | S_set_forbidden of cst_info * term list * stack_cell
 
     type stack = {
       mutable stack_level: int;
@@ -278,15 +275,12 @@ module Make(Dummy : sig end) = struct
           if l=l'
           then st' (* stop *)
           else aux l st' (* continue *)
-        | S_nil -> assert false
+        | S_nil -> st
         | S_set_nf (t, nf, st') ->
           t.term_nf <- nf;
           aux l st'
         | S_set_watcher (t, ts, st') ->
           t.term_watchers <- ts;
-          aux l st'
-        | S_set_forbidden (c, ts, st') ->
-          c.cst_cases_blocked <- ts;
           aux l st'
       in
       st_.stack <- aux l st_.stack
@@ -304,9 +298,6 @@ module Make(Dummy : sig end) = struct
 
     let push_set_watcher_ (t:term) =
       st_.stack <- S_set_watcher (t, t.term_watchers, st_.stack)
-
-    let push_set_forbidden (c:cst_info) =
-      st_.stack <- S_set_forbidden (c, c.cst_cases_blocked, st_.stack)
   end
 
   module Term = struct
@@ -558,6 +549,13 @@ module Make(Dummy : sig end) = struct
       in
       aux t
 
+    (* return [Some] iff the term is an undefined constant *)
+    let as_cst_undef (t:term): (cst * Ty.t * cst_info) option =
+      match t.term_cell with
+        | Const ({cst_kind=Cst_undef (ty,info); _} as c) ->
+          Some (c,ty,info)
+        | _ -> None
+
     let fpf = Format.fprintf
     let pp_list_ pp out l =
       CCFormat.list ~start:"" ~stop:"" ~sep:" " pp out l
@@ -574,11 +572,8 @@ module Make(Dummy : sig end) = struct
       | If (a, b, c) ->
         fpf out "(@[if %a@ %a@ %a@])" pp a pp b pp c
       | Match (t,m) ->
-        let pp_bind out (id,(tys,rhs)) = match tys with
-          | [] -> fpf out "(@[%a %a@])" ID.pp id pp rhs
-          | _::_ ->
-            fpf out "(@[(@[%a@ %a@])@ %a@])"
-              ID.pp id (pp_list_ Ty.pp) tys pp rhs
+        let pp_bind out (id,(_tys,rhs)) =
+          fpf out "(@[%a %a@])" ID.pp id pp rhs
         in
         let print_map = CCFormat.seq ~start:"" ~stop:"" ~sep:" " pp_bind in
         fpf out "(@[match %a@ (@[<hv>%a@])@])"
@@ -590,310 +585,59 @@ module Make(Dummy : sig end) = struct
       | Builtin (B_eq (a,b)) -> fpf out "(@[=@ %a@ %a@])" pp a pp b
   end
 
-  let exp_empty = E_empty
-  let exp_singleton e = E_leaf e
-  let exp_append s1 s2 = match s1, s2 with
-    | E_empty, _ -> s2
-    | _, E_empty -> s1
-    | _ -> E_append (s1, s2)
+  module Explanation = struct
+    type t = explanation
+    let empty = E_empty
+    let return e = E_leaf e
+    let append s1 s2 = match s1, s2 with
+      | E_empty, _ -> s2
+      | _, E_empty -> s1
+      | _ -> E_append (s1, s2)
 
-  let rec exp_to_seq e yield = match e with
-    | E_empty -> ()
-    | E_leaf x -> yield x
-    | E_append (a,b) -> exp_to_seq a yield; exp_to_seq b yield
+    let is_empty = function
+      | E_empty -> true
+      | E_leaf _
+      | E_append _ -> false (* by smart cstor *)
 
-  let rec exp_level e = match e with
-    | E_empty -> 0
-    | E_leaf (E_choice (_,_,l))
-    | E_leaf (E_lit (_,_,l)) -> l
-    | E_append (a,b) -> max (exp_level a) (exp_level b)
+    let rec to_seq e yield = match e with
+      | E_empty -> ()
+      | E_leaf x -> yield x
+      | E_append (a,b) -> to_seq a yield; to_seq b yield
 
-  let pp_explanation_atom out = function
-    | E_choice (c,t,lev) ->
-      Format.fprintf out
-        "(@[choice(%d) %a@ -> %a@])" lev Typed_cst.pp c Term.pp t
-    | E_lit (t,b,lev) ->
-      Format.fprintf out "(@[lit(%d) %a@ -> %B@])" lev Term.pp t b
+    let pp_explanation_atom out = function
+      | E_choice (c,t) ->
+        Format.fprintf out
+          "(@[choice %a@ -> %a@])" Typed_cst.pp c Term.pp t
+      | E_lit (t,b) ->
+        Format.fprintf out "(@[lit %a@ -> %B@])" Term.pp t b
 
-  let pp_explanation out e =
-    Format.fprintf out "@[%a@]"
-      (CCFormat.seq ~start:"" ~stop:"" ~sep:", " pp_explanation_atom)
-      (exp_to_seq e)
-
-  (* return [Some] iff the term is an undefined constant *)
-  let as_cst_undef (t:term): (cst * Ty.t * cst_info) option =
-    match t.term_cell with
-      | Const ({cst_kind=Cst_undef (ty,info); _} as c) ->
-        Some (c,ty,info)
-      | _ -> None
-
-  (* retrieve the normal form of [t], and the explanation
-     of why [t -> normal_form(t) *)
-  let normal_form (t:term) : explanation * term =
-    let rec aux set t = match t.term_nf with
-      | None -> set, t
-      | Some (t',set') -> aux (exp_append set set') t'
-    in
-    match t.term_nf with
-      | None -> exp_empty, t
-      | Some (t',set) -> aux set t'
-
-  let normal_form_append (e:explanation) (t:term) : explanation * term =
-    let e', t' = normal_form t in
-    exp_append e e', t'
-
-  let check_eq t1 t2 =
-    let _, t1' = normal_form t1 in
-    let _, t2' = normal_form t2 in
-    Term.equal t1' t2'
-
-  exception Inconsistent of explanation * term
-  (* semantically equivalent to [explanation => term], where
-     the term evaluates to [false] *)
-
-  (* environment for evaluation: not-yet-evaluated terms *)
-  type eval_env = (explanation * term) lazy_t DB_env.t
-
-  (* just evaluate the De Bruijn indices, and return
-     the explanations used to evaluate subterms *)
-  let eval_db (env:eval_env) (t:term) : explanation * term =
-    if DB_env.size env = 0
-    then exp_empty, t (* trivial *)
-    else (
-      let e = ref exp_empty in
-      let rec aux env t : term = match t.term_cell with
-        | DB d ->
-          begin match DB_env.get d env with
-            | None -> t
-            | Some (lazy (e', t')) ->
-              e := exp_append !e e'; (* save explanation *)
-              t'
-          end
-        | Const _
-        | True
-        | False -> t
-        | Fun (ty, body) ->
-          let body' = aux (DB_env.push_none env) body in
-          Term.fun_ ty body'
-        | Match (u, m) ->
-          let u = aux env u in
-          let m =
-            ID.Map.map
-              (fun (tys,rhs) ->
-                 tys, aux (DB_env.push_none_l tys env) rhs)
-              m
-          in
-          Term.match_ u m
-        | If (a,b,c) ->
-          Term.if_ (aux env a) (aux env b) (aux env c)
-        | App (f, l) -> Term.app (aux env f) (aux_l env l)
-        | Builtin b -> Term.builtin_ (Term.map_builtin (aux env) b)
-      and aux_l env l =
-        List.map (aux env) l
-      in
-      let t = aux env t in
-      !e, t
-    )
-
-  (* set the normal form of [t], propagate to watchers *)
-  let rec set_nf_ t new_t (e:explanation) : unit =
-    if Term.equal t new_t then ()
-    else (
-      assert (t.term_nf = None);
-      Backtrack.push_set_nf_ t;
-      t.term_nf <- Some (new_t, e);
-      Log.debugf 5
-        (fun k->k "@[<hv2>set_nf@ `@[%a@]` :=@ `@[%a@]`@ with exp %a@]"
-            Term.pp t Term.pp new_t pp_explanation e);
-      (* we just changed [t]'s normal form, ensure that [t]'s
-         watching terms are up-to-date *)
-      List.iter
-        (fun watcher -> match watcher.term_nf with
-           | Some _ -> ()   (* already reduced *)
-           | None -> ignore (compute_nf watcher))
-        t.term_watchers;
-    )
-
-  (* compute the normal form of this term. We know at least one of its
-     subterm(s) has been reduced *)
-  and compute_nf (t:term) : explanation * term =
-    (* follow the "normal form" pointer *)
-    match t.term_nf with
-      | Some (t', e) ->
-        let e', nf = compute_nf t' in
-        (* NOTE path compression here, maybe *)
-        exp_append e e', nf
-      | None -> compute_nf_noncached t
-  and compute_nf_noncached t =
-    assert (t.term_nf = None);
-    match t.term_cell with
-      | DB _ -> assert false (* non closed! *)
-      | True | False | Const _ -> exp_empty, t (* always trivial *)
-      | Fun _ -> exp_empty, t (* no eval under lambda *)
-      | Builtin b ->
-        let e, b' =
-          Term.fold_map_builtin compute_nf_add exp_empty b
-        in
-        (* try boolean reductions *)
-        let t' = match b' with
-          | B_not a ->
-            begin match a.term_cell with
-              | True -> Term.false_
-              | False -> Term.true_
-              | _ -> Term.not_ a
-            end
-          | B_and (a,b) ->
-            begin match a.term_cell, b.term_cell with
-              | True, _ -> b
-              | _, True -> a
-              | False, _
-              | _, False -> Term.false_
-              | _ -> Term.and_ a b
-            end
-          | B_or (a,b) ->
-            begin match a.term_cell, b.term_cell with
-              | True, _
-              | _, True -> Term.true_
-              | False, _ -> b
-              | _, False -> a
-              | _ -> Term.or_ a b
-            end
-          | B_imply (a,b) ->
-            begin match a.term_cell, b.term_cell with
-              | _, True
-              | False, _ -> Term.true_
-              | True, _ -> b
-              | _, False -> Term.not_ a
-              | _ -> Term.imply a b
-            end
-          | B_eq (a,b) ->
-            begin match a.term_cell, b.term_cell with
-              | False, False
-              | True, True -> Term.true_
-              | True, False
-              | False, True -> Term.false_
-              | _ when Term.equal a b -> Term.true_ (* syntactic *)
-              | App (
-                  {term_cell=Const ({cst_kind=Cst_cstor _; _} as c1); _},
-                  _),
-                App (
-                  {term_cell=Const ({cst_kind=Cst_cstor _; _} as c2); _},
-                  _)
-                when not (Typed_cst.equal c1 c2) ->
-                (* [c1 ... = c2 ...] --> false, as distinct constructors
-                   can never be equal *)
-                Term.false_
-              | _ -> Term.eq a b
-            end
-        in
-        assert (not (Term.equal t t'));
-        set_nf_ t t' e;
-        e, t'
-      | If (a,b,c) ->
-        let e_a, a' = normal_form a in
-        assert (not (Term.equal a a'));
-        let default() = Term.if_ a' b c in
-        let e_branch, t' = match a'.term_cell with
-          | True -> compute_nf b
-          | False -> compute_nf c
-          | _ -> exp_empty, default()
-        in
-        (* merge evidence from [a]'s normal form and [b/c]'s normal form *)
-        let e = exp_append e_a e_branch in
-        set_nf_ t t' e;
-        e, t'
-      | Match (u, m) ->
-        let e_u, u' = normal_form u in
-        let default() = Term.match_ u' m in
-        let e_branch, t' = match u'.term_cell with
-          | App ({term_cell=Const c; _}, l) ->
-            begin
-              try
-                let tys, rhs = ID.Map.find (Typed_cst.id c) m in
-                if List.length tys = List.length l
-                then
-                  (* evaluate arguments *)
-                  let l =
-                    List.map
-                      (fun t -> lazy (compute_nf t))
-                      l
-                  in
-                  let env = DB_env.push_l l DB_env.empty in
-                  (* replace in [rhs] *)
-                  let e', rhs = eval_db env rhs in
-                  (* evaluate new [rhs] *)
-                  compute_nf_add e' rhs
-                else exp_empty, Term.match_ u' m
-              with Not_found ->
-                exp_empty, Term.match_ u' m
-            end
-          | _ -> exp_empty, default()
-        in
-        let e = exp_append e_u e_branch in
-        set_nf_ t t' e;
-        e, t'
-      | App (f, l) ->
-        let e_f, f' = normal_form f in
-        (* now beta-reduce if needed *)
-        let e_reduce, new_t = compute_nf_app DB_env.empty exp_empty f' l in
-        (* merge explanations *)
-        let e = exp_append e_reduce e_f in
-        set_nf_ t new_t e;
-        e, new_t
-
-  (* apply [f] to [l], until no beta-redex is found *)
-  and compute_nf_app env e f l = match f.term_cell, l with
-    | Const {cst_kind=Cst_defined (_, lazy def_f); _}, l ->
-      assert (l <> []);
-      (* reduce [f l] into [def_f l] when [f := def_f] *)
-      compute_nf_app env e def_f l
-    | Fun (_ty, body), arg :: other_args ->
-      (* beta-reduce *)
-      assert (Ty.equal _ty arg.term_ty);
-      let new_env = DB_env.push (lazy (compute_nf arg)) env in
-      (* apply [body] to [other_args] *)
-      compute_nf_app new_env e body other_args
-    | _ ->
-      (* cannot reduce; substitute in [f] and re-apply *)
-      let e', f = eval_db env f in
-      let t' = Term.app f l in
-      exp_append e e', t'
-
-  (* compute nf of [t], append [e] to the explanation *)
-  and compute_nf_add (e : explanation) (t:term) : explanation * term =
-    let e', t' = compute_nf t in
-    exp_append e e', t'
+    let pp out e =
+      Format.fprintf out "@[%a@]"
+        (CCFormat.seq ~start:"" ~stop:"" ~sep:", " pp_explanation_atom)
+        (to_seq e)
+  end
 
   (** {2 Literals} *)
   module Lit = struct
     type t = term
-    let not_ = Term.not_
+    let neg = Term.not_
 
     type view =
       | V_true
       | V_false
       | V_assert of term * bool
-      | V_cst_choice of cst * term * bool
+      | V_cst_choice of cst * term
 
     let view (t:t): view = match t.term_cell with
       | False -> V_false
       | True -> V_true
       | Builtin (B_eq (a, b)) ->
-        begin match as_cst_undef a, as_cst_undef b with
-          | Some (c,_,_), _ -> V_cst_choice (c,b,true)
-          | None, Some (c,_,_) -> V_cst_choice (c,a,true)
+        begin match Term.as_cst_undef a, Term.as_cst_undef b with
+          | Some (c,_,_), _ -> V_cst_choice (c,b)
+          | None, Some (c,_,_) -> V_cst_choice (c,a)
           | None, None -> V_assert (t, true)
         end
-      | Builtin (B_not t') ->
-        begin match t'.term_cell with
-          | Builtin (B_eq (a,b)) ->
-              begin match as_cst_undef a, as_cst_undef b with
-                | Some (c,_,_), _ -> V_cst_choice (c,b,false)
-                | None, Some (c,_,_) -> V_cst_choice (c,a,false)
-                | _ -> V_assert (t', false)
-              end
-          | _ -> V_assert (t', false)
-        end
+      | Builtin (B_not t') -> V_assert (t', false)
       | _ -> V_assert (t, true)
 
     let fresh =
@@ -907,7 +651,7 @@ module Make(Dummy : sig end) = struct
 
     let dummy = fresh()
 
-    let atom ?(sign=true) t = if sign then t else not_ t
+    let atom ?(sign=true) t = if sign then t else neg t
     let eq a b = Term.eq a b
     let neq a b = Term.neq a b
     let cst_choice c t = Term.eq (Term.const c) t
@@ -923,28 +667,141 @@ module Make(Dummy : sig end) = struct
     let norm l = l, false (* TODO? *)
   end
 
-  type clause = Lit.t list
+  module Clause = struct
+    type t = Lit.t list
 
-  let pp_clause out c = match c with
-    | [] -> CCFormat.string out "false"
-    | [lit] -> Lit.pp out lit
-    | _ ->
-      Format.fprintf out "(@[or@ %a@])"
-        (CCFormat.list ~start:"" ~stop:"" ~sep:" " Lit.pp) c
+    let pp out c = match c with
+      | [] -> CCFormat.string out "false"
+      | [lit] -> Lit.pp out lit
+      | _ ->
+        Format.fprintf out "(@[or@ %a@])"
+          (CCFormat.list ~start:"" ~stop:"" ~sep:" " Lit.pp) c
 
-  let explain t1 t2 : explanation =
-    let e1, t1 = normal_form t1 in
-    let e2, t2 = normal_form t2 in
-    if not (Term.equal t1 t2)
-    then invalid_arg "term.explain: not equal";
-    (* merge the two explanations *)
-    exp_append e1 e2
+    (* list of clauses that have been newly generated, waiting
+       to be propagated to Msat.
+       invariant: those clauses must be tautologies *)
+    let new_ : t list ref = ref []
+
+    let pop_new () : t list =
+      let l = !new_ in
+      new_ := [];
+      l
+
+    let push_new (c:t): unit =
+      Log.debugf 5 (fun k->k "new tautology: `@[%a@]`" pp c);
+      new_ := c :: !new_;
+      ()
+  end
+
+  (** {2 Iterative Deepening} *)
+
+  module Iterative_deepening : sig
+    type t = private int
+    val max_depth : t
+
+    type state =
+      | At of t * Lit.t
+      | Exhausted
+
+    val reset : unit -> unit
+    val current : unit -> state
+    val next : unit -> state
+    val lit_of_depth : int -> Lit.t option
+    val pp: t CCFormat.printer
+  end = struct
+    type t = int
+
+    let pp = CCFormat.int
+
+    (* truncate at powers of 5 *)
+    let max_depth =
+      if Config.max_depth < 5
+      then invalid_arg "max-depth should be >= 5";
+      let rem = Config.max_depth mod 5 in
+      let res = Config.max_depth - rem in
+      Log.debugf 1 (fun k->k "max depth = %d" res);
+      res
+
+    type state =
+      | At of t * Lit.t
+      | Exhausted
+
+    (* create a literal standing for [max_depth = d] *)
+    let mk_lit_ d : Lit.t =
+      ID.makef "max_depth_leq_%d" d
+      |> Typed_cst.make_bool
+      |> Term.const
+      |> Lit.atom ~sign:true
+
+    let lits_ : (int, Lit.t) Hashtbl.t = Hashtbl.create 32
+
+    (* get the literal correspond to depth [d], if any *)
+    let lit_of_depth d : Lit.t option =
+      if d < 5 || (d mod 5 <> 0) || d > max_depth
+      then None
+      else match CCHashtbl.get lits_ d with
+        | Some l -> Some l
+        | None ->
+          let lit = mk_lit_ d in
+          Hashtbl.add lits_ d lit;
+          Some lit
+
+    (* initial state *)
+    let start_ = At (5, mk_lit_ 5)
+
+    let cur_ = ref start_
+    let reset () = cur_ := start_
+    let current () = !cur_
+
+    (* next state *)
+    let next () = match !cur_ with
+      | Exhausted -> assert false
+      | At (l_old, _) ->
+        (* update level and current lit *)
+        let l = l_old + 5 in
+        let st =
+          if l > max_depth
+          then Exhausted
+          else (
+            let lit =
+              match lit_of_depth l with
+                | Some lit -> lit
+                | None -> errorf "increased depth to %d, but not lit" l
+            in
+            At (l, lit)
+          )
+        in
+        cur_ := st;
+        st
+  end
+
+  (** {2 Case Expansion} *)
 
   (* build a clause that explains that [c] must be one of its
      cases *)
-  let clause_of_cases (c:cst) : clause = match c.cst_kind with
-    | Cst_undef (_, {cst_cases=Some l; _}) ->
-      List.map (fun t -> Lit.cst_choice c t) l
+  let clause_of_cases (c:cst) : Clause.t = match c.cst_kind with
+    | Cst_undef (_, {cst_cases=Some l; cst_depth=lazy d; _}) ->
+      (* guard for non-constant cases (depth limit) *)
+      let lit_guard = Iterative_deepening.lit_of_depth d in
+      List.map
+        (fun rhs ->
+           let lit = Lit.cst_choice c rhs in
+           (* does [rhs] use constants deeper than [d]? *)
+           let goes_deeper =
+             Term.to_seq rhs
+             |> Sequence.exists
+               (fun sub -> match sub.term_cell with
+                  | Const {cst_kind=Cst_undef (_,info); _} ->
+                    (* is [sub] a constant deeper than [d]? *)
+                    Lazy.force info.cst_depth > d
+                  | _ -> false)
+           in
+           match lit_guard, goes_deeper with
+             | Some guard, true ->
+               Term.and_ lit guard (* this branch might be too deep *)
+             | _ -> lit
+        )
+        l
     | _ -> assert false
 
   (* make a fresh constant, with a unique name *)
@@ -990,78 +847,328 @@ module Make(Dummy : sig end) = struct
     Log.debugf 4
       (fun k->k "@[<2>expand cases `@[%a@]` into:@ @[%a@]@]"
           Typed_cst.pp cst (CCFormat.list Term.pp) l);
-    (* TODO: if depth is limited??? *)
     info.cst_cases <- Some l;
     l
 
-  (** {2 Iterative Deepening} *)
+  (* retrieve the normal form of [t], and the explanation
+     of why [t -> normal_form(t) *)
+  let normal_form (t:term) : explanation * term =
+    let rec aux set t = match t.term_nf with
+      | None -> set, t
+      | Some (t',set') -> aux (Explanation.append set set') t'
+    in
+    match t.term_nf with
+      | None -> Explanation.empty, t
+      | Some (t',set) -> aux set t'
 
-  module Depth_limit : sig
-    type t = private int
-    val current : unit -> t
-    val next : unit -> t
-  end = struct
-    type t = int
+  let normal_form_append (e:explanation) (t:term) : explanation * term =
+    let e', t' = normal_form t in
+    Explanation.append e e', t'
 
-    let cur_ = ref 5
+  let check_eq t1 t2 =
+    let _, t1' = normal_form t1 in
+    let _, t2' = normal_form t2 in
+    Term.equal t1' t2'
 
-    let current () = !cur_
+  exception Inconsistent of explanation * term
+  (* semantically equivalent to [explanation => term], where
+     the term evaluates to [false] *)
 
-    let next () =
-      cur_ := !cur_ + 5;
-      !cur_
-  end
+  (* environment for evaluation: not-yet-evaluated terms *)
+  type eval_env = (explanation * term) lazy_t DB_env.t
 
-  (** {2 MCSat Solver} *)
+  (* just evaluate the De Bruijn indices, and return
+     the explanations used to evaluate subterms *)
+  let eval_db (env:eval_env) (t:term) : explanation * term =
+    if DB_env.size env = 0
+    then Explanation.empty, t (* trivial *)
+    else (
+      let e = ref Explanation.empty in
+      let rec aux env t : term = match t.term_cell with
+        | DB d ->
+          begin match DB_env.get d env with
+            | None -> t
+            | Some (lazy (e', t')) ->
+              e := Explanation.append !e e'; (* save explanation *)
+              t'
+          end
+        | Const _
+        | True
+        | False -> t
+        | Fun (ty, body) ->
+          let body' = aux (DB_env.push_none env) body in
+          Term.fun_ ty body'
+        | Match (u, m) ->
+          let u = aux env u in
+          let m =
+            ID.Map.map
+              (fun (tys,rhs) ->
+                 tys, aux (DB_env.push_none_l tys env) rhs)
+              m
+          in
+          Term.match_ u m
+        | If (a,b,c) ->
+          Term.if_ (aux env a) (aux env b) (aux env c)
+        | App (f, l) -> Term.app (aux env f) (aux_l env l)
+        | Builtin b -> Term.builtin_ (Term.map_builtin (aux env) b)
+      and aux_l env l =
+        List.map (aux env) l
+      in
+      let t = aux env t in
+      !e, t
+    )
 
-  (* terms/formulas for mcsat *)
+  (* find the set of constants potentially blocking
+     the evaluation of [t] *)
+  let find_blocking_undef (t:term): (cst * Ty.t * cst_info) Sequence.t =
+    let rec aux t yield = match t.term_cell with
+      | Const c ->
+        begin match c.cst_kind with
+          | Cst_undef (ty, info) -> yield (c, ty, info)
+          | Cst_bool
+          | Cst_cstor _
+          | Cst_defined _ -> ()
+        end
+      | App (f, _) -> aux f yield
+      | Builtin b ->
+        Term.builtin_to_seq b
+        |> Sequence.flat_map aux
+        |> Sequence.iter yield
+      | Fun _ (* in normal form *)
+      | True
+      | False
+      | DB _ -> ()
+      | Match (u,_) -> aux u yield
+      | If (a,_,_) -> aux a yield
+    in
+    aux t
+
+  (* find blocking undefined constants, and expand their list of cases *)
+  let expand_blocking_undef (t:term) : unit =
+    find_blocking_undef t
+    |> Sequence.iter
+      (fun (c,ty,info) -> match info.cst_cases with
+         | Some _ -> ()
+         | None ->
+           let _ = expand_cases c ty info in
+           assert (info.cst_cases <> None);
+           (* also push a new tautology to force a choice in [l] *)
+           let new_c = clause_of_cases c in
+           Clause.push_new new_c)
+
+  (* set the normal form of [t], propagate to watchers *)
+  let rec set_nf_ t new_t (e:explanation) : unit =
+    if Term.equal t new_t then ()
+    else (
+      assert (t.term_nf = None);
+      Backtrack.push_set_nf_ t;
+      t.term_nf <- Some (new_t, e);
+      Log.debugf 5
+        (fun k->k "@[<hv2>set_nf@ `@[%a@]` :=@ `@[%a@]`@ with exp %a@]"
+            Term.pp t Term.pp new_t Explanation.pp e);
+      (* we just changed [t]'s normal form, ensure that [t]'s
+         watching terms are up-to-date *)
+      List.iter
+        (fun watcher -> match watcher.term_nf with
+           | Some _ -> ()   (* already reduced *)
+           | None -> ignore (compute_nf watcher))
+        t.term_watchers;
+    )
+
+  (* compute the normal form of this term. We know at least one of its
+     subterm(s) has been reduced *)
+  and compute_nf (t:term) : explanation * term =
+    Log.debugf 5 (fun k->k "compute_nf `@[%a@]`" Term.pp t);
+    (* follow the "normal form" pointer *)
+    match t.term_nf with
+      | Some (t', e) ->
+        let e', nf = compute_nf t' in
+        (* NOTE path compression here, maybe *)
+        Explanation.append e e', nf
+      | None -> compute_nf_noncached t
+
+  and compute_nf_noncached t =
+    assert (t.term_nf = None);
+    match t.term_cell with
+      | DB _ -> assert false (* non closed! *)
+      | True | False | Const _ ->
+        Explanation.empty, t (* always trivial *)
+      | Fun _ -> Explanation.empty, t (* no eval under lambda *)
+      | Builtin b ->
+        let e, b' =
+          Term.fold_map_builtin compute_nf_add Explanation.empty b
+        in
+        (* try boolean reductions *)
+        let t' = compute_builtin b' in
+        set_nf_ t t' e;
+        e, t'
+      | If (a,b,c) ->
+        let e_a, a' = normal_form a in
+        assert (not (Term.equal a a'));
+        let default() = Term.if_ a' b c in
+        let e_branch, t' = match a'.term_cell with
+          | True -> compute_nf b
+          | False -> compute_nf c
+          | _ -> Explanation.empty, default()
+        in
+        (* merge evidence from [a]'s normal form and [b/c]'s normal form *)
+        let e = Explanation.append e_a e_branch in
+        set_nf_ t t' e;
+        e, t'
+      | Match (u, m) ->
+        let e_u, u' = normal_form u in
+        let default() = Term.match_ u' m in
+        let e_branch, t' = match u'.term_cell with
+          | App ({term_cell=Const c; _}, l) ->
+            begin
+              try
+                let tys, rhs = ID.Map.find (Typed_cst.id c) m in
+                if List.length tys = List.length l
+                then (
+                  (* evaluate arguments *)
+                  let l =
+                    List.map
+                      (fun t -> lazy (compute_nf t))
+                      l
+                  in
+                  let env = DB_env.push_l l DB_env.empty in
+                  (* replace in [rhs] *)
+                  let e', rhs = eval_db env rhs in
+                  (* evaluate new [rhs] *)
+                  compute_nf_add e' rhs
+                )
+                else Explanation.empty, Term.match_ u' m
+              with Not_found ->
+                Explanation.empty, Term.match_ u' m
+            end
+          | _ -> Explanation.empty, default()
+        in
+        let e = Explanation.append e_u e_branch in
+        set_nf_ t t' e;
+        e, t'
+      | App (f, l) ->
+        let e_f, f' = normal_form f in
+        (* now beta-reduce if needed *)
+        let e_reduce, new_t =
+          compute_nf_app DB_env.empty Explanation.empty f' l
+        in
+        (* merge explanations *)
+        let e = Explanation.append e_reduce e_f in
+        set_nf_ t new_t e;
+        e, new_t
+
+  (* apply [f] to [l], until no beta-redex is found *)
+  and compute_nf_app env e f l = match f.term_cell, l with
+    | Const {cst_kind=Cst_defined (_, lazy def_f); _}, l ->
+      assert (l <> []);
+      (* reduce [f l] into [def_f l] when [f := def_f] *)
+      compute_nf_app env e def_f l
+    | Fun (_ty, body), arg :: other_args ->
+      (* beta-reduce *)
+      assert (Ty.equal _ty arg.term_ty);
+      let new_env = DB_env.push (lazy (compute_nf arg)) env in
+      (* apply [body] to [other_args] *)
+      compute_nf_app new_env e body other_args
+    | _ ->
+      (* cannot reduce; substitute in [f] and re-apply *)
+      let e', f = eval_db env f in
+      let t' = Term.app f l in
+      Explanation.append e e', t'
+
+  (* compute nf of [t], append [e] to the explanation *)
+  and compute_nf_add (e : explanation) (t:term) : explanation * term =
+    let e', t' = compute_nf t in
+    Explanation.append e e', t'
+
+  (* compute the builtin, assuming its components are
+     already reduced *)
+  and compute_builtin bu: term = match bu with
+    | B_not a ->
+      begin match a.term_cell with
+        | True -> Term.false_
+        | False -> Term.true_
+        | _ -> Term.not_ a
+      end
+    | B_and (a,b) ->
+      begin match a.term_cell, b.term_cell with
+        | True, _ -> b
+        | _, True -> a
+        | False, _
+        | _, False -> Term.false_
+        | _ -> Term.and_ a b
+      end
+    | B_or (a,b) ->
+      begin match a.term_cell, b.term_cell with
+        | True, _
+        | _, True -> Term.true_
+        | False, _ -> b
+        | _, False -> a
+        | _ -> Term.or_ a b
+      end
+    | B_imply (a,b) ->
+      begin match a.term_cell, b.term_cell with
+        | _, True
+        | False, _ -> Term.true_
+        | True, _ -> b
+        | _, False -> Term.not_ a
+        | _ -> Term.imply a b
+      end
+    | B_eq (a,b) ->
+      begin match a.term_cell, b.term_cell with
+        | False, False
+        | True, True -> Term.true_
+        | True, False
+        | False, True -> Term.false_
+        | _ when Term.equal a b -> Term.true_ (* syntactic *)
+        | App (
+            {term_cell=Const ({cst_kind=Cst_cstor _; _} as c1); _},
+            _),
+          App (
+            {term_cell=Const ({cst_kind=Cst_cstor _; _} as c2); _},
+            _)
+          when not (Typed_cst.equal c1 c2) ->
+          (* [c1 ... = c2 ...] --> false, as distinct constructors
+             can never be equal *)
+          Term.false_
+        | _ -> Term.eq a b
+      end
+
+  (** {2 Sat Solver} *)
+
+  (* formulas for msat *)
   module M_expr
-    : Msat.Expr_intf.S
-      with type Term.t = term
-       and type Formula.t = Lit.t
+    : Msat.Formula_intf.S
+      with type t = Term.t
        and type proof = unit
   = struct
-    module Term = struct
-      type t = term
-      let equal = Term.equal
-      let hash = Term.hash
-      let compare = Term.compare
-      let print = Term.pp
-    end
-    module Formula = Lit
-
+    include Lit
     type proof = unit (* TODO later *)
-    let dummy = Lit.dummy
-    let fresh = Lit.fresh
-    let neg = Lit.not_
-    let norm = Lit.norm
+    let label _ = assert false
+    let add_label _ _ = assert false
+    let print = Lit.pp
   end
 
   (* the "theory" part: propagations *)
-  module M_th = struct
-    type term = M_expr.Term.t
-    type formula = M_expr.Formula.t
+  module M_th :
+    Msat.Theory_intf.S
+    with type formula = M_expr.t
+     and type proof = M_expr.proof
+  = struct
+    type formula = M_expr.t
     type proof = M_expr.proof
-    type assumption =
-      | Lit of formula
-      | Assign of term * term
+
     type slice = {
       start : int;
       length : int;
-      get : int -> assumption * int;
+      get : int -> formula;
       push : formula list -> proof -> unit;
-      propagate : formula -> int -> unit;
     }
 
     type level = Backtrack.level
 
     type res =
-      | Sat
+      | Sat of level
       | Unsat of formula list * proof
-
-    type eval_res =
-      | Valued of bool * int
-      | Unknown
 
     let dummy = Backtrack.dummy_level
 
@@ -1070,15 +1177,11 @@ module Make(Dummy : sig end) = struct
     let backtrack = Backtrack.backtrack
 
     let lit_of_exp_ (e:explanation_atom): Lit.t = match e with
-      | E_lit (t, b, _) ->
-        Lit.atom ~sign:b t
-      | E_choice (cst,t,_) ->
-        (* NOTE: hack, because mcsat doesn't accept an assignment
-           in conflict clauses *)
-        Lit.eq (Term.const cst) t
+      | E_lit (t, b) -> Lit.atom ~sign:b t
+      | E_choice (cst, t) -> Lit.cst_choice cst t
 
-    let clause_of_exp_ (e:explanation): clause =
-      exp_to_seq e
+    let clause_of_exp_ (e:explanation): Clause.t =
+      Explanation.to_seq e
       |> Sequence.map lit_of_exp_
       |> Sequence.to_rev_list
 
@@ -1087,128 +1190,52 @@ module Make(Dummy : sig end) = struct
        turn them into literals and propagate them via [slice] *)
 
     (* assert [c := new_t] and propagate *)
-    let assert_choice _slice lev (c:cst) (new_t:term) : unit =
+    let assert_choice _slice (c:cst) (new_t:term) : unit =
       let t_c = Term.const c in
       assert (t_c.term_nf = None);
       (* set normal form, then compute *)
-      set_nf_ t_c new_t (exp_singleton (E_choice (c, new_t, lev)));
+      set_nf_ t_c new_t (Explanation.return (E_choice (c, new_t)));
       ()
 
-    (* forbid the choice [c := t];
-       - propagate if only one choice remains *)
-    let assert_not_choice slice level (c:cst) (t:term) : unit =
-      match c.cst_kind with
-        | Cst_undef (ty, info) ->
-          (* list of cases *)
-          let cases = match info.cst_cases with
-            | None -> expand_cases c ty info
-            | Some l -> l
-          in
-          (* forbid [t] *)
-          Backtrack.push_set_forbidden info;
-          let blocked = t :: info.cst_cases_blocked in
-          info.cst_cases_blocked <- blocked;
-          (* find the cases not blocked yet *)
-          let nonblocked =
-            List.filter
-              (fun t -> not (List.memq t blocked))
-              cases
-          in
-          begin match nonblocked with
-            | [] -> assert false (* should have propagated earlier *)
-            | [t] ->
-              (* unit propagation *)
-              (* FIXME: should level be given as param? *)
-              slice.propagate (Lit.cst_choice c t) level
-            | _::_::_ -> ()
-          end;
-          ()
-        | _ -> assert false
-
-    let assert_lit slice level (l:Lit.t) : unit = match Lit.view l with
+    let assert_lit slice (l:Lit.t) : unit = match Lit.view l with
       | Lit.V_false -> assert false
       | Lit.V_true -> ()
       | Lit.V_assert (_, _) -> () (* TODO? *)
-      | Lit.V_cst_choice (c, t, true) ->
-        assert_choice slice level c t
-      | Lit.V_cst_choice (c, t, false) ->
-        assert_not_choice slice level c t
+      | Lit.V_cst_choice (c, t) ->
+        assert_choice slice c t
 
     (* propagation from the bool solver *)
     let assume slice =
       let start = slice.start in
       try
-        (* TODO: propagate/use level in explanations *)
         for i = start to start + slice.length - 1 do
-          let assum, level = slice.get i in
-          match assum with
-            | Lit lit ->
-              Log.debugf 3 (fun k->k "assert_lit %a" Lit.pp lit);
-              assert_lit slice level lit
-            | Assign (t,u) ->
-              begin match as_cst_undef t with
-                | None -> assert false
-                | Some (c, _, _) ->
-                  Log.debugf 3
-                    (fun k->k "assert_choice %a -> %a"
-                        Typed_cst.pp c Term.pp u);
-                  assert_choice slice level c u
-              end
+          let lit = slice.get i in
+          Log.debugf 3 (fun k->k "assert_lit %a" Lit.pp lit);
+          assert_lit slice lit;
+          (* also assert the new tautologies *)
+          let new_clauses = Clause.pop_new () in
+          List.iter
+            (fun c -> slice.push c ())
+            new_clauses
         done;
-        Sat
+        let lev = Backtrack.cur_level () in
+        Sat lev
       with Inconsistent (e, concl) ->
         (* conflict clause: [e => concl] *)
-        let guard = clause_of_exp_ e |> List.map Lit.not_ in
+        let guard = clause_of_exp_ e |> List.map Lit.neg in
         let conflict_clause = Lit.atom ~sign:true concl :: guard in
         Unsat (conflict_clause, ())
-
-    (* find an assignment for [t], where [t] should be an
-       undefined constant *)
-    let assign t = match as_cst_undef t with
-      | None -> assert false
-      | Some (cst, ty, info) ->
-        (* develop the list of cases, if needed, and pick one *)
-        let cases = match info.cst_cases with
-          | Some l -> l
-          | None -> expand_cases cst ty info
-        in
-        (* find the cases not blocked yet *)
-        let nonblocked =
-          List.filter
-            (fun t -> not (List.memq t info.cst_cases_blocked))
-            cases
-        in
-        let res = match nonblocked with
-          | [] -> assert false (* TODO: conflict *)
-          | t :: _ ->
-            t (* pick first available case *)
-        in
-        Log.debugf 3
-          (fun k->k "@[assign %a -> %a@]" Typed_cst.pp cst Term.pp res);
-        res
-
-    let iter_assignable (yield:term->unit) (lit:Lit.t): unit =
-      (* return the undefined sub-constants *)
-      Term.to_seq lit
-      |> Sequence.filter
-        (fun t -> match as_cst_undef t with
-           | None -> false
-           | Some _ -> true)
-      |> Sequence.iter yield
-
-    let eval t : eval_res =
-      let e, new_t = compute_nf t in
-      let level = exp_level e in
-      begin match new_t.term_cell with
-        | True -> Valued (true, level)
-        | False -> Valued (false, level)
-        | _ -> Unknown
-      end
-
-    let if_sat _slice = ()
   end
 
-  module M = Msat.Mcsolver.Make(M_expr)(M_th)(struct end)
+  module M = Msat.Solver.Make(M_expr)(M_th)(struct end)
+
+  (* push one clause into [M] *)
+  let push_clause (c:Clause.t): unit =
+    Log.debugf 3 (fun k->k "@[<2>push clause `@[%a@]`@]" Clause.pp c);
+    (* ensure that all constants that might block the evaluation
+       of [c] are expanded *)
+    List.iter expand_blocking_undef c;
+    M.assume [c]
 
   (** {2 Conversion} *)
 
@@ -1289,17 +1316,27 @@ module Make(Dummy : sig end) = struct
     (* list of constants we are interested in *)
     let model_support_ : Typed_cst.t list ref = ref []
 
-    let push_clause (c:clause): unit =
-      Log.debugf 3 (fun k->k "@[<2>push clause `@[%a@]`@]" pp_clause c);
-      M.assume [c]
+    let add_cst_support_ (c:cst): unit =
+      CCList.Ref.push model_support_ c
 
-    (* TODO: transform into terms, blabla *)
+    (* normalize [c], at toplevel only (no assumption) *)
+    let push_normalized_clause c =
+      let c =
+        List.map
+          (fun t ->
+             let e, t' = compute_nf t in
+             assert (Explanation.is_empty e);
+             t')
+          c
+      in
+      push_clause c
+
     let add_statement st =
       Log.debugf 2 (fun k->k "add statement `@[%a@]`" Ast.pp_statement st);
       match st with
         | Ast.Assert t ->
           let t = conv_term [] t in
-          push_clause [t]
+          push_normalized_clause [t]
         | Ast.Goal (vars, t) ->
           (* skolemize *)
           let env, consts =
@@ -1312,9 +1349,9 @@ module Make(Dummy : sig end) = struct
               vars
           in
           (* model should contain values of [consts] *)
-          CCList.Ref.push_list model_support_ consts;
+          List.iter add_cst_support_ consts;
           let t = conv_term env t in
-          push_clause [t]
+          push_normalized_clause [t]
         | Ast.TyDecl id ->
           let ty = Ty.atomic id Uninterpreted in
           ID.Tbl.add ty_tbl_ id (Lazy.from_val ty)
@@ -1327,6 +1364,7 @@ module Make(Dummy : sig end) = struct
               Typed_cst.make_undef id ty
             | Prop -> Typed_cst.make_bool id
           in
+          add_cst_support_ cst; (* need it in model *)
           ID.Tbl.add decl_ty_ id (Lazy.from_val cst)
         | Ast.Data l ->
           (* declare the type, and all the constructors *)
@@ -1375,9 +1413,6 @@ module Make(Dummy : sig end) = struct
     let add_statement_l = List.iter add_statement
   end
 
-  let add_statement = Conv.add_statement
-  let add_statement_l = Conv.add_statement_l
-
   (** {2 Main} *)
 
   (* TODO: literals for iterative deepening
@@ -1415,13 +1450,65 @@ module Make(Dummy : sig end) = struct
          c, t)
     |> Typed_cst.Map.of_seq
 
-  (* TODO: iterative deepening *)
-  let check () =
-    try
-      M.solve ();
-      let m = compute_model_ () in
-      Sat m
-    with M.Unsat ->
-      Unsat (* TODO: check if max depth involved *)
+  (* convert unsat-core *)
+  let conv_unsat_core (core:M.St.clause list): Clause.t Sequence.t =
+    Sequence.of_list core
+    |> Sequence.map
+      (fun c ->
+         M.Proof.to_list c |> List.map (fun a -> a.M.St.lit))
+
+  (* safe push/pop in msat *)
+  let with_push_ f =
+    let lev = M.push () in
+    Iterative_deepening.reset ();
+    CCFun.finally
+      ~f
+      ~h:(fun () -> M.pop lev)
+
+  let check l =
+    let module ID = Iterative_deepening in
+    (* iterated deepening *)
+    let rec iter state = match state with
+      | ID.Exhausted -> Unknown U_max_depth
+      | ID.At (cur_depth, cur_lit) ->
+        let lev = M.push () in
+        (* restrict depth *)
+        push_clause [cur_lit];
+        match M.solve () with
+          | M.Sat ->
+            let m = compute_model_ () in
+            Log.debugf 1
+              (fun k->k "*** found SAT at depth %a" ID.pp cur_depth);
+            M.pop lev; (* remove clause *)
+            Sat m
+          | M.Unsat ->
+            (* check if [max depth] literal involved in unsat-core;
+               - if not, truly UNSAT
+               - if yes, try next level
+            *)
+            let core = M.get_proof () |> M.unsat_core in
+            let cur_lit_neg = Lit.neg cur_lit in
+            let depth_limited =
+              conv_unsat_core core
+              |> Sequence.flat_map Sequence.of_list
+              |> Sequence.exists
+                (fun lit ->
+                   Lit.equal lit cur_lit || Lit.equal lit cur_lit_neg)
+            in
+            Log.debugf 1
+              (fun k->k "*** found Unsat at depth %a; depends on %a: %B"
+                  ID.pp cur_depth Lit.pp cur_lit depth_limited);
+            (* remove depth limiting clause in any case*)
+            M.pop lev;
+            if depth_limited
+            then ID.next () |> iter (* deeper! *)
+            else Unsat
+    in
+    (* in a stack frame, do the solving *)
+    with_push_
+      (fun () ->
+         Conv.add_statement_l l;
+         ID.current () |> iter
+      )
 end
 
