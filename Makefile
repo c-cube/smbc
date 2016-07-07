@@ -1,6 +1,6 @@
 
 OCAMLBUILD=ocamlbuild -use-ocamlfind
-TARGETS=src/e3.native
+TARGETS=src/smbc.native
 
 all: build
 
