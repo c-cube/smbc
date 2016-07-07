@@ -17,11 +17,11 @@ let solve (ast:Ast.statement list) : unit =
   (* solve *)
   match S.check () with
     | S.Sat m ->
-      Format.printf "result: @{<Green>sat@}@, model @[%a@]@." S.pp_model m
+      Format.printf "result: @{<Green>SAT@}@, model @[%a@]@." S.pp_model m
     | S.Unsat ->
-      Format.printf "result: @{<Yellow>unsat@}@."
+      Format.printf "result: @{<Yellow>UNSAT@}@."
     | S.Unknown _ ->
-      Format.printf "result: @{<blue>unknown@}@."
+      Format.printf "result: @{<blue>UNKNOWN@}@."
 
 (** {2 Main} *)
 
@@ -43,7 +43,7 @@ let options =
 let () =
   Arg.parse options set_file "experimental SMT solver";
   if !file = "" then failwith "provide one file";
-  if !color_ then CCFormat.set_color_tag_handling CCFormat.stdout;
+  CCFormat.set_color_default !color_;
   (* parse *)
   let ast = parse_file !file in
   if !print_input_
