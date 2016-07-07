@@ -351,7 +351,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         ID.Map.for_all (fun k2 _ -> ID.Map.mem k2 m1) m2
       | Builtin b1, Builtin b2 ->
         begin match b1, b2 with
-          | B_not t1, B_not t2 -> t1 == t2
+          | B_not a1, B_not a2 -> a1 == a2
           | B_and (a1,b1), B_and (a2,b2)
           | B_or (a1,b1), B_or (a2,b2)
           | B_eq (a1,b1), B_eq (a2,b2)
@@ -375,11 +375,11 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         let hash = term_hash_
       end)
 
-    (* hashconsing function *)
-    let hashcons_ =
+    (* hashconsing function + iterating on all terms *)
+    let hashcons_, all_terms_ =
       let tbl_ : W.t = W.create 1024 in
       let term_count_ : int ref = ref 0 in
-      fun t ->
+      let hashcons t =
         let t' = W.merge tbl_ t in
         if t == t' then (
           t.term_id <- !term_count_;
@@ -389,6 +389,10 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           assert (t'.term_id >= 0);
         );
         t'
+      and iter yield =
+        W.iter yield tbl_
+      in
+      hashcons, iter
 
     let mk_bool_ (b:bool) : term =
       let t = {
@@ -517,6 +521,10 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           let acc, a, b = fold_binary acc a b in
           acc, B_imply (a, b)
 
+    let is_const t = match t.term_cell with
+      | Const _ -> true
+      | _ -> false
+
     let map_builtin f b =
       let (), b = fold_map_builtin (fun () t -> (), f t) () b in
       b
@@ -583,6 +591,81 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       | Builtin (B_or (a,b)) -> fpf out "(@[or@ %a@ %a@])" pp a pp b
       | Builtin (B_imply (a,b)) -> fpf out "(@[imply@ %a@ %a@])" pp a pp b
       | Builtin (B_eq (a,b)) -> fpf out "(@[=@ %a@ %a@])" pp a pp b
+
+    type graph_edge =
+      | GE_sub of int (* n-th subterm *)
+      | GE_nf (* pointer to normal_form *)
+      | GE_watch (* watched term *)
+
+    let as_graph : (term, term * graph_edge * term) CCGraph.t =
+      CCGraph.make_labelled_tuple
+        (fun t ->
+           let sub =
+             begin match t.term_cell with
+               | True | False | Const _ | DB _ -> Sequence.empty
+               | App (f,l) when is_const f -> Sequence.of_list l
+               | App (f,l) -> Sequence.cons f (Sequence.of_list l)
+               | Fun (_, body) -> Sequence.return body
+               | If (a,b,c) -> Sequence.of_list [a;b;c]
+               | Builtin b -> builtin_to_seq b
+               | Match (u,m) ->
+                 Sequence.cons u (ID.Map.values m |> Sequence.map snd)
+             end
+             |> Sequence.mapi (fun i t' -> GE_sub i, t')
+           and watched =
+             t.term_watchers
+             |> Sequence.of_list
+             |> Sequence.map (fun t' -> GE_watch, t')
+           and nf = match t.term_nf with
+             | None -> Sequence.empty
+             | Some (t',_) -> Sequence.return (GE_nf, t')
+           in
+           Sequence.of_list [sub; watched; nf] |> Sequence.flatten)
+
+    (* print this set of terms (and their subterms) in DOT *)
+    let pp_dot out terms =
+      let pp_node out t = match t.term_cell with
+        | True -> CCFormat.string out "true"
+        | False -> CCFormat.string out "false"
+        | DB d -> DB.pp out d
+        | Const c -> Typed_cst.pp out c
+        | App (f,_) ->
+          begin match f.term_cell with
+            | Const c -> Typed_cst.pp out c (* no boxing *)
+            | _ -> CCFormat.string out "@"
+          end
+        | If _ -> CCFormat.string out "if"
+        | Match _ -> CCFormat.string out "match"
+        | Fun (ty,_) -> Format.fprintf out "fun %a" Ty.pp ty
+        | Builtin b ->
+          CCFormat.string out
+            begin match b with
+              | B_not _ -> "not" | B_and _ -> "and"
+              | B_or _ -> "or" | B_imply _ -> "=>" | B_eq _ -> "="
+            end
+      in
+      let attrs_v t =
+        [`Label (CCFormat.to_string pp_node t); `Shape "box"]
+      and attrs_e (_,e,_) = match e with
+        | GE_sub i -> [`Label (string_of_int i); `Weight 15]
+        | GE_nf ->
+          [`Label "nf"; `Style "dashed"; `Weight 0; `Color "green"]
+        | GE_watch ->
+          [`Style  "dotted"; `Weight 0; `Color "grey"]
+      in
+      let pp_ out terms =
+        CCGraph.Dot.pp_seq
+          ~tbl:(CCGraph.mk_table ~eq:equal ~hash:hash 256)
+          ~eq:equal
+          ~attrs_v
+          ~attrs_e
+          ~graph:as_graph
+          out
+          terms
+      in
+      Format.fprintf out "@[%a@]@." pp_ terms
+
+    let pp_dot_all out () = pp_dot out all_terms_
   end
 
   module Explanation = struct
@@ -864,11 +947,6 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
   let normal_form_append (e:explanation) (t:term) : explanation * term =
     let e', t' = normal_form t in
     Explanation.append e e', t'
-
-  let check_eq t1 t2 =
-    let _, t1' = normal_form t1 in
-    let _, t2' = normal_form t2 in
-    Term.equal t1' t2'
 
   exception Inconsistent of explanation * term
   (* semantically equivalent to [explanation => term], where
@@ -1458,14 +1536,16 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
          M.Proof.to_list c |> List.map (fun a -> a.M.St.lit))
 
   (* safe push/pop in msat *)
-  let with_push_ f =
+  let with_push_ ~on_exit f =
     let lev = M.push () in
     Iterative_deepening.reset ();
     CCFun.finally
       ~f
-      ~h:(fun () -> M.pop lev)
+      ~h:(fun () ->
+        List.iter (fun f->f()) on_exit;
+        M.pop lev)
 
-  let check l =
+  let check ?(on_exit=[]) l =
     let module ID = Iterative_deepening in
     (* iterated deepening *)
     let rec iter state = match state with
@@ -1505,7 +1585,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
             else Unsat
     in
     (* in a stack frame, do the solving *)
-    with_push_
+    with_push_ ~on_exit
       (fun () ->
          Conv.add_statement_l l;
          ID.current () |> iter

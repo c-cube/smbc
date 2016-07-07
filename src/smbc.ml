@@ -1,6 +1,11 @@
 
 (* This file is free software. See file "license" for more details. *)
 
+type config = {
+  max_depth: int;
+  dot_term_graph: string option;
+}
+
 let parse_file file =
   let res = CCSexpM.parse_file_list file in
   match res with
@@ -10,13 +15,29 @@ let parse_file file =
         | Result.Error msg -> print_endline msg; exit 1
         | Result.Ok ast -> ast
 
-let solve ~max_depth (ast:Ast.statement list) : unit =
+let solve ~config (ast:Ast.statement list) : unit =
   let module Conf = struct
-    let max_depth = max_depth
+    let max_depth = config.max_depth
   end in
   let module S = Solver.Make(Conf)(struct end) in
+  let print_term_graph = match config.dot_term_graph with
+    | None -> []
+    | Some file ->
+      let doit() =
+        Log.debugf 1 (fun k->k "print term graph in `%s`" file);
+        CCIO.with_out file
+          (fun oc ->
+             let fmt = Format.formatter_of_out_channel oc in
+             S.Term.pp_dot_all fmt ())
+      in
+      [doit]
+  in
+  let on_exit =
+    print_term_graph
+    @ []
+  in
   (* solve *)
-  match S.check ast with
+  match S.check ~on_exit ast with
     | S.Sat m ->
       Format.printf "result: @{<Green>SAT@}@, model @[%a@]@." S.pp_model m
     | S.Unsat ->
@@ -28,8 +49,10 @@ let solve ~max_depth (ast:Ast.statement list) : unit =
 
 let print_input_ = ref false
 let color_ = ref true
-let file = ref ""
+let dot_term_graph_ = ref ""
 let max_depth_ = ref 60
+
+let file = ref ""
 let set_file s =
   if !file = "" then file := s
   else failwith "provide at most one file"
@@ -38,6 +61,7 @@ let options =
   Arg.align [
     "--print-input", Arg.Set print_input_, " print input";
     "--max-depth", Arg.Set_int max_depth_, " set max depth";
+    "--dot-term-graph", Arg.Set_string dot_term_graph_, " print term graph in file";
     "-nc", Arg.Clear color_, " do not use colors";
     "--debug", Arg.Int Log.set_debug, " set debug level";
     "--backtrace", Arg.Unit (fun () -> Printexc.record_backtrace true), " enable backtrace";
@@ -54,4 +78,9 @@ let () =
     Format.printf "@[parsed:@ @[<v>%a@]@]@."
       (CCFormat.list ~start:"" ~stop:"" ~sep:"" Ast.pp_statement) ast;
   (* solve *)
-  solve ~max_depth:!max_depth_ ast
+  let config = {
+    max_depth = !max_depth_;
+    dot_term_graph =
+      (if !dot_term_graph_ = "" then None else Some !dot_term_graph_);
+  } in
+  solve ~config ast

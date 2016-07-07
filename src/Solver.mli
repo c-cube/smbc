@@ -112,6 +112,9 @@ module Make(C:CONFIG)(Dummy : sig end) : sig
     include Intf.ORD with type t := t
     include Intf.HASH with type t := t
     include Intf.PRINT with type t := t
+
+    val pp_dot : t Sequence.t CCFormat.printer
+    val pp_dot_all : unit CCFormat.printer
   end
 
   (** {2 Literals} *)
@@ -145,7 +148,11 @@ module Make(C:CONFIG)(Dummy : sig end) : sig
     | Unsat (* TODO: proof *)
     | Unknown of unknown
 
-  val check : Ast.statement list -> res
+  val check :
+    ?on_exit:(unit -> unit) list ->
+    Ast.statement list ->
+    res
   (** [check l] checks the satisfiability of the
-      given set of statements *)
+      given set of statements.
+      @param on_exit functions to be run before this returns *)
 end
