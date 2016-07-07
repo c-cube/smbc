@@ -17,6 +17,7 @@ module Var : sig
 
   val make : ID.t -> 'ty -> 'ty t
   val copy : 'a t -> 'a t
+  val id : _ t -> ID.t
   val ty : 'a t -> 'a
 
   val equal : 'a t -> 'a t -> bool
@@ -69,6 +70,7 @@ type binop =
   | And
   | Or
   | Imply
+  | Eq
 
 type term = private {
   term: term_cell;
@@ -81,7 +83,6 @@ and term_cell =
   | If of term * term * term
   | Match of term * (var list * term) ID.Map.t
   | Fun of var * term
-  | Eq of term * term
   | Not of term
   | Binop of binop * term * term
   | True
@@ -100,6 +101,8 @@ type statement =
   | Goal of var list * term
 
 (** {2 Constructors} *)
+
+val term_view : term -> term_cell
 
 val var : var -> term
 val const : ID.t -> Ty.t -> term

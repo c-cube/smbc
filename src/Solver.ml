@@ -6,6 +6,10 @@
 (** {2 The Main Solver} *)
 
 module Make(Dummy : sig end) = struct
+  exception Error of string
+
+  let errorf msg = CCFormat.ksprintf msg ~f:(fun s -> raise (Error s))
+
   (* main term cell *)
   type term = {
     mutable term_id: int; (* unique ID *)
@@ -61,7 +65,7 @@ module Make(Dummy : sig end) = struct
     | Cst_bool
     | Cst_undef of ty_h * cst_info
     | Cst_cstor of ty_h
-    | Cst_defined of ty_h * term
+    | Cst_defined of ty_h * term lazy_t
 
   and cst_info = {
     cst_depth: int lazy_t;
@@ -83,7 +87,7 @@ module Make(Dummy : sig end) = struct
 
   and ty_def =
     | Uninterpreted (* uninterpreted type TODO *)
-    | Data of cst list (* set of constructors *)
+    | Data of cst lazy_t list (* set of constructors *)
 
   and ty_cell =
     | Prop
@@ -1027,11 +1031,16 @@ module Make(Dummy : sig end) = struct
         for i = start to start + slice.length - 1 do
           let assum, level = slice.get i in
           match assum with
-            | Lit lit -> assert_lit slice level lit
+            | Lit lit ->
+              Log.debugf 3 (fun k->k "assert_lit %a" Lit.pp lit);
+              assert_lit slice level lit
             | Assign (t,u) ->
               begin match as_cst_undef t with
                 | None -> assert false
                 | Some (c, _, _) ->
+                  Log.debugf 3
+                    (fun k->k "assert_choice %a -> %a"
+                        Typed_cst.pp c Term.pp u);
                   assert_choice slice level c u
               end
         done;
@@ -1063,7 +1072,7 @@ module Make(Dummy : sig end) = struct
             let l = match Ty.view ty with
               | Atomic (_, Data cstors) ->
                   List.map
-                    (fun c ->
+                    (fun (lazy c) ->
                        let rec case = lazy (
                          let ty_args, _ = Typed_cst.ty c |> Ty.unfold in
                          let args =
@@ -1098,11 +1107,14 @@ module Make(Dummy : sig end) = struct
             (fun t -> not (List.memq t info.cst_cases_blocked))
             cases
         in
-        begin match nonblocked with
+        let res = match nonblocked with
           | [] -> assert false (* TODO: conflict *)
           | t :: _ ->
             t (* pick first available case *)
-        end
+        in
+        Log.debugf 3
+          (fun k->k "@[assign %a -> %a@]" Typed_cst.pp cst Term.pp res);
+        res
 
     let iter_assignable (yield:term->unit) (lit:Lit.t): unit =
       (* return the undefined sub-constants *)
@@ -1125,7 +1137,166 @@ module Make(Dummy : sig end) = struct
     let if_sat _slice = ()
   end
 
-  module M = Msat.Mcsolver.Make(M_expr)(M_th)
+  module M = Msat.Mcsolver.Make(M_expr)(M_th)(struct end)
+
+  (** {2 Conversion} *)
+
+  (* for converting Ast.Ty into Ty *)
+  let ty_tbl_ : Ty.t lazy_t ID.Tbl.t = ID.Tbl.create 16
+
+  (* for converting constants *)
+  let decl_ty_ : cst lazy_t ID.Tbl.t = ID.Tbl.create 16
+
+  (* environment for variables *)
+  type conv_env = (Ast.var * term option) list
+
+  let rec conv_ty (ty:Ast.Ty.t): Ty.t = match ty with
+    | Ast.Ty.Prop -> Ty.prop
+    | Ast.Ty.Const id ->
+      begin try ID.Tbl.find ty_tbl_ id |> Lazy.force
+        with Not_found -> errorf "type %a not in ty_tbl" ID.pp id
+      end
+    | Ast.Ty.Arrow (a,b) -> Ty.arrow (conv_ty a) (conv_ty b)
+
+  let rec conv_term
+      (env: conv_env)
+      (t:Ast.term): term = match Ast.term_view t with
+    | Ast.True -> Term.true_
+    | Ast.False -> Term.false_
+    | Ast.Const id ->
+      begin
+        try ID.Tbl.find decl_ty_ id |> Lazy.force |> Term.const
+        with Not_found ->
+          errorf "could not find constant `%a`" ID.pp id
+      end
+    | Ast.App (f, l) ->
+      let f = conv_term env f in
+      let l = List.map (conv_term env) l in
+      Term.app f l
+    | Ast.Var v ->
+      begin match
+          CCList.find_idx (fun (v',_) -> Ast.Var.equal v v') env
+        with
+        | None -> errorf "could not find var `%a`" Ast.Var.pp v
+        | Some (i,(_, None)) ->
+          let ty = Ast.Var.ty v |> conv_ty in
+          Term.db (DB.make i ty)
+        | Some (_,(_,Some t)) -> t
+      end
+    | Ast.Fun (v,body) ->
+      let body = conv_term ((v,None)::env) body in
+      let ty = Ast.Var.ty v |> conv_ty in
+      Term.fun_ ty body
+    | Ast.Match (u,m) ->
+      let u = conv_term env u in
+      let m =
+        ID.Map.map
+          (fun (vars,rhs) ->
+             let env', tys =
+               CCList.fold_map
+                 (fun env v -> (v,None)::env, Ast.Var.ty v |> conv_ty)
+                 env vars
+             in
+             tys, conv_term env' rhs)
+          m
+      in
+      Term.match_ u m
+    | Ast.If (a,b,c) ->
+      Term.if_ (conv_term env a)(conv_term env b) (conv_term env c)
+    | Ast.Not t -> Term.not_ (conv_term env t)
+    | Ast.Binop (op,a,b) ->
+      let a = conv_term env a in
+      let b = conv_term env b in
+      begin match op with
+        | Ast.And -> Term.and_ a b
+        | Ast.Or -> Term.or_ a b
+        | Ast.Imply -> Term.imply a b
+        | Ast.Eq -> Term.eq a b
+      end
+
+  (* list of constants we are interested in *)
+  let model_support_ : Typed_cst.t list ref = ref []
+
+  (* TODO: transform into terms, blabla *)
+  let add_statement st =
+    Log.debugf 2 (fun k->k "add statement `@[%a@]`" Ast.pp_statement st);
+    match st with
+    | Ast.Assert t ->
+      let t = conv_term [] t in
+      M.assume [[t]]
+    | Ast.Goal (vars, t) ->
+      (* skolemize *)
+      let env, consts =
+        CCList.fold_map
+          (fun env v ->
+             let ty = Ast.Var.ty v |> conv_ty in
+             let c = Typed_cst.make_undef (Ast.Var.id v) ty in
+             (v,Some (Term.const c)) :: env, c)
+          []
+          vars
+      in
+      (* model should contain values of [consts] *)
+      CCList.Ref.push_list model_support_ consts;
+      let t = conv_term env t in
+      M.assume [[t]]
+    | Ast.TyDecl id ->
+      let ty = Ty.atomic id Uninterpreted in
+      ID.Tbl.add ty_tbl_ id (Lazy.from_val ty)
+    | Ast.Decl (id, ty) ->
+      assert (not (ID.Tbl.mem decl_ty_ id));
+      let ty = conv_ty ty in
+      let cst = match ty.ty_cell with
+        | Arrow _
+        | Atomic (_, _) ->
+          Typed_cst.make_undef id ty
+        | Prop -> Typed_cst.make_bool id
+      in
+      ID.Tbl.add decl_ty_ id (Lazy.from_val cst)
+    | Ast.Data l ->
+      (* declare the type, and all the constructors *)
+      List.iter
+        (fun {Ast.Ty.data_id; data_cstors} ->
+           let ty = lazy (
+             let cstors =
+               ID.Map.to_seq data_cstors
+               |> Sequence.map
+                 (fun (id_c, ty_c) ->
+                    let c = lazy (
+                      let ty_c = conv_ty ty_c in
+                      Typed_cst.make_cstor id_c ty_c
+                    ) in
+                    ID.Tbl.add decl_ty_ id_c c; (* declare *)
+                    c)
+               |> Sequence.to_rev_list
+             in
+             Ty.atomic data_id (Data cstors)
+           ) in
+           ID.Tbl.add ty_tbl_ data_id ty;
+        )
+        l;
+      (* force evaluation *)
+      List.iter
+        (fun {Ast.Ty.data_id; _} ->
+           ID.Tbl.find ty_tbl_ data_id |> Lazy.force |> ignore)
+        l
+    | Ast.Define l ->
+      (* declare the mutually recursive functions *)
+      List.iter
+        (fun (id,ty,rhs) ->
+           let ty = conv_ty ty in
+           let rhs = lazy (conv_term [] rhs) in
+           let cst = lazy (
+             Typed_cst.make_defined id ty rhs
+           ) in
+           ID.Tbl.add decl_ty_ id cst)
+        l;
+      (* force thunks *)
+      List.iter
+        (fun (id,_,_) ->
+           ID.Tbl.find decl_ty_ id |> Lazy.force |> ignore)
+        l
+
+  let add_statement_l = List.iter add_statement
 
   (** {2 Main} *)
 
@@ -1145,13 +1316,32 @@ module Make(Dummy : sig end) = struct
     | Unsat (* TODO: proof *)
     | Unknown of unknown
 
-  (* TODO: transform into terms, blabla *)
-  let add_statement st = ()
+  let pp_model out m =
+    let pp_pair out (c,t) =
+      Format.fprintf out "(@[%a %a@])" ID.pp (Typed_cst.id c) Term.pp t
+    in
+    Format.fprintf out "(@[%a@])"
+      (CCFormat.list ~start:"" ~stop:"" ~sep:" " pp_pair)
+      (Typed_cst.Map.to_list m)
 
-  let add_statement_l = List.iter add_statement
+  let compute_model_ () : model =
+    !model_support_
+    |> Sequence.of_list
+    |> Sequence.map
+      (fun c ->
+         (* find normal form of [c] *)
+         let t = Term.const c in
+         let _, t = normal_form t in
+         c, t)
+    |> Typed_cst.Map.of_seq
 
-  (* TODO: iterative deepening, with calls to M.solve *)
+  (* TODO: iterative deepening *)
   let check () =
-    assert false
+    try
+      M.solve ();
+      let m = compute_model_ () in
+      Sat m
+    with M.Unsat ->
+      Unsat (* TODO: check if max depth involved *)
 end
 

@@ -21,6 +21,7 @@ module Var = struct
 
   let make id ty = {id;ty}
   let copy {id;ty} = {ty; id=ID.copy id}
+  let id v = v.id
   let ty v = v.ty
 
   let equal a b = ID.equal a.id b.id
@@ -111,6 +112,7 @@ type binop =
   | And
   | Or
   | Imply
+  | Eq
 
 type term = {
   term: term_cell;
@@ -123,7 +125,6 @@ and term_cell =
   | If of term * term * term
   | Match of term * (var list * term) ID.Map.t
   | Fun of var * term
-  | Eq of term * term
   | Not of term
   | Binop of binop * term * term
   | True
@@ -162,9 +163,11 @@ let rec term_to_sexp t = match t.term with
                   term_to_sexp rhs]
          )))
     |> S.of_list
-  | Fun (v,t) -> S.of_list [S.atom "fun"; typed_var_to_sexp v; term_to_sexp t]
-  | Eq (a,b) -> S.of_list [S.atom "="; term_to_sexp a; term_to_sexp b]
+  | Fun (v,t) ->
+    S.of_list [S.atom "fun"; typed_var_to_sexp v; term_to_sexp t]
   | Not t -> S.of_list [S.atom "not"; term_to_sexp t]
+  | Binop (Eq, a, b) ->
+    S.of_list [S.atom "="; term_to_sexp a; term_to_sexp b]
   | Binop (And, a, b) ->
     S.of_list [S.atom "and"; term_to_sexp a; term_to_sexp b]
   | Binop (Or, a, b) ->
@@ -199,6 +202,8 @@ let pp_term out t = CCSexpM.print out (term_to_sexp t)
 let pp_statement out t = CCSexpM.print out (statement_to_sexp t)
 
 (** {2 Constructors} *)
+
+let term_view t = t.term
 
 let rec app_ty_ ty l : Ty.t = match ty, l with
   | _, [] -> ty
@@ -252,7 +257,7 @@ let eq a b =
   if not (Ty.equal a.ty b.ty)
   then Ty.ill_typed "eq: `@[%a@]` and `@[%a@]` do not have the same type"
       pp_term a pp_term b;
-  mk_ (Eq (a,b)) Ty.prop
+  mk_ (Binop (Eq,a,b)) Ty.prop
 
 let check_prop_ t =
   if not (Ty.equal t.ty Ty.prop)
@@ -302,7 +307,7 @@ module Ctx = struct
     | K_ty
     | K_fun of Ty.t
     | K_cstor of Ty.t
-    | K_var of Ty.t (* local *)
+    | K_var of var (* local *)
 
   type t = {
     names: ID.t StrTbl.t;
@@ -323,8 +328,8 @@ module Ctx = struct
   let with_var t (s:string) (ty:Ty.t) (f:Ty.t Var.t -> 'a): 'a =
     let id = ID.make s in
     StrTbl.add t.names s id;
-    ID.Tbl.add t.kinds id (K_var ty);
     let v = Var.make id ty in
+    ID.Tbl.add t.kinds id (K_var v);
     CCFun.finally1 f v
       ~h:(fun () -> StrTbl.remove t.names s)
 
@@ -345,8 +350,8 @@ module Ctx = struct
       Format.fprintf out "(@[cstor : %a@])" Ty.pp ty
     | K_fun ty ->
       Format.fprintf out "(@[fun : %a@])" Ty.pp ty
-    | K_var ty ->
-      Format.fprintf out "(@[var : %a@])" Ty.pp ty
+    | K_var v ->
+      Format.fprintf out "(@[var : %a@])" Ty.pp (Var.ty v)
 
   let pp out t =
     Format.fprintf out "ctx {@[%a@]}"
@@ -376,13 +381,12 @@ let rec conv_term ctx s = match s with
   | `Atom "false" -> false_
   | `Atom s ->
     let id = find_id_ ctx s in
-    let ty = match Ctx.find_kind ctx id with
-      | Ctx.K_var ty
+    begin match Ctx.find_kind ctx id with
+      | Ctx.K_var v -> var v
       | Ctx.K_fun ty
-      | Ctx.K_cstor ty -> ty
+      | Ctx.K_cstor ty -> const id ty
       | Ctx.K_ty -> errorf "expected term, not type; got `%a`" ID.pp id
-    in
-    const id ty
+    end
   | `List [`Atom "if"; a; b; c] ->
     let a = conv_term ctx a in
     let b = conv_term ctx b in

@@ -27,12 +27,12 @@ module Make(Dummy : sig end) : sig
     | Cst_bool
     | Cst_undef of ty_h * cst_info
     | Cst_cstor of ty_h
-    | Cst_defined of ty_h * term
+    | Cst_defined of ty_h * term lazy_t
 
   (** Definition of an atomic type *)
   type ty_def =
     | Uninterpreted (* uninterpreted type TODO: cardinal, \And, \Or *)
-    | Data of cst list (* set of constructors *)
+    | Data of cst lazy_t list (* set of constructors *)
 
   type ty_cell =
     | Prop
@@ -77,7 +77,7 @@ module Make(Dummy : sig end) : sig
     val make_bool : ID.t -> t
     val make_undef : ?parent:(t * term) lazy_t -> ID.t -> Ty.t -> t
     val make_cstor : ID.t -> Ty.t -> t
-    val make_defined: ID.t -> Ty.t -> term -> t
+    val make_defined: ID.t -> Ty.t -> term lazy_t -> t
 
     val id : t -> ID.t
     val kind : t -> cst_kind
@@ -143,6 +143,8 @@ module Make(Dummy : sig end) : sig
 
   type model = term Typed_cst.Map.t
   (** Map from constants to their value *)
+
+  val pp_model : model CCFormat.printer
 
   type unknown =
     | U_timeout

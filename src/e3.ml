@@ -16,8 +16,8 @@ let solve (ast:Ast.statement list) : unit =
   S.add_statement_l ast;
   (* solve *)
   match S.check () with
-    | S.Sat _ ->
-      Format.printf "result: @{<Green>sat@}@."
+    | S.Sat m ->
+      Format.printf "result: @{<Green>sat@}@, model @[%a@]@." S.pp_model m
     | S.Unsat ->
       Format.printf "result: @{<Yellow>unsat@}@."
     | S.Unknown _ ->
@@ -35,7 +35,9 @@ let set_file s =
 let options =
   Arg.align [
     "--print-input", Arg.Set print_input_, " print input";
-    "-nc", Arg.Clear color_, " do not use colors"
+    "-nc", Arg.Clear color_, " do not use colors";
+    "--debug", Arg.Int Log.set_debug, " set debug level";
+    "--backtrace", Arg.Unit (fun () -> Printexc.record_backtrace true), " enable backtrace";
   ]
 
 let () =
