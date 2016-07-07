@@ -25,6 +25,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       (* normal form + explanation of why *)
     mutable term_watchers: term list; (* terms watching this term's nf *)
   }
+  (* TODO: use a weak array for watchers *)
 
   (* term shallow structure *)
   and term_cell =
@@ -255,8 +256,6 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       | S_set_nf of
           term * (term * explanation) option * stack_cell
           (* t1.nf <- t2 *)
-      | S_set_watcher of term * term list * stack_cell
-          (* t1.watchers <- l2 *)
 
     type stack = {
       mutable stack_level: int;
@@ -279,9 +278,6 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         | S_set_nf (t, nf, st') ->
           t.term_nf <- nf;
           aux l st'
-        | S_set_watcher (t, ts, st') ->
-          t.term_watchers <- ts;
-          aux l st'
       in
       st_.stack <- aux l st_.stack
 
@@ -293,11 +289,9 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       st_.stack <- S_level (l, st_.stack);
       l
 
+    (* TODO: use weak resizable array instead *)
     let push_set_nf_ (t:term) =
       st_.stack <- S_set_nf (t, t.term_nf, st_.stack)
-
-    let push_set_watcher_ (t:term) =
-      st_.stack <- S_set_watcher (t, t.term_watchers, st_.stack)
   end
 
   module Term = struct
@@ -407,7 +401,14 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     let true_ = mk_bool_ true
     let false_ = mk_bool_ false
 
-    let mk_term_ cell ~ty : term =
+    let add_watcher ~watcher t =
+      t.term_watchers <- watcher :: t.term_watchers
+
+    let add_watcher_l ~watcher l = List.iter (add_watcher ~watcher) l
+
+    (* build a term. If it's new, add it to the watchlist
+       of every member of [watching] *)
+    let mk_term_ ~(watching:term list) cell ~ty : term =
       let t = {
         term_id= -1;
         term_ty=ty;
@@ -415,17 +416,17 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         term_nf=None;
         term_watchers=[];
       } in
-      hashcons_ t
+      let t' = hashcons_ t in
+      if t==t' then (
+        List.iter (fun u -> add_watcher ~watcher:t u) watching;
+      );
+      t'
 
-    let db d = mk_term_ (DB d) ~ty:(DB.ty d)
+    let db d =
+      mk_term_ ~watching:[] (DB d) ~ty:(DB.ty d)
 
-    let const c = mk_term_ (Const c) ~ty:(Typed_cst.ty c)
-
-    let add_watcher ~watcher t =
-      Backtrack.push_set_watcher_ t; (* upon backtrack *)
-      t.term_watchers <- watcher :: t.term_watchers
-
-    let add_watcher_l ~watcher l = List.iter (add_watcher ~watcher) l
+    let const c =
+      mk_term_ ~watching:[] (Const c) ~ty:(Typed_cst.ty c)
 
     (* type of an application *)
     let rec app_ty_ ty l : Ty.t = match Ty.view ty, l with
@@ -440,15 +441,13 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       | [] -> f
       | _ ->
         let ty = app_ty_ f.term_ty l in
-        let t, f = match f.term_cell with
+        (* watch head, not arguments *)
+        let t = match f.term_cell with
           | App (f1, l1) ->
             let l' = l1 @ l in
-            let t = mk_term_ (App (f1, l')) ~ty in
-            t, f1
-          | _ -> mk_term_ (App (f,l)) ~ty, f
+            mk_term_ ~watching:[f1] (App (f1, l')) ~ty
+          | _ -> mk_term_ ~watching:[f] (App (f,l)) ~ty
         in
-        (* watch head, not arguments *)
-        add_watcher ~watcher:t f;
         t
 
     let app_cst f l = app (const f) l
@@ -456,7 +455,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     let fun_ ty body =
       let ty' = Ty.arrow ty body.term_ty in
       (* do not add watcher: propagation under λ forbidden *)
-      mk_term_ (Fun (ty, body)) ~ty:ty'
+      mk_term_ ~watching:[] (Fun (ty, body)) ~ty:ty'
 
     (* TODO: check types *)
 
@@ -465,36 +464,38 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         let _, (_,rhs) = ID.Map.choose m in
         rhs.term_ty
       in
-      let t = mk_term_ (Match (u,m)) ~ty in
-      add_watcher ~watcher:t u; (* propagate only from [u] *)
+      (* propagate only from [u] *)
+      let t = mk_term_ ~watching:[u] (Match (u,m)) ~ty in
       t
 
     let if_ a b c =
       assert (Ty.equal b.term_ty c.term_ty);
-      let t = mk_term_ (If (a,b,c)) ~ty:b.term_ty in
-      add_watcher ~watcher:t a; (* propagate under test only *)
+      (* propagate under test only *)
+      let t = mk_term_ ~watching:[a] (If (a,b,c)) ~ty:b.term_ty in
       t
 
-    let builtin_ b =
-      let t = mk_term_ (Builtin b) ~ty:Ty.prop in
-      begin match b with
-        | B_not u -> add_watcher ~watcher:t u
-        | B_and (a,b)
-        | B_or (a,b)
-        | B_eq (a,b)
-        | B_imply (a,b) -> add_watcher_l ~watcher:t [a;b]
-      end;
+    let builtin_ ~watching b =
+      let t = mk_term_ ~watching (Builtin b) ~ty:Ty.prop in
       t
+
+    let builtin b =
+      let watching = match b with
+        | B_not u -> [u]
+        | B_and (a,b) | B_or (a,b)
+        | B_eq (a,b) | B_imply (a,b) -> [a;b]
+      in
+      builtin_ ~watching b
 
     let not_ t = match t.term_cell with
       | True -> false_
       | False -> true_
       | Builtin (B_not t') -> t'
-      | _ -> builtin_ (B_not t)
-    let and_ a b = builtin_ (B_and (a,b))
-    let or_ a b = builtin_ (B_or (a,b))
-    let imply a b = builtin_ (B_imply (a,b))
-    let eq a b = builtin_ (B_eq (a,b))
+      | _ -> builtin_ ~watching:[t] (B_not t)
+
+    let and_ a b = builtin_ ~watching:[a;b] (B_and (a,b))
+    let or_ a b = builtin_ ~watching:[a;b] (B_or (a,b))
+    let imply a b = builtin_ ~watching:[a;b] (B_imply (a,b))
+    let eq a b = builtin_ ~watching:[a;b] (B_eq (a,b))
     let neq a b = not_ (eq a b)
 
     let fold_map_builtin
@@ -988,7 +989,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         | If (a,b,c) ->
           Term.if_ (aux env a) (aux env b) (aux env c)
         | App (f, l) -> Term.app (aux env f) (aux_l env l)
-        | Builtin b -> Term.builtin_ (Term.map_builtin (aux env) b)
+        | Builtin b -> Term.builtin (Term.map_builtin (aux env) b)
       and aux_l env l =
         List.map (aux env) l
       in
