@@ -28,7 +28,7 @@ let solve ~config (ast:Ast.statement list) : unit =
         CCIO.with_out file
           (fun oc ->
              let fmt = Format.formatter_of_out_channel oc in
-             S.Term.pp_dot_all fmt ())
+             S.pp_term_graph fmt ())
       in
       [doit]
   in

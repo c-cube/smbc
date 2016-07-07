@@ -272,21 +272,23 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       let rec aux l st = match st with
         | S_level (l', st') ->
           if l=l'
-          then st' (* stop *)
+          then st (* stop *)
           else aux l st' (* continue *)
         | S_nil -> st
         | S_set_nf (t, nf, st') ->
           t.term_nf <- nf;
           aux l st'
       in
+      Log.debugf 2 (fun k->k "@{<Yellow>** now at level %d@}" l);
       st_.stack <- aux l st_.stack
 
     let cur_level () = st_.stack_level
 
     let push_level () : level =
-      let l = st_.stack_level in
-      st_.stack_level <- l+1;
+      let l = st_.stack_level + 1 in
+      st_.stack_level <- l;
       st_.stack <- S_level (l, st_.stack);
+      Log.debugf 2 (fun k->k "@{<Yellow>** now at level %d@}" l);
       l
 
     (* TODO: use weak resizable array instead *)
@@ -794,6 +796,8 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       Log.debugf 5 (fun k->k "new tautology: `@[%a@]`" pp c);
       new_ := c :: !new_;
       ()
+
+    let push_new_l = List.iter push_new
   end
 
   (** {2 Iterative Deepening} *)
@@ -880,31 +884,51 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
 
   (** {2 Case Expansion} *)
 
-  (* build a clause that explains that [c] must be one of its
+  (* build clause(s) that explains that [c] must be one of its
      cases *)
-  let clause_of_cases (c:cst) : Clause.t = match c.cst_kind with
+  let clauses_of_cases (c:cst) : Clause.t list = match c.cst_kind with
     | Cst_undef (_, {cst_cases=Some l; cst_depth=lazy d; _}) ->
       (* guard for non-constant cases (depth limit) *)
       let lit_guard = Iterative_deepening.lit_of_depth d in
-      List.map
-        (fun rhs ->
-           let lit = Lit.cst_choice c rhs in
-           (* does [rhs] use constants deeper than [d]? *)
-           let goes_deeper =
-             Term.to_seq rhs
-             |> Sequence.exists
-               (fun sub -> match sub.term_cell with
-                  | Const {cst_kind=Cst_undef (_,info); _} ->
-                    (* is [sub] a constant deeper than [d]? *)
-                    Lazy.force info.cst_depth > d
-                  | _ -> false)
-           in
-           match lit_guard, goes_deeper with
-             | Some guard, true ->
-               Term.and_ lit guard (* this branch might be too deep *)
-             | _ -> lit
-        )
-        l
+      let guard_is_some = CCOpt.is_some lit_guard in
+      (* lits with a boolean indicating whether they have
+         to be depth-guarded *)
+      let lits =
+        List.map
+          (fun rhs ->
+             let lit = Lit.cst_choice c rhs in
+             (* does [rhs] use constants deeper than [d]? *)
+             let needs_guard =
+               guard_is_some &&
+               Term.to_seq rhs
+               |> Sequence.exists
+                 (fun sub -> match sub.term_cell with
+                    | Const {cst_kind=Cst_undef (_,info); _} ->
+                      (* is [sub] a constant deeper than [d]? *)
+                      Lazy.force info.cst_depth > d
+                    | _ -> false)
+             in
+             lit, needs_guard)
+          l
+      in
+      (* at least one case *)
+      let c_choose =
+        List.map
+          (fun (lit,needs_guard) ->
+             match lit_guard, needs_guard with
+               | None, true -> assert false
+               | Some guard, true ->
+                 Term.and_ lit guard (* this branch might be too deep *)
+               | _ -> lit)
+          lits
+
+      (* at most one case *)
+      and cs_once =
+        CCList.diagonal lits
+        |> List.map
+          (fun ((l1,_),(l2,_)) -> [Term.not_ l1; Term.not_ l2])
+      in
+      c_choose :: cs_once
     | _ -> assert false
 
   (* make a fresh constant, with a unique name *)
@@ -1050,9 +1074,9 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
          | None ->
            let _ = expand_cases c ty info in
            assert (info.cst_cases <> None);
-           (* also push a new tautology to force a choice in [l] *)
-           let new_c = clause_of_cases c in
-           Clause.push_new new_c)
+           (* also push new tautologies to force a choice in [l] *)
+           let new_c = clauses_of_cases c in
+           Clause.push_new_l new_c)
 
   (* set the normal form of [t], propagate to watchers *)
   let rec set_nf_ t new_t (e:explanation) : unit =
@@ -1317,7 +1341,6 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       (* increase level *)
       let _ = Backtrack.push_level () in
       let lev = Backtrack.cur_level () in
-      Log.debugf 2 (fun k->k "** now at level %d" lev);
       try
         for i = start to start + slice.length - 1 do
           let lit = slice.get i in
@@ -1563,6 +1586,10 @@ end
       (fun c ->
          M.Proof.to_list c |> List.map (fun a -> a.M.St.lit))
 
+  (* NOTE: would be nice to just iterate over
+     all literals instead *)
+  let pp_term_graph = Term.pp_dot_all
+
   (* safe push/pop in msat *)
   let with_push_ ~on_exit f =
     let lev = M.push () in
@@ -1586,7 +1613,8 @@ end
           | M.Sat ->
             let m = compute_model_ () in
             Log.debugf 1
-              (fun k->k "*** found SAT at depth %a" ID.pp cur_depth);
+              (fun k->k "@{<Yellow>** found SAT@} at depth %a"
+                  ID.pp cur_depth);
             M.pop lev; (* remove clause *)
             Sat m
           | M.Unsat ->
@@ -1604,7 +1632,9 @@ end
                    Lit.equal lit cur_lit || Lit.equal lit cur_lit_neg)
             in
             Log.debugf 1
-              (fun k->k "*** found Unsat at depth %a; depends on %a: %B"
+              (fun k->k
+                  "@{<Yellow>** found Unsat@} at depth %a;@ \
+                   depends on %a: %B"
                   ID.pp cur_depth Lit.pp cur_lit depth_limited);
             (* remove depth limiting clause in any case*)
             M.pop lev;

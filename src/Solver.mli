@@ -114,7 +114,6 @@ module Make(C:CONFIG)(Dummy : sig end) : sig
     include Intf.PRINT with type t := t
 
     val pp_dot : t Sequence.t CCFormat.printer
-    val pp_dot_all : unit CCFormat.printer
   end
 
   (** {2 Literals} *)
@@ -147,6 +146,8 @@ module Make(C:CONFIG)(Dummy : sig end) : sig
     | Sat of model
     | Unsat (* TODO: proof *)
     | Unknown of unknown
+
+  val pp_term_graph: unit CCFormat.printer
 
   val check :
     ?on_exit:(unit -> unit) list ->
