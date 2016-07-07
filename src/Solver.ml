@@ -498,6 +498,11 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     let eq a b = builtin_ ~watching:[a;b] (B_eq (a,b))
     let neq a b = not_ (eq a b)
 
+    let and_l = function
+      | [] -> false_
+      | [t] -> t
+      | a :: l -> List.fold_left and_ a l
+
     let fold_map_builtin
         (f:'a -> term -> 'a * term) (acc:'a) (b:builtin): 'a * builtin =
       let fold_binary acc a b =
@@ -563,6 +568,18 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       match t.term_cell with
         | Const ({cst_kind=Cst_undef (ty,info); _} as c) ->
           Some (c,ty,info)
+        | _ -> None
+
+    (* return [Some (cstor,ty,args)] if the term is a constructor
+       applied to some arguments *)
+    let as_cstor_app (t:term): (cst * Ty.t * term list) option =
+      match t.term_cell with
+        | Const ({cst_kind=Cst_cstor ty; _} as c) -> Some (c,ty,[])
+        | App (f, l) ->
+          begin match f.term_cell with
+            | Const ({cst_kind=Cst_cstor ty; _} as c) -> Some (c,ty,l)
+            | _ -> None
+          end
         | _ -> None
 
     let fpf = Format.fprintf
@@ -748,7 +765,9 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
 
     (** {2 Normalization} *)
 
-    let norm l = l, false (* TODO? *)
+    let norm l =
+      Log.debugf 5 (fun k->k "Lit.norm `@[%a@]`" pp l);
+      l, false (* TODO? *)
   end
 
   module Clause = struct
@@ -1038,21 +1057,23 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
   (* set the normal form of [t], propagate to watchers *)
   let rec set_nf_ t new_t (e:explanation) : unit =
     if Term.equal t new_t then ()
-    else (
-      assert (t.term_nf = None);
-      Backtrack.push_set_nf_ t;
-      t.term_nf <- Some (new_t, e);
-      Log.debugf 5
-        (fun k->k "@[<hv2>set_nf@ `@[%a@]` :=@ `@[%a@]`@ with exp %a@]"
-            Term.pp t Term.pp new_t Explanation.pp e);
-      (* we just changed [t]'s normal form, ensure that [t]'s
-         watching terms are up-to-date *)
-      List.iter
-        (fun watcher -> match watcher.term_nf with
-           | Some _ -> ()   (* already reduced *)
-           | None -> ignore (compute_nf watcher))
-        t.term_watchers;
-    )
+    else begin match t.term_nf with
+      | Some (new_t', _) -> assert (Term.equal new_t new_t')
+      | None ->
+        Backtrack.push_set_nf_ t;
+        t.term_nf <- Some (new_t, e);
+        Log.debugf 5
+          (fun k->k "@[<hv2>set_nf@ `@[%a@]` :=@ `@[%a@]`@ with exp %a@]"
+              Term.pp t Term.pp new_t Explanation.pp e);
+        (* we just changed [t]'s normal form, ensure that [t]'s
+           watching terms are up-to-date *)
+        List.iter
+          (fun watcher -> match watcher.term_nf with
+             | Some _ -> ()   (* already reduced *)
+             | None -> ignore (compute_nf watcher))
+          t.term_watchers;
+        ()
+    end
 
   (* compute the normal form of this term. We know at least one of its
      subterm(s) has been reduced *)
@@ -1199,17 +1220,23 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         | True, False
         | False, True -> Term.false_
         | _ when Term.equal a b -> Term.true_ (* syntactic *)
-        | App (
-            {term_cell=Const ({cst_kind=Cst_cstor _; _} as c1); _},
-            _),
-          App (
-            {term_cell=Const ({cst_kind=Cst_cstor _; _} as c2); _},
-            _)
-          when not (Typed_cst.equal c1 c2) ->
-          (* [c1 ... = c2 ...] --> false, as distinct constructors
-             can never be equal *)
-          Term.false_
-        | _ -> Term.eq a b
+        | _ ->
+          begin match Term.as_cstor_app a, Term.as_cstor_app b with
+            | Some (c1,_,l1), Some (c2,_,l2) ->
+              if not (Typed_cst.equal c1 c2)
+              then Term.false_
+                  (* [c1 ... = c2 ...] --> false, as distinct constructors
+                     can never be equal *)
+              else if Typed_cst.equal c1 c2
+                   && List.length l1 = List.length l2
+              then (
+                (* injectivity: arguments are equal *)
+                List.map2 Term.eq l1 l2
+                |> Term.and_l
+              )
+              else Term.eq a b
+            | _ -> Term.eq a b
+          end
       end
 
   (** {2 Sat Solver} *)
@@ -1286,10 +1313,15 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     (* propagation from the bool solver *)
     let assume slice =
       let start = slice.start in
+      assert (slice.length > 0);
+      (* increase level *)
+      let _ = Backtrack.push_level () in
+      let lev = Backtrack.cur_level () in
+      Log.debugf 2 (fun k->k "** now at level %d" lev);
       try
         for i = start to start + slice.length - 1 do
           let lit = slice.get i in
-          Log.debugf 3 (fun k->k "assert_lit %a" Lit.pp lit);
+          Log.debugf 3 (fun k->k "assert_lit `@[%a@]`" Lit.pp lit);
           assert_lit slice lit;
           (* also assert the new tautologies *)
           let new_clauses = Clause.pop_new () in
@@ -1297,14 +1329,13 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
             (fun c -> slice.push c ())
             new_clauses
         done;
-        let lev = Backtrack.cur_level () in
         Sat lev
       with Inconsistent (e, concl) ->
         (* conflict clause: [e => concl] *)
         let guard = clause_of_exp_ e |> List.map Lit.neg in
         let conflict_clause = Lit.atom ~sign:true concl :: guard in
         Unsat (conflict_clause, ())
-  end
+end
 
   module M = Msat.Solver.Make(M_expr)(M_th)(struct end)
 
@@ -1493,10 +1524,6 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
   end
 
   (** {2 Main} *)
-
-  (* TODO: literals for iterative deepening
-     TODO: main iterative deepening loop (checking unsat-core to
-     see if  really unsat) *)
 
   type unknown =
     | U_timeout
