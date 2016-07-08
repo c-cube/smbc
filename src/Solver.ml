@@ -795,10 +795,15 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       | False -> V_false
       | True -> V_true
       | Builtin (B_eq (a, b)) ->
+        (* is [t] one of the cases for this constant? *)
+        let is_case info t = match info.cst_cases with
+          | Some l -> List.memq t l
+          | None -> false
+        in
         begin match Term.as_cst_undef a, Term.as_cst_undef b with
-          | Some (c,_,_), _ -> V_cst_choice (c,b)
-          | None, Some (c,_,_) -> V_cst_choice (c,a)
-          | None, None -> V_assert (t, true)
+          | Some (c,_,info), _ when is_case info b -> V_cst_choice (c,b)
+          | _, Some (c,_,info) when is_case info a -> V_cst_choice (c,a)
+          | _ -> V_assert (t, true)
         end
       | Builtin (B_not t') -> V_assert (t', false)
       | _ -> V_assert (t, true)
@@ -828,33 +833,12 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     module Map = Term.Map
     module Tbl = Term.Tbl
 
-    (** {6 Propagation} *)
-
-    let propagated_ : explanation Map.t ref = ref Map.empty
-
-    let add_propagated (t:t) (e:explanation): unit =
-      Log.debugf 4 (fun k->k "(@[<1>Lit.add_propagated@ %a@])" pp t);
-      propagated_ := Map.add t e !propagated_
-
-    let pop_propagated () : (t * explanation) Sequence.t =
-      let m = !propagated_ in
-      propagated_ := Map.empty;
-      Map.to_seq m
-
     (** {6 Normalization} *)
 
-    let norm l =
-      let l', negated = match l.term_cell with
-        | False -> Term.true_, true
-        | Builtin (B_not t') -> t', true
-        | _ -> l, false
-      in
-      if l!=l'  then (
-        Log.debugf 3
-          (fun k->k "(@[<1>Lit.norm@ @[%a@]@ :into %a@ :negated %B@])"
-              pp l pp l' negated);
-      );
-      l', negated
+    let norm l = match l.term_cell with
+      | False -> Term.true_, true
+      | Builtin (B_not t') -> t', true
+      | _ -> l, false
   end
 
   module Clause = struct
@@ -864,21 +848,21 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       | [] -> CCFormat.string out "false"
       | [lit] -> Lit.pp out lit
       | _ ->
-        Format.fprintf out "(@[or@ %a@])" (Utils.pp_list Lit.pp) c
+        Format.fprintf out "(@[<hv1>or@ %a@])" (Utils.pp_list Lit.pp) c
 
     (* list of clauses that have been newly generated, waiting
        to be propagated to Msat.
        invariant: those clauses must be tautologies *)
-    let new_ : t list ref = ref []
-
-    let pop_new () : t list =
-      let l = !new_ in
-      new_ := [];
-      l
+    let tautology_queue : t Queue.t = Queue.create()
 
     let push_new (c:t): unit =
-      Log.debugf 5 (fun k->k "(@[<1>new_tautology@ @[%a@]@])" pp c);
-      new_ := c :: !new_;
+      begin match c with
+        | [a;b] when Lit.equal (Lit.neg a) b -> () (* trivial *)
+        | _ ->
+          Log.debugf 4
+            (fun k->k "(@[<1>@{<green>new_tautology@}@ @[%a@]@])" pp c);
+          Queue.push c tautology_queue
+      end;
       ()
 
     let push_new_l = List.iter push_new
@@ -1136,6 +1120,28 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       !e, t
     )
 
+  let lit_of_exp_ (e:explanation_atom): Lit.t = match e with
+    | E_lit (t, b) -> Lit.atom ~sign:b t
+    | E_choice (cst, t) -> Lit.cst_choice cst t
+
+  (* from explanation [e1, e2, ..., en] build the guard
+       [e1 & e2 & ... & en => …], that is, the clause
+       [not e1 | not e2 | ... | not en] *)
+  let clause_guard_of_exp_ (e:explanation): Clause.t =
+    Explanation.to_seq e
+    |> Sequence.map lit_of_exp_
+    |> Sequence.map Lit.neg (* this is a guard! *)
+    |> Sequence.to_rev_list
+    |> CCList.sort_uniq ~cmp:Lit.compare
+
+  let propagate_lit (l:Lit.t) (e:explanation): unit =
+    let c = l :: clause_guard_of_exp_ e in
+    Log.debugf 4
+      (fun k->k "(@[<1>@{<green>propagate_lit@}@ %a@ clause: %a@])"
+          Lit.pp l Clause.pp c);
+    Clause.push_new c;
+    ()
+
   (* set the normal form of [t], propagate to watchers *)
   let rec set_nf_ t new_t (e:explanation) : unit =
     if Term.equal t new_t then ()
@@ -1149,8 +1155,8 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
               Term.pp t Term.pp new_t Explanation.pp e);
         (* if [new_t = true/false], propagate literal *)
         begin match new_t.term_cell with
-          | True -> Lit.add_propagated t e
-          | False -> Lit.add_propagated (Lit.neg t) e
+          | True -> propagate_lit t e
+          | False -> propagate_lit (Lit.neg t) e
           | _ when Ty.is_prop new_t.term_ty ->
             (* partially evaluated boolean: watch blocking literals *)
             update_watches new_t;
@@ -1187,7 +1193,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         set_nf_ t t' e;
         e, t'
       | If (a,b,c) ->
-        let e_a, a' = normal_form a in
+        let e_a, a' = compute_nf a in
         assert (not (Term.equal a a'));
         let default() = Term.if_ a' b c in
         let e_branch, t' = match a'.term_cell with
@@ -1200,10 +1206,10 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         set_nf_ t t' e;
         e, t'
       | Match (u, m) ->
-        let e_u, u' = normal_form u in
+        let e_u, u' = compute_nf u in
         let default() = Term.match_ u' m in
-        let e_branch, t' = match u'.term_cell with
-          | App ({term_cell=Const c; _}, l) ->
+        let e_branch, t' = match Term.as_cstor_app u' with
+          | Some (c, _, l) ->
             begin
               try
                 let tys, rhs = ID.Map.find (Typed_cst.id c) m in
@@ -1225,13 +1231,13 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
               with Not_found ->
                 Explanation.empty, Term.match_ u' m
             end
-          | _ -> Explanation.empty, default()
+          | None -> Explanation.empty, default()
         in
         let e = Explanation.append e_u e_branch in
         set_nf_ t t' e;
         e, t'
       | App (f, l) ->
-        let e_f, f' = normal_form f in
+        let e_f, f' = compute_nf f in
         (* now beta-reduce if needed *)
         let e_reduce, new_t =
           compute_nf_app DB_env.empty Explanation.empty f' l
@@ -1306,15 +1312,17 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         | _ when Term.equal a b -> Term.true_ (* syntactic *)
         | _ ->
           begin match Term.as_cstor_app a, Term.as_cstor_app b with
-            | Some (c1,_,l1), Some (c2,_,l2) ->
+            | Some (c1,ty1,l1), Some (c2,_,l2) ->
               if not (Typed_cst.equal c1 c2)
               then Term.false_
                   (* [c1 ... = c2 ...] --> false, as distinct constructors
                      can never be equal *)
               else if Typed_cst.equal c1 c2
                    && List.length l1 = List.length l2
+                   && List.length l1 = List.length (fst (Ty.unfold ty1))
               then (
-                (* injectivity: arguments are equal *)
+                (* same constructor, fully applied -> injectivity:
+                   arguments are pairwise equal *)
                 List.map2 Term.eq l1 l2
                 |> Term.and_l
               )
@@ -1342,11 +1350,16 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     in
     (* check whether [c] is expanded *)
     begin match info.cst_cases with
-      | None when not_too_deep (Lazy.force info.cst_depth) ->
-        (* [c] is blocking, not too deep, but not expanded *)
-        let _ = expand_cases c ty info in
-        Clause.push_new_l (clauses_of_cases c)
-      | None -> ()
+      | None ->
+        if not_too_deep (Lazy.force info.cst_depth)
+        then (
+          (* [c] is blocking, not too deep, but not expanded *)
+          let _ = expand_cases c ty info in
+          Clause.push_new_l (clauses_of_cases c)
+        ) else (
+          Log.debugf 3
+            (fun k->k "cannot expand %a: too deep" Typed_cst.pp c);
+        );
       | Some _ ->
         (* already recompute the sub-term *)
         compute_nf_ignore t
@@ -1358,7 +1371,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
      also ensure those constants are expanded *)
   and update_watches (t:term): unit =
     assert (Ty.is_prop t.term_ty);
-    Log.debugf 5
+    Log.debugf 4
       (fun k->k "(@[<1>update_watches@ %a@ :deps (@[%a@])@])"
           Term.pp t (Utils.pp_list Typed_cst.pp) t.term_deps);
     List.iter (fun c -> watch_cst c t) t.term_deps;
@@ -1422,40 +1435,43 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
 
     let backtrack = Backtrack.backtrack
 
-    let lit_of_exp_ (e:explanation_atom): Lit.t = match e with
-      | E_lit (t, b) -> Lit.atom ~sign:b t
-      | E_choice (cst, t) -> Lit.cst_choice cst t
-
-    (* from explanation [e1, e2, ..., en] build the guard
-       [e1 & e2 & ... & en => …], that is, the clause
-       [not e1 | not e2 | ... | not en] *)
-    let clause_guard_of_exp_ (e:explanation): Clause.t =
-      Explanation.to_seq e
-      |> Sequence.map lit_of_exp_
-      |> Sequence.map Lit.neg (* this is a guard! *)
-      |> Sequence.to_rev_list
-      |> CCList.sort_uniq ~cmp:Lit.compare
+    (* push clauses from {!tautology_queue} into the slice *)
+    let flush_tautologies_into_slice slice =
+      while not (Queue.is_empty Clause.tautology_queue) do
+        let c = Queue.pop Clause.tautology_queue in
+        slice.push c ();
+      done
 
     (* assert [c := new_t] and propagate *)
-    let assert_choice _ (c:cst) (new_t:term) : unit =
+    let assert_choice (c:cst) (new_t:term) : unit =
       let t_c = Term.const c in
-      assert (t_c.term_nf = None);
-      (* set normal form *)
-      set_nf_ t_c new_t (Explanation.return (E_choice (c, new_t)));
-      (* re-compute every watching literal *)
-      begin match c.cst_kind with
-        | Cst_undef (_, info) ->
-          Weak_set.iter compute_nf_ignore info.cst_watched
-        | Cst_defined _ | Cst_bool | Cst_cstor _  -> assert false
-      end;
-      ()
-
-    let push_propagated_clause v (c:Clause.t) : unit =
-      Log.debugf 3 (fun k->k "(@[<1>slice_push@ @[%a@]@])" Clause.pp c);
-      CCVector.push v c
+      begin match t_c.term_nf with
+        | None ->
+          (* set normal form *)
+          set_nf_ t_c new_t (Explanation.return (E_choice (c, new_t)));
+          (* re-compute every watching literal *)
+          begin match c.cst_kind with
+            | Cst_undef (_, info) ->
+              Weak_set.iter compute_nf_ignore info.cst_watched
+            | Cst_defined _ | Cst_bool | Cst_cstor _  -> assert false
+          end;
+        | Some (c_nf, e) ->
+          (* compute current normal forms, to be sure *)
+          let e, c_nf = compute_nf_add e c_nf in
+          let _, new_t = compute_nf new_t in
+          if Term.equal new_t c_nf
+          then ()
+          else (
+            (* incompatible assignments: fail *)
+            let concl = Lit.neg (Lit.cst_choice c new_t) in
+            raise (Inconsistent (e, concl))
+          )
+      end
 
     (* handle a literal assumed by the SAT solver *)
-    let assume_lit v (lit:Lit.t) : unit =
+    let assume_lit (lit:Lit.t) : unit =
+      Log.debugf 3
+        (fun k->k "(@[<1>@{<green>assume_lit@}@ @[%a@]@])" Lit.pp lit);
       add_lit_to_global_set lit;
       (* check consistency first *)
       let e, lit' = compute_nf lit in
@@ -1464,14 +1480,14 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         | False ->
           (* conflict! *)
           let c = Lit.neg lit :: clause_guard_of_exp_ e in
-          push_propagated_clause v c
+          Clause.push_new c
         | _ ->
           (* otherwise, see if it's an assignment *)
           begin match Lit.view lit with
             | Lit.V_false -> assert false
             | Lit.V_true
             | Lit.V_assert _ -> ()
-            | Lit.V_cst_choice (c, t) -> assert_choice v c t
+            | Lit.V_cst_choice (c, t) -> assert_choice c t
           end
       end
 
@@ -1482,26 +1498,14 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       let old_lev = Backtrack.cur_level () in
       (* do the propagations in a local frame *)
       Backtrack.push_level ();
-      (* set of new clauses to push *)
-      let c_vec = CCVector.create() in
       try
+        (* first, empty the tautology queue *)
+        flush_tautologies_into_slice slice;
         for i = start to start + slice.length - 1 do
           let lit = slice.get i in
-          Log.debugf 3 (fun k->k "(@[<1>assume_lit@ @[%a@]@])" Lit.pp lit);
-          assume_lit c_vec lit;
-          (* propagate literals *)
-          let propagated_lits = Lit.pop_propagated () in
-          Sequence.iter
-            (fun (lit, e) ->
-               let c = lit :: clause_guard_of_exp_ e in
-               push_propagated_clause c_vec c)
-            propagated_lits;
-          (* also assert the new tautologies *)
-          let new_clauses = Clause.pop_new () in
-          List.iter (push_propagated_clause c_vec) new_clauses
+          assume_lit lit;
         done;
-        (* push all the clauses at once *)
-        CCVector.iter (fun c -> slice.push c ()) c_vec;
+        flush_tautologies_into_slice slice;
         (* let the solver do its work on top of the local stack *)
         Backtrack.push_level ();
         let lev = Backtrack.cur_level () in
@@ -1510,6 +1514,9 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         (* conflict clause: [e => concl] *)
         let guard = clause_guard_of_exp_ e in
         let conflict_clause = Lit.atom ~sign:true concl :: guard in
+        Log.debugf 3
+          (fun k->k "(@[<1>raise_inconsistent@ %a@])"
+              Clause.pp conflict_clause);
         (* undo partial propagation(s) *)
         Backtrack.backtrack old_lev;
         Unsat (conflict_clause, ())
@@ -1554,15 +1561,33 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
   (* check that this term fully evaluated *)
   let fully_evaluated (t:term): bool =
     let _, t' = compute_nf t in
-    t'.term_deps = []
+    match t'.term_cell with
+      | True
+      | False -> true
+      | _ when Ty.is_prop t'.term_ty -> false
+      | _ -> t'.term_deps = []
 
   (* main solve function *)
-  let solve () : M.res =
-    match M.solve () with
-      | M.Unsat -> M.Unsat
-      | M.Sat ->
-        assert (List.for_all fully_evaluated !must_evaluate_);
-        M.Sat
+  let rec solve () : M.res = match M.solve () with
+    | M.Unsat -> M.Unsat
+    | M.Sat ->
+      if List.for_all fully_evaluated !must_evaluate_
+      then M.Sat
+      else (
+        Log.debugf 1 (fun k->k "@{<Yellow>solve: udpate watches@}");
+        List.iter
+          (fun t ->
+             let _, t' = compute_nf t in
+             update_watches t')
+          !must_evaluate_;
+        (* there must be some new clauses after the expansion *)
+        while not (Queue.is_empty Clause.tautology_queue) do
+          let c = Queue.pop Clause.tautology_queue in
+          push_clause c
+        done;
+        (* solve again *)
+        solve()
+      )
 
   (** {2 Conversion} *)
 
@@ -1807,9 +1832,6 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         (* restrict depth *)
         push_clause [cur_lit];
         match solve () with
-          | exception e ->
-            do_on_exit ~on_exit;
-            raise e
           | M.Sat ->
             let m = compute_model_ () in
             Log.debugf 1
