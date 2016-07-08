@@ -1,5 +1,6 @@
 
 ; find a list of length 6, where `rev l = l`
+; expect: SAT
 
 (include "nat.lisp")
 (include "list.lisp")
