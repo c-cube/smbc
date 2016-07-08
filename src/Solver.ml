@@ -313,12 +313,12 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
 
     let cur_level () = st_.stack_level
 
-    let push_level () : level =
+    let push_level () : unit =
       let l = st_.stack_level + 1 in
       st_.stack_level <- l;
       st_.stack <- S_level (l, st_.stack);
       Log.debugf 2 (fun k->k "@{<Yellow>** now at level %d@}" l);
-      l
+      ()
 
     let push_set_nf_ (t:term) =
       st_.stack <- S_set_nf (t, t.term_nf, st_.stack)
@@ -347,7 +347,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           Hash.seq (Hash.pair ID.hash hash_case) (ID.Map.to_seq m)
         in
         Hash.combine3 8 u.term_id hash_m
-      | Builtin (B_not t) -> Hash.combine2 20 t.term_id
+      | Builtin (B_not a) -> Hash.combine2 20 a.term_id
       | Builtin (B_and (t1,t2)) -> Hash.combine3 21 t1.term_id t2.term_id
       | Builtin (B_or (t1,t2)) -> Hash.combine3 22 t1.term_id t2.term_id
       | Builtin (B_imply (t1,t2)) -> Hash.combine3 23 t1.term_id t2.term_id
@@ -368,7 +368,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         u1 == u2 &&
         ID.Map.for_all
           (fun k1 v1 ->
-             try v1 == (ID.Map.find k1 m2)
+             try v1 == ID.Map.find k1 m2
              with Not_found -> false)
           m1
         &&
@@ -520,6 +520,13 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       t
 
     let builtin_ ~deps b =
+      (* normalize a bit *)
+      let b = match b with
+        | B_eq (a,b) when a.term_id > b.term_id -> B_eq (b,a)
+        | B_and (a,b) when a.term_id > b.term_id -> B_and (b,a)
+        | B_or (a,b) when a.term_id > b.term_id -> B_or (b,a)
+        | _ -> b
+      in
       let t = mk_term_ ~deps (Builtin b) ~ty:Ty.prop in
       t
 
@@ -662,7 +669,8 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       | Builtin (B_or (a,b)) -> fpf out "(@[<hv1>or@ %a@ %a@])" pp a pp b
       | Builtin (B_imply (a,b)) ->
         fpf out "(@[<hv1>=>@ %a@ %a@])" pp a pp b
-      | Builtin (B_eq (a,b)) -> fpf out "(@[<hv1>=@ %a@ %a@])" pp a pp b
+      | Builtin (B_eq (a,b)) ->
+        fpf out "(@[<hv1>=@ %a@ %a@])" pp a pp b
 
     type graph_edge =
       | GE_sub of int (* n-th subterm *)
@@ -836,8 +844,17 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     (** {6 Normalization} *)
 
     let norm l =
-      Log.debugf 5 (fun k->k "(@[<1>Lit.norm@ @[%a@]@])" pp l);
-      l, false (* TODO? *)
+      let l', negated = match l.term_cell with
+        | False -> Term.true_, true
+        | Builtin (B_not t') -> t', true
+        | _ -> l, false
+      in
+      if l!=l'  then (
+        Log.debugf 3
+          (fun k->k "(@[<1>Lit.norm@ @[%a@]@ :into %a@ :negated %B@])"
+              pp l pp l' negated);
+      );
+      l', negated
   end
 
   module Clause = struct
@@ -897,6 +914,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       let rem = Config.max_depth mod step_ in
       let res = Config.max_depth - rem in
       Log.debugf 1 (fun k->k "(set_max_depth %d)" res);
+      assert (res mod step_ = 0);
       res
 
     type state =
@@ -908,7 +926,6 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       ID.makef "max_depth_leq_%d" d
       |> Typed_cst.make_bool
       |> Term.const
-      |> Lit.atom ~sign:true
 
     let lits_ : (int, Lit.t) Hashtbl.t = Hashtbl.create 32
 
@@ -924,7 +941,10 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           Some lit
 
     (* initial state *)
-    let start_ = At (step_, mk_lit_ step_)
+    let start_ =
+      match lit_of_depth step_ with
+        | None -> assert false
+        | Some lit -> At (step_, lit)
 
     let cur_ = ref start_
     let reset () = cur_ := start_
@@ -1417,7 +1437,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       |> CCList.sort_uniq ~cmp:Lit.compare
 
     (* assert [c := new_t] and propagate *)
-    let assert_choice _slice (c:cst) (new_t:term) : unit =
+    let assert_choice _ (c:cst) (new_t:term) : unit =
       let t_c = Term.const c in
       assert (t_c.term_nf = None);
       (* set normal form *)
@@ -1430,12 +1450,12 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       end;
       ()
 
-    let push_slice_ slice (c:Clause.t) : unit =
+    let push_propagated_clause v (c:Clause.t) : unit =
       Log.debugf 3 (fun k->k "(@[<1>slice_push@ @[%a@]@])" Clause.pp c);
-      slice.push c ()
+      CCVector.push v c
 
     (* handle a literal assumed by the SAT solver *)
-    let assume_lit slice (lit:Lit.t) : unit =
+    let assume_lit v (lit:Lit.t) : unit =
       add_lit_to_global_set lit;
       (* check consistency first *)
       let e, lit' = compute_nf lit in
@@ -1444,14 +1464,14 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         | False ->
           (* conflict! *)
           let c = Lit.neg lit :: clause_guard_of_exp_ e in
-          push_slice_ slice c
+          push_propagated_clause v c
         | _ ->
           (* otherwise, see if it's an assignment *)
           begin match Lit.view lit with
             | Lit.V_false -> assert false
             | Lit.V_true
             | Lit.V_assert _ -> ()
-            | Lit.V_cst_choice (c, t) -> assert_choice slice c t
+            | Lit.V_cst_choice (c, t) -> assert_choice v c t
           end
       end
 
@@ -1459,30 +1479,39 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     let assume slice =
       let start = slice.start in
       assert (slice.length > 0);
-      (* increase level *)
-      let _ = Backtrack.push_level () in
-      let lev = Backtrack.cur_level () in
+      let old_lev = Backtrack.cur_level () in
+      (* do the propagations in a local frame *)
+      Backtrack.push_level ();
+      (* set of new clauses to push *)
+      let c_vec = CCVector.create() in
       try
         for i = start to start + slice.length - 1 do
           let lit = slice.get i in
           Log.debugf 3 (fun k->k "(@[<1>assume_lit@ @[%a@]@])" Lit.pp lit);
-          assume_lit slice lit;
+          assume_lit c_vec lit;
           (* propagate literals *)
           let propagated_lits = Lit.pop_propagated () in
           Sequence.iter
             (fun (lit, e) ->
                let c = lit :: clause_guard_of_exp_ e in
-               push_slice_ slice c)
+               push_propagated_clause c_vec c)
             propagated_lits;
           (* also assert the new tautologies *)
           let new_clauses = Clause.pop_new () in
-          List.iter (push_slice_ slice) new_clauses
+          List.iter (push_propagated_clause c_vec) new_clauses
         done;
+        (* push all the clauses at once *)
+        CCVector.iter (fun c -> slice.push c ()) c_vec;
+        (* let the solver do its work on top of the local stack *)
+        Backtrack.push_level ();
+        let lev = Backtrack.cur_level () in
         Sat lev
       with Inconsistent (e, concl) ->
         (* conflict clause: [e => concl] *)
         let guard = clause_guard_of_exp_ e in
         let conflict_clause = Lit.atom ~sign:true concl :: guard in
+        (* undo partial propagation(s) *)
+        Backtrack.backtrack old_lev;
         Unsat (conflict_clause, ())
   end
 
@@ -1495,6 +1524,45 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
        are added to the proper constant watchlist(s) *)
     List.iter add_lit_to_global_set c;
     M.assume [c]
+
+  type unknown =
+    | U_timeout
+    | U_max_depth
+
+  type model = term Typed_cst.Map.t
+  (** Map from constants to their value *)
+
+  type res =
+    | Sat of model
+    | Unsat (* TODO: proof *)
+    | Unknown of unknown
+
+  (* list of constants we are interested in *)
+  let model_support_ : Typed_cst.t list ref = ref []
+
+  let add_cst_support_ (c:cst): unit =
+    CCList.Ref.push model_support_ c
+
+  (* list of terms to fully evaluate *)
+  let must_evaluate_ : term list ref = ref []
+
+  (* add [t] to the set of terms that must be evaluated *)
+  let push_toplevel_term (t:term): unit =
+    must_evaluate_ := t :: !must_evaluate_;
+    ()
+
+  (* check that this term fully evaluated *)
+  let fully_evaluated (t:term): bool =
+    let _, t' = compute_nf t in
+    t'.term_deps = []
+
+  (* main solve function *)
+  let solve () : M.res =
+    match M.solve () with
+      | M.Unsat -> M.Unsat
+      | M.Sat ->
+        assert (List.for_all fully_evaluated !must_evaluate_);
+        M.Sat
 
   (** {2 Conversion} *)
 
@@ -1572,31 +1640,14 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           | Ast.Eq -> Term.eq a b
         end
 
-    (* list of constants we are interested in *)
-    let model_support_ : Typed_cst.t list ref = ref []
-
-    let add_cst_support_ (c:cst): unit =
-      CCList.Ref.push model_support_ c
-
-    (* normalize [c], at toplevel only (no assumption) *)
-    let push_normalized_clause c =
-      let c =
-        List.map
-          (fun t ->
-             let e, t' = compute_nf t in
-             assert (Explanation.is_empty e);
-             t')
-          c
-      in
-      push_clause c
-
     let add_statement st =
       Log.debugf 2
         (fun k->k "(@[add_statement@ @[%a@]@])" Ast.pp_statement st);
       match st with
         | Ast.Assert t ->
           let t = conv_term [] t in
-          push_normalized_clause [t]
+          push_toplevel_term t;
+          push_clause [t]
         | Ast.Goal (vars, t) ->
           (* skolemize *)
           let env, consts =
@@ -1611,7 +1662,8 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           (* model should contain values of [consts] *)
           List.iter add_cst_support_ consts;
           let t = conv_term env t in
-          push_normalized_clause [t]
+          push_toplevel_term t;
+          push_clause [t]
         | Ast.TyDecl id ->
           let ty = Ty.atomic id Uninterpreted in
           ID.Tbl.add ty_tbl_ id (Lazy.from_val ty)
@@ -1625,6 +1677,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
             | Prop -> Typed_cst.make_bool id
           in
           add_cst_support_ cst; (* need it in model *)
+          push_toplevel_term (Term.const cst);
           ID.Tbl.add decl_ty_ id (Lazy.from_val cst)
         | Ast.Data l ->
           (* declare the type, and all the constructors *)
@@ -1675,18 +1728,6 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
 
   (** {2 Main} *)
 
-  type unknown =
-    | U_timeout
-    | U_max_depth
-
-  type model = term Typed_cst.Map.t
-  (** Map from constants to their value *)
-
-  type res =
-    | Sat of model
-    | Unsat (* TODO: proof *)
-    | Unknown of unknown
-
   let pp_model out m =
     let pp_pair out (c,t) =
       Format.fprintf out "(@[%a %a@])" ID.pp (Typed_cst.id c) Term.pp t
@@ -1721,7 +1762,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     aux t
 
   let compute_model_ () : model =
-    !Conv.model_support_
+    !model_support_
     |> Sequence.of_list
     |> Sequence.map
       (fun c ->
@@ -1765,7 +1806,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         let lev = M.push () in
         (* restrict depth *)
         push_clause [cur_lit];
-        match M.solve () with
+        match solve () with
           | exception e ->
             do_on_exit ~on_exit;
             raise e
