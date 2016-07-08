@@ -14,6 +14,11 @@ end
 module Make(Config : CONFIG)(Dummy : sig end) = struct
   exception Error of string
 
+  let () = Printexc.register_printer
+      (function
+        | Error msg -> Some ("internal error: " ^ msg)
+        | _ -> None)
+
   let errorf msg = CCFormat.ksprintf msg ~f:(fun s -> raise (Error s))
 
   type level = int
@@ -25,9 +30,10 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     term_cell: term_cell;
     mutable term_nf: (term * explanation) option;
       (* normal form + explanation of why *)
-    mutable term_watchers: term list; (* terms watching this term's nf *)
+    mutable term_deps: cst list;
+    (* set of undefined constants
+       that can make evaluation go further *)
   }
-  (* TODO: use a weak array for watchers *)
 
   (* term shallow structure *)
   and term_cell =
@@ -81,6 +87,14 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
        a given case *)
     mutable cst_cases : term list option;
     (* cover set (lazily evaluated) *)
+    cst_watched: term Weak_set.t;
+    (* set of (bool) terms that depend on this constant for evaluation.
+
+       A literal [lit] can watch several typed constants. If
+       [lit.nf = t], and [t]'s evaluation is blocked by [c1,...,ck],
+       then [lit] will watch [c1,...,ck].
+
+       Watches are backtrackables. *)
   }
 
   (* Hashconsed type *)
@@ -196,6 +210,9 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       if n < env.size then List.nth env.st n else None
   end
 
+  let term_equal_ a b = a==b
+  let term_hash_ a = a.term_id
+
   module Typed_cst = struct
     type t = cst
     type _cst_kind = cst_kind
@@ -231,9 +248,18 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
             invalid_arg "make_const: parent should be a constant"
           | None -> 0
         ) in
-        { cst_depth; cst_parent=parent; cst_cases=None; }
+        { cst_depth; cst_parent=parent;
+          cst_cases=None;
+          cst_watched=
+            Weak_set.create ~eq:term_equal_ ~hash:term_hash_ 16;
+        }
       in
       make id (Cst_undef (ty, info))
+
+    let as_undefined (c:t): (t * Ty.t * cst_info) option =
+      match c.cst_kind with
+        | Cst_undef (ty,i) -> Some (c,ty,i)
+        | Cst_bool | Cst_defined _ | Cst_cstor _ -> None
 
     let equal a b = ID.equal a.cst_id b.cst_id
     let compare a b = ID.compare a.cst_id b.cst_id
@@ -272,11 +298,11 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
 
     let backtrack (l:level): unit =
       let rec aux l st = match st with
+        | S_nil -> st
         | S_level (l', st') ->
           if l=l'
           then st (* stop *)
           else aux l st' (* continue *)
-        | S_nil -> st
         | S_set_nf (t, nf, st') ->
           t.term_nf <- nf;
           aux l st'
@@ -294,7 +320,6 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       Log.debugf 2 (fun k->k "@{<Yellow>** now at level %d@}" l);
       l
 
-    (* TODO: use weak resizable array instead *)
     let push_set_nf_ (t:term) =
       st_.stack <- S_set_nf (t, t.term_nf, st_.stack)
   end
@@ -399,39 +424,54 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         term_ty=Ty.prop;
         term_cell=if b then True else False;
         term_nf=None;
-        term_watchers=[];
+        term_deps=[];
       } in
       hashcons_ t
 
     let true_ = mk_bool_ true
     let false_ = mk_bool_ false
 
-    let add_watcher ~watcher t =
-      t.term_watchers <- watcher :: t.term_watchers
-
-    let add_watcher_l ~watcher l = List.iter (add_watcher ~watcher) l
+    type deps =
+      | Dep_cst of cst (* the term itself is a constant *)
+      | Dep_none
+      | Dep_sub of term
+      | Dep_subs of term list
 
     (* build a term. If it's new, add it to the watchlist
        of every member of [watching] *)
-    let mk_term_ ~(watching:term list) cell ~ty : term =
+    let mk_term_ ~(deps:deps) cell ~ty : term =
       let t = {
         term_id= -1;
         term_ty=ty;
         term_cell=cell;
         term_nf=None;
-        term_watchers=[];
+        term_deps=[];
       } in
       let t' = hashcons_ t in
       if t==t' then (
-        List.iter (fun u -> add_watcher ~watcher:t u) watching;
+        (* compute evaluation dependencies *)
+        let deps = match deps with
+          | Dep_none -> []
+          | Dep_cst c -> [c]
+          | Dep_sub t -> t.term_deps
+          | Dep_subs l ->
+            l
+            |> CCList.flat_map (fun sub -> sub.term_deps)
+            |> CCList.sort_uniq ~cmp:Typed_cst.compare
+        in
+        t'.term_deps <- deps
       );
       t'
 
     let db d =
-      mk_term_ ~watching:[] (DB d) ~ty:(DB.ty d)
+      mk_term_ ~deps:Dep_none (DB d) ~ty:(DB.ty d)
 
     let const c =
-      mk_term_ ~watching:[] (Const c) ~ty:(Typed_cst.ty c)
+      let deps = match c.cst_kind with
+        | Cst_undef _ -> Dep_cst c (* depends on evaluation! *)
+        | Cst_bool | Cst_defined _ | Cst_cstor _ -> Dep_none
+      in
+      mk_term_ ~deps (Const c) ~ty:(Typed_cst.ty c)
 
     (* type of an application *)
     let rec app_ty_ ty l : Ty.t = match Ty.view ty, l with
@@ -450,8 +490,8 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         let t = match f.term_cell with
           | App (f1, l1) ->
             let l' = l1 @ l in
-            mk_term_ ~watching:[f1] (App (f1, l')) ~ty
-          | _ -> mk_term_ ~watching:[f] (App (f,l)) ~ty
+            mk_term_ ~deps:(Dep_sub f1) (App (f1, l')) ~ty
+          | _ -> mk_term_ ~deps:(Dep_sub f) (App (f,l)) ~ty
         in
         t
 
@@ -460,7 +500,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     let fun_ ty body =
       let ty' = Ty.arrow ty body.term_ty in
       (* do not add watcher: propagation under λ forbidden *)
-      mk_term_ ~watching:[] (Fun (ty, body)) ~ty:ty'
+      mk_term_ ~deps:Dep_none (Fun (ty, body)) ~ty:ty'
 
     (* TODO: check types *)
 
@@ -470,37 +510,37 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         rhs.term_ty
       in
       (* propagate only from [u] *)
-      let t = mk_term_ ~watching:[u] (Match (u,m)) ~ty in
+      let t = mk_term_ ~deps:(Dep_sub u) (Match (u,m)) ~ty in
       t
 
     let if_ a b c =
       assert (Ty.equal b.term_ty c.term_ty);
       (* propagate under test only *)
-      let t = mk_term_ ~watching:[a] (If (a,b,c)) ~ty:b.term_ty in
+      let t = mk_term_ ~deps:(Dep_sub a) (If (a,b,c)) ~ty:b.term_ty in
       t
 
-    let builtin_ ~watching b =
-      let t = mk_term_ ~watching (Builtin b) ~ty:Ty.prop in
+    let builtin_ ~deps b =
+      let t = mk_term_ ~deps (Builtin b) ~ty:Ty.prop in
       t
 
     let builtin b =
-      let watching = match b with
-        | B_not u -> [u]
+      let deps = match b with
+        | B_not u -> Dep_sub u
         | B_and (a,b) | B_or (a,b)
-        | B_eq (a,b) | B_imply (a,b) -> [a;b]
+        | B_eq (a,b) | B_imply (a,b) -> Dep_subs [a;b]
       in
-      builtin_ ~watching b
+      builtin_ ~deps b
 
     let not_ t = match t.term_cell with
       | True -> false_
       | False -> true_
       | Builtin (B_not t') -> t'
-      | _ -> builtin_ ~watching:[t] (B_not t)
+      | _ -> builtin_ ~deps:(Dep_sub t) (B_not t)
 
-    let and_ a b = builtin_ ~watching:[a;b] (B_and (a,b))
-    let or_ a b = builtin_ ~watching:[a;b] (B_or (a,b))
-    let imply a b = builtin_ ~watching:[a;b] (B_imply (a,b))
-    let eq a b = builtin_ ~watching:[a;b] (B_eq (a,b))
+    let and_ a b = builtin_ ~deps:(Dep_subs [a;b]) (B_and (a,b))
+    let or_ a b = builtin_ ~deps:(Dep_subs [a;b]) (B_or (a,b))
+    let imply a b = builtin_ ~deps:(Dep_subs [a;b]) (B_imply (a,b))
+    let eq a b = builtin_ ~deps:(Dep_subs [a;b]) (B_eq (a,b))
     let neq a b = not_ (eq a b)
 
     let and_l = function
@@ -549,14 +589,19 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
 
     let ty t = t.term_ty
 
-    let equal a b = a==b
-    let hash t = t.term_id
+    let equal = term_equal_
+    let hash = term_hash_
     let compare a b = CCOrd.int_ a.term_id b.term_id
 
-    module Map = CCMap.Make(struct
+    module As_key = struct
         type t = term
         let compare = compare
-      end)
+        let equal = equal
+        let hash = hash
+    end
+
+    module Map = CCMap.Make(As_key)
+    module Tbl = CCHashtbl.Make(As_key)
 
     let to_seq t yield =
       let rec aux t =
@@ -593,8 +638,6 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         | _ -> None
 
     let fpf = Format.fprintf
-    let pp_list_ pp out l =
-      CCFormat.list ~start:"" ~stop:"" ~sep:" " pp out l
 
     let rec pp out t = match t.term_cell with
       | True -> CCFormat.string out "true"
@@ -602,7 +645,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       | DB d -> DB.pp out d
       | Const c -> Typed_cst.pp out c
       | App (f,l) ->
-        fpf out "(@[%a %a@])" pp f (pp_list_ pp) l
+        fpf out "(@[%a %a@])" pp f (Utils.pp_list pp) l
       | Fun (ty,f) ->
         fpf out "(@[fun %a.@ %a@])" Ty.pp ty pp f
       | If (a, b, c) ->
@@ -624,7 +667,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     type graph_edge =
       | GE_sub of int (* n-th subterm *)
       | GE_nf (* pointer to normal_form *)
-      | GE_watch (* watched term *)
+      | GE_dep  (* dependencies on constants *)
 
     let as_graph : (term, term * graph_edge * term) CCGraph.t =
       CCGraph.make_labelled_tuple
@@ -642,9 +685,9 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
              end
              |> Sequence.mapi (fun i t' -> GE_sub i, t')
            and watched =
-             t.term_watchers
+             t.term_deps
              |> Sequence.of_list
-             |> Sequence.map (fun t' -> GE_watch, t')
+             |> Sequence.map (fun c -> GE_dep, const c)
            and nf = match t.term_nf with
              | None -> Sequence.empty
              | Some (t',_) -> Sequence.return (GE_nf, t')
@@ -679,7 +722,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         | GE_sub i -> [`Label (string_of_int i); `Weight 15]
         | GE_nf ->
           [`Label "nf"; `Style "dashed"; `Weight 0; `Color "green"]
-        | GE_watch ->
+        | GE_dep ->
           [`Style  "dotted"; `Weight 0; `Color "grey"]
       in
       let pp_ out terms =
@@ -775,12 +818,14 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     let print = pp
 
     module Map = Term.Map
+    module Tbl = Term.Tbl
 
-    (** {2 Propagation} *)
+    (** {6 Propagation} *)
 
     let propagated_ : explanation Map.t ref = ref Map.empty
 
     let add_propagated (t:t) (e:explanation): unit =
+      Log.debugf 4 (fun k->k "(@[<1>Lit.add_propagated@ %a@])" pp t);
       propagated_ := Map.add t e !propagated_
 
     let pop_propagated () : (t * explanation) Sequence.t =
@@ -788,7 +833,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       propagated_ := Map.empty;
       Map.to_seq m
 
-    (** {2 Normalization} *)
+    (** {6 Normalization} *)
 
     let norm l =
       Log.debugf 5 (fun k->k "(@[<1>Lit.norm@ @[%a@]@])" pp l);
@@ -802,8 +847,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       | [] -> CCFormat.string out "false"
       | [lit] -> Lit.pp out lit
       | _ ->
-        Format.fprintf out "(@[or@ %a@])"
-          (CCFormat.list ~start:"" ~stop:"" ~sep:" " Lit.pp) c
+        Format.fprintf out "(@[or@ %a@])" (Utils.pp_list Lit.pp) c
 
     (* list of clauses that have been newly generated, waiting
        to be propagated to Msat.
@@ -1005,8 +1049,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     in
     Log.debugf 4
       (fun k->k "(@[<1>expand_cases@ @[%a@]@ :into (@[%a@])@])"
-          Typed_cst.pp cst
-          (CCFormat.list ~start:"" ~stop:"" ~sep:" " Term.pp) l);
+          Typed_cst.pp cst (Utils.pp_list Term.pp) l);
     info.cst_cases <- Some l;
     l
 
@@ -1073,68 +1116,6 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       !e, t
     )
 
-  (* follow "normal form" pointers deeply in the term *)
-  let deref_deep (t:term) : term =
-    let rec aux t =
-      let _, t = normal_form t in
-      match t.term_cell with
-        | True | False | Const _ | DB _ -> t
-        | App (f,l) ->
-          Term.app (aux f) (List.map aux l)
-        | If (a,b,c) -> Term.if_ (aux a)(aux b)(aux c)
-        | Match (u,m) ->
-          let m = ID.Map.map (fun (tys,rhs) -> tys, aux rhs) m in
-          Term.match_ (aux u) m
-        | Fun (ty,body) -> Term.fun_ ty (aux body)
-        | Builtin b -> Term.builtin (Term.map_builtin aux b)
-    in
-    aux t
-
-  (* find the set of constants potentially blocking
-     the evaluation of [t] *)
-  let find_blocking_undef (t:term): (cst * Ty.t * cst_info) Sequence.t =
-    let not_too_deep l : bool = match Iterative_deepening.current () with
-      | Iterative_deepening.Exhausted -> false
-      | Iterative_deepening.At (l', _) -> l <= (l' :> int)
-    in
-    let rec aux t yield = match t.term_cell with
-      | Const c ->
-        begin match c.cst_kind with
-          | Cst_undef (ty, info) ->
-            (* only expand if not too deep *)
-            if not_too_deep (Lazy.force info.cst_depth)
-            then yield (c, ty, info)
-          | Cst_bool
-          | Cst_cstor _
-          | Cst_defined _ -> ()
-        end
-      | App (f, _) -> aux f yield
-      | Builtin b ->
-        Term.builtin_to_seq b
-        |> Sequence.flat_map aux
-        |> Sequence.iter yield
-      | Fun _ (* in normal form *)
-      | True
-      | False
-      | DB _ -> ()
-      | Match (u,_) -> aux u yield
-      | If (a,_,_) -> aux a yield
-    in
-    aux t
-
-  (* find blocking undefined constants, and expand their list of cases *)
-  let expand_blocking_undef (t:term) : unit =
-    find_blocking_undef t
-    |> Sequence.iter
-      (fun (c,ty,info) -> match info.cst_cases with
-         | Some _ -> ()
-         | None ->
-           let _ = expand_cases c ty info in
-           assert (info.cst_cases <> None);
-           (* also push new tautologies to force a choice in [l] *)
-           let new_c = clauses_of_cases c in
-           Clause.push_new_l new_c)
-
   (* set the normal form of [t], propagate to watchers *)
   let rec set_nf_ t new_t (e:explanation) : unit =
     if Term.equal t new_t then ()
@@ -1150,18 +1131,11 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         begin match new_t.term_cell with
           | True -> Lit.add_propagated t e
           | False -> Lit.add_propagated (Lit.neg t) e
+          | _ when Ty.is_prop new_t.term_ty ->
+            (* partially evaluated boolean: watch blocking literals *)
+            update_watches new_t;
           | _ -> ()
         end;
-        (* boolean? check if we need to expand some variables further *)
-        if Ty.is_prop (new_t.term_ty)
-        then expand_blocking_undef new_t;
-        (* we just changed [t]'s normal form, ensure that [t]'s
-           watching terms are up-to-date *)
-        List.iter
-          (fun watcher -> match watcher.term_nf with
-             | Some _ -> ()   (* already reduced *)
-             | None -> ignore (compute_nf watcher))
-          t.term_watchers;
         ()
     end
 
@@ -1173,7 +1147,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     match t.term_nf with
       | Some (t', e) ->
         let e', nf = compute_nf t' in
-        (* NOTE path compression here, maybe *)
+        (* NOTE: path compression here, maybe *)
         Explanation.append e e', nf
       | None -> compute_nf_noncached t
 
@@ -1329,6 +1303,47 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           end
       end
 
+  and compute_nf_ignore t: unit = ignore (compute_nf t)
+
+  (* add [t] to the list of literals that watch the constant [c] *)
+  and watch_cst (c:cst) (t:term): unit =
+    assert (Ty.is_prop t.term_ty);
+    Log.debugf 5
+      (fun k->k "(@[<1>watch_cst@ %a@ %a@])" Typed_cst.pp c Term.pp t);
+    let ty, info = match c.cst_kind with
+      | Cst_undef (ty,i) -> ty,i
+      | Cst_bool | Cst_defined _ | Cst_cstor _ -> assert false
+    in
+    Weak_set.add info.cst_watched t;
+    (* ensure [c] is expanded, unless it is currently too deep *)
+    let not_too_deep l : bool = match Iterative_deepening.current () with
+      | Iterative_deepening.Exhausted -> false
+      | Iterative_deepening.At (l', _) -> l <= (l' :> int)
+    in
+    (* check whether [c] is expanded *)
+    begin match info.cst_cases with
+      | None when not_too_deep (Lazy.force info.cst_depth) ->
+        (* [c] is blocking, not too deep, but not expanded *)
+        let _ = expand_cases c ty info in
+        Clause.push_new_l (clauses_of_cases c)
+      | None -> ()
+      | Some _ ->
+        (* already recompute the sub-term *)
+        compute_nf_ignore t
+    end;
+    ()
+
+  (* ensure that [t] (a prop) is on the watchlist of all the
+     constants it depends on;
+     also ensure those constants are expanded *)
+  and update_watches (t:term): unit =
+    assert (Ty.is_prop t.term_ty);
+    Log.debugf 5
+      (fun k->k "(@[<1>update_watches@ %a@ :deps (@[%a@])@])"
+          Term.pp t (Utils.pp_list Typed_cst.pp) t.term_deps);
+    List.iter (fun c -> watch_cst c t) t.term_deps;
+    ()
+
   (** {2 Sat Solver} *)
 
   (* formulas for msat *)
@@ -1343,6 +1358,21 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     let add_label _ _ = assert false
     let print = Lit.pp
   end
+
+  (* the set of literals we pushed into SAT *)
+  let all_lits_ : unit Lit.Tbl.t = Lit.Tbl.create 256
+
+  (* add a literal to {!all_lits_} *)
+  let add_lit_to_global_set lit =
+    if not (Lit.Tbl.mem all_lits_ lit) then (
+      Log.debugf 4
+        (fun k->k "(@[<2>add_lit_to_global_set@ %a@])" Lit.pp lit);
+      Lit.Tbl.add all_lits_ lit ();
+      (* also ensure it is watched properly *)
+      let _, lit' = compute_nf lit in
+      update_watches lit';
+    );
+    ()
 
   (* the "theory" part: propagations *)
   module M_th :
@@ -1390,15 +1420,23 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     let assert_choice _slice (c:cst) (new_t:term) : unit =
       let t_c = Term.const c in
       assert (t_c.term_nf = None);
-      (* set normal form, then compute *)
+      (* set normal form *)
       set_nf_ t_c new_t (Explanation.return (E_choice (c, new_t)));
+      (* re-compute every watching literal *)
+      begin match c.cst_kind with
+        | Cst_undef (_, info) ->
+          Weak_set.iter compute_nf_ignore info.cst_watched
+        | Cst_defined _ | Cst_bool | Cst_cstor _  -> assert false
+      end;
       ()
 
     let push_slice_ slice (c:Clause.t) : unit =
       Log.debugf 3 (fun k->k "(@[<1>slice_push@ @[%a@]@])" Clause.pp c);
       slice.push c ()
 
-    let assert_lit slice (lit:Lit.t) : unit =
+    (* handle a literal assumed by the SAT solver *)
+    let assume_lit slice (lit:Lit.t) : unit =
+      add_lit_to_global_set lit;
       (* check consistency first *)
       let e, lit' = compute_nf lit in
       begin match lit'.term_cell with
@@ -1413,9 +1451,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
             | Lit.V_false -> assert false
             | Lit.V_true
             | Lit.V_assert _ -> ()
-            | Lit.V_cst_choice (c, t) ->
-              expand_blocking_undef t;
-              assert_choice slice c t
+            | Lit.V_cst_choice (c, t) -> assert_choice slice c t
           end
       end
 
@@ -1430,7 +1466,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         for i = start to start + slice.length - 1 do
           let lit = slice.get i in
           Log.debugf 3 (fun k->k "(@[<1>assume_lit@ @[%a@]@])" Lit.pp lit);
-          assert_lit slice lit;
+          assume_lit slice lit;
           (* propagate literals *)
           let propagated_lits = Lit.pop_propagated () in
           Sequence.iter
@@ -1455,9 +1491,9 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
   (* push one clause into [M] *)
   let push_clause (c:Clause.t): unit =
     Log.debugf 3 (fun k->k "(@[<1>push_clause@ @[%a@]@])" Clause.pp c);
-    (* ensure that all constants that might block the evaluation
-       of [c] are expanded *)
-    List.iter expand_blocking_undef c;
+    (* reduce to normal form the literals, ensure they
+       are added to the proper constant watchlist(s) *)
+    List.iter add_lit_to_global_set c;
     M.assume [c]
 
   (** {2 Conversion} *)
@@ -1656,8 +1692,33 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       Format.fprintf out "(@[%a %a@])" ID.pp (Typed_cst.id c) Term.pp t
     in
     Format.fprintf out "(@[%a@])"
-      (CCFormat.list ~start:"" ~stop:"" ~sep:" " pp_pair)
+      (Utils.pp_list pp_pair)
       (Typed_cst.Map.to_list m)
+
+  (* follow "normal form" pointers deeply in the term
+     @raise Error if the term contains unevaluated parts *)
+  let deref_deep (t:term) : term =
+    let rec aux t =
+      let _, t = normal_form t in
+      match t.term_cell with
+        | True | False | DB _ -> t
+        | Const c ->
+          begin match Typed_cst.as_undefined c with
+            | Some _ ->
+              errorf "constant `%a` does not have a value" Typed_cst.pp c
+            | None -> ()
+          end;
+          t
+        | App (f,l) ->
+          Term.app (aux f) (List.map aux l)
+        | If (a,b,c) -> Term.if_ (aux a)(aux b)(aux c)
+        | Match (u,m) ->
+          let m = ID.Map.map (fun (tys,rhs) -> tys, aux rhs) m in
+          Term.match_ (aux u) m
+        | Fun (ty,body) -> Term.fun_ ty (aux body)
+        | Builtin b -> Term.builtin (Term.map_builtin aux b)
+    in
+    aux t
 
   let compute_model_ () : model =
     !Conv.model_support_
@@ -1705,6 +1766,9 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         (* restrict depth *)
         push_clause [cur_lit];
         match M.solve () with
+          | exception e ->
+            do_on_exit ~on_exit;
+            raise e
           | M.Sat ->
             let m = compute_model_ () in
             Log.debugf 1

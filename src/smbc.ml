@@ -39,7 +39,7 @@ let solve ~config (ast:Ast.statement list) : unit =
   (* solve *)
   match S.check ~on_exit ast with
     | S.Sat m ->
-      Format.printf "result: @{<Green>SAT@}@, model @[%a@]@." S.pp_model m
+      Format.printf "result: @{<Green>SAT@},@ (@[<1>model@ @[%a@]@])@." S.pp_model m
     | S.Unsat ->
       Format.printf "result: @{<Yellow>UNSAT@}@."
     | S.Unknown _ ->
