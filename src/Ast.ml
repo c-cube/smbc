@@ -312,11 +312,15 @@ module Ctx = struct
   type t = {
     names: ID.t StrTbl.t;
     kinds: kind ID.Tbl.t;
+    included: unit StrTbl.t; (* included paths *)
+    include_dir: string; (* where to look for includes *)
   }
 
-  let create() : t = {
+  let create ~include_dir () : t = {
     names=StrTbl.create 64;
     kinds=ID.Tbl.create 64;
+    included=StrTbl.create 8;
+    include_dir;
   }
 
   let add_id t (s:string) (k:kind): ID.t =
@@ -392,12 +396,16 @@ let rec conv_term ctx s = match s with
     let b = conv_term ctx b in
     let c = conv_term ctx c in
     if_ a b c
+  | `List (`Atom "if" :: _) ->
+    errorf "invalid syntax for if@ in `%a`" CCSexpM.print s
   | `List [`Atom "fun"; `List [`Atom x; ty]; body] ->
     let ty = conv_ty ctx ty in
     Ctx.with_var ctx x ty
       (fun var ->
          let body = conv_term ctx body in
          fun_ var body)
+  | `List (`Atom "fun" :: _) ->
+    errorf "invalid syntax for fun@ in `%a`" CCSexpM.print s
   | `List (`Atom "and" :: l) ->
     let l = List.map (conv_term ctx) l in
     and_l l
@@ -452,17 +460,46 @@ let rec conv_term ctx s = match s with
     let lhs = conv_term ctx lhs in
     let cases = List.map parse_case cases |> ID.Map.of_list in
     match_ lhs cases
+  | `List (`Atom "match" :: _) ->
+    errorf "invalid syntax for match@ in `%a`" CCSexpM.print s
   | `List (f :: ((_::_) as args)) ->
     let f = conv_term ctx f in
     let args = List.map (conv_term ctx) args in
     app f args
   | _ -> errorf "expected term,@ got `@[%a@]`" CCSexpM.print s
 
-let conv_statement ctx s : statement = match s with
+let find_file_ name ~dir : string option =
+  Log.debugf 2 (fun k->k "search `%s` in `%s`" name dir);
+  let abs_path = Filename.concat dir name in
+  if Sys.file_exists abs_path
+  then Some abs_path
+  else None
+
+let rec conv_statement ctx s =
+  Log.debugf 2 (fun k->k "(@[<1>statement_of_sexp@ %a@])" CCSexpM.print s);
+  conv_statement_aux ctx s
+
+and conv_statement_aux ctx s : statement list = match s with
+  | `List [`Atom "include"; `Atom s] ->
+    (* include now! *)
+    let dir = ctx.Ctx.include_dir in
+    begin match find_file_ s ~dir with
+      | None -> errorf "could not find included file `%s`" s
+      | Some s' when StrTbl.mem ctx.Ctx.included s' ->
+        [] (* already included *)
+      | Some s' ->
+        (* put in cache *)
+        StrTbl.add ctx.Ctx.included s' ();
+        let sexp = match CCSexpM.parse_file_list s' with
+          | `Ok l -> l
+          | `Error msg -> errorf "could not parse `%s`: %s" s' msg
+        in
+        CCList.flat_map (conv_statement ctx) sexp
+    end
   | `List [`Atom "decl"; `Atom s; ty] ->
     let ty = conv_ty ctx ty in
     let id = Ctx.add_id ctx s (Ctx.K_fun ty) in
-    Decl (id,ty)
+    [Decl (id,ty)]
   | `List (`Atom "data" :: l) ->
     (* first, read and declare each datatype (it can occur in the other
        datatypes' construtors) *)
@@ -496,7 +533,7 @@ let conv_statement ctx s : statement = match s with
            {Ty.data_id; data_cstors})
         l
     in
-    Data l
+    [Data l]
   | `List (`Atom "define" :: defs) ->
     (* parse id,ty and declare them before parsing the function bodies *)
     let preparse = function
@@ -514,11 +551,11 @@ let conv_statement ctx s : statement = match s with
            id,ty,rhs)
         defs
     in
-    Define defs
+    [Define defs]
   | `List [`Atom "assert"; t] ->
     let t = conv_term ctx t in
     check_prop_ t;
-    Assert t
+    [Assert t]
   | `List [`Atom "goal"; `List vars; t] ->
     let vars =
       List.map
@@ -531,7 +568,7 @@ let conv_statement ctx s : statement = match s with
     Ctx.with_vars ctx vars
       (fun vars ->
          let t = conv_term ctx t in
-         Goal (vars, t))
+         [Goal (vars, t)])
   | _ -> errorf "expected statement,@ got `@[%a@]`" CCSexpM.print s
 
 let term_of_sexp ctx s =
@@ -542,9 +579,9 @@ let statement_of_sexp ctx s =
   try conv_statement ctx s |> CCResult.return
   with e -> CCResult.of_exn_trace e
 
-let statements_of_sexps ?(init=Ctx.create()) l =
+let statements_of_sexps ctx l =
   try
-    CCList.map (conv_statement init) l
+    CCList.flat_map (conv_statement ctx) l
     |> CCResult.return
   with e ->
     CCResult.of_exn_trace e

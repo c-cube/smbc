@@ -11,7 +11,9 @@ let parse_file file =
   match res with
     | `Error msg -> print_endline msg; exit 1
     | `Ok l ->
-      match Ast.statements_of_sexps l with
+      let dir = Filename.dirname file in
+      let ctx = Ast.Ctx.create ~include_dir:dir () in
+      match Ast.statements_of_sexps ctx l with
         | Result.Error msg -> print_endline msg; exit 1
         | Result.Ok ast -> ast
 

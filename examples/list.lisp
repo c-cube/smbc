@@ -1,7 +1,7 @@
 
-; `l1 ++ l2 != l2 ++ l1`
+; theory of lists
 
-(data (nat z (s nat)))
+(include "nat.lisp")
 
 (data (list nil (cons nat list)))
 
@@ -25,4 +25,17 @@
         (nil nil)
         ((cons x xs) (append (rev xs) (cons x nil)))))))
 
-(goal ((l list)) (not (= l (rev l))))
+(define
+  (length (-> list nat)
+  (fun (l list)
+    (match l
+      (nil z)
+      ((cons x tail) (s (length tail)))))))
+
+(define
+  (sum
+    (-> list nat)
+    (fun (l list)
+      (match l
+        (nil z)
+        ((cons x tail) (plus x (sum tail)))))))

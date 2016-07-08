@@ -134,14 +134,13 @@ val pp_statement : statement CCFormat.printer
 
 module Ctx : sig
   type t
-  val create: unit -> t
+  val create: include_dir:string -> unit -> t
   include Intf.PRINT with type t := t
 end
 
 val term_of_sexp : Ctx.t -> sexp -> term or_error
 
-val statement_of_sexp : Ctx.t -> sexp -> statement or_error
+val statement_of_sexp : Ctx.t -> sexp -> statement list or_error
 
-val statements_of_sexps :
-  ?init:Ctx.t -> sexp list -> statement list or_error
+val statements_of_sexps : Ctx.t -> sexp list -> statement list or_error
 
