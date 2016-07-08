@@ -912,23 +912,25 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           l
       in
       (* at least one case *)
-      let c_choose =
-        List.map
+      let c_choose = List.map fst lits
+      (* at most one case *)
+      and cs_once : Clause.t list =
+        CCList.diagonal lits
+        |> List.map
+          (fun ((l1,_),(l2,_)) -> [Term.not_ l1; Term.not_ l2])
+      (* enforce depth limit *)
+      and cs_limit : Clause.t list =
+        CCList.flat_map
           (fun (lit,needs_guard) ->
              match lit_guard, needs_guard with
                | None, true -> assert false
                | Some guard, true ->
-                 Term.and_ lit guard (* this branch might be too deep *)
-               | _ -> lit)
+                 (* depth limit and this literal are incompatible *)
+                 [[ Lit.neg lit; Lit.neg guard ]]
+               | _ -> [])
           lits
-
-      (* at most one case *)
-      and cs_once =
-        CCList.diagonal lits
-        |> List.map
-          (fun ((l1,_),(l2,_)) -> [Term.not_ l1; Term.not_ l2])
       in
-      c_choose :: cs_once
+      c_choose :: cs_once @ cs_limit
     | _ -> assert false
 
   (* make a fresh constant, with a unique name *)
@@ -939,12 +941,14 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       incr n;
       Typed_cst.make_undef ?parent id ty
 
-  (* build the disjunction of cases for [info] *)
+  (* build the disjunction [l] of cases for [info];
+     set [info.cst_cases] to [Some l] *)
   let expand_cases (cst:cst) (ty:Ty.t) (info:cst_info): term list =
     assert (info.cst_cases = None);
     (* expand the given type *)
     let l = match Ty.view ty with
       | Atomic (_, Data cstors) ->
+        (* datatype: refine by picking the head constructor *)
         List.map
           (fun (lazy c) ->
              let rec case = lazy (
