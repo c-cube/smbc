@@ -313,7 +313,9 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       in
       Log.debugf 2 (fun k->k "@{<Yellow>** now at level %d@}" l);
       let st' = aux l st_.stack in
-      st_.stack <- st'
+      st_.stack <- st';
+      st_.stack_level <- l;
+      ()
 
     let cur_level () = st_.stack_level
 
@@ -656,7 +658,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       | DB d -> DB.pp out d
       | Const c -> Typed_cst.pp out c
       | App (f,l) ->
-        fpf out "(@[%a %a@])" pp f (Utils.pp_list pp) l
+        fpf out "(@[<1>%a@ %a@])" pp f (Utils.pp_list pp) l
       | Fun (ty,f) ->
         fpf out "(@[fun %a.@ %a@])" Ty.pp ty pp f
       | If (a, b, c) ->
@@ -896,7 +898,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     let pp = CCFormat.int
 
     (* how much between two consecutive depths? *)
-    let step_ = 20
+    let step_ = 5
 
     (* truncate at powers of {!step_} *)
     let max_depth =
@@ -957,7 +959,8 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
                 | None -> errorf "increased depth to %d, but not lit" l
             in
             Log.debugf 2
-              (fun k->k "(@[<1>iterative_deepening :level %d@])" l);
+              (fun k->k
+                  "(@[<1>iterative_deepening :level %d :lit %a@])" l Lit.pp lit);
             At (l, lit)
           )
         in
@@ -1811,17 +1814,16 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
          c, t)
     |> Typed_cst.Map.of_seq
 
-  (* convert unsat-core *)
-  let conv_unsat_core (core:M.St.clause list): Clause.t Sequence.t =
-    Sequence.of_list core
-    |> Sequence.map
-      (fun c ->
-         M.Proof.to_list c |> List.map (fun a -> a.M.St.lit))
+  let clause_of_mclause (c:M.St.clause): Clause.t =
+    M.Proof.to_list c |> List.map (fun a -> a.M.St.lit)
 
-  (* NOTE: would be nice to just iterate over
-     all literals instead *)
-  let pp_term_graph out () =
-    Term.pp_dot out Watched_lit.to_seq
+  (* convert unsat-core *)
+  let clauses_of_unsat_core (core:M.St.clause list): Clause.t Sequence.t =
+    Sequence.of_list core
+    |> Sequence.map clause_of_mclause
+
+  (* print all terms reachable from watched literals *)
+  let pp_term_graph out () = Term.pp_dot out Watched_lit.to_seq
 
   let pp_stats out () : unit =
     Format.fprintf out
@@ -1842,15 +1844,32 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
 
   let add_statement_l = Conv.add_statement_l
 
+  let rec pp_proof out p =
+    let pp_step out = function
+      | M.Proof.Hypothesis -> CCFormat.string out "hypothesis"
+      | M.Proof.Lemma () -> Format.fprintf out "(@[<1>lemma@ ()@])"
+      | M.Proof.Resolution (p1, p2, _) ->
+        Format.fprintf out "(@[<1>resolution@ %a@ %a@])" pp_proof p1 pp_proof p2
+    in
+    let {M.Proof.conclusion; step } = M.Proof.expand p in
+    let conclusion = clause_of_mclause conclusion in
+    Format.fprintf out "(@[<hv1>step@ %a@ @[<1>from:@ %a@]@])"
+      Clause.pp conclusion pp_step step
+
   let check ?(on_exit=[]) () =
     let module ID = Iterative_deepening in
+    (* create a base level, just to be sure *)
+    let base_level =
+      ignore (M.push ());
+      M.current_level ()
+    in
     (* iterated deepening *)
     let rec iter state = match state with
       | ID.Exhausted ->
         do_on_exit ~on_exit;
         Unknown U_max_depth
       | ID.At (cur_depth, cur_lit) ->
-        let lev = M.push () in
+        let _ = M.push () in
         (* restrict depth *)
         push_clause [cur_lit];
         match Main_loop.solve () with
@@ -1860,17 +1879,16 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
               (fun k->k "@{<Yellow>** found SAT@} at depth %a"
                   ID.pp cur_depth);
             do_on_exit ~on_exit;
-            M.pop lev; (* remove clause *)
             Sat m
           | M.Unsat ->
-            (* check if [max depth] literal involved in unsat-core;
+            (* check if [max depth] literal involved in proof;
                - if not, truly UNSAT
                - if yes, try next level
             *)
             let core = M.get_proof () |> M.unsat_core in
             let cur_lit_neg = Lit.neg cur_lit in
             let depth_limited =
-              conv_unsat_core core
+              clauses_of_unsat_core core
               |> Sequence.flat_map Sequence.of_list
               |> Sequence.exists
                 (fun lit ->
@@ -1883,16 +1901,21 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
                   ID.pp cur_depth Lit.pp cur_lit depth_limited);
             if depth_limited
             then (
-              M.pop lev;
+              (* negation of the previous limit *)
+              M.pop base_level;
+              push_clause [cur_lit_neg];
               iter (ID.next ()) (* deeper! *)
             )
             else (
               do_on_exit ~on_exit;
-              M.pop lev;
+              M.pop base_level;
               Unsat
             )
     in
     ID.reset ();
-    iter (ID.current ())
+    Backtrack.backtrack 0;
+    CCFun.finally
+      ~h:(fun () -> M.pop M.base_level)
+      ~f:(fun () -> iter (ID.current ()))
 end
 
