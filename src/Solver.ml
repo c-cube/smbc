@@ -843,11 +843,14 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
 
     let pp = CCFormat.int
 
+    (* how much between two consecutive depths? *)
+    let step_ = 2
+
     (* truncate at powers of 5 *)
     let max_depth =
-      if Config.max_depth < 5
-      then invalid_arg "max-depth should be >= 5";
-      let rem = Config.max_depth mod 5 in
+      if Config.max_depth < step_
+      then errorf "max-depth should be >= %d" step_;
+      let rem = Config.max_depth mod step_ in
       let res = Config.max_depth - rem in
       Log.debugf 1 (fun k->k "(set_max_depth %d)" res);
       res
@@ -867,7 +870,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
 
     (* get the literal correspond to depth [d], if any *)
     let lit_of_depth d : Lit.t option =
-      if d < 5 || (d mod 5 <> 0) || d > max_depth
+      if d < step_ || (d mod step_ <> 0) || d > max_depth
       then None
       else match CCHashtbl.get lits_ d with
         | Some l -> Some l
@@ -877,7 +880,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           Some lit
 
     (* initial state *)
-    let start_ = At (5, mk_lit_ 5)
+    let start_ = At (step_, mk_lit_ step_)
 
     let cur_ = ref start_
     let reset () = cur_ := start_
@@ -888,7 +891,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       | Exhausted -> assert false
       | At (l_old, _) ->
         (* update level and current lit *)
-        let l = l_old + 5 in
+        let l = l_old + step_ in
         let st =
           if l > max_depth
           then Exhausted
@@ -898,6 +901,8 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
                 | Some lit -> lit
                 | None -> errorf "increased depth to %d, but not lit" l
             in
+            Log.debugf 2
+              (fun k->k "(@[<1>iterative_deepening :level %d@])" l);
             At (l, lit)
           )
         in
@@ -1088,10 +1093,17 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
   (* find the set of constants potentially blocking
      the evaluation of [t] *)
   let find_blocking_undef (t:term): (cst * Ty.t * cst_info) Sequence.t =
+    let not_too_deep l : bool = match Iterative_deepening.current () with
+      | Iterative_deepening.Exhausted -> false
+      | Iterative_deepening.At (l', _) -> l <= (l' :> int)
+    in
     let rec aux t yield = match t.term_cell with
       | Const c ->
         begin match c.cst_kind with
-          | Cst_undef (ty, info) -> yield (c, ty, info)
+          | Cst_undef (ty, info) ->
+            (* only expand if not too deep *)
+            if not_too_deep (Lazy.force info.cst_depth)
+            then yield (c, ty, info)
           | Cst_bool
           | Cst_cstor _
           | Cst_defined _ -> ()
@@ -1140,6 +1152,9 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           | False -> Lit.add_propagated (Lit.neg t) e
           | _ -> ()
         end;
+        (* boolean? check if we need to expand some variables further *)
+        if Ty.is_prop (new_t.term_ty)
+        then expand_blocking_undef new_t;
         (* we just changed [t]'s normal form, ensure that [t]'s
            watching terms are up-to-date *)
         List.iter
@@ -1396,10 +1411,8 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           (* otherwise, see if it's an assignment *)
           begin match Lit.view lit with
             | Lit.V_false -> assert false
-            | Lit.V_true -> ()
-            | Lit.V_assert (t,_) ->
-              (* ensure that nothing blocks its evaluation further *)
-              expand_blocking_undef t;
+            | Lit.V_true
+            | Lit.V_assert _ -> ()
             | Lit.V_cst_choice (c, t) ->
               expand_blocking_undef t;
               assert_choice slice c t
