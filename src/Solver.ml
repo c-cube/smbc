@@ -1,6 +1,8 @@
 
 (* This file is free software. See file "license" for more details. *)
 
+let (<?>) = CCOrd.(<?>)
+
 (** {1 Solver} *)
 
 module type CONFIG = sig
@@ -1066,6 +1068,23 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       !e, t
     )
 
+  (* follow "normal form" pointers deeply in the term *)
+  let deref_deep (t:term) : term =
+    let rec aux t =
+      let _, t = normal_form t in
+      match t.term_cell with
+        | True | False | Const _ | DB _ -> t
+        | App (f,l) ->
+          Term.app (aux f) (List.map aux l)
+        | If (a,b,c) -> Term.if_ (aux a)(aux b)(aux c)
+        | Match (u,m) ->
+          let m = ID.Map.map (fun (tys,rhs) -> tys, aux rhs) m in
+          Term.match_ (aux u) m
+        | Fun (ty,body) -> Term.fun_ ty (aux body)
+        | Builtin b -> Term.builtin (Term.map_builtin aux b)
+    in
+    aux t
+
   (* find the set of constants potentially blocking
      the evaluation of [t] *)
   let find_blocking_undef (t:term): (cst * Ty.t * cst_info) Sequence.t =
@@ -1348,7 +1367,9 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     let clause_guard_of_exp_ (e:explanation): Clause.t =
       Explanation.to_seq e
       |> Sequence.map lit_of_exp_
+      |> Sequence.map Lit.neg (* this is a guard! *)
       |> Sequence.to_rev_list
+      |> CCList.sort_uniq ~cmp:Lit.compare
 
     (* assert [c := new_t] and propagate *)
     let assert_choice _slice (c:cst) (new_t:term) : unit =
@@ -1375,9 +1396,12 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           (* otherwise, see if it's an assignment *)
           begin match Lit.view lit with
             | Lit.V_false -> assert false
-            | Lit.V_true
-            | Lit.V_assert _ -> ()
+            | Lit.V_true -> ()
+            | Lit.V_assert (t,_) ->
+              (* ensure that nothing blocks its evaluation further *)
+              expand_blocking_undef t;
             | Lit.V_cst_choice (c, t) ->
+              expand_blocking_undef t;
               assert_choice slice c t
           end
       end
@@ -1408,7 +1432,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         Sat lev
       with Inconsistent (e, concl) ->
         (* conflict clause: [e => concl] *)
-        let guard = clause_guard_of_exp_ e |> List.map Lit.neg in
+        let guard = clause_guard_of_exp_ e in
         let conflict_clause = Lit.atom ~sign:true concl :: guard in
         Unsat (conflict_clause, ())
   end
@@ -1629,7 +1653,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       (fun c ->
          (* find normal form of [c] *)
          let t = Term.const c in
-         let _, t = normal_form t in
+         let t = deref_deep t in
          c, t)
     |> Typed_cst.Map.of_seq
 
@@ -1645,20 +1669,24 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
   let pp_term_graph = Term.pp_dot_all
 
   (* safe push/pop in msat *)
-  let with_push_ ~on_exit f =
+  let with_push_ f =
     let lev = M.push () in
     Iterative_deepening.reset ();
     CCFun.finally
       ~f
-      ~h:(fun () ->
-        List.iter (fun f->f()) on_exit;
-        M.pop lev)
+      ~h:(fun () -> M.pop lev)
+
+  let do_on_exit ~on_exit =
+    List.iter (fun f->f()) on_exit;
+    ()
 
   let check ?(on_exit=[]) l =
     let module ID = Iterative_deepening in
     (* iterated deepening *)
     let rec iter state = match state with
-      | ID.Exhausted -> Unknown U_max_depth
+      | ID.Exhausted ->
+        do_on_exit ~on_exit;
+        Unknown U_max_depth
       | ID.At (cur_depth, cur_lit) ->
         let lev = M.push () in
         (* restrict depth *)
@@ -1669,6 +1697,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
             Log.debugf 1
               (fun k->k "@{<Yellow>** found SAT@} at depth %a"
                   ID.pp cur_depth);
+            do_on_exit ~on_exit;
             M.pop lev; (* remove clause *)
             Sat m
           | M.Unsat ->
@@ -1690,14 +1719,19 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
                   "@{<Yellow>** found Unsat@} at depth %a;@ \
                    depends on %a: %B"
                   ID.pp cur_depth Lit.pp cur_lit depth_limited);
-            (* remove depth limiting clause in any case*)
-            M.pop lev;
             if depth_limited
-            then ID.next () |> iter (* deeper! *)
-            else Unsat
+            then (
+              M.pop lev;
+              ID.next () |> iter (* deeper! *)
+            )
+            else (
+              do_on_exit ~on_exit;
+              M.pop lev;
+              Unsat
+            )
     in
     (* in a stack frame, do the solving *)
-    with_push_ ~on_exit
+    with_push_
       (fun () ->
          Conv.add_statement_l l;
          ID.current () |> iter
