@@ -1,9 +1,7 @@
 
 (* This file is free software. See file "license" for more details. *)
 
-(** {1 Weak set}
-
-    A simple weak set *)
+(** {1 Imperative Set} *)
 
 type 'a t
 

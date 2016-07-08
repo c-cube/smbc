@@ -87,14 +87,14 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
        a given case *)
     mutable cst_cases : term list option;
     (* cover set (lazily evaluated) *)
-    cst_watched: term Weak_set.t;
-    (* set of (bool) terms that depend on this constant for evaluation.
+    cst_watched: term Hash_set.t;
+    (* set of (bool) literals terms that depend on this constant for evaluation.
 
        A literal [lit] can watch several typed constants. If
        [lit.nf = t], and [t]'s evaluation is blocked by [c1,...,ck],
        then [lit] will watch [c1,...,ck].
 
-       Watches are backtrackables. *)
+       Watch list only grow, they never shrink. *)
   }
 
   (* Hashconsed type *)
@@ -251,7 +251,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         { cst_depth; cst_parent=parent;
           cst_cases=None;
           cst_watched=
-            Weak_set.create ~eq:term_equal_ ~hash:term_hash_ 16;
+            Hash_set.create ~eq:term_equal_ ~hash:term_hash_ 16;
         }
       in
       make id (Cst_undef (ty, info))
@@ -841,6 +841,8 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       | _ -> l, false
   end
 
+  (** {2 Clauses} *)
+
   module Clause = struct
     type t = Lit.t list
 
@@ -960,55 +962,6 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
 
   (** {2 Case Expansion} *)
 
-  (* build clause(s) that explains that [c] must be one of its
-     cases *)
-  let clauses_of_cases (c:cst) : Clause.t list = match c.cst_kind with
-    | Cst_undef (_, {cst_cases=Some l; cst_depth=lazy d; _}) ->
-      (* guard for non-constant cases (depth limit) *)
-      let lit_guard = Iterative_deepening.lit_of_depth d in
-      let guard_is_some = CCOpt.is_some lit_guard in
-      (* lits with a boolean indicating whether they have
-         to be depth-guarded *)
-      let lits =
-        List.map
-          (fun rhs ->
-             let lit = Lit.cst_choice c rhs in
-             (* does [rhs] use constants deeper than [d]? *)
-             let needs_guard =
-               guard_is_some &&
-               Term.to_seq rhs
-               |> Sequence.exists
-                 (fun sub -> match sub.term_cell with
-                    | Const {cst_kind=Cst_undef (_,info); _} ->
-                      (* is [sub] a constant deeper than [d]? *)
-                      Lazy.force info.cst_depth > d
-                    | _ -> false)
-             in
-             lit, needs_guard)
-          l
-      in
-      (* at least one case *)
-      let c_choose = List.map fst lits
-      (* at most one case *)
-      and cs_once : Clause.t list =
-        CCList.diagonal lits
-        |> List.map
-          (fun ((l1,_),(l2,_)) -> [Term.not_ l1; Term.not_ l2])
-      (* enforce depth limit *)
-      and cs_limit : Clause.t list =
-        CCList.flat_map
-          (fun (lit,needs_guard) ->
-             match lit_guard, needs_guard with
-               | None, true -> assert false
-               | Some guard, true ->
-                 (* depth limit and this literal are incompatible *)
-                 [[ Lit.neg lit; Lit.neg guard ]]
-               | _ -> [])
-          lits
-      in
-      cs_limit @ cs_once @ [c_choose]
-    | _ -> assert false
-
   (* make a fresh constant, with a unique name *)
   let new_cst_ =
     let n = ref 0 in
@@ -1057,76 +1010,246 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     info.cst_cases <- Some l;
     l
 
-  (* retrieve the normal form of [t], and the explanation
-     of why [t -> normal_form(t) *)
-  let normal_form (t:term) : explanation * term =
-    let rec aux set t = match t.term_nf with
-      | None -> set, t
-      | Some (t',set') -> aux (Explanation.append set set') t'
-    in
-    match t.term_nf with
-      | None -> Explanation.empty, t
-      | Some (t',set) -> aux set t'
-
-  let normal_form_append (e:explanation) (t:term) : explanation * term =
-    let e', t' = normal_form t in
-    Explanation.append e e', t'
+  (** {2 Reduction to Normal Form} *)
 
   exception Inconsistent of explanation * term
   (* semantically equivalent to [explanation => term], where
      the term evaluates to [false] *)
 
-  (* environment for evaluation: not-yet-evaluated terms *)
-  type eval_env = (explanation * term) lazy_t DB_env.t
+  module Reduce = struct
+    (* environment for evaluation: not-yet-evaluated terms *)
+    type eval_env = (explanation * term) lazy_t DB_env.t
 
-  (* just evaluate the De Bruijn indices, and return
-     the explanations used to evaluate subterms *)
-  let eval_db (env:eval_env) (t:term) : explanation * term =
-    if DB_env.size env = 0
-    then Explanation.empty, t (* trivial *)
-    else (
-      let e = ref Explanation.empty in
-      let rec aux env t : term = match t.term_cell with
-        | DB d ->
-          begin match DB_env.get d env with
-            | None -> t
-            | Some (lazy (e', t')) ->
-              e := Explanation.append !e e'; (* save explanation *)
-              t'
-          end
-        | Const _
-        | True
-        | False -> t
-        | Fun (ty, body) ->
-          let body' = aux (DB_env.push_none env) body in
-          Term.fun_ ty body'
-        | Match (u, m) ->
-          let u = aux env u in
-          let m =
-            ID.Map.map
-              (fun (tys,rhs) ->
-                 tys, aux (DB_env.push_none_l tys env) rhs)
-              m
+    (* just evaluate the De Bruijn indices, and return
+       the explanations used to evaluate subterms *)
+    let eval_db (env:eval_env) (t:term) : explanation * term =
+      if DB_env.size env = 0
+      then Explanation.empty, t (* trivial *)
+      else (
+        let e = ref Explanation.empty in
+        let rec aux env t : term = match t.term_cell with
+          | DB d ->
+            begin match DB_env.get d env with
+              | None -> t
+              | Some (lazy (e', t')) ->
+                e := Explanation.append !e e'; (* save explanation *)
+                t'
+            end
+          | Const _
+          | True
+          | False -> t
+          | Fun (ty, body) ->
+            let body' = aux (DB_env.push_none env) body in
+            Term.fun_ ty body'
+          | Match (u, m) ->
+            let u = aux env u in
+            let m =
+              ID.Map.map
+                (fun (tys,rhs) ->
+                   tys, aux (DB_env.push_none_l tys env) rhs)
+                m
+            in
+            Term.match_ u m
+          | If (a,b,c) ->
+            Term.if_ (aux env a) (aux env b) (aux env c)
+          | App (f, l) -> Term.app (aux env f) (aux_l env l)
+          | Builtin b -> Term.builtin (Term.map_builtin (aux env) b)
+        and aux_l env l =
+          List.map (aux env) l
+        in
+        let t = aux env t in
+        !e, t
+      )
+
+    (* set the normal form of [t], propagate to watchers *)
+    let set_nf_ t new_t (e:explanation) : unit =
+      if Term.equal t new_t then ()
+      else begin match t.term_nf with
+        | Some (new_t', _) -> assert (Term.equal new_t new_t')
+        | None ->
+          Backtrack.push_set_nf_ t;
+          t.term_nf <- Some (new_t, e);
+          Log.debugf 5
+            (fun k->k "(@[<hv1>set_nf@ @[%a@]@ @[%a@]@ :explanation %a@])"
+                Term.pp t Term.pp new_t Explanation.pp e);
+      end
+
+    (* compute the normal form of this term. We know at least one of its
+       subterm(s) has been reduced *)
+    let rec compute_nf (t:term) : explanation * term =
+      Log.debugf 5 (fun k->k "(@[<1>compute_nf@ @[%a@]@])" Term.pp t);
+      (* follow the "normal form" pointer *)
+      match t.term_nf with
+        | Some (t', e) ->
+          let e', nf = compute_nf t' in
+          (* NOTE: path compression here, maybe *)
+          Explanation.append e e', nf
+        | None -> compute_nf_noncached t
+
+    and compute_nf_noncached t =
+      assert (t.term_nf = None);
+      match t.term_cell with
+        | DB _ -> assert false (* non closed! *)
+        | True | False | Const _ ->
+          Explanation.empty, t (* always trivial *)
+        | Fun _ -> Explanation.empty, t (* no eval under lambda *)
+        | Builtin b ->
+          let e, b' =
+            Term.fold_map_builtin compute_nf_add Explanation.empty b
           in
-          Term.match_ u m
+          (* try boolean reductions *)
+          let t' = compute_builtin b' in
+          set_nf_ t t' e;
+          e, t'
         | If (a,b,c) ->
-          Term.if_ (aux env a) (aux env b) (aux env c)
-        | App (f, l) -> Term.app (aux env f) (aux_l env l)
-        | Builtin b -> Term.builtin (Term.map_builtin (aux env) b)
-      and aux_l env l =
-        List.map (aux env) l
-      in
-      let t = aux env t in
-      !e, t
-    )
+          let e_a, a' = compute_nf a in
+          assert (not (Term.equal a a'));
+          let default() = Term.if_ a' b c in
+          let e_branch, t' = match a'.term_cell with
+            | True -> compute_nf b
+            | False -> compute_nf c
+            | _ -> Explanation.empty, default()
+          in
+          (* merge evidence from [a]'s normal form and [b/c]'s normal form *)
+          let e = Explanation.append e_a e_branch in
+          set_nf_ t t' e;
+          e, t'
+        | Match (u, m) ->
+          let e_u, u' = compute_nf u in
+          let default() = Term.match_ u' m in
+          let e_branch, t' = match Term.as_cstor_app u' with
+            | Some (c, _, l) ->
+              begin
+                try
+                  let tys, rhs = ID.Map.find (Typed_cst.id c) m in
+                  if List.length tys = List.length l
+                  then (
+                    (* evaluate arguments *)
+                    let l =
+                      List.map
+                        (fun t -> lazy (compute_nf t))
+                        l
+                    in
+                    let env = DB_env.push_l l DB_env.empty in
+                    (* replace in [rhs] *)
+                    let e', rhs = eval_db env rhs in
+                    (* evaluate new [rhs] *)
+                    compute_nf_add e' rhs
+                  )
+                  else Explanation.empty, Term.match_ u' m
+                with Not_found ->
+                  Explanation.empty, Term.match_ u' m
+              end
+            | None -> Explanation.empty, default()
+          in
+          let e = Explanation.append e_u e_branch in
+          set_nf_ t t' e;
+          e, t'
+        | App (f, l) ->
+          let e_f, f' = compute_nf f in
+          (* now beta-reduce if needed *)
+          let e_reduce, new_t =
+            compute_nf_app DB_env.empty Explanation.empty f' l
+          in
+          (* merge explanations *)
+          let e = Explanation.append e_reduce e_f in
+          set_nf_ t new_t e;
+          e, new_t
+
+    (* apply [f] to [l], until no beta-redex is found *)
+    and compute_nf_app env e f l = match f.term_cell, l with
+      | Const {cst_kind=Cst_defined (_, lazy def_f); _}, l ->
+        assert (l <> []);
+        (* reduce [f l] into [def_f l] when [f := def_f] *)
+        compute_nf_app env e def_f l
+      | Fun (_ty, body), arg :: other_args ->
+        (* beta-reduce *)
+        assert (Ty.equal _ty arg.term_ty);
+        let new_env = DB_env.push (lazy (compute_nf arg)) env in
+        (* apply [body] to [other_args] *)
+        compute_nf_app new_env e body other_args
+      | _ ->
+        (* cannot reduce; substitute in [f] and re-apply *)
+        let e', f = eval_db env f in
+        let t' = Term.app f l in
+        Explanation.append e e', t'
+
+    (* compute nf of [t], append [e] to the explanation *)
+    and compute_nf_add (e : explanation) (t:term) : explanation * term =
+      let e', t' = compute_nf t in
+      Explanation.append e e', t'
+
+    (* compute the builtin, assuming its components are
+       already reduced *)
+    and compute_builtin bu: term = match bu with
+      | B_not a ->
+        begin match a.term_cell with
+          | True -> Term.false_
+          | False -> Term.true_
+          | _ -> Term.not_ a
+        end
+      | B_and (a,b) ->
+        begin match a.term_cell, b.term_cell with
+          | True, _ -> b
+          | _, True -> a
+          | False, _
+          | _, False -> Term.false_
+          | _ -> Term.and_ a b
+        end
+      | B_or (a,b) ->
+        begin match a.term_cell, b.term_cell with
+          | True, _
+          | _, True -> Term.true_
+          | False, _ -> b
+          | _, False -> a
+          | _ -> Term.or_ a b
+        end
+      | B_imply (a,b) ->
+        begin match a.term_cell, b.term_cell with
+          | _, True
+          | False, _ -> Term.true_
+          | True, _ -> b
+          | _, False -> Term.not_ a
+          | _ -> Term.imply a b
+        end
+      | B_eq (a,b) ->
+        begin match a.term_cell, b.term_cell with
+          | False, False
+          | True, True -> Term.true_
+          | True, False
+          | False, True -> Term.false_
+          | _ when Term.equal a b -> Term.true_ (* syntactic *)
+          | _ ->
+            begin match Term.as_cstor_app a, Term.as_cstor_app b with
+              | Some (c1,ty1,l1), Some (c2,_,l2) ->
+                if not (Typed_cst.equal c1 c2)
+                then Term.false_
+                (* [c1 ... = c2 ...] --> false, as distinct constructors
+                   can never be equal *)
+                else if Typed_cst.equal c1 c2
+                     && List.length l1 = List.length l2
+                     && List.length l1 = List.length (fst (Ty.unfold ty1))
+                then (
+                  (* same constructor, fully applied -> injectivity:
+                     arguments are pairwise equal *)
+                  List.map2 Term.eq l1 l2
+                  |> Term.and_l
+                )
+                else Term.eq a b
+              | _ -> Term.eq a b
+            end
+        end
+
+    and compute_nf_ignore t: unit = ignore (compute_nf t)
+  end
 
   let lit_of_exp_ (e:explanation_atom): Lit.t = match e with
     | E_lit (t, b) -> Lit.atom ~sign:b t
     | E_choice (cst, t) -> Lit.cst_choice cst t
 
   (* from explanation [e1, e2, ..., en] build the guard
-       [e1 & e2 & ... & en => …], that is, the clause
-       [not e1 | not e2 | ... | not en] *)
+         [e1 & e2 & ... & en => …], that is, the clause
+         [not e1 | not e2 | ... | not en] *)
   let clause_guard_of_exp_ (e:explanation): Clause.t =
     Explanation.to_seq e
     |> Sequence.map lit_of_exp_
@@ -1134,248 +1257,148 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     |> Sequence.to_rev_list
     |> CCList.sort_uniq ~cmp:Lit.compare
 
-  let propagate_lit (l:Lit.t) (e:explanation): unit =
-    let c = l :: clause_guard_of_exp_ e in
-    Log.debugf 4
-      (fun k->k "(@[<1>@{<green>propagate_lit@}@ %a@ clause: %a@])"
-          Lit.pp l Clause.pp c);
-    Clause.push_new c;
-    ()
+  (** {2 A literal asserted to SAT}
 
-  (* set the normal form of [t], propagate to watchers *)
-  let rec set_nf_ t new_t (e:explanation) : unit =
-    if Term.equal t new_t then ()
-    else begin match t.term_nf with
-      | Some (new_t', _) -> assert (Term.equal new_t new_t')
-      | None ->
-        Backtrack.push_set_nf_ t;
-        t.term_nf <- Some (new_t, e);
-        Log.debugf 5
-          (fun k->k "(@[<hv1>set_nf@ @[%a@]@ @[%a@]@ :explanation %a@])"
-              Term.pp t Term.pp new_t Explanation.pp e);
-        (* if [new_t = true/false], propagate literal *)
-        begin match new_t.term_cell with
-          | True -> propagate_lit t e
-          | False -> propagate_lit (Lit.neg t) e
-          | _ when Ty.is_prop new_t.term_ty ->
-            (* partially evaluated boolean: watch blocking literals *)
-            update_watches new_t;
-          | _ -> ()
-        end;
-        ()
-    end
+      We watch those literals depending on the set of constants
+      that block their current normal form *)
 
-  (* compute the normal form of this term. We know at least one of its
-     subterm(s) has been reduced *)
-  and compute_nf (t:term) : explanation * term =
-    Log.debugf 5 (fun k->k "(@[<1>compute_nf@ @[%a@]@])" Term.pp t);
-    (* follow the "normal form" pointer *)
-    match t.term_nf with
-      | Some (t', e) ->
-        let e', nf = compute_nf t' in
-        (* NOTE: path compression here, maybe *)
-        Explanation.append e e', nf
-      | None -> compute_nf_noncached t
+  module Watched_lit : sig
+    type t = Lit.t
 
-  and compute_nf_noncached t =
-    assert (t.term_nf = None);
-    match t.term_cell with
-      | DB _ -> assert false (* non closed! *)
-      | True | False | Const _ ->
-        Explanation.empty, t (* always trivial *)
-      | Fun _ -> Explanation.empty, t (* no eval under lambda *)
-      | Builtin b ->
-        let e, b' =
-          Term.fold_map_builtin compute_nf_add Explanation.empty b
+    val watch : t -> unit
+    val update_watches_of : t -> unit
+    val update_all : unit -> unit
+  end = struct
+    type t = Lit.t
+
+    let propagate_lit_ (l:t) (e:explanation): unit =
+      let c = l :: clause_guard_of_exp_ e in
+      Log.debugf 4
+        (fun k->k "(@[<1>@{<green>propagate_lit@}@ %a@ clause: %a@])"
+            Lit.pp l Clause.pp c);
+      Clause.push_new c;
+      ()
+
+    (* build clause(s) that explains that [c] must be one of its
+       cases *)
+    let clauses_of_cases (c:cst) : Clause.t list = match c.cst_kind with
+      | Cst_undef (_, {cst_cases=Some l; cst_depth=lazy d; _}) ->
+        (* guard for non-constant cases (depth limit) *)
+        let lit_guard = Iterative_deepening.lit_of_depth d in
+        let guard_is_some = CCOpt.is_some lit_guard in
+        (* lits with a boolean indicating whether they have
+           to be depth-guarded *)
+        let lits =
+          List.map
+            (fun rhs ->
+               let lit = Lit.cst_choice c rhs in
+               (* does [rhs] use constants deeper than [d]? *)
+               let needs_guard =
+                 guard_is_some &&
+                 Term.to_seq rhs
+                 |> Sequence.exists
+                   (fun sub -> match sub.term_cell with
+                      | Const {cst_kind=Cst_undef (_,info); _} ->
+                        (* is [sub] a constant deeper than [d]? *)
+                        Lazy.force info.cst_depth > d
+                      | _ -> false)
+               in
+               lit, needs_guard)
+            l
         in
-        (* try boolean reductions *)
-        let t' = compute_builtin b' in
-        set_nf_ t t' e;
-        e, t'
-      | If (a,b,c) ->
-        let e_a, a' = compute_nf a in
-        assert (not (Term.equal a a'));
-        let default() = Term.if_ a' b c in
-        let e_branch, t' = match a'.term_cell with
-          | True -> compute_nf b
-          | False -> compute_nf c
-          | _ -> Explanation.empty, default()
+        (* at least one case *)
+        let c_choose = List.map fst lits
+        (* at most one case *)
+        and cs_once : Clause.t list =
+          CCList.diagonal lits
+          |> List.map
+            (fun ((l1,_),(l2,_)) -> [Term.not_ l1; Term.not_ l2])
+        (* enforce depth limit *)
+        and cs_limit : Clause.t list =
+          CCList.flat_map
+            (fun (lit,needs_guard) ->
+               match lit_guard, needs_guard with
+                 | None, true -> assert false
+                 | Some guard, true ->
+                   (* depth limit and this literal are incompatible *)
+                   [[ Lit.neg lit; Lit.neg guard ]]
+                 | _ -> [])
+            lits
         in
-        (* merge evidence from [a]'s normal form and [b/c]'s normal form *)
-        let e = Explanation.append e_a e_branch in
-        set_nf_ t t' e;
-        e, t'
-      | Match (u, m) ->
-        let e_u, u' = compute_nf u in
-        let default() = Term.match_ u' m in
-        let e_branch, t' = match Term.as_cstor_app u' with
-          | Some (c, _, l) ->
-            begin
-              try
-                let tys, rhs = ID.Map.find (Typed_cst.id c) m in
-                if List.length tys = List.length l
-                then (
-                  (* evaluate arguments *)
-                  let l =
-                    List.map
-                      (fun t -> lazy (compute_nf t))
-                      l
-                  in
-                  let env = DB_env.push_l l DB_env.empty in
-                  (* replace in [rhs] *)
-                  let e', rhs = eval_db env rhs in
-                  (* evaluate new [rhs] *)
-                  compute_nf_add e' rhs
-                )
-                else Explanation.empty, Term.match_ u' m
-              with Not_found ->
-                Explanation.empty, Term.match_ u' m
-            end
-          | None -> Explanation.empty, default()
-        in
-        let e = Explanation.append e_u e_branch in
-        set_nf_ t t' e;
-        e, t'
-      | App (f, l) ->
-        let e_f, f' = compute_nf f in
-        (* now beta-reduce if needed *)
-        let e_reduce, new_t =
-          compute_nf_app DB_env.empty Explanation.empty f' l
-        in
-        (* merge explanations *)
-        let e = Explanation.append e_reduce e_f in
-        set_nf_ t new_t e;
-        e, new_t
+        cs_limit @ cs_once @ [c_choose]
+      | _ -> assert false
 
-  (* apply [f] to [l], until no beta-redex is found *)
-  and compute_nf_app env e f l = match f.term_cell, l with
-    | Const {cst_kind=Cst_defined (_, lazy def_f); _}, l ->
-      assert (l <> []);
-      (* reduce [f l] into [def_f l] when [f := def_f] *)
-      compute_nf_app env e def_f l
-    | Fun (_ty, body), arg :: other_args ->
-      (* beta-reduce *)
-      assert (Ty.equal _ty arg.term_ty);
-      let new_env = DB_env.push (lazy (compute_nf arg)) env in
-      (* apply [body] to [other_args] *)
-      compute_nf_app new_env e body other_args
-    | _ ->
-      (* cannot reduce; substitute in [f] and re-apply *)
-      let e', f = eval_db env f in
-      let t' = Term.app f l in
-      Explanation.append e e', t'
+    (* add [t] to the list of literals that watch the constant [c] *)
+    let watch_cst_ (c:cst) (t:t): unit =
+      assert (Ty.is_prop t.term_ty);
+      Log.debugf 5
+        (fun k->k "(@[<1>watch_cst@ %a@ %a@])" Typed_cst.pp c Term.pp t);
+      let ty, info = match c.cst_kind with
+        | Cst_undef (ty,i) -> ty,i
+        | Cst_bool | Cst_defined _ | Cst_cstor _ -> assert false
+      in
+      Hash_set.add info.cst_watched t;
+      (* ensure [c] is expanded, unless it is currently too deep *)
+      let not_too_deep l : bool = match Iterative_deepening.current () with
+        | Iterative_deepening.Exhausted -> false
+        | Iterative_deepening.At (l', _) -> l <= (l' :> int)
+      in
+      (* check whether [c] is expanded *)
+      begin match info.cst_cases with
+        | None ->
+          if not_too_deep (Lazy.force info.cst_depth)
+          then (
+            (* [c] is blocking, not too deep, but not expanded *)
+            let _ = expand_cases c ty info in
+            Clause.push_new_l (clauses_of_cases c)
+          ) else (
+            Log.debugf 3
+              (fun k->k "cannot expand %a: too deep" Typed_cst.pp c);
+          );
+        | Some _ ->
+          (* already recompute the sub-term *)
+          Reduce.compute_nf_ignore t
+      end;
+      ()
 
-  (* compute nf of [t], append [e] to the explanation *)
-  and compute_nf_add (e : explanation) (t:term) : explanation * term =
-    let e', t' = compute_nf t in
-    Explanation.append e e', t'
-
-  (* compute the builtin, assuming its components are
-     already reduced *)
-  and compute_builtin bu: term = match bu with
-    | B_not a ->
-      begin match a.term_cell with
-        | True -> Term.false_
-        | False -> Term.true_
-        | _ -> Term.not_ a
-      end
-    | B_and (a,b) ->
-      begin match a.term_cell, b.term_cell with
-        | True, _ -> b
-        | _, True -> a
-        | False, _
-        | _, False -> Term.false_
-        | _ -> Term.and_ a b
-      end
-    | B_or (a,b) ->
-      begin match a.term_cell, b.term_cell with
-        | True, _
-        | _, True -> Term.true_
-        | False, _ -> b
-        | _, False -> a
-        | _ -> Term.or_ a b
-      end
-    | B_imply (a,b) ->
-      begin match a.term_cell, b.term_cell with
-        | _, True
-        | False, _ -> Term.true_
-        | True, _ -> b
-        | _, False -> Term.not_ a
-        | _ -> Term.imply a b
-      end
-    | B_eq (a,b) ->
-      begin match a.term_cell, b.term_cell with
-        | False, False
-        | True, True -> Term.true_
-        | True, False
-        | False, True -> Term.false_
-        | _ when Term.equal a b -> Term.true_ (* syntactic *)
+    (* ensure that [t] is on the watchlist of all the
+       constants it depends on;
+       also ensure those constants are expanded *)
+    let update_watches_of (t:t): unit =
+      assert (Ty.is_prop t.term_ty);
+      let e, new_t = Reduce.compute_nf t in
+      (* if [new_t = true/false], propagate literal *)
+      begin match new_t.term_cell with
+        | True -> propagate_lit_ t e
+        | False -> propagate_lit_ (Lit.neg t) e
         | _ ->
-          begin match Term.as_cstor_app a, Term.as_cstor_app b with
-            | Some (c1,ty1,l1), Some (c2,_,l2) ->
-              if not (Typed_cst.equal c1 c2)
-              then Term.false_
-                  (* [c1 ... = c2 ...] --> false, as distinct constructors
-                     can never be equal *)
-              else if Typed_cst.equal c1 c2
-                   && List.length l1 = List.length l2
-                   && List.length l1 = List.length (fst (Ty.unfold ty1))
-              then (
-                (* same constructor, fully applied -> injectivity:
-                   arguments are pairwise equal *)
-                List.map2 Term.eq l1 l2
-                |> Term.and_l
-              )
-              else Term.eq a b
-            | _ -> Term.eq a b
-          end
-      end
+          (* partially evaluated literal: add [t] (not its
+             temporary normal form) to the watch list of every
+             blocking constant *)
+          Log.debugf 4
+            (fun k->k
+                "(@[<1>update_watches@ %a@ :normal_form %a@ :deps (@[%a@])@])"
+                Term.pp t Term.pp new_t
+                (Utils.pp_list Typed_cst.pp) t.term_deps);
+          List.iter (fun c -> watch_cst_ c t) new_t.term_deps;
+      end;
+      ()
 
-  and compute_nf_ignore t: unit = ignore (compute_nf t)
+    let watched_ : unit Lit.Tbl.t = Lit.Tbl.create 256
 
-  (* add [t] to the list of literals that watch the constant [c] *)
-  and watch_cst (c:cst) (t:term): unit =
-    assert (Ty.is_prop t.term_ty);
-    Log.debugf 5
-      (fun k->k "(@[<1>watch_cst@ %a@ %a@])" Typed_cst.pp c Term.pp t);
-    let ty, info = match c.cst_kind with
-      | Cst_undef (ty,i) -> ty,i
-      | Cst_bool | Cst_defined _ | Cst_cstor _ -> assert false
-    in
-    Weak_set.add info.cst_watched t;
-    (* ensure [c] is expanded, unless it is currently too deep *)
-    let not_too_deep l : bool = match Iterative_deepening.current () with
-      | Iterative_deepening.Exhausted -> false
-      | Iterative_deepening.At (l', _) -> l <= (l' :> int)
-    in
-    (* check whether [c] is expanded *)
-    begin match info.cst_cases with
-      | None ->
-        if not_too_deep (Lazy.force info.cst_depth)
-        then (
-          (* [c] is blocking, not too deep, but not expanded *)
-          let _ = expand_cases c ty info in
-          Clause.push_new_l (clauses_of_cases c)
-        ) else (
-          Log.debugf 3
-            (fun k->k "cannot expand %a: too deep" Typed_cst.pp c);
-        );
-      | Some _ ->
-        (* already recompute the sub-term *)
-        compute_nf_ignore t
-    end;
-    ()
+    let watch (lit:t) =
+      if not (Lit.Tbl.mem watched_ lit) then (
+        Log.debugf 4
+          (fun k->k "(@[<1>@{<green>watch_lit@}@ %a@])" Lit.pp lit);
+        Lit.Tbl.add watched_ lit ();
+        (* also ensure it is watched properly *)
+        update_watches_of lit;
+      )
 
-  (* ensure that [t] (a prop) is on the watchlist of all the
-     constants it depends on;
-     also ensure those constants are expanded *)
-  and update_watches (t:term): unit =
-    assert (Ty.is_prop t.term_ty);
-    Log.debugf 4
-      (fun k->k "(@[<1>update_watches@ %a@ :deps (@[%a@])@])"
-          Term.pp t (Utils.pp_list Typed_cst.pp) t.term_deps);
-    List.iter (fun c -> watch_cst c t) t.term_deps;
-    ()
+    let update_all (): unit =
+      Lit.Tbl.keys watched_
+      |> Sequence.iter update_watches_of
+  end
 
   (** {2 Sat Solver} *)
 
@@ -1391,21 +1414,6 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     let add_label _ _ = assert false
     let print = Lit.pp
   end
-
-  (* the set of literals we pushed into SAT *)
-  let all_lits_ : unit Lit.Tbl.t = Lit.Tbl.create 256
-
-  (* add a literal to {!all_lits_} *)
-  let add_lit_to_global_set lit =
-    if not (Lit.Tbl.mem all_lits_ lit) then (
-      Log.debugf 4
-        (fun k->k "(@[<2>add_lit_to_global_set@ %a@])" Lit.pp lit);
-      Lit.Tbl.add all_lits_ lit ();
-      (* also ensure it is watched properly *)
-      let _, lit' = compute_nf lit in
-      update_watches lit';
-    );
-    ()
 
   (* the "theory" part: propagations *)
   module M_th :
@@ -1448,17 +1456,17 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       begin match t_c.term_nf with
         | None ->
           (* set normal form *)
-          set_nf_ t_c new_t (Explanation.return (E_choice (c, new_t)));
+          Reduce.set_nf_ t_c new_t (Explanation.return (E_choice (c, new_t)));
           (* re-compute every watching literal *)
           begin match c.cst_kind with
             | Cst_undef (_, info) ->
-              Weak_set.iter compute_nf_ignore info.cst_watched
+              Hash_set.iter Watched_lit.update_watches_of info.cst_watched
             | Cst_defined _ | Cst_bool | Cst_cstor _  -> assert false
           end;
         | Some (c_nf, e) ->
           (* compute current normal forms, to be sure *)
-          let e, c_nf = compute_nf_add e c_nf in
-          let _, new_t = compute_nf new_t in
+          let e, c_nf = Reduce.compute_nf_add e c_nf in
+          let _, new_t = Reduce.compute_nf new_t in
           if Term.equal new_t c_nf
           then ()
           else (
@@ -1472,9 +1480,9 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     let assume_lit (lit:Lit.t) : unit =
       Log.debugf 3
         (fun k->k "(@[<1>@{<green>assume_lit@}@ @[%a@]@])" Lit.pp lit);
-      add_lit_to_global_set lit;
+      Watched_lit.watch lit;
       (* check consistency first *)
-      let e, lit' = compute_nf lit in
+      let e, lit' = Reduce.compute_nf lit in
       begin match lit'.term_cell with
         | True -> ()
         | False ->
@@ -1528,68 +1536,64 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
   let push_clause (c:Clause.t): unit =
     Log.debugf 3 (fun k->k "(@[<1>push_clause@ @[%a@]@])" Clause.pp c);
     (* reduce to normal form the literals, ensure they
-       are added to the proper constant watchlist(s) *)
-    List.iter add_lit_to_global_set c;
+         are added to the proper constant watchlist(s) *)
+    List.iter Watched_lit.watch c;
     M.assume [c]
 
-  type unknown =
-    | U_timeout
-    | U_max_depth
+  (** {2 Main Loop}
 
-  type model = term Typed_cst.Map.t
-  (** Map from constants to their value *)
+      - expand constants that block some literal
+      - do some SAT solving
+      - if there remain non-true goals, repeat
+  *)
 
-  type res =
-    | Sat of model
-    | Unsat (* TODO: proof *)
-    | Unknown of unknown
+  module Main_loop : sig
+    val push_toplevel_goal : Lit.t -> unit
+    val solve : unit -> M.res
+  end = struct
+    (* list of terms to fully evaluate *)
+    let toplevel_goals_ : term list ref = ref []
+
+    (* add [t] to the set of terms that must be evaluated *)
+    let push_toplevel_goal (t:term): unit =
+      toplevel_goals_ := t :: !toplevel_goals_;
+      ()
+
+    (* check that this term fully evaluates to [true] *)
+    let is_true_ (t:term): bool =
+      let _, t' = Reduce.compute_nf t in
+      match t'.term_cell with
+        | True -> true
+        | False -> assert false (* should have triggered conflict *)
+        | _ when Ty.is_prop t'.term_ty -> false
+        | _ -> t'.term_deps = []
+
+    (* main solve function *)
+    let rec solve () : M.res = match M.solve () with
+      | M.Unsat -> M.Unsat
+      | M.Sat ->
+        if List.for_all is_true_ !toplevel_goals_
+        then M.Sat
+        else (
+          Log.debugf 1 (fun k->k "@{<Yellow>solve: udpate watches@}");
+          Watched_lit.update_all ();
+          (* there must be some new clauses after the expansion *)
+          while not (Queue.is_empty Clause.tautology_queue) do
+            let c = Queue.pop Clause.tautology_queue in
+            push_clause c
+          done;
+          (* solve again *)
+          solve()
+        )
+  end
+
+  (** {2 Conversion} *)
 
   (* list of constants we are interested in *)
   let model_support_ : Typed_cst.t list ref = ref []
 
   let add_cst_support_ (c:cst): unit =
     CCList.Ref.push model_support_ c
-
-  (* list of terms to fully evaluate *)
-  let must_evaluate_ : term list ref = ref []
-
-  (* add [t] to the set of terms that must be evaluated *)
-  let push_toplevel_term (t:term): unit =
-    must_evaluate_ := t :: !must_evaluate_;
-    ()
-
-  (* check that this term fully evaluated *)
-  let fully_evaluated (t:term): bool =
-    let _, t' = compute_nf t in
-    match t'.term_cell with
-      | True
-      | False -> true
-      | _ when Ty.is_prop t'.term_ty -> false
-      | _ -> t'.term_deps = []
-
-  (* main solve function *)
-  let rec solve () : M.res = match M.solve () with
-    | M.Unsat -> M.Unsat
-    | M.Sat ->
-      if List.for_all fully_evaluated !must_evaluate_
-      then M.Sat
-      else (
-        Log.debugf 1 (fun k->k "@{<Yellow>solve: udpate watches@}");
-        List.iter
-          (fun t ->
-             let _, t' = compute_nf t in
-             update_watches t')
-          !must_evaluate_;
-        (* there must be some new clauses after the expansion *)
-        while not (Queue.is_empty Clause.tautology_queue) do
-          let c = Queue.pop Clause.tautology_queue in
-          push_clause c
-        done;
-        (* solve again *)
-        solve()
-      )
-
-  (** {2 Conversion} *)
 
   module Conv = struct
     (* for converting Ast.Ty into Ty *)
@@ -1671,7 +1675,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       match st with
         | Ast.Assert t ->
           let t = conv_term [] t in
-          push_toplevel_term t;
+          Main_loop.push_toplevel_goal t;
           push_clause [t]
         | Ast.Goal (vars, t) ->
           (* skolemize *)
@@ -1687,7 +1691,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           (* model should contain values of [consts] *)
           List.iter add_cst_support_ consts;
           let t = conv_term env t in
-          push_toplevel_term t;
+          Main_loop.push_toplevel_goal t;
           push_clause [t]
         | Ast.TyDecl id ->
           let ty = Ty.atomic id Uninterpreted in
@@ -1702,7 +1706,6 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
             | Prop -> Typed_cst.make_bool id
           in
           add_cst_support_ cst; (* need it in model *)
-          push_toplevel_term (Term.const cst);
           ID.Tbl.add decl_ty_ id (Lazy.from_val cst)
         | Ast.Data l ->
           (* declare the type, and all the constructors *)
@@ -1753,6 +1756,18 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
 
   (** {2 Main} *)
 
+  type unknown =
+    | U_timeout
+    | U_max_depth
+
+  type model = term Typed_cst.Map.t
+  (** Map from constants to their value *)
+
+  type res =
+    | Sat of model
+    | Unsat (* TODO: proof *)
+    | Unknown of unknown
+
   let pp_model out m =
     let pp_pair out (c,t) =
       Format.fprintf out "(@[%a %a@])" ID.pp (Typed_cst.id c) Term.pp t
@@ -1761,20 +1776,13 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       (Utils.pp_list pp_pair)
       (Typed_cst.Map.to_list m)
 
-  (* follow "normal form" pointers deeply in the term
-     @raise Error if the term contains unevaluated parts *)
+  (* follow "normal form" pointers deeply in the term *)
   let deref_deep (t:term) : term =
     let rec aux t =
-      let _, t = normal_form t in
+      let _, t = Reduce.compute_nf t in
       match t.term_cell with
         | True | False | DB _ -> t
-        | Const c ->
-          begin match Typed_cst.as_undefined c with
-            | Some _ ->
-              errorf "constant `%a` does not have a value" Typed_cst.pp c
-            | None -> ()
-          end;
-          t
+        | Const _ -> t
         | App (f,l) ->
           Term.app (aux f) (List.map aux l)
         | If (a,b,c) -> Term.if_ (aux a)(aux b)(aux c)
@@ -1831,7 +1839,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         let lev = M.push () in
         (* restrict depth *)
         push_clause [cur_lit];
-        match solve () with
+        match Main_loop.solve () with
           | M.Sat ->
             let m = compute_model_ () in
             Log.debugf 1
