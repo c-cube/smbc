@@ -280,7 +280,8 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           aux l st'
       in
       Log.debugf 2 (fun k->k "@{<Yellow>** now at level %d@}" l);
-      st_.stack <- aux l st_.stack
+      let st' = aux l st_.stack in
+      st_.stack <- st'
 
     let cur_level () = st_.stack_level
 
@@ -550,6 +551,11 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     let hash t = t.term_id
     let compare a b = CCOrd.int_ a.term_id b.term_id
 
+    module Map = CCMap.Make(struct
+        type t = term
+        let compare = compare
+      end)
+
     let to_seq t yield =
       let rec aux t =
         yield t;
@@ -606,11 +612,12 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         let print_map = CCFormat.seq ~start:"" ~stop:"" ~sep:" " pp_bind in
         fpf out "(@[match %a@ (@[<hv>%a@])@])"
           pp t print_map (ID.Map.to_seq m)
-      | Builtin (B_not t) -> fpf out "(@[not@ %a@])" pp t
-      | Builtin (B_and (a,b)) -> fpf out "(@[and@ %a@ %a@])" pp a pp b
-      | Builtin (B_or (a,b)) -> fpf out "(@[or@ %a@ %a@])" pp a pp b
-      | Builtin (B_imply (a,b)) -> fpf out "(@[imply@ %a@ %a@])" pp a pp b
-      | Builtin (B_eq (a,b)) -> fpf out "(@[=@ %a@ %a@])" pp a pp b
+      | Builtin (B_not t) -> fpf out "(@[<hv1>not@ %a@])" pp t
+      | Builtin (B_and (a,b)) -> fpf out "(@[<hv1>and@ %a@ %a@])" pp a pp b
+      | Builtin (B_or (a,b)) -> fpf out "(@[<hv1>or@ %a@ %a@])" pp a pp b
+      | Builtin (B_imply (a,b)) ->
+        fpf out "(@[<hv1>=>@ %a@ %a@])" pp a pp b
+      | Builtin (B_eq (a,b)) -> fpf out "(@[<hv1>=@ %a@ %a@])" pp a pp b
 
     type graph_edge =
       | GE_sub of int (* n-th subterm *)
@@ -710,12 +717,12 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     let pp_explanation_atom out = function
       | E_choice (c,t) ->
         Format.fprintf out
-          "(@[choice %a@ -> %a@])" Typed_cst.pp c Term.pp t
+          "(@[choice@ %a@ %a@])" Typed_cst.pp c Term.pp t
       | E_lit (t,b) ->
-        Format.fprintf out "(@[lit %a@ -> %B@])" Term.pp t b
+        Format.fprintf out "(@[assert_lit@ %a@ %B@])" Term.pp t b
 
     let pp out e =
-      Format.fprintf out "@[%a@]"
+      Format.fprintf out "(@[%a@])"
         (CCFormat.seq ~start:"" ~stop:"" ~sep:", " pp_explanation_atom)
         (to_seq e)
   end
@@ -765,10 +772,24 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     let pp = Term.pp
     let print = pp
 
+    module Map = Term.Map
+
+    (** {2 Propagation} *)
+
+    let propagated_ : explanation Map.t ref = ref Map.empty
+
+    let add_propagated (t:t) (e:explanation): unit =
+      propagated_ := Map.add t e !propagated_
+
+    let pop_propagated () : (t * explanation) Sequence.t =
+      let m = !propagated_ in
+      propagated_ := Map.empty;
+      Map.to_seq m
+
     (** {2 Normalization} *)
 
     let norm l =
-      Log.debugf 5 (fun k->k "Lit.norm `@[%a@]`" pp l);
+      Log.debugf 5 (fun k->k "(@[<1>Lit.norm@ @[%a@]@])" pp l);
       l, false (* TODO? *)
   end
 
@@ -793,7 +814,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       l
 
     let push_new (c:t): unit =
-      Log.debugf 5 (fun k->k "new tautology: `@[%a@]`" pp c);
+      Log.debugf 5 (fun k->k "(@[<1>new_tautology@ @[%a@]@])" pp c);
       new_ := c :: !new_;
       ()
 
@@ -826,7 +847,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       then invalid_arg "max-depth should be >= 5";
       let rem = Config.max_depth mod 5 in
       let res = Config.max_depth - rem in
-      Log.debugf 1 (fun k->k "max depth = %d" res);
+      Log.debugf 1 (fun k->k "(set_max_depth %d)" res);
       res
 
     type state =
@@ -930,7 +951,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
                | _ -> [])
           lits
       in
-      c_choose :: cs_once @ cs_limit
+      cs_limit @ cs_once @ [c_choose]
     | _ -> assert false
 
   (* make a fresh constant, with a unique name *)
@@ -976,8 +997,9 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         assert false (* TODO: try true or false? *)
     in
     Log.debugf 4
-      (fun k->k "@[<2>expand cases `@[%a@]` into:@ @[%a@]@]"
-          Typed_cst.pp cst (CCFormat.list Term.pp) l);
+      (fun k->k "(@[<1>expand_cases@ @[%a@]@ :into (@[%a@])@])"
+          Typed_cst.pp cst
+          (CCFormat.list ~start:"" ~stop:"" ~sep:" " Term.pp) l);
     info.cst_cases <- Some l;
     l
 
@@ -1091,8 +1113,14 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         Backtrack.push_set_nf_ t;
         t.term_nf <- Some (new_t, e);
         Log.debugf 5
-          (fun k->k "@[<hv2>set_nf@ `@[%a@]` :=@ `@[%a@]`@ with exp %a@]"
+          (fun k->k "(@[<hv1>set_nf@ @[%a@]@ @[%a@]@ :explanation %a@])"
               Term.pp t Term.pp new_t Explanation.pp e);
+        (* if [new_t = true/false], propagate literal *)
+        begin match new_t.term_cell with
+          | True -> Lit.add_propagated t e
+          | False -> Lit.add_propagated (Lit.neg t) e
+          | _ -> ()
+        end;
         (* we just changed [t]'s normal form, ensure that [t]'s
            watching terms are up-to-date *)
         List.iter
@@ -1106,7 +1134,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
   (* compute the normal form of this term. We know at least one of its
      subterm(s) has been reduced *)
   and compute_nf (t:term) : explanation * term =
-    Log.debugf 5 (fun k->k "compute_nf `@[%a@]`" Term.pp t);
+    Log.debugf 5 (fun k->k "(@[<1>compute_nf@ @[%a@]@])" Term.pp t);
     (* follow the "normal form" pointer *)
     match t.term_nf with
       | Some (t', e) ->
@@ -1314,14 +1342,13 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       | E_lit (t, b) -> Lit.atom ~sign:b t
       | E_choice (cst, t) -> Lit.cst_choice cst t
 
-    let clause_of_exp_ (e:explanation): Clause.t =
+    (* from explanation [e1, e2, ..., en] build the guard
+       [e1 & e2 & ... & en => …], that is, the clause
+       [not e1 | not e2 | ... | not en] *)
+    let clause_guard_of_exp_ (e:explanation): Clause.t =
       Explanation.to_seq e
       |> Sequence.map lit_of_exp_
       |> Sequence.to_rev_list
-
-    (* TODO: a good way of finding whether, during evaluation,
-       some prop-typed terms reduced to true/false, so we can
-       turn them into literals and propagate them via [slice] *)
 
     (* assert [c := new_t] and propagate *)
     let assert_choice _slice (c:cst) (new_t:term) : unit =
@@ -1331,12 +1358,29 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       set_nf_ t_c new_t (Explanation.return (E_choice (c, new_t)));
       ()
 
-    let assert_lit slice (l:Lit.t) : unit = match Lit.view l with
-      | Lit.V_false -> assert false
-      | Lit.V_true -> ()
-      | Lit.V_assert (_, _) -> () (* TODO? *)
-      | Lit.V_cst_choice (c, t) ->
-        assert_choice slice c t
+    let push_slice_ slice (c:Clause.t) : unit =
+      Log.debugf 3 (fun k->k "(@[<1>slice_push@ @[%a@]@])" Clause.pp c);
+      slice.push c ()
+
+    let assert_lit slice (lit:Lit.t) : unit =
+      (* check consistency first *)
+      let e, lit' = compute_nf lit in
+      begin match lit'.term_cell with
+        | True -> ()
+        | False ->
+          (* conflict! *)
+          let c = Lit.neg lit :: clause_guard_of_exp_ e in
+          push_slice_ slice c
+        | _ ->
+          (* otherwise, see if it's an assignment *)
+          begin match Lit.view lit with
+            | Lit.V_false -> assert false
+            | Lit.V_true
+            | Lit.V_assert _ -> ()
+            | Lit.V_cst_choice (c, t) ->
+              assert_choice slice c t
+          end
+      end
 
     (* propagation from the bool solver *)
     let assume slice =
@@ -1348,27 +1392,32 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       try
         for i = start to start + slice.length - 1 do
           let lit = slice.get i in
-          Log.debugf 3 (fun k->k "assert_lit `@[%a@]`" Lit.pp lit);
+          Log.debugf 3 (fun k->k "(@[<1>assume_lit@ @[%a@]@])" Lit.pp lit);
           assert_lit slice lit;
+          (* propagate literals *)
+          let propagated_lits = Lit.pop_propagated () in
+          Sequence.iter
+            (fun (lit, e) ->
+               let c = lit :: clause_guard_of_exp_ e in
+               push_slice_ slice c)
+            propagated_lits;
           (* also assert the new tautologies *)
           let new_clauses = Clause.pop_new () in
-          List.iter
-            (fun c -> slice.push c ())
-            new_clauses
+          List.iter (push_slice_ slice) new_clauses
         done;
         Sat lev
       with Inconsistent (e, concl) ->
         (* conflict clause: [e => concl] *)
-        let guard = clause_of_exp_ e |> List.map Lit.neg in
+        let guard = clause_guard_of_exp_ e |> List.map Lit.neg in
         let conflict_clause = Lit.atom ~sign:true concl :: guard in
         Unsat (conflict_clause, ())
-end
+  end
 
   module M = Msat.Solver.Make(M_expr)(M_th)(struct end)
 
   (* push one clause into [M] *)
   let push_clause (c:Clause.t): unit =
-    Log.debugf 3 (fun k->k "@[<2>push clause `@[%a@]`@]" Clause.pp c);
+    Log.debugf 3 (fun k->k "(@[<1>push_clause@ @[%a@]@])" Clause.pp c);
     (* ensure that all constants that might block the evaluation
        of [c] are expanded *)
     List.iter expand_blocking_undef c;
@@ -1469,7 +1518,8 @@ end
       push_clause c
 
     let add_statement st =
-      Log.debugf 2 (fun k->k "add statement `@[%a@]`" Ast.pp_statement st);
+      Log.debugf 2
+        (fun k->k "(@[add_statement@ @[%a@]@])" Ast.pp_statement st);
       match st with
         | Ast.Assert t ->
           let t = conv_term [] t in
