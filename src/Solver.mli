@@ -149,11 +149,12 @@ module Make(C:CONFIG)(Dummy : sig end) : sig
 
   val pp_term_graph: unit CCFormat.printer
 
+  val add_statement_l : Ast.statement list -> unit
+
   val check :
     ?on_exit:(unit -> unit) list ->
-    Ast.statement list ->
+    unit ->
     res
-  (** [check l] checks the satisfiability of the
-      given set of statements.
+  (** [check ()] checks the satisfiability of the statement added so far
       @param on_exit functions to be run before this returns *)
 end

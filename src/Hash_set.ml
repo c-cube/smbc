@@ -28,7 +28,7 @@ module Mk(E : ELT)
   let tbl_ = H.create E.size
 
   let mem x = H.mem tbl_ x
-  let add x = H.add tbl_ x ()
+  let add x = H.replace tbl_ x ()
   let to_seq yield = H.iter (fun k () -> yield k) tbl_
 end
 

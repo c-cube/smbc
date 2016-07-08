@@ -891,9 +891,9 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     let pp = CCFormat.int
 
     (* how much between two consecutive depths? *)
-    let step_ = 2
+    let step_ = 20
 
-    (* truncate at powers of 5 *)
+    (* truncate at powers of {!step_} *)
     let max_depth =
       if Config.max_depth < step_
       then errorf "max-depth should be >= %d" step_;
@@ -970,8 +970,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       incr n;
       Typed_cst.make_undef ?parent id ty
 
-  (* build the disjunction [l] of cases for [info];
-     set [info.cst_cases] to [Some l] *)
+  (* build the disjunction [l] of cases for [info]. No side effect. *)
   let expand_cases (cst:cst) (ty:Ty.t) (info:cst_info): term list =
     assert (info.cst_cases = None);
     (* expand the given type *)
@@ -1004,10 +1003,6 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       | Prop ->
         assert false (* TODO: try true or false? *)
     in
-    Log.debugf 4
-      (fun k->k "(@[<1>expand_cases@ @[%a@]@ :into (@[%a@])@])"
-          Typed_cst.pp cst (Utils.pp_list Term.pp) l);
-    info.cst_cases <- Some l;
     l
 
   (** {2 Reduction to Normal Form} *)
@@ -1281,57 +1276,55 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
 
     (* build clause(s) that explains that [c] must be one of its
        cases *)
-    let clauses_of_cases (c:cst) : Clause.t list = match c.cst_kind with
-      | Cst_undef (_, {cst_cases=Some l; cst_depth=lazy d; _}) ->
-        (* guard for non-constant cases (depth limit) *)
-        let lit_guard = Iterative_deepening.lit_of_depth d in
-        let guard_is_some = CCOpt.is_some lit_guard in
-        (* lits with a boolean indicating whether they have
+    let clauses_of_cases (c:cst) (l:term list) (depth:int) : Clause.t list =
+      (* guard for non-constant cases (depth limit) *)
+      let lit_guard = Iterative_deepening.lit_of_depth depth in
+      let guard_is_some = CCOpt.is_some lit_guard in
+      (* lits with a boolean indicating whether they have
            to be depth-guarded *)
-        let lits =
-          List.map
-            (fun rhs ->
-               let lit = Lit.cst_choice c rhs in
-               (* does [rhs] use constants deeper than [d]? *)
-               let needs_guard =
-                 guard_is_some &&
-                 Term.to_seq rhs
-                 |> Sequence.exists
-                   (fun sub -> match sub.term_cell with
-                      | Const {cst_kind=Cst_undef (_,info); _} ->
-                        (* is [sub] a constant deeper than [d]? *)
-                        Lazy.force info.cst_depth > d
-                      | _ -> false)
-               in
-               lit, needs_guard)
-            l
-        in
-        (* at least one case *)
-        let c_choose = List.map fst lits
-        (* at most one case *)
-        and cs_once : Clause.t list =
-          CCList.diagonal lits
-          |> List.map
-            (fun ((l1,_),(l2,_)) -> [Term.not_ l1; Term.not_ l2])
-        (* enforce depth limit *)
-        and cs_limit : Clause.t list =
-          CCList.flat_map
-            (fun (lit,needs_guard) ->
-               match lit_guard, needs_guard with
-                 | None, true -> assert false
-                 | Some guard, true ->
-                   (* depth limit and this literal are incompatible *)
-                   [[ Lit.neg lit; Lit.neg guard ]]
-                 | _ -> [])
-            lits
-        in
-        cs_limit @ cs_once @ [c_choose]
-      | _ -> assert false
+      let lits =
+        List.map
+          (fun rhs ->
+             let lit = Lit.cst_choice c rhs in
+             (* does [rhs] use constants deeper than [d]? *)
+             let needs_guard =
+               guard_is_some &&
+               Term.to_seq rhs
+               |> Sequence.exists
+                 (fun sub -> match sub.term_cell with
+                    | Const {cst_kind=Cst_undef (_,info); _} ->
+                      (* is [sub] a constant deeper than [d]? *)
+                      Lazy.force info.cst_depth > depth
+                    | _ -> false)
+             in
+             lit, needs_guard)
+          l
+      in
+      (* at least one case *)
+      let c_choose = List.map fst lits
+      (* at most one case *)
+      and cs_once : Clause.t list =
+        CCList.diagonal lits
+        |> List.map
+          (fun ((l1,_),(l2,_)) -> [Term.not_ l1; Term.not_ l2])
+      (* enforce depth limit *)
+      and cs_limit : Clause.t list =
+        CCList.flat_map
+          (fun (lit,needs_guard) ->
+             match lit_guard, needs_guard with
+               | None, true -> assert false
+               | Some guard, true ->
+                 (* depth limit and this literal are incompatible *)
+                 [[ Lit.neg lit; Lit.neg guard ]]
+               | _ -> [])
+          lits
+      in
+      c_choose :: cs_limit @ cs_once
 
     (* add [t] to the list of literals that watch the constant [c] *)
     let watch_cst_ (c:cst) (t:t): unit =
       assert (Ty.is_prop t.term_ty);
-      Log.debugf 5
+      Log.debugf 2
         (fun k->k "(@[<1>watch_cst@ %a@ %a@])" Typed_cst.pp c Term.pp t);
       let ty, info = match c.cst_kind with
         | Cst_undef (ty,i) -> ty,i
@@ -1346,11 +1339,16 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       (* check whether [c] is expanded *)
       begin match info.cst_cases with
         | None ->
-          if not_too_deep (Lazy.force info.cst_depth)
+          let depth = Lazy.force info.cst_depth in
+          if not_too_deep depth
           then (
             (* [c] is blocking, not too deep, but not expanded *)
-            let _ = expand_cases c ty info in
-            Clause.push_new_l (clauses_of_cases c)
+            let l = expand_cases c ty info in
+            Log.debugf 4
+              (fun k->k "(@[<1>expand_cases@ @[%a@]@ :into (@[%a@])@])"
+                  Typed_cst.pp c (Utils.pp_list Term.pp) l);
+            info.cst_cases <- Some l;
+            Clause.push_new_l (clauses_of_cases c l depth)
           ) else (
             Log.debugf 3
               (fun k->k "cannot expand %a: too deep" Typed_cst.pp c);
@@ -1478,7 +1476,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
 
     (* handle a literal assumed by the SAT solver *)
     let assume_lit (lit:Lit.t) : unit =
-      Log.debugf 3
+      Log.debugf 2
         (fun k->k "(@[<1>@{<green>assume_lit@}@ @[%a@]@])" Lit.pp lit);
       Watched_lit.watch lit;
       (* check consistency first *)
@@ -1564,9 +1562,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       let _, t' = Reduce.compute_nf t in
       match t'.term_cell with
         | True -> true
-        | False -> assert false (* should have triggered conflict *)
-        | _ when Ty.is_prop t'.term_ty -> false
-        | _ -> t'.term_deps = []
+        | _ -> false
 
     (* main solve function *)
     let rec solve () : M.res = match M.solve () with
@@ -1575,9 +1571,10 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         if List.for_all is_true_ !toplevel_goals_
         then M.Sat
         else (
-          Log.debugf 1 (fun k->k "@{<Yellow>solve: udpate watches@}");
+          Log.debugf 2 (fun k->k "@{<Yellow>solve: udpate watches@}");
           Watched_lit.update_all ();
           (* there must be some new clauses after the expansion *)
+          assert (not (Queue.is_empty Clause.tautology_queue));
           while not (Queue.is_empty Clause.tautology_queue) do
             let c = Queue.pop Clause.tautology_queue in
             push_clause c
@@ -1816,19 +1813,13 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
      all literals instead *)
   let pp_term_graph = Term.pp_dot_all
 
-  (* safe push/pop in msat *)
-  let with_push_ f =
-    let lev = M.push () in
-    Iterative_deepening.reset ();
-    CCFun.finally
-      ~f
-      ~h:(fun () -> M.pop lev)
-
   let do_on_exit ~on_exit =
     List.iter (fun f->f()) on_exit;
     ()
 
-  let check ?(on_exit=[]) l =
+  let add_statement_l = Conv.add_statement_l
+
+  let check ?(on_exit=[]) () =
     let module ID = Iterative_deepening in
     (* iterated deepening *)
     let rec iter state = match state with
@@ -1870,7 +1861,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
             if depth_limited
             then (
               M.pop lev;
-              ID.next () |> iter (* deeper! *)
+              iter (ID.next ()) (* deeper! *)
             )
             else (
               do_on_exit ~on_exit;
@@ -1878,11 +1869,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
               Unsat
             )
     in
-    (* in a stack frame, do the solving *)
-    with_push_
-      (fun () ->
-         Conv.add_statement_l l;
-         ID.current () |> iter
-      )
+    ID.reset ();
+    iter (ID.current ())
 end
 
