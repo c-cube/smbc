@@ -148,6 +148,7 @@ module Make(C:CONFIG)(Dummy : sig end) : sig
     | Unknown of unknown
 
   val pp_term_graph: unit CCFormat.printer
+  val pp_stats : unit CCFormat.printer
 
   val add_statement_l : Ast.statement list -> unit
 

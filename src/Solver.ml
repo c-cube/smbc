@@ -23,6 +23,10 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
 
   type level = int
 
+  let stat_num_cst_expanded = ref 0
+  let stat_num_clause_push = ref 0
+  let stat_num_clause_tautology = ref 0
+
   (* main term cell *)
   type term = {
     mutable term_id: int; (* unique ID *)
@@ -863,6 +867,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         | _ ->
           Log.debugf 4
             (fun k->k "(@[<1>@{<green>new_tautology@}@ @[%a@]@])" pp c);
+          incr stat_num_clause_tautology;
           Queue.push c tautology_queue
       end;
       ()
@@ -1263,6 +1268,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     val watch : t -> unit
     val update_watches_of : t -> unit
     val update_all : unit -> unit
+    val to_seq : t Sequence.t
   end = struct
     type t = Lit.t
 
@@ -1348,6 +1354,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
               (fun k->k "(@[<1>expand_cases@ @[%a@]@ :into (@[%a@])@])"
                   Typed_cst.pp c (Utils.pp_list Term.pp) l);
             info.cst_cases <- Some l;
+            incr stat_num_cst_expanded;
             Clause.push_new_l (clauses_of_cases c l depth)
           ) else (
             Log.debugf 3
@@ -1393,9 +1400,10 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         update_watches_of lit;
       )
 
+    let to_seq = Lit.Tbl.keys watched_
+
     let update_all (): unit =
-      Lit.Tbl.keys watched_
-      |> Sequence.iter update_watches_of
+      to_seq |> Sequence.iter update_watches_of
   end
 
   (** {2 Sat Solver} *)
@@ -1536,6 +1544,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     (* reduce to normal form the literals, ensure they
          are added to the proper constant watchlist(s) *)
     List.iter Watched_lit.watch c;
+    incr stat_num_clause_push;
     M.assume [c]
 
   (** {2 Main Loop}
@@ -1811,7 +1820,21 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
 
   (* NOTE: would be nice to just iterate over
      all literals instead *)
-  let pp_term_graph = Term.pp_dot_all
+  let pp_term_graph out () =
+    Term.pp_dot out Watched_lit.to_seq
+
+  let pp_stats out () : unit =
+    Format.fprintf out
+      "(@[<hv1>stats@ \
+       :num_expanded %d@ \
+       :num_clause_push %d@ \
+       :num_clause_tautology %d@ \
+       :num_lits %d\
+       @])"
+      !stat_num_cst_expanded
+      !stat_num_clause_push
+      !stat_num_clause_tautology
+      (Watched_lit.to_seq |> Sequence.length)
 
   let do_on_exit ~on_exit =
     List.iter (fun f->f()) on_exit;
