@@ -3,6 +3,11 @@
 
 let (<?>) = CCOrd.(<?>)
 
+let get_time : unit -> float =
+  let start = Unix.gettimeofday() in
+  fun () ->
+    Unix.gettimeofday() -. start
+
 (** {1 Solver} *)
 
 module type CONFIG = sig
@@ -1271,6 +1276,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     val watch : t -> unit
     val update_watches_of : t -> unit
     val update_all : unit -> unit
+    val size : unit -> int
     val to_seq : t Sequence.t
   end = struct
     type t = Lit.t
@@ -1404,6 +1410,8 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       )
 
     let to_seq = Lit.Tbl.keys watched_
+
+    let size () = Lit.Tbl.length watched_
 
     let update_all (): unit =
       to_seq |> Sequence.iter update_watches_of
@@ -1557,9 +1565,21 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       - if there remain non-true goals, repeat
   *)
 
+  let print_progress () : unit =
+    Printf.printf "\r[%.2f] expanded %d | clause %d | lemma %d | lits %d%!"
+      (get_time())
+      !stat_num_cst_expanded
+      !stat_num_clause_push
+      !stat_num_clause_tautology
+      (Watched_lit.size())
+
+  (* TODO: find the proper code for "kill line" *)
+  let flush_progress (): unit =
+    Printf.printf "\r%-80d\r%!" 0
+
   module Main_loop : sig
     val push_toplevel_goal : Lit.t -> unit
-    val solve : unit -> M.res
+    val solve : progress:bool -> unit -> M.res
   end = struct
     (* list of terms to fully evaluate *)
     let toplevel_goals_ : term list ref = ref []
@@ -1577,11 +1597,17 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         | _ -> false
 
     (* main solve function *)
-    let rec solve () : M.res = match M.solve () with
-      | M.Unsat -> M.Unsat
+    let rec solve ~progress () : M.res = match M.solve () with
+      | M.Unsat ->
+        if progress then flush_progress();
+        M.Unsat
       | M.Sat ->
+        if progress then print_progress();
         if List.for_all is_true_ !toplevel_goals_
-        then M.Sat
+        then (
+          if progress then flush_progress();
+          M.Sat
+        )
         else (
           Log.debugf 2 (fun k->k "@{<Yellow>solve: udpate watches@}");
           Watched_lit.update_all ();
@@ -1592,7 +1618,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
             push_clause c
           done;
           (* solve again *)
-          solve()
+          solve ~progress ()
         )
   end
 
@@ -1836,7 +1862,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       !stat_num_cst_expanded
       !stat_num_clause_push
       !stat_num_clause_tautology
-      (Watched_lit.to_seq |> Sequence.length)
+      (Watched_lit.size())
 
   let do_on_exit ~on_exit =
     List.iter (fun f->f()) on_exit;
@@ -1856,7 +1882,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     Format.fprintf out "(@[<hv1>step@ %a@ @[<1>from:@ %a@]@])"
       Clause.pp conclusion pp_step step
 
-  let check ?(on_exit=[]) () =
+  let check ?(on_exit=[]) ?(progress=false) () =
     let module ID = Iterative_deepening in
     (* create a base level, just to be sure *)
     let base_level =
@@ -1872,7 +1898,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         let _ = M.push () in
         (* restrict depth *)
         push_clause [cur_lit];
-        match Main_loop.solve () with
+        match Main_loop.solve ~progress () with
           | M.Sat ->
             let m = compute_model_ () in
             Log.debugf 1

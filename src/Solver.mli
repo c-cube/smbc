@@ -154,8 +154,10 @@ module Make(C:CONFIG)(Dummy : sig end) : sig
 
   val check :
     ?on_exit:(unit -> unit) list ->
+    ?progress:bool ->
     unit ->
     res
   (** [check ()] checks the satisfiability of the statement added so far
+      @param progress display progress bar
       @param on_exit functions to be run before this returns *)
 end

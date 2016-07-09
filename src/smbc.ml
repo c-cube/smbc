@@ -5,6 +5,7 @@ type config = {
   max_depth: int;
   print_stat: bool;
   dot_term_graph: string option;
+  progress : bool;
 }
 
 let parse_file file =
@@ -41,7 +42,7 @@ let solve ~config (ast:Ast.statement list) : unit =
   in
   (* solve *)
   S.add_statement_l ast;
-  let res = S.check ~on_exit () in
+  let res = S.check ~on_exit ~progress:config.progress () in
   if config.print_stat then Format.printf "%a@." S.pp_stats ();
   match res with
     | S.Sat m ->
@@ -57,6 +58,7 @@ let print_input_ = ref false
 let color_ = ref true
 let dot_term_graph_ = ref ""
 let stats_ = ref false
+let progress_  = ref false
 let max_depth_ = ref 60
 
 let file = ref ""
@@ -70,6 +72,7 @@ let options =
     "--max-depth", Arg.Set_int max_depth_, " set max depth";
     "--dot-term-graph", Arg.Set_string dot_term_graph_, " print term graph in file";
     "-nc", Arg.Clear color_, " do not use colors";
+    "-p", Arg.Set progress_, " progress bar";
     "--debug", Arg.Int Log.set_debug, " set debug level";
     "--stats", Arg.Set stats_, " print stats";
     "--backtrace", Arg.Unit (fun () -> Printexc.record_backtrace true), " enable backtrace";
@@ -89,6 +92,7 @@ let () =
   let config = {
     max_depth = !max_depth_;
     print_stat = !stats_;
+    progress = !progress_;
     dot_term_graph =
       (if !dot_term_graph_ = "" then None else Some !dot_term_graph_);
   } in
