@@ -796,6 +796,12 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     type t = term
     let neg = Term.not_
 
+    (* unsigned lit *)
+    let abs t = match t.term_cell with
+      | False -> Term.true_
+      | Builtin (B_not t) -> t
+      | _ -> t
+
     type view =
       | V_true
       | V_false
@@ -1912,13 +1918,12 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
                - if yes, try next level
             *)
             let core = M.get_proof () |> M.unsat_core in
-            let cur_lit_neg = Lit.neg cur_lit in
+            assert (Lit.equal (Lit.abs cur_lit) cur_lit);
             let depth_limited =
               clauses_of_unsat_core core
               |> Sequence.flat_map Sequence.of_list
               |> Sequence.exists
-                (fun lit ->
-                   Lit.equal lit cur_lit || Lit.equal lit cur_lit_neg)
+                (fun lit -> Lit.equal cur_lit (Lit.abs lit ))
             in
             Log.debugf 1
               (fun k->k
@@ -1929,7 +1934,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
             then (
               (* negation of the previous limit *)
               M.pop base_level;
-              push_clause [cur_lit_neg];
+              push_clause [Lit.neg cur_lit];
               iter (ID.next ()) (* deeper! *)
             )
             else (
