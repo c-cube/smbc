@@ -900,6 +900,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
 
     val reset : unit -> unit
     val current : unit -> state
+    val current_depth : unit -> t
     val next : unit -> state
     val lit_of_depth : int -> Lit.t option
     val pp: t CCFormat.printer
@@ -953,6 +954,10 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     let cur_ = ref start_
     let reset () = cur_ := start_
     let current () = !cur_
+
+    let current_depth () = match !cur_ with
+      | Exhausted -> max_depth
+      | At (d,_) -> d
 
     (* next state *)
     let next () = match !cur_ with
@@ -1353,9 +1358,8 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       in
       Hash_set.add info.cst_watched t;
       (* ensure [c] is expanded, unless it is currently too deep *)
-      let not_too_deep l : bool = match Iterative_deepening.current () with
-        | Iterative_deepening.Exhausted -> false
-        | Iterative_deepening.At (l', _) -> l <= (l' :> int)
+      let not_too_deep l : bool =
+        l <= (Iterative_deepening.current_depth() :> int)
       in
       (* check whether [c] is expanded *)
       begin match info.cst_cases with
@@ -1572,8 +1576,9 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
   *)
 
   let print_progress () : unit =
-    Printf.printf "\r[%.2f] expanded %d | clause %d | lemma %d | lits %d%!"
+    Printf.printf "\r[%.2f] depth %d | expanded %d | clause %d | lemma %d | lits %d%!"
       (get_time())
+      (Iterative_deepening.current_depth() :> int)
       !stat_num_cst_expanded
       !stat_num_clause_push
       !stat_num_clause_tautology
