@@ -787,7 +787,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
 
     let pp out e =
       Format.fprintf out "(@[%a@])"
-        (CCFormat.seq ~start:"" ~stop:"" ~sep:", " pp_explanation_atom)
+        (CCFormat.seq ~start:"" ~stop:"" ~sep:" " pp_explanation_atom)
         (to_seq e)
   end
 
@@ -860,7 +860,16 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
 
   (** {2 Clauses} *)
 
-  module Clause = struct
+  module Clause : sig
+    type t = private Lit.t list
+    val make : Lit.t list -> t
+    val lemma_queue : t Queue.t
+    val push_new : t -> unit
+    val push_new_l : t list -> unit
+    val iter : (Lit.t -> unit) -> t -> unit
+    val to_seq : t -> Lit.t Sequence.t
+    val pp : t CCFormat.printer
+  end = struct
     type t = Lit.t list
 
     let pp out c = match c with
@@ -869,23 +878,44 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       | _ ->
         Format.fprintf out "(@[<hv1>or@ %a@])" (Utils.pp_list Lit.pp) c
 
+    (* canonical form: sorted list *)
+    let make l = CCList.sort_uniq ~cmp:Lit.compare l
+
+    let equal_ c1 c2 = CCList.equal Lit.equal c1 c2
+    let hash_ c = Hash.list Lit.hash c
+
+    module Tbl = CCHashtbl.Make(struct
+        type t_ = t
+        type t = t_
+        let equal = equal_
+        let hash = hash_
+      end)
+
+    (* all lemmas generated so far, to avoid duplicates *)
+    let all_lemmas_ : unit Tbl.t = Tbl.create 1024
+
     (* list of clauses that have been newly generated, waiting
        to be propagated to Msat.
        invariant: those clauses must be tautologies *)
-    let tautology_queue : t Queue.t = Queue.create()
+    let lemma_queue : t Queue.t = Queue.create()
 
     let push_new (c:t): unit =
       begin match c with
         | [a;b] when Lit.equal (Lit.neg a) b -> () (* trivial *)
+        | _ when Tbl.mem all_lemmas_ c -> () (* already asserted *)
         | _ ->
           Log.debugf 4
             (fun k->k "(@[<1>@{<green>new_tautology@}@ @[%a@]@])" pp c);
           incr stat_num_clause_tautology;
-          Queue.push c tautology_queue
+          Tbl.add all_lemmas_ c ();
+          Queue.push c lemma_queue
       end;
       ()
 
     let push_new_l = List.iter push_new
+
+    let iter = List.iter
+    let to_seq = Sequence.of_list
   end
 
   (** {2 Iterative Deepening} *)
@@ -1117,7 +1147,8 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
             Term.fold_map_builtin compute_nf_add Explanation.empty b
           in
           (* try boolean reductions *)
-          let t' = compute_builtin b' in
+          let e', t' = compute_builtin b' in
+          let e = Explanation.append e' e in
           set_nf_ t t' e;
           e, t'
         | If (a,b,c) ->
@@ -1200,66 +1231,68 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
 
     (* compute the builtin, assuming its components are
        already reduced *)
-    and compute_builtin bu: term = match bu with
+    and compute_builtin bu: explanation * term = match bu with
       | B_not a ->
         begin match a.term_cell with
-          | True -> Term.false_
-          | False -> Term.true_
-          | _ -> Term.not_ a
+          | True -> Explanation.empty, Term.false_
+          | False -> Explanation.empty, Term.true_
+          | _ -> Explanation.empty, Term.not_ a
         end
       | B_and (a,b) ->
         begin match a.term_cell, b.term_cell with
-          | True, _ -> b
-          | _, True -> a
+          | True, _ -> Explanation.empty, b
+          | _, True -> Explanation.empty, a
           | False, _
-          | _, False -> Term.false_
-          | _ -> Term.and_ a b
+          | _, False -> Explanation.empty, Term.false_
+          | _ -> Explanation.empty, Term.and_ a b
         end
       | B_or (a,b) ->
         begin match a.term_cell, b.term_cell with
           | True, _
-          | _, True -> Term.true_
-          | False, _ -> b
-          | _, False -> a
-          | _ -> Term.or_ a b
+          | _, True -> Explanation.empty, Term.true_
+          | False, _ -> Explanation.empty, b
+          | _, False -> Explanation.empty, a
+          | _ -> Explanation.empty, Term.or_ a b
         end
       | B_imply (a,b) ->
         begin match a.term_cell, b.term_cell with
           | _, True
-          | False, _ -> Term.true_
-          | True, _ -> b
-          | _, False -> Term.not_ a
-          | _ -> Term.imply a b
+          | False, _ -> Explanation.empty, Term.true_
+          | True, _ -> Explanation.empty, b
+          | _, False -> Explanation.empty, Term.not_ a
+          | _ -> Explanation.empty, Term.imply a b
         end
       | B_eq (a,b) ->
         begin match a.term_cell, b.term_cell with
           | False, False
-          | True, True -> Term.true_
+          | True, True -> Explanation.empty, Term.true_
           | True, False
-          | False, True -> Term.false_
-          | _ when Term.equal a b -> Term.true_ (* syntactic *)
+          | False, True -> Explanation.empty, Term.false_
+          | _ when Term.equal a b -> Explanation.empty, Term.true_ (* syntactic *)
           | _ ->
             begin match Term.as_cstor_app a, Term.as_cstor_app b with
               | Some (c1,ty1,l1), Some (c2,_,l2) ->
                 if not (Typed_cst.equal c1 c2)
-                then Term.false_
-                (* [c1 ... = c2 ...] --> false, as distinct constructors
-                   can never be equal *)
+                then
+                  (* [c1 ... = c2 ...] --> false, as distinct constructors
+                     can never be equal *)
+                  Explanation.empty, Term.false_
                 else if Typed_cst.equal c1 c2
                      && List.length l1 = List.length l2
                      && List.length l1 = List.length (fst (Ty.unfold ty1))
                 then (
                   (* same constructor, fully applied -> injectivity:
-                     arguments are pairwise equal *)
+                     arguments are pairwise equal.
+                     We need to evaluate the arguments further (e.g.
+                     if they start with constructors) *)
                   List.map2 Term.eq l1 l2
                   |> Term.and_l
+                  |> compute_nf
                 )
-                else Term.eq a b
-              | _ -> Term.eq a b
+                else Explanation.empty, Term.eq a b
+              | _ -> Explanation.empty, Term.eq a b
             end
         end
-
-    and compute_nf_ignore t: unit = ignore (compute_nf t)
   end
 
   let lit_of_exp_ (e:explanation_atom): Lit.t = match e with
@@ -1269,7 +1302,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
   (* from explanation [e1, e2, ..., en] build the guard
          [e1 & e2 & ... & en => …], that is, the clause
          [not e1 | not e2 | ... | not en] *)
-  let clause_guard_of_exp_ (e:explanation): Clause.t =
+  let clause_guard_of_exp_ (e:explanation): Lit.t list =
     Explanation.to_seq e
     |> Sequence.map lit_of_exp_
     |> Sequence.map Lit.neg (* this is a guard! *)
@@ -1293,7 +1326,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     type t = Lit.t
 
     let propagate_lit_ (l:t) (e:explanation): unit =
-      let c = l :: clause_guard_of_exp_ e in
+      let c = l :: clause_guard_of_exp_ e |> Clause.make in
       Log.debugf 4
         (fun k->k "(@[<1>@{<green>propagate_lit@}@ %a@ clause: %a@])"
             Lit.pp l Clause.pp c);
@@ -1327,12 +1360,13 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           l
       in
       (* at least one case *)
-      let c_choose = List.map fst lits
+      let c_choose : Clause.t =
+        List.map fst lits |> Clause.make
       (* at most one case *)
       and cs_once : Clause.t list =
         CCList.diagonal lits
         |> List.map
-          (fun ((l1,_),(l2,_)) -> [Term.not_ l1; Term.not_ l2])
+          (fun ((l1,_),(l2,_)) -> Clause.make [Term.not_ l1; Term.not_ l2])
       (* enforce depth limit *)
       and cs_limit : Clause.t list =
         CCList.flat_map
@@ -1341,7 +1375,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
                | None, true -> assert false
                | Some guard, true ->
                  (* depth limit and this literal are incompatible *)
-                 [[ Lit.neg lit; Lit.neg guard ]]
+                 [Clause.make [ Lit.neg lit; Lit.neg guard ]]
                | _ -> [])
           lits
       in
@@ -1379,9 +1413,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
             Log.debugf 3
               (fun k->k "cannot expand %a: too deep" Typed_cst.pp c);
           );
-        | Some _ ->
-          (* already recompute the sub-term *)
-          Reduce.compute_nf_ignore t
+        | Some _ -> ()
       end;
       ()
 
@@ -1411,8 +1443,9 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     let watched_ : unit Lit.Tbl.t = Lit.Tbl.create 256
 
     let watch (lit:t) =
+      let lit = Lit.abs lit in
       if not (Lit.Tbl.mem watched_ lit) then (
-        Log.debugf 4
+        Log.debugf 3
           (fun k->k "(@[<1>@{<green>watch_lit@}@ %a@])" Lit.pp lit);
         Lit.Tbl.add watched_ lit ();
         (* also ensure it is watched properly *)
@@ -1470,11 +1503,11 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
 
     let backtrack = Backtrack.backtrack
 
-    (* push clauses from {!tautology_queue} into the slice *)
+    (* push clauses from {!lemma_queue} into the slice *)
     let flush_tautologies_into_slice slice =
-      while not (Queue.is_empty Clause.tautology_queue) do
-        let c = Queue.pop Clause.tautology_queue in
-        slice.push c ();
+      while not (Queue.is_empty Clause.lemma_queue) do
+        let c = Queue.pop Clause.lemma_queue in
+        slice.push (c:>Lit.t list) ();
       done
 
     (* assert [c := new_t] and propagate *)
@@ -1514,7 +1547,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         | True -> ()
         | False ->
           (* conflict! *)
-          let c = Lit.neg lit :: clause_guard_of_exp_ e in
+          let c = Lit.neg lit :: clause_guard_of_exp_ e |> Clause.make in
           Clause.push_new c
         | _ ->
           (* otherwise, see if it's an assignment *)
@@ -1548,25 +1581,25 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       with Inconsistent (e, concl) ->
         (* conflict clause: [e => concl] *)
         let guard = clause_guard_of_exp_ e in
-        let conflict_clause = Lit.atom ~sign:true concl :: guard in
+        let conflict_clause = concl :: guard |> Clause.make in
         Log.debugf 3
           (fun k->k "(@[<1>raise_inconsistent@ %a@])"
               Clause.pp conflict_clause);
         (* undo partial propagation(s) *)
         Backtrack.backtrack old_lev;
-        Unsat (conflict_clause, ())
+        Unsat ((conflict_clause :> Lit.t list), ())
   end
 
   module M = Msat.Solver.Make(M_expr)(M_th)(struct end)
 
   (* push one clause into [M] *)
   let push_clause (c:Clause.t): unit =
-    Log.debugf 3 (fun k->k "(@[<1>push_clause@ @[%a@]@])" Clause.pp c);
+    Log.debugf 2 (fun k->k "(@[<1>push_clause@ @[%a@]@])" Clause.pp c);
     (* reduce to normal form the literals, ensure they
          are added to the proper constant watchlist(s) *)
-    List.iter Watched_lit.watch c;
+    Clause.iter Watched_lit.watch c;
     incr stat_num_clause_push;
-    M.assume [c]
+    M.assume [(c :> Lit.t list)]
 
   (** {2 Main Loop}
 
@@ -1623,9 +1656,9 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           Log.debugf 2 (fun k->k "@{<Yellow>solve: udpate watches@}");
           Watched_lit.update_all ();
           (* there must be some new clauses after the expansion *)
-          assert (not (Queue.is_empty Clause.tautology_queue));
-          while not (Queue.is_empty Clause.tautology_queue) do
-            let c = Queue.pop Clause.tautology_queue in
+          assert (not (Queue.is_empty Clause.lemma_queue));
+          while not (Queue.is_empty Clause.lemma_queue) do
+            let c = Queue.pop Clause.lemma_queue in
             push_clause c
           done;
           (* solve again *)
@@ -1722,7 +1755,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         | Ast.Assert t ->
           let t = conv_term [] t in
           Main_loop.push_toplevel_goal t;
-          push_clause [t]
+          push_clause (Clause.make [t])
         | Ast.Goal (vars, t) ->
           (* skolemize *)
           let env, consts =
@@ -1738,7 +1771,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           List.iter add_cst_support_ consts;
           let t = conv_term env t in
           Main_loop.push_toplevel_goal t;
-          push_clause [t]
+          push_clause (Clause.make [t])
         | Ast.TyDecl id ->
           let ty = Ty.atomic id Uninterpreted in
           ID.Tbl.add ty_tbl_ id (Lazy.from_val ty)
@@ -1818,7 +1851,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     let pp_pair out (c,t) =
       Format.fprintf out "(@[%a %a@])" ID.pp (Typed_cst.id c) Term.pp t
     in
-    Format.fprintf out "(@[%a@])"
+    Format.fprintf out "(@[<v>%a@])"
       (Utils.pp_list pp_pair)
       (Typed_cst.Map.to_list m)
 
@@ -1852,7 +1885,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     |> Typed_cst.Map.of_seq
 
   let clause_of_mclause (c:M.St.clause): Clause.t =
-    M.Proof.to_list c |> List.map (fun a -> a.M.St.lit)
+    M.Proof.to_list c |> List.map (fun a -> a.M.St.lit) |> Clause.make
 
   (* convert unsat-core *)
   let clauses_of_unsat_core (core:M.St.clause list): Clause.t Sequence.t =
@@ -1908,7 +1941,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       | ID.At (cur_depth, cur_lit) ->
         let _ = M.push () in
         (* restrict depth *)
-        push_clause [cur_lit];
+        push_clause (Clause.make [cur_lit]);
         match Main_loop.solve ~progress () with
           | M.Sat ->
             let m = compute_model_ () in
@@ -1926,7 +1959,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
             assert (Lit.equal (Lit.abs cur_lit) cur_lit);
             let depth_limited =
               clauses_of_unsat_core core
-              |> Sequence.flat_map Sequence.of_list
+              |> Sequence.flat_map Clause.to_seq
               |> Sequence.exists
                 (fun lit -> Lit.equal cur_lit (Lit.abs lit ))
             in
@@ -1939,7 +1972,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
             then (
               (* negation of the previous limit *)
               M.pop base_level;
-              push_clause [Lit.neg cur_lit];
+              push_clause (Clause.make [Lit.neg cur_lit]);
               iter (ID.next ()) (* deeper! *)
             )
             else (

@@ -46,11 +46,11 @@ let solve ~config (ast:Ast.statement list) : unit =
   if config.print_stat then Format.printf "%a@." S.pp_stats ();
   match res with
     | S.Sat m ->
-      Format.printf "result: @{<Green>SAT@},@ (@[<1>model@ @[%a@]@])@." S.pp_model m;
+      Format.printf "(@[<1>result @{<Green>SAT@}@ :model @[%a@]@])@." S.pp_model m;
     | S.Unsat ->
-      Format.printf "result: @{<Yellow>UNSAT@}@."
+      Format.printf "(result @{<Yellow>UNSAT@})@."
     | S.Unknown _ ->
-      Format.printf "result: @{<blue>UNKNOWN@}@."
+      Format.printf "(result @{<blue>UNKNOWN@})@."
 
 (** {2 Main} *)
 
