@@ -1,6 +1,6 @@
 
-OCAMLBUILD=ocamlbuild -use-ocamlfind
-TARGETS=src/smbc.native
+OCAMLBUILD=ocamlbuild -use-ocamlfind -tag debug
+TARGETS=src/smbc.native src/smbc.byte
 
 all: build
 

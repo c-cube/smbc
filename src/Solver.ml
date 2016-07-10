@@ -1498,6 +1498,10 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       !stat_num_clause_tautology
       (Watched_lit.size())
 
+  (* TODO: find the proper code for "kill line" *)
+  let flush_progress (): unit =
+    Printf.printf "\r%-80d\r%!" 0
+
   (* the "theory" part: propagations *)
   module M_th :
     Msat.Theory_intf.S
@@ -1632,10 +1636,6 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       - do some SAT solving
       - if there remain non-true goals, repeat
   *)
-
-  (* TODO: find the proper code for "kill line" *)
-  let flush_progress (): unit =
-    Printf.printf "\r%-80d\r%!" 0
 
   module Main_loop : sig
     val push_toplevel_goal : Lit.t -> unit
