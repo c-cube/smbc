@@ -5,6 +5,7 @@ type config = {
   max_depth: int;
   print_stat: bool;
   dot_term_graph: string option;
+  pp_hashcons: bool;
   progress : bool;
 }
 
@@ -22,6 +23,8 @@ let parse_file file =
 let solve ~config (ast:Ast.statement list) : unit =
   let module Conf = struct
     let max_depth = config.max_depth
+    let pp_hashcons = config.pp_hashcons
+    let progress = config.progress
   end in
   let module S = Solver.Make(Conf)(struct end) in
   let print_term_graph = match config.dot_term_graph with
@@ -42,7 +45,7 @@ let solve ~config (ast:Ast.statement list) : unit =
   in
   (* solve *)
   S.add_statement_l ast;
-  let res = S.check ~on_exit ~progress:config.progress () in
+  let res = S.check ~on_exit () in
   if config.print_stat then Format.printf "%a@." S.pp_stats ();
   match res with
     | S.Sat m ->
@@ -59,6 +62,7 @@ let color_ = ref true
 let dot_term_graph_ = ref ""
 let stats_ = ref false
 let progress_  = ref false
+let pp_hashcons_ = ref false
 let max_depth_ = ref 60
 
 let file = ref ""
@@ -73,6 +77,7 @@ let options =
     "--dot-term-graph", Arg.Set_string dot_term_graph_, " print term graph in file";
     "-nc", Arg.Clear color_, " do not use colors";
     "-p", Arg.Set progress_, " progress bar";
+    "--pp-hashcons", Arg.Set pp_hashcons_, " print hashconsing IDs";
     "--debug", Arg.Int Log.set_debug, " set debug level";
     "--stats", Arg.Set stats_, " print stats";
     "--backtrace", Arg.Unit (fun () -> Printexc.record_backtrace true), " enable backtrace";
@@ -93,6 +98,7 @@ let () =
     max_depth = !max_depth_;
     print_stat = !stats_;
     progress = !progress_;
+    pp_hashcons = !pp_hashcons_;
     dot_term_graph =
       (if !dot_term_graph_ = "" then None else Some !dot_term_graph_);
   } in

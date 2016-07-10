@@ -12,6 +12,11 @@ let get_time : unit -> float =
 
 module type CONFIG = sig
   val max_depth: int
+
+  val progress: bool
+  (** progress display progress bar *)
+
+  val pp_hashcons: bool
 end
 
 (** {2 The Main Solver} *)
@@ -657,7 +662,12 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
 
     let fpf = Format.fprintf
 
-    let rec pp out t = match t.term_cell with
+    let rec pp out t =
+      pp_rec out t;
+      if Config.pp_hashcons then Format.fprintf out "/%d" t.term_id;
+      ()
+
+    and pp_rec out t = match t.term_cell with
       | True -> CCFormat.string out "true"
       | False -> CCFormat.string out "false"
       | DB d -> DB.pp out d
@@ -1328,8 +1338,9 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     let propagate_lit_ (l:t) (e:explanation): unit =
       let c = l :: clause_guard_of_exp_ e |> Clause.make in
       Log.debugf 4
-        (fun k->k "(@[<1>@{<green>propagate_lit@}@ %a@ clause: %a@])"
-            Lit.pp l Clause.pp c);
+        (fun k->k
+            "(@[<hv1>@{<green>propagate_lit@}@ %a@ nf: %a@ clause: %a@])"
+            Lit.pp l Lit.pp (snd (Reduce.compute_nf l)) Clause.pp c);
       Clause.push_new c;
       ()
 
@@ -1442,6 +1453,9 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
 
     let watched_ : unit Lit.Tbl.t = Lit.Tbl.create 256
 
+  (* TODO: if [lit] is new, do on-the-fly CNF of its inner formula
+     (break not/and/or, maybe explore a bit the equalities eagerly?). *)
+
     let watch (lit:t) =
       let lit = Lit.abs lit in
       if not (Lit.Tbl.mem watched_ lit) then (
@@ -1474,6 +1488,15 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     let add_label _ _ = assert false
     let print = Lit.pp
   end
+
+  let print_progress () : unit =
+    Printf.printf "\r[%.2f] depth %d | expanded %d | clauses %d | lemmas %d | lits %d%!"
+      (get_time())
+      (Iterative_deepening.current_depth() :> int)
+      !stat_num_cst_expanded
+      !stat_num_clause_push
+      !stat_num_clause_tautology
+      (Watched_lit.size())
 
   (* the "theory" part: propagations *)
   module M_th :
@@ -1510,7 +1533,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         slice.push (c:>Lit.t list) ();
       done
 
-    (* assert [c := new_t] and propagate *)
+    (* assert [c := new_t], or conflict *)
     let assert_choice (c:cst) (new_t:term) : unit =
       let t_c = Term.const c in
       begin match t_c.term_nf with
@@ -1556,7 +1579,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
             | Lit.V_true
             | Lit.V_assert _ -> ()
             | Lit.V_cst_choice (c, t) -> assert_choice c t
-          end
+          end;
       end
 
     (* propagation from the bool solver *)
@@ -1566,6 +1589,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       let old_lev = Backtrack.cur_level () in
       (* do the propagations in a local frame *)
       Backtrack.push_level ();
+      if Config.progress then print_progress();
       try
         (* first, empty the tautology queue *)
         flush_tautologies_into_slice slice;
@@ -1592,7 +1616,8 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
 
   module M = Msat.Solver.Make(M_expr)(M_th)(struct end)
 
-  (* push one clause into [M] *)
+  (* push one clause into [M], in the current level (not a lemma but
+     an axiom) *)
   let push_clause (c:Clause.t): unit =
     Log.debugf 2 (fun k->k "(@[<1>push_clause@ @[%a@]@])" Clause.pp c);
     (* reduce to normal form the literals, ensure they
@@ -1608,22 +1633,13 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       - if there remain non-true goals, repeat
   *)
 
-  let print_progress () : unit =
-    Printf.printf "\r[%.2f] depth %d | expanded %d | clause %d | lemma %d | lits %d%!"
-      (get_time())
-      (Iterative_deepening.current_depth() :> int)
-      !stat_num_cst_expanded
-      !stat_num_clause_push
-      !stat_num_clause_tautology
-      (Watched_lit.size())
-
   (* TODO: find the proper code for "kill line" *)
   let flush_progress (): unit =
     Printf.printf "\r%-80d\r%!" 0
 
   module Main_loop : sig
     val push_toplevel_goal : Lit.t -> unit
-    val solve : progress:bool -> unit -> M.res
+    val solve : unit -> M.res
   end = struct
     (* list of terms to fully evaluate *)
     let toplevel_goals_ : term list ref = ref []
@@ -1641,28 +1657,27 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         | _ -> false
 
     (* main solve function *)
-    let rec solve ~progress () : M.res = match M.solve () with
+    let solve () : M.res = match M.solve () with
       | M.Unsat ->
-        if progress then flush_progress();
+        if Config.progress then flush_progress();
         M.Unsat
       | M.Sat ->
-        if progress then print_progress();
+        assert (List.for_all is_true_ !toplevel_goals_);
         if List.for_all is_true_ !toplevel_goals_
         then (
-          if progress then flush_progress();
+          if Config.progress then flush_progress();
           M.Sat
         )
         else (
-          Log.debugf 2 (fun k->k "@{<Yellow>solve: udpate watches@}");
-          Watched_lit.update_all ();
-          (* there must be some new clauses after the expansion *)
-          assert (not (Queue.is_empty Clause.lemma_queue));
-          while not (Queue.is_empty Clause.lemma_queue) do
-            let c = Queue.pop Clause.lemma_queue in
-            push_clause c
-          done;
-          (* solve again *)
-          solve ~progress ()
+          Log.debugf 5
+            (fun k->
+               let pp_lit out l =
+                 Format.fprintf out "(@[<1>%a@ %a@])" Lit.pp l
+                   Lit.pp (snd (Reduce.compute_nf l))
+               in
+               k "(@[<hv1>status_watched_lit@ (@[<v>%a@])@])"
+                 (Utils.pp_list pp_lit) !toplevel_goals_);
+          assert false;
         )
   end
 
@@ -1926,7 +1941,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     Format.fprintf out "(@[<hv1>step@ %a@ @[<1>from:@ %a@]@])"
       Clause.pp conclusion pp_step step
 
-  let check ?(on_exit=[]) ?(progress=false) () =
+  let check ?(on_exit=[]) () =
     let module ID = Iterative_deepening in
     (* create a base level, just to be sure *)
     let base_level =
@@ -1942,7 +1957,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         let _ = M.push () in
         (* restrict depth *)
         push_clause (Clause.make [cur_lit]);
-        match Main_loop.solve ~progress () with
+        match Main_loop.solve () with
           | M.Sat ->
             let m = compute_model_ () in
             Log.debugf 1
