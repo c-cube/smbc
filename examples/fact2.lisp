@@ -11,18 +11,12 @@
      (match n
       (z (s z))
       ((s n2)
-       (let
-         sub
-         (fact n2)
-         (mult n sub)))))))
+         (mult n 
+         (fact n2)))))))
 
-(define
-  (100 nat
-   (let
-     5
-     (s (s (s (s (s z)))))
-     (let 10 (mult (s (s z)) 5)
-       (mult 10 10)))))
+(define (5 nat (s (s (s (s (s z)))))))
+(define (10 nat (mult (s (s z)) 5)))
+(define (100 nat (mult 10 10)))
 
 (goal
   ((n nat))
