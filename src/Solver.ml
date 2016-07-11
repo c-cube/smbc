@@ -1,6 +1,8 @@
 
 (* This file is free software. See file "license" for more details. *)
 
+[@@@landmark "auto"]
+
 let get_time : unit -> float =
   let start = Unix.gettimeofday() in
   fun () ->
