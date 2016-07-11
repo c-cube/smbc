@@ -43,7 +43,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
   (* main term cell *)
   type term = {
     mutable term_id: int; (* unique ID *)
-    term_ty: ty_h;
+    mutable term_ty: ty_h;
     term_cell: term_cell;
     mutable term_nf: (term * explanation) option;
       (* normal form + explanation of why *)
@@ -430,7 +430,6 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         if t == t' then (
           t.term_id <- !term_count_;
           incr term_count_
-
         ) else (
           assert (t'.term_id >= 0);
         );
@@ -459,18 +458,27 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       | Dep_sub of term
       | Dep_subs of term list
 
+    type delayed_ty =
+      | DTy_direct of ty_h
+      | DTy_lazy of (unit -> ty_h)
+
     (* build a term. If it's new, add it to the watchlist
        of every member of [watching] *)
-    let mk_term_ ~(deps:deps) cell ~ty : term =
+    let mk_term_ ~(deps:deps) cell ~(ty:delayed_ty) : term =
       let t = {
         term_id= -1;
-        term_ty=ty;
+        term_ty=Ty.prop; (* will be changed *)
         term_cell=cell;
         term_nf=None;
         term_deps=[];
       } in
       let t' = hashcons_ t in
       if t==t' then (
+        (* compute ty *)
+        t.term_ty <- begin match ty with
+          | DTy_direct ty -> ty
+          | DTy_lazy f -> f ()
+        end;
         (* compute evaluation dependencies *)
         let deps = match deps with
           | Dep_none -> []
@@ -486,14 +494,14 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       t'
 
     let db d =
-      mk_term_ ~deps:Dep_none (DB d) ~ty:(DB.ty d)
+      mk_term_ ~deps:Dep_none (DB d) ~ty:(DTy_direct (DB.ty d))
 
     let const c =
       let deps = match c.cst_kind with
         | Cst_undef _ -> Dep_cst c (* depends on evaluation! *)
         | Cst_bool | Cst_defined _ | Cst_cstor _ -> Dep_none
       in
-      mk_term_ ~deps (Const c) ~ty:(Typed_cst.ty c)
+      mk_term_ ~deps (Const c) ~ty:(DTy_direct (Typed_cst.ty c))
 
     (* type of an application *)
     let rec app_ty_ ty l : Ty.t = match Ty.view ty, l with
@@ -507,38 +515,44 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     let app f l = match l with
       | [] -> f
       | _ ->
-        let ty = app_ty_ f.term_ty l in
         (* watch head, not arguments *)
         let t = match f.term_cell with
           | App (f1, l1) ->
             let l' = l1 @ l in
-            mk_term_ ~deps:(Dep_sub f1) (App (f1, l')) ~ty
-          | _ -> mk_term_ ~deps:(Dep_sub f) (App (f,l)) ~ty
+            mk_term_ ~deps:(Dep_sub f1) (App (f1, l'))
+              ~ty:(DTy_lazy (fun () -> app_ty_ f.term_ty l'))
+          | _ ->
+            mk_term_ ~deps:(Dep_sub f) (App (f,l))
+              ~ty:(DTy_lazy (fun () -> app_ty_ f.term_ty l))
         in
         t
 
     let app_cst f l = app (const f) l
 
     let fun_ ty body =
-      let ty' = Ty.arrow ty body.term_ty in
       (* do not add watcher: propagation under λ forbidden *)
-      mk_term_ ~deps:Dep_none (Fun (ty, body)) ~ty:ty'
+      mk_term_ ~deps:Dep_none (Fun (ty, body))
+        ~ty:(DTy_lazy (fun () -> Ty.arrow ty body.term_ty))
 
     (* TODO: check types *)
 
     let match_ u m =
-      let ty =
-        let _, (_,rhs) = ID.Map.choose m in
-        rhs.term_ty
-      in
       (* propagate only from [u] *)
-      let t = mk_term_ ~deps:(Dep_sub u) (Match (u,m)) ~ty in
+      let t =
+        mk_term_ ~deps:(Dep_sub u) (Match (u,m))
+          ~ty:(DTy_lazy (fun () ->
+              let _, (_,rhs) = ID.Map.choose m in
+              rhs.term_ty
+            ))
+      in
       t
 
     let if_ a b c =
       assert (Ty.equal b.term_ty c.term_ty);
       (* propagate under test only *)
-      let t = mk_term_ ~deps:(Dep_sub a) (If (a,b,c)) ~ty:b.term_ty in
+      let t =
+        mk_term_ ~deps:(Dep_sub a)
+          (If (a,b,c)) ~ty:(DTy_direct b.term_ty) in
       t
 
     let builtin_ ~deps b =
@@ -549,7 +563,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         | B_or (a,b) when a.term_id > b.term_id -> B_or (b,a)
         | _ -> b
       in
-      let t = mk_term_ ~deps (Builtin b) ~ty:Ty.prop in
+      let t = mk_term_ ~deps (Builtin b) ~ty:(DTy_direct Ty.prop) in
       t
 
     let builtin b =
