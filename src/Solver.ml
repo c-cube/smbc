@@ -888,8 +888,12 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
   (** {2 Clauses} *)
 
   module Clause : sig
-    type t = private Lit.t list
+    type t = private {
+      lits: Lit.t list;
+      id: int;
+    }
     val make : Lit.t list -> t
+    val lits : t -> Lit.t list
     val conflicts : t Queue.t
     val lemma_queue : t Queue.t
     val push_new : t -> unit
@@ -899,19 +903,33 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     val to_seq : t -> Lit.t Sequence.t
     val pp : t CCFormat.printer
   end = struct
-    type t = Lit.t list
+    type t = {
+      lits: Lit.t list;
+      id: int;
+    }
 
-    let pp out c = match c with
+    let lits c = c.lits
+
+    let pp out c = match c.lits with
       | [] -> CCFormat.string out "false"
       | [lit] -> Lit.pp out lit
       | _ ->
-        Format.fprintf out "(@[<hv1>or@ %a@])" (Utils.pp_list Lit.pp) c
+        Format.fprintf out "(@[<hv1>or@ %a@ id: %d@])"
+          (Utils.pp_list Lit.pp) c.lits c.id
 
     (* canonical form: sorted list *)
-    let make l = CCList.sort_uniq ~cmp:Lit.compare l
+    let make =
+      let n_ = ref 0 in
+      fun l ->
+        let c = {
+          lits=CCList.sort_uniq ~cmp:Lit.compare l;
+          id= !n_;
+        } in
+        incr n_;
+        c
 
-    let equal_ c1 c2 = CCList.equal Lit.equal c1 c2
-    let hash_ c = Hash.list Lit.hash c
+    let equal_ c1 c2 = CCList.equal Lit.equal c1.lits c2.lits
+    let hash_ c = Hash.list Lit.hash c.lits
 
     module Tbl = CCHashtbl.Make(struct
         type t_ = t
@@ -933,7 +951,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     let lemma_queue : t Queue.t = Queue.create()
 
     let push_new (c:t): unit =
-      begin match c with
+      begin match c.lits with
         | [a;b] when Lit.equal (Lit.neg a) b -> () (* trivial *)
         | _ when Tbl.mem all_lemmas_ c -> () (* already asserted *)
         | _ ->
@@ -947,8 +965,8 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
 
     let push_new_l = List.iter push_new
 
-    let iter = List.iter
-    let to_seq = Sequence.of_list
+    let iter f c = List.iter f c.lits
+    let to_seq c = Sequence.of_list c.lits
   end
 
   (** {2 Iterative Deepening} *)
@@ -1582,7 +1600,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         while not (Queue.is_empty Clause.lemma_queue) do
           let c = Queue.pop Clause.lemma_queue in
           Log.debugf 5 (fun k->k "(@[<2>push_lemma@ %a@])" Clause.pp c);
-          slice.push (c:>Lit.t list) ();
+          slice.push (Clause.lits c) ();
         done
       else (
         let c = Queue.pop Clause.conflicts in
@@ -1660,7 +1678,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         Log.debugf 3
           (fun k->k "(@[<1>raise_inconsistent@ %a@])"
               Clause.pp conflict_clause);
-        Unsat ((conflict_clause :> Lit.t list), ())
+        Unsat (Clause.lits conflict_clause, ())
   end
 
   module M = Msat.Solver.Make(M_expr)(M_th)(struct end)
@@ -1673,7 +1691,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
          are added to the proper constant watchlist(s) *)
     Clause.iter Watched_lit.watch c;
     incr stat_num_clause_push;
-    M.assume [(c :> Lit.t list)]
+    M.assume [Clause.lits c]
 
   (** {2 Main Loop}
 
