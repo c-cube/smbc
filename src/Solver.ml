@@ -670,36 +670,46 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
 
     let fpf = Format.fprintf
 
-    let rec pp out t =
-      pp_rec out t;
-      if Config.pp_hashcons then Format.fprintf out "/%d" t.term_id;
-      ()
+    let pp_top ~ids out t =
+      let rec pp out t =
+        pp_rec out t;
+        if Config.pp_hashcons then Format.fprintf out "/%d" t.term_id;
+        ()
 
-    and pp_rec out t = match t.term_cell with
-      | True -> CCFormat.string out "true"
-      | False -> CCFormat.string out "false"
-      | DB d -> DB.pp out d
-      | Const c -> Typed_cst.pp out c
-      | App (f,l) ->
-        fpf out "(@[<1>%a@ %a@])" pp f (Utils.pp_list pp) l
-      | Fun (ty,f) ->
-        fpf out "(@[fun %a.@ %a@])" Ty.pp ty pp f
-      | If (a, b, c) ->
-        fpf out "(@[if %a@ %a@ %a@])" pp a pp b pp c
-      | Match (t,m) ->
-        let pp_bind out (id,(_tys,rhs)) =
-          fpf out "(@[%a %a@])" ID.pp id pp rhs
-        in
-        let print_map = CCFormat.seq ~start:"" ~stop:"" ~sep:" " pp_bind in
-        fpf out "(@[match %a@ (@[<hv>%a@])@])"
-          pp t print_map (ID.Map.to_seq m)
-      | Builtin (B_not t) -> fpf out "(@[<hv1>not@ %a@])" pp t
-      | Builtin (B_and (a,b)) -> fpf out "(@[<hv1>and@ %a@ %a@])" pp a pp b
-      | Builtin (B_or (a,b)) -> fpf out "(@[<hv1>or@ %a@ %a@])" pp a pp b
-      | Builtin (B_imply (a,b)) ->
-        fpf out "(@[<hv1>=>@ %a@ %a@])" pp a pp b
-      | Builtin (B_eq (a,b)) ->
-        fpf out "(@[<hv1>=@ %a@ %a@])" pp a pp b
+      and pp_rec out t = match t.term_cell with
+        | True -> CCFormat.string out "true"
+        | False -> CCFormat.string out "false"
+        | DB d -> DB.pp out d
+        | Const c when ids -> Typed_cst.pp out c
+        | Const c -> ID.pp_name out c.cst_id
+        | App (f,l) ->
+          fpf out "(@[<1>%a@ %a@])" pp f (Utils.pp_list pp) l
+        | Fun (ty,f) ->
+          fpf out "(@[fun %a.@ %a@])" Ty.pp ty pp f
+        | If (a, b, c) ->
+          fpf out "(@[if %a@ %a@ %a@])" pp a pp b pp c
+        | Match (t,m) ->
+          let pp_bind out (id,(_tys,rhs)) =
+            fpf out "(@[%a %a@])" ID.pp id pp rhs
+          in
+          let print_map =
+            CCFormat.seq ~start:"" ~stop:"" ~sep:" " pp_bind
+          in
+          fpf out "(@[match %a@ (@[<hv>%a@])@])"
+            pp t print_map (ID.Map.to_seq m)
+        | Builtin (B_not t) -> fpf out "(@[<hv1>not@ %a@])" pp t
+        | Builtin (B_and (a,b)) ->
+          fpf out "(@[<hv1>and@ %a@ %a@])" pp a pp b
+        | Builtin (B_or (a,b)) ->
+          fpf out "(@[<hv1>or@ %a@ %a@])" pp a pp b
+        | Builtin (B_imply (a,b)) ->
+          fpf out "(@[<hv1>=>@ %a@ %a@])" pp a pp b
+        | Builtin (B_eq (a,b)) ->
+          fpf out "(@[<hv1>=@ %a@ %a@])" pp a pp b
+      in
+      pp out t
+
+    let pp = pp_top ~ids:true
 
     type graph_edge =
       | GE_sub of int (* n-th subterm *)
@@ -1914,7 +1924,9 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
 
   let pp_model out m =
     let pp_pair out (c,t) =
-      Format.fprintf out "(@[%a %a@])" ID.pp (Typed_cst.id c) Term.pp t
+      Format.fprintf out "(@[%a %a@])"
+        ID.pp_name (Typed_cst.id c)
+        (Term.pp_top ~ids:false) t
     in
     Format.fprintf out "(@[<v>%a@])"
       (Utils.pp_list pp_pair)
