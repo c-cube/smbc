@@ -325,7 +325,8 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           t.term_nf <- nf;
           aux l st'
       in
-      Log.debugf 2 (fun k->k "@{<Yellow>** now at level %d@}" l);
+      Log.debugf 2
+        (fun k->k "@{<Yellow>** now at level %d (backtrack)@}" l);
       let st' = aux l st_.stack in
       st_.stack <- st';
       st_.stack_level <- l;
@@ -337,7 +338,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       let l = st_.stack_level + 1 in
       st_.stack_level <- l;
       st_.stack <- S_level (l, st_.stack);
-      Log.debugf 2 (fun k->k "@{<Yellow>** now at level %d@}" l);
+      Log.debugf 2 (fun k->k "@{<Yellow>** now at level %d (push)@}" l);
       ()
 
     let push_set_nf_ (t:term) =
@@ -877,9 +878,11 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
   module Clause : sig
     type t = private Lit.t list
     val make : Lit.t list -> t
+    val conflicts : t Queue.t
     val lemma_queue : t Queue.t
     val push_new : t -> unit
     val push_new_l : t list -> unit
+    val push_conflict : t -> unit
     val iter : (Lit.t -> unit) -> t -> unit
     val to_seq : t -> Lit.t Sequence.t
     val pp : t CCFormat.printer
@@ -907,6 +910,10 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
 
     (* all lemmas generated so far, to avoid duplicates *)
     let all_lemmas_ : unit Tbl.t = Tbl.create 1024
+
+    let conflicts : t Queue.t = Queue.create ()
+
+    let push_conflict c = Queue.push c conflicts
 
     (* list of clauses that have been newly generated, waiting
        to be propagated to Msat.
@@ -1074,10 +1081,6 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     l
 
   (** {2 Reduction to Normal Form} *)
-
-  exception Inconsistent of explanation * term
-  (* semantically equivalent to [explanation => term], where
-     the term evaluates to [false] *)
 
   module Reduce = struct
     (* environment for evaluation: not-yet-evaluated terms *)
@@ -1551,12 +1554,20 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
 
     let backtrack = Backtrack.backtrack
 
+    exception Conflict of Clause.t
+
     (* push clauses from {!lemma_queue} into the slice *)
-    let flush_tautologies_into_slice slice =
-      while not (Queue.is_empty Clause.lemma_queue) do
-        let c = Queue.pop Clause.lemma_queue in
-        slice.push (c:>Lit.t list) ();
-      done
+    let flush_new_clauses_into_slice slice =
+      if Queue.is_empty Clause.conflicts then
+        while not (Queue.is_empty Clause.lemma_queue) do
+          let c = Queue.pop Clause.lemma_queue in
+          slice.push (c:>Lit.t list) ();
+        done
+      else (
+        let c = Queue.pop Clause.conflicts in
+        Queue.clear Clause.conflicts;
+        raise (Conflict c)
+      )
 
     (* assert [c := new_t], or conflict *)
     let assert_choice (c:cst) (new_t:term) : unit =
@@ -1580,7 +1591,8 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           else (
             (* incompatible assignments: fail *)
             let concl = Lit.neg (Lit.cst_choice c new_t) in
-            raise (Inconsistent (e, concl))
+            let c = concl :: clause_guard_of_exp_ e |> Clause.make in
+            Clause.push_conflict c
           )
       end
 
@@ -1596,7 +1608,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         | False ->
           (* conflict! *)
           let c = Lit.neg lit :: clause_guard_of_exp_ e |> Clause.make in
-          Clause.push_new c
+          Clause.push_conflict c
         | _ ->
           (* otherwise, see if it's an assignment *)
           begin match Lit.view lit with
@@ -1617,20 +1629,17 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       if Config.progress then print_progress();
       try
         (* first, empty the tautology queue *)
-        flush_tautologies_into_slice slice;
+        flush_new_clauses_into_slice slice;
         for i = start to start + slice.length - 1 do
           let lit = slice.get i in
           assume_lit lit;
         done;
-        flush_tautologies_into_slice slice;
+        flush_new_clauses_into_slice slice;
         (* let the solver do its work on top of the local stack *)
         Backtrack.push_level ();
         let lev = Backtrack.cur_level () in
         Sat lev
-      with Inconsistent (e, concl) ->
-        (* conflict clause: [e => concl] *)
-        let guard = clause_guard_of_exp_ e in
-        let conflict_clause = concl :: guard |> Clause.make in
+      with Conflict conflict_clause ->
         Log.debugf 3
           (fun k->k "(@[<1>raise_inconsistent@ %a@])"
               Clause.pp conflict_clause);
@@ -1695,17 +1704,19 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
             (fun k->
                let pp_dep out c =
                  let _, nf = Reduce.get_nf (Term.const c) in
-                 Format.fprintf out "(@[%a@ nf:%a@ expanded: %B@])"
+                 Format.fprintf out
+                   "(@[%a@ nf:%a@ xpanded: %B@])"
                    Typed_cst.pp c Term.pp nf
                    (match Typed_cst.as_undefined c with
                      | None -> assert false
                      | Some (_,_,i) -> i.cst_cases <> None)
                in
                let pp_lit out l =
-                 let _, nf = Reduce.get_nf l in
+                 let e, nf = Reduce.get_nf l in
                  Format.fprintf out
-                   "(@[<hv1>%a@ nf: %a@ deps: (@[<hv>%a@])@])"
-                   Lit.pp l Lit.pp nf (Utils.pp_list pp_dep) nf.term_deps
+                   "(@[<hv1>%a@ nf: %a@ exp: %a@ deps: (@[<hv>%a@])@])"
+                   Lit.pp l Lit.pp nf Explanation.pp e
+                   (Utils.pp_list pp_dep) nf.term_deps
                in
                k "(@[<hv1>status_watched_lit@ (@[<v>%a@])@])"
                  (Utils.pp_list pp_lit) !toplevel_goals_);
