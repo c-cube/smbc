@@ -175,6 +175,9 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     let is_data t =
       match t.ty_cell with | Atomic (_, Data _) -> true | _ -> false
 
+    let is_arrow t =
+      match t.ty_cell with | Arrow _ -> true | _ -> false
+
     let unfold ty : t list * t =
       let rec aux acc ty = match ty.ty_cell with
         | Arrow (a,b) -> aux (a::acc) b
@@ -213,6 +216,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       size: int;
     }
 
+    let is_empty e = e.size = 0
     let push x env = { size=env.size+1; st=Some x :: env.st }
     let push_l l env = List.fold_left (fun e x -> push x e) env l
     let push_none env = { size=env.size+1; st=None::env.st }
@@ -1077,22 +1081,19 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
 
   module Reduce = struct
     (* environment for evaluation: not-yet-evaluated terms *)
-    type eval_env = (explanation * term) lazy_t DB_env.t
+    type eval_env = term DB_env.t
 
     (* just evaluate the De Bruijn indices, and return
        the explanations used to evaluate subterms *)
-    let eval_db (env:eval_env) (t:term) : explanation * term =
+    let eval_db (env:eval_env) (t:term) : term =
       if DB_env.size env = 0
-      then Explanation.empty, t (* trivial *)
+      then t (* trivial *)
       else (
-        let e = ref Explanation.empty in
         let rec aux env t : term = match t.term_cell with
           | DB d ->
             begin match DB_env.get d env with
               | None -> t
-              | Some (lazy (e', t')) ->
-                e := Explanation.append !e e'; (* save explanation *)
-                t'
+              | Some t' -> t'
             end
           | Const _
           | True
@@ -1116,41 +1117,51 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         and aux_l env l =
           List.map (aux env) l
         in
-        let t = aux env t in
-        !e, t
+        aux env t
       )
 
     (* set the normal form of [t], propagate to watchers *)
     let set_nf_ t new_t (e:explanation) : unit =
       if Term.equal t new_t then ()
-      else begin match t.term_nf with
-        | Some (new_t', _) -> assert (Term.equal new_t new_t')
-        | None ->
-          Backtrack.push_set_nf_ t;
-          t.term_nf <- Some (new_t, e);
-          Log.debugf 5
-            (fun k->k "(@[<hv1>set_nf@ @[%a@]@ @[%a@]@ :explanation %a@])"
-                Term.pp t Term.pp new_t Explanation.pp e);
-      end
+      else (
+        Backtrack.push_set_nf_ t;
+        t.term_nf <- Some (new_t, e);
+        Log.debugf 5
+          (fun k->k "(@[<hv1>set_nf@ @[%a@]@ @[%a@]@ :explanation %a@])"
+              Term.pp t Term.pp new_t Explanation.pp e);
+      )
+
+    let get_nf t : explanation * term =
+      match t.term_nf with
+        | None -> Explanation.empty, t
+        | Some (new_t,e) -> e, new_t
 
     (* compute the normal form of this term. We know at least one of its
        subterm(s) has been reduced *)
     let rec compute_nf (t:term) : explanation * term =
-      Log.debugf 5 (fun k->k "(@[<1>compute_nf@ @[%a@]@])" Term.pp t);
       (* follow the "normal form" pointer *)
       match t.term_nf with
         | Some (t', e) ->
           let e', nf = compute_nf t' in
-          (* NOTE: path compression here, maybe *)
-          Explanation.append e e', nf
+          let exp = Explanation.append e e' in
+          (* path compression here *)
+          set_nf_ t nf exp;
+          exp, nf
         | None -> compute_nf_noncached t
 
     and compute_nf_noncached t =
       assert (t.term_nf = None);
       match t.term_cell with
         | DB _ -> assert false (* non closed! *)
-        | True | False | Const _ ->
+        | True | False ->
           Explanation.empty, t (* always trivial *)
+        | Const c ->
+          begin match c.cst_kind with
+            | Cst_defined (ty, rhs) when not (Ty.is_arrow ty) ->
+              (* expand defined constants *)
+              compute_nf (Lazy.force rhs)
+            | _ -> Explanation.empty, t
+          end
         | Fun _ -> Explanation.empty, t (* no eval under lambda *)
         | Builtin b ->
           let e, b' =
@@ -1170,7 +1181,8 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
             | False -> compute_nf c
             | _ -> Explanation.empty, default()
           in
-          (* merge evidence from [a]'s normal form and [b/c]'s normal form *)
+          (* merge evidence from [a]'s normal form and [b/c]'s
+             normal form *)
           let e = Explanation.append e_a e_branch in
           set_nf_ t t' e;
           e, t'
@@ -1185,20 +1197,14 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
                   if List.length tys = List.length l
                   then (
                     (* evaluate arguments *)
-                    let l =
-                      List.map
-                        (fun t -> lazy (compute_nf t))
-                        l
-                    in
                     let env = DB_env.push_l l DB_env.empty in
                     (* replace in [rhs] *)
-                    let e', rhs = eval_db env rhs in
+                    let rhs = eval_db env rhs in
                     (* evaluate new [rhs] *)
-                    compute_nf_add e' rhs
+                    compute_nf rhs
                   )
                   else Explanation.empty, Term.match_ u' m
-                with Not_found ->
-                  Explanation.empty, Term.match_ u' m
+                with Not_found -> assert false
               end
             | None -> Explanation.empty, default()
           in
@@ -1225,14 +1231,22 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       | Fun (_ty, body), arg :: other_args ->
         (* beta-reduce *)
         assert (Ty.equal _ty arg.term_ty);
-        let new_env = DB_env.push (lazy (compute_nf arg)) env in
+        let new_env = DB_env.push arg env in
         (* apply [body] to [other_args] *)
         compute_nf_app new_env e body other_args
       | _ ->
-        (* cannot reduce; substitute in [f] and re-apply *)
-        let e', f = eval_db env f in
-        let t' = Term.app f l in
-        Explanation.append e e', t'
+        (* cannot reduce, unless [f] reduces to something else. *)
+        let e_f, f' = eval_db env f |> compute_nf in
+        let exp = Explanation.append e e_f in
+        if Term.equal f f'
+        then (
+          (* no more reduction *)
+          let t' = Term.app f' l in
+          exp, t'
+        ) else (
+          (* try it again *)
+          compute_nf_app DB_env.empty exp f' l
+        )
 
     (* compute nf of [t], append [e] to the explanation *)
     and compute_nf_add (e : explanation) (t:term) : explanation * term =
@@ -1330,6 +1344,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     val watch : t -> unit
     val update_watches_of : t -> unit
     val update_all : unit -> unit
+    val is_watched : t -> bool
     val size : unit -> int
     val to_seq : t Sequence.t
   end = struct
@@ -1444,17 +1459,19 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
              blocking constant *)
           Log.debugf 4
             (fun k->k
-                "(@[<1>update_watches@ %a@ :normal_form %a@ :deps (@[%a@])@])"
+                "(@[<1>update_watches@ %a@ :normal_form %a@ \
+                 :deps (@[%a@])@])"
                 Term.pp t Term.pp new_t
-                (Utils.pp_list Typed_cst.pp) t.term_deps);
+                (Utils.pp_list Typed_cst.pp) new_t.term_deps);
           List.iter (fun c -> watch_cst_ c t) new_t.term_deps;
       end;
       ()
 
     let watched_ : unit Lit.Tbl.t = Lit.Tbl.create 256
 
-  (* TODO: if [lit] is new, do on-the-fly CNF of its inner formula
-     (break not/and/or, maybe explore a bit the equalities eagerly?). *)
+      (* TODO: if [lit] is new, do on-the-fly CNF of its inner formula
+         (break not/and/or, maybe explore a bit the equalities eagerly?).
+      *)
 
     let watch (lit:t) =
       let lit = Lit.abs lit in
@@ -1465,6 +1482,10 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         (* also ensure it is watched properly *)
         update_watches_of lit;
       )
+
+    let is_watched lit : bool =
+      let lit = Lit.abs lit in
+      Lit.Tbl.mem watched_ lit
 
     let to_seq = Lit.Tbl.keys watched_
 
@@ -1652,6 +1673,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     (* check that this term fully evaluates to [true] *)
     let is_true_ (t:term): bool =
       let _, t' = Reduce.compute_nf t in
+      assert (Term.equal t' (Reduce.get_nf t |> snd));
       match t'.term_cell with
         | True -> true
         | _ -> false
@@ -1662,18 +1684,28 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         if Config.progress then flush_progress();
         M.Unsat
       | M.Sat ->
-        assert (List.for_all is_true_ !toplevel_goals_);
+        assert (List.for_all Watched_lit.is_watched !toplevel_goals_);
         if List.for_all is_true_ !toplevel_goals_
         then (
           if Config.progress then flush_progress();
           M.Sat
         )
         else (
-          Log.debugf 5
+          Log.debugf 4
             (fun k->
+               let pp_dep out c =
+                 let _, nf = Reduce.get_nf (Term.const c) in
+                 Format.fprintf out "(@[%a@ nf:%a@ expanded: %B@])"
+                   Typed_cst.pp c Term.pp nf
+                   (match Typed_cst.as_undefined c with
+                     | None -> assert false
+                     | Some (_,_,i) -> i.cst_cases <> None)
+               in
                let pp_lit out l =
-                 Format.fprintf out "(@[<1>%a@ %a@])" Lit.pp l
-                   Lit.pp (snd (Reduce.compute_nf l))
+                 let _, nf = Reduce.get_nf l in
+                 Format.fprintf out
+                   "(@[<hv1>%a@ nf: %a@ deps: (@[<hv>%a@])@])"
+                   Lit.pp l Lit.pp nf (Utils.pp_list pp_dep) nf.term_deps
                in
                k "(@[<hv1>status_watched_lit@ (@[<v>%a@])@])"
                  (Utils.pp_list pp_lit) !toplevel_goals_);
