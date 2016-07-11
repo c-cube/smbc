@@ -73,6 +73,11 @@ let set_file s =
   if !file = "" then file := s
   else failwith "provide at most one file"
 
+let set_debug_ d =
+  Log.set_debug d;
+  Msat.Log.set_debug d;
+  ()
+
 let options =
   Arg.align [
     "--print-input", Arg.Set print_input_, " print input";
@@ -81,7 +86,7 @@ let options =
     "-nc", Arg.Clear color_, " do not use colors";
     "-p", Arg.Set progress_, " progress bar";
     "--pp-hashcons", Arg.Set pp_hashcons_, " print hashconsing IDs";
-    "--debug", Arg.Int Log.set_debug, " set debug level";
+    "--debug", Arg.Int set_debug_, " set debug level";
     "--stats", Arg.Set stats_, " print stats";
     "--backtrace", Arg.Unit (fun () -> Printexc.record_backtrace true), " enable backtrace";
     "--depth-step", Arg.Set_int depth_step_, " increment for iterative deepening";
