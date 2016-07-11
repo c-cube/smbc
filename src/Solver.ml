@@ -1138,7 +1138,8 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         Backtrack.push_set_nf_ t;
         t.term_nf <- Some (new_t, e);
         Log.debugf 5
-          (fun k->k "(@[<hv1>set_nf@ @[%a@]@ @[%a@]@ :explanation %a@])"
+          (fun k->k
+              "(@[<hv1>set_nf@ @[%a@]@ @[%a@]@ :explanation @[<v>%a@}@])"
               Term.pp t Term.pp new_t Explanation.pp e);
       )
 
@@ -1558,7 +1559,10 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
 
     let dummy = Backtrack.dummy_level
 
-    let current_level = Backtrack.cur_level
+    (* increment and return level *)
+    let current_level () =
+      Backtrack.push_level ();
+      Backtrack.cur_level ()
 
     let backtrack = Backtrack.backtrack
 
@@ -1631,9 +1635,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     let assume slice =
       let start = slice.start in
       assert (slice.length > 0);
-      let old_lev = Backtrack.cur_level () in
       (* do the propagations in a local frame *)
-      Backtrack.push_level ();
       if Config.progress then print_progress();
       try
         (* first, empty the tautology queue *)
@@ -1643,16 +1645,12 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           assume_lit lit;
         done;
         flush_new_clauses_into_slice slice;
-        (* let the solver do its work on top of the local stack *)
-        Backtrack.push_level ();
         let lev = Backtrack.cur_level () in
         Sat lev
       with Conflict conflict_clause ->
         Log.debugf 3
           (fun k->k "(@[<1>raise_inconsistent@ %a@])"
               Clause.pp conflict_clause);
-        (* undo partial propagation(s) *)
-        Backtrack.backtrack old_lev;
         Unsat ((conflict_clause :> Lit.t list), ())
   end
 
