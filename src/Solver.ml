@@ -13,6 +13,9 @@ let get_time : unit -> float =
 module type CONFIG = sig
   val max_depth: int
 
+  val deepening_step : int option
+  (** Increment between two successive max depths in iterative deepening *)
+
   val progress: bool
   (** progress display progress bar *)
 
@@ -809,6 +812,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
   (** {2 Literals} *)
   module Lit = struct
     type t = term
+
     let neg = Term.not_
 
     (* unsigned lit *)
@@ -961,7 +965,11 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     let pp = CCFormat.int
 
     (* how much between two consecutive depths? *)
-    let step_ = 5
+    let step_ = match Config.deepening_step with
+      | None -> 5
+      | Some s ->
+        if s < 1 then invalid_arg "depth-step must be >= 1";
+        s
 
     (* truncate at powers of {!step_} *)
     let max_depth =

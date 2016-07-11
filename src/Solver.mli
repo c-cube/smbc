@@ -8,6 +8,9 @@
 module type CONFIG = sig
   val max_depth: int
 
+  val deepening_step : int option
+  (** Increment between two successive max depths in iterative deepening *)
+
   val progress: bool
   (** progress display progress bar *)
 

@@ -7,6 +7,7 @@ type config = {
   dot_term_graph: string option;
   pp_hashcons: bool;
   progress : bool;
+  deepening_step: int option;
 }
 
 let parse_file file =
@@ -25,6 +26,7 @@ let solve ~config (ast:Ast.statement list) : unit =
     let max_depth = config.max_depth
     let pp_hashcons = config.pp_hashcons
     let progress = config.progress
+    let deepening_step = config.deepening_step
   end in
   let module S = Solver.Make(Conf)(struct end) in
   let print_term_graph = match config.dot_term_graph with
@@ -64,6 +66,7 @@ let stats_ = ref false
 let progress_  = ref false
 let pp_hashcons_ = ref false
 let max_depth_ = ref 60
+let depth_step_ = ref 0
 
 let file = ref ""
 let set_file s =
@@ -81,6 +84,7 @@ let options =
     "--debug", Arg.Int Log.set_debug, " set debug level";
     "--stats", Arg.Set stats_, " print stats";
     "--backtrace", Arg.Unit (fun () -> Printexc.record_backtrace true), " enable backtrace";
+    "--depth-step", Arg.Set_int depth_step_, " increment for iterative deepening";
   ]
 
 let () =
@@ -99,6 +103,8 @@ let () =
     print_stat = !stats_;
     progress = !progress_;
     pp_hashcons = !pp_hashcons_;
+    deepening_step =
+      (if !depth_step_ = 0 then None else Some !depth_step_);
     dot_term_graph =
       (if !dot_term_graph_ = "" then None else Some !dot_term_graph_);
   } in
