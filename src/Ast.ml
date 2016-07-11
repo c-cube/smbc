@@ -123,6 +123,7 @@ and term_cell =
   | Const of ID.t
   | App of term * term list
   | If of term * term * term
+  | Let of var * term * term
   | Match of term * (var list * term) ID.Map.t
   | Fun of var * term
   | Not of term
@@ -165,6 +166,8 @@ let rec term_to_sexp t = match t.term with
     |> S.of_list
   | Fun (v,t) ->
     S.of_list [S.atom "fun"; typed_var_to_sexp v; term_to_sexp t]
+  | Let (v,t,u) ->
+    S.of_list [S.atom "let"; ID.to_sexp v.Var.id; term_to_sexp t; term_to_sexp u]
   | Not t -> S.of_list [S.atom "not"; term_to_sexp t]
   | Binop (Eq, a, b) ->
     S.of_list [S.atom "="; term_to_sexp a; term_to_sexp b]
@@ -241,6 +244,13 @@ let if_ a b c =
       "if: both branches must have same type,@ not `@[%a@]` and `@[%a@]`"
       Ty.pp b.ty Ty.pp c.ty;
   mk_ (If (a,b,c)) b.ty
+
+let let_ v t u =
+  if not (Ty.equal (Var.ty v) t.ty)
+  then Ty.ill_typed
+      "let: var and term must have the same type@, not `@[%a@]` and `@[%a@]`"
+      Ty.pp (Var.ty v) Ty.pp t.ty;
+  mk_ (Let (v,t,u)) u.ty
 
 (* TODO: check types *)
 let match_ t m =
@@ -398,6 +408,14 @@ let rec conv_term ctx s = match s with
     if_ a b c
   | `List (`Atom "if" :: _) ->
     errorf "invalid syntax for if@ in `%a`" CCSexpM.print s
+  | `List [`Atom "let"; `Atom v; t; u] ->
+    let t = conv_term ctx t in
+    Ctx.with_var ctx v t.ty
+      (fun v ->
+         let u = conv_term ctx u in
+         let_ v t u)
+  | `List (`Atom "let" :: _) ->
+    errorf "invalid syntax for let@ in `%a`" CCSexpM.print s
   | `List [`Atom "fun"; `List [`Atom x; ty]; body] ->
     let ty = conv_ty ctx ty in
     Ctx.with_var ctx x ty

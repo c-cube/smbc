@@ -60,6 +60,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     | Const of cst
     | App of term * term list
     | Fun of ty_h * term
+    | Let of term * term
     | If of term * term * term
     | Match of term * (ty_h list * term) ID.Map.t
     | Builtin of builtin
@@ -379,6 +380,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           | Builtin (B_or (t1,t2)) -> Hash.combine3 22 t1.term_id t2.term_id
           | Builtin (B_imply (t1,t2)) -> Hash.combine3 23 t1.term_id t2.term_id
           | Builtin (B_eq (t1,t2)) -> Hash.combine3 24 t1.term_id t2.term_id
+          | Let (t,u) -> Hash.combine3 30 t.term_id u.term_id
 
         (* equality that relies on physical equality of subterms *)
         let equal t1 t2 : bool = match t1.term_cell, t2.term_cell with
@@ -389,6 +391,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           | App (f1, l1), App (f2, l2) ->
             f1 == f2 && CCList.equal (==) l1 l2
           | Fun (ty1,f1), Fun (ty2,f2) -> Ty.equal ty1 ty2 && f1 == f2
+          | Let (t1,u1), Let (t2,u2) -> t1 == t2 && u1 == u2
           | If (a1,b1,c1), If (a2,b2,c2) ->
             a1 == a2 && b1 == b2 && c1 == c2
           | Match (u1, m1), Match (u2, m2) ->
@@ -416,6 +419,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           | Const _, _
           | App _, _
           | Fun _, _
+          | Let _, _
           | If _, _
           | Match _, _
           | Builtin _, _ -> false
@@ -523,6 +527,9 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       let ty' = Ty.arrow ty body.term_ty in
       (* do not add watcher: propagation under λ forbidden *)
       mk_term_ ~deps:Dep_none (Fun (ty, body)) ~ty:ty'
+
+    let let_ t u =
+      mk_term_ ~deps:(Dep_sub t) (Let (t,u)) ~ty:u.term_ty
 
     (* TODO: check types *)
 
@@ -639,6 +646,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           | DB _ | Const _ | True | False -> ()
           | App (f,l) -> aux f; List.iter aux l
           | If (a,b,c) -> aux a; aux b; aux c
+          | Let (t,u) -> aux t; aux u
           | Match (t, m) ->
             aux t;
             ID.Map.iter (fun _ (_,rhs) -> aux rhs) m
@@ -684,6 +692,8 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           fpf out "(@[<1>%a@ %a@])" pp f (Utils.pp_list pp) l
         | Fun (ty,f) ->
           fpf out "(@[fun %a.@ %a@])" Ty.pp ty pp f
+        | Let (t,u) ->
+          fpf out "(@[let@ %a@ %a@])" pp t pp u
         | If (a, b, c) ->
           fpf out "(@[if %a@ %a@ %a@])" pp a pp b pp c
         | Match (t,m) ->
@@ -723,6 +733,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
                | App (f,l) when is_const f -> Sequence.of_list l
                | App (f,l) -> Sequence.cons f (Sequence.of_list l)
                | Fun (_, body) -> Sequence.return body
+               | Let (t,u) -> Sequence.of_list [t;u]
                | If (a,b,c) -> Sequence.of_list [a;b;c]
                | Builtin b -> builtin_to_seq b
                | Match (u,m) ->
@@ -752,6 +763,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
             | _ -> CCFormat.string out "@"
           end
         | If _ -> CCFormat.string out "if"
+        | Let _ -> CCFormat.string out "let"
         | Match _ -> CCFormat.string out "match"
         | Fun (ty,_) -> Format.fprintf out "fun %a" Ty.pp ty
         | Builtin b ->
@@ -1138,6 +1150,10 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           | Fun (ty, body) ->
             let body' = aux (DB_env.push_none env) body in
             Term.fun_ ty body'
+          | Let (t, u) ->
+            let t' = aux env t in
+            let u' = aux (DB_env.push_none env) u in
+            Term.let_ t' u'
           | Match (u, m) ->
             let u = aux env u in
             let m =
@@ -1210,6 +1226,11 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           let e = Explanation.append e' e in
           set_nf_ t t' e;
           e, t'
+        | Let (t, u) ->
+          (* expand *)
+          let env = DB_env.singleton t in
+          let u' = eval_db env u in
+          compute_nf u'
         | If (a,b,c) ->
           let e_a, a' = compute_nf a in
           assert (not (Term.equal a a'));
@@ -1812,6 +1833,10 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         let body = conv_term ((v,None)::env) body in
         let ty = Ast.Var.ty v |> conv_ty in
         Term.fun_ ty body
+      | Ast.Let (v,t,u) ->
+        let t = conv_term env t in
+        let u = conv_term ((v,None)::env) u in
+        Term.let_ t u
       | Ast.Match (u,m) ->
         let u = conv_term env u in
         let m =
@@ -1958,6 +1983,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         | App (f,l) ->
           Term.app (aux f) (List.map aux l)
         | If (a,b,c) -> Term.if_ (aux a)(aux b)(aux c)
+        | Let (t,u) -> Term.let_ (aux t) (aux u)
         | Match (u,m) ->
           let m = ID.Map.map (fun (tys,rhs) -> tys, aux rhs) m in
           Term.match_ (aux u) m
