@@ -353,74 +353,72 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
 
     let sub_hash (t:term): int = t.term_id
 
-    (* shallow hash *)
-    let term_hash_ (t:term) : int = match t.term_cell with
-      | True -> 1
-      | False -> 2
-      | DB d -> Hash.combine DB.hash 3 d
-      | Const c -> Hash.combine Typed_cst.hash 4 c
-      | App (f,l) ->
-        Hash.combine3 5 f.term_id (Hash.list sub_hash l)
-      | Fun (ty, f) -> Hash.combine3 6 (Ty.hash ty) f.term_id
-      | If (a,b,c) -> Hash.combine4 7 a.term_id b.term_id c.term_id
-      | Match (u,m) ->
-        let hash_case (tys,rhs) =
-          Hash.combine2 (Hash.list Ty.hash tys) rhs.term_id
-        in
-        let hash_m =
-          Hash.seq (Hash.pair ID.hash hash_case) (ID.Map.to_seq m)
-        in
-        Hash.combine3 8 u.term_id hash_m
-      | Builtin (B_not a) -> Hash.combine2 20 a.term_id
-      | Builtin (B_and (t1,t2)) -> Hash.combine3 21 t1.term_id t2.term_id
-      | Builtin (B_or (t1,t2)) -> Hash.combine3 22 t1.term_id t2.term_id
-      | Builtin (B_imply (t1,t2)) -> Hash.combine3 23 t1.term_id t2.term_id
-      | Builtin (B_eq (t1,t2)) -> Hash.combine3 24 t1.term_id t2.term_id
-
-    (* equality that relies on physical equality of subterms *)
-    let term_eq_ t1 t2 : bool = match t1.term_cell, t2.term_cell with
-      | True, True
-      | False, False -> true
-      | DB x, DB y -> DB.equal x y
-      | Const c1, Const c2 -> Typed_cst.equal c1 c2
-      | App (f1, l1), App (f2, l2) ->
-        f1 == f2 && CCList.equal (==) l1 l2
-      | Fun (ty1,f1), Fun (ty2,f2) -> Ty.equal ty1 ty2 && f1 == f2
-      | If (a1,b1,c1), If (a2,b2,c2) ->
-        a1 == a2 && b1 == b2 && c1 == c2
-      | Match (u1, m1), Match (u2, m2) ->
-        u1 == u2 &&
-        ID.Map.for_all
-          (fun k1 v1 ->
-             try v1 == ID.Map.find k1 m2
-             with Not_found -> false)
-          m1
-        &&
-        ID.Map.for_all (fun k2 _ -> ID.Map.mem k2 m1) m2
-      | Builtin b1, Builtin b2 ->
-        begin match b1, b2 with
-          | B_not a1, B_not a2 -> a1 == a2
-          | B_and (a1,b1), B_and (a2,b2)
-          | B_or (a1,b1), B_or (a2,b2)
-          | B_eq (a1,b1), B_eq (a2,b2)
-          | B_imply (a1,b1), B_imply (a2,b2) -> a1 == a2 && b1 == b2
-          | B_not _, _ | B_and _, _ | B_eq _, _
-          | B_or _, _ | B_imply _, _ -> false
-        end
-      | True, _
-      | False, _
-      | DB _, _
-      | Const _, _
-      | App _, _
-      | Fun _, _
-      | If _, _
-      | Match _, _
-      | Builtin _, _ -> false
-
     module W = Weak.Make(struct
         type t = term
-        let equal = term_eq_
-        let hash = term_hash_
+
+        (* shallow hash *)
+        let hash (t:term) : int = match t.term_cell with
+          | True -> 1
+          | False -> 2
+          | DB d -> Hash.combine DB.hash 3 d
+          | Const c -> Hash.combine Typed_cst.hash 4 c
+          | App (f,l) ->
+            Hash.combine3 5 f.term_id (Hash.list sub_hash l)
+          | Fun (ty, f) -> Hash.combine3 6 (Ty.hash ty) f.term_id
+          | If (a,b,c) -> Hash.combine4 7 a.term_id b.term_id c.term_id
+          | Match (u,m) ->
+            let hash_case (tys,rhs) =
+              Hash.combine2 (Hash.list Ty.hash tys) rhs.term_id
+            in
+            let hash_m =
+              Hash.seq (Hash.pair ID.hash hash_case) (ID.Map.to_seq m)
+            in
+            Hash.combine3 8 u.term_id hash_m
+          | Builtin (B_not a) -> Hash.combine2 20 a.term_id
+          | Builtin (B_and (t1,t2)) -> Hash.combine3 21 t1.term_id t2.term_id
+          | Builtin (B_or (t1,t2)) -> Hash.combine3 22 t1.term_id t2.term_id
+          | Builtin (B_imply (t1,t2)) -> Hash.combine3 23 t1.term_id t2.term_id
+          | Builtin (B_eq (t1,t2)) -> Hash.combine3 24 t1.term_id t2.term_id
+
+        (* equality that relies on physical equality of subterms *)
+        let equal t1 t2 : bool = match t1.term_cell, t2.term_cell with
+          | True, True
+          | False, False -> true
+          | DB x, DB y -> DB.equal x y
+          | Const c1, Const c2 -> Typed_cst.equal c1 c2
+          | App (f1, l1), App (f2, l2) ->
+            f1 == f2 && CCList.equal (==) l1 l2
+          | Fun (ty1,f1), Fun (ty2,f2) -> Ty.equal ty1 ty2 && f1 == f2
+          | If (a1,b1,c1), If (a2,b2,c2) ->
+            a1 == a2 && b1 == b2 && c1 == c2
+          | Match (u1, m1), Match (u2, m2) ->
+            u1 == u2 &&
+            ID.Map.for_all
+              (fun k1 v1 ->
+                 try v1 == ID.Map.find k1 m2
+                 with Not_found -> false)
+              m1
+            &&
+            ID.Map.for_all (fun k2 _ -> ID.Map.mem k2 m1) m2
+          | Builtin b1, Builtin b2 ->
+            begin match b1, b2 with
+              | B_not a1, B_not a2 -> a1 == a2
+              | B_and (a1,b1), B_and (a2,b2)
+              | B_or (a1,b1), B_or (a2,b2)
+              | B_eq (a1,b1), B_eq (a2,b2)
+              | B_imply (a1,b1), B_imply (a2,b2) -> a1 == a2 && b1 == b2
+              | B_not _, _ | B_and _, _ | B_eq _, _
+              | B_or _, _ | B_imply _, _ -> false
+            end
+          | True, _
+          | False, _
+          | DB _, _
+          | Const _, _
+          | App _, _
+          | Fun _, _
+          | If _, _
+          | Match _, _
+          | Builtin _, _ -> false
       end)
 
     (* hashconsing function + iterating on all terms *)
