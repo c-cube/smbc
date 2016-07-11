@@ -955,7 +955,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         | [a;b] when Lit.equal (Lit.neg a) b -> () (* trivial *)
         | _ when Tbl.mem all_lemmas_ c -> () (* already asserted *)
         | _ ->
-          Log.debugf 4
+          Log.debugf 3
             (fun k->k "(@[<1>@{<green>new_tautology@}@ @[%a@]@])" pp c);
           incr stat_num_clause_tautology;
           Tbl.add all_lemmas_ c ();
@@ -1600,7 +1600,9 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         while not (Queue.is_empty Clause.lemma_queue) do
           let c = Queue.pop Clause.lemma_queue in
           Log.debugf 5 (fun k->k "(@[<2>push_lemma@ %a@])" Clause.pp c);
-          slice.push (Clause.lits c) ();
+          let lits = Clause.lits c in
+          List.iter Watched_lit.watch lits;
+          slice.push lits ();
         done
       else (
         let c = Queue.pop Clause.conflicts in
