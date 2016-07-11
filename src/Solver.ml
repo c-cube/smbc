@@ -1573,6 +1573,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       if Queue.is_empty Clause.conflicts then
         while not (Queue.is_empty Clause.lemma_queue) do
           let c = Queue.pop Clause.lemma_queue in
+          Log.debugf 5 (fun k->k "(@[<2>push_lemma@ %a@])" Clause.pp c);
           slice.push (c:>Lit.t list) ();
         done
       else (
