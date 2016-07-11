@@ -1,5 +1,6 @@
 
 ; `l1 ++ l2 != l2 ++ l1`
+; expect: SAT
 
 (data (nat z (s nat)))
 

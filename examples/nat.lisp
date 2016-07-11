@@ -1,5 +1,6 @@
 
 ; theory of nat
+; expect: SAT
 
 (data (nat z (s nat)))
 

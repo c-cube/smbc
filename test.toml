@@ -1,0 +1,25 @@
+
+[smbc-5]
+
+cmd = "./smbc.native --depth-step 5 -nc $file"
+unsat = "UNSAT"
+sat = "SAT"
+unknown = "TIMEOUT|UNKNOWN"
+timeout = "TIMEOUT"
+
+[smbc-30]
+
+cmd = "./smbc.native --depth-step 30 -nc $file"
+unsat = "UNSAT"
+sat = "SAT"
+unknown = "TIMEOUT|UNKNOWN"
+timeout = "TIMEOUT"
+
+[test]
+
+timeout=5
+problems = ".*.lisp"
+provers = [ "smbc-5", "smbc-30" ]
+dir = [ "examples" ]
+
+

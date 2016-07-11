@@ -1,5 +1,6 @@
 
 ; theory of lists
+; expect: SAT
 
 (include "nat.lisp")
 

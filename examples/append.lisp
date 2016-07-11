@@ -1,4 +1,6 @@
 
+; expect: SAT
+
 (data (nat z (s nat)))
 
 (data (list nil (cons nat list)))
