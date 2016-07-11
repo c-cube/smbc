@@ -1,6 +1,7 @@
 <src/>: include
 <src/**/*.*>: package(containers), package(msat), \
               package(containers.sexp), package(containers.data), \
-              package(sequence), package(unix)
+              package(sequence), \
+              package(landmarks.ppx), package(landmarks), package(unix)
 
 true: safe_string, annot, bin_annot, color(always), optimize(3)

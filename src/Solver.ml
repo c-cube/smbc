@@ -1,6 +1,8 @@
 
 (* This file is free software. See file "license" for more details. *)
 
+[@@@landmark "auto"]
+
 let (<?>) = CCOrd.(<?>)
 
 let get_time : unit -> float =
