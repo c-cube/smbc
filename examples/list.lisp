@@ -40,3 +40,14 @@
       (match l
         (nil z)
         ((cons x tail) (plus x (sum tail)))))))
+
+(define
+  (sorted (-> list prop)
+   (fun (l list)
+     (match l
+      (nil true)
+      ((cons x l2)
+        (match l2
+          (nil true)
+          ((cons y l3)
+           (and (leq x y) (sorted (cons y l3))))))))))
