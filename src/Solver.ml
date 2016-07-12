@@ -602,7 +602,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           | App (f1, l1) ->
             let l' = l1 @ l in
             mk_term_ ~deps:(Dep_sub f1) (App (f1, l'))
-              ~ty:(DTy_lazy (fun () -> app_ty_ f.term_ty l'))
+              ~ty:(DTy_lazy (fun () -> app_ty_ f1.term_ty l'))
           | _ ->
             mk_term_ ~deps:(Dep_sub f) (App (f,l))
               ~ty:(DTy_lazy (fun () -> app_ty_ f.term_ty l))
