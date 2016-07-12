@@ -1421,10 +1421,19 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
 
     (* build clause(s) that explains that [c] must be one of its
        cases *)
-    let clauses_of_cases (c:cst) (l:term list) (depth:int) : Clause.t list =
+    let clauses_of_cases (c:cst) (l:term list) (depth:int): Clause.t list =
       (* guard for non-constant cases (depth limit) *)
       let lit_guard = Iterative_deepening.lit_of_depth depth in
       let guard_is_some = CCOpt.is_some lit_guard in
+      let info = match Typed_cst.as_undefined c with
+        | None -> assert false
+        | Some (_,_,info) -> info
+      in
+      let guard_parent = match info.cst_parent with
+        | None -> None
+        | Some (lazy (par, par_case)) ->
+          Some (Lit.cst_choice par par_case |> Lit.neg)
+      in
       (* lits with a boolean indicating whether they have
            to be depth-guarded *)
       let lits =
@@ -1445,9 +1454,12 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
              lit, needs_guard)
           l
       in
-      (* at least one case *)
+      (* at least one case. We only enforce that if the
+         parent constant has the proper case *)
       let c_choose : Clause.t =
-        List.map fst lits |> Clause.make
+        List.map fst lits
+        |> CCList.cons_maybe guard_parent
+        |> Clause.make
       (* at most one case *)
       and cs_once : Clause.t list =
         CCList.diagonal lits
