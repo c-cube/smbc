@@ -41,6 +41,8 @@ module Make(C:CONFIG)(Dummy : sig end) : sig
     | Atomic of ID.t * ty_def
     | Arrow of ty_h * ty_h
 
+  type 'a db_env
+
   (** {2 Hashconsed Types} *)
   module Ty : sig
     type t = ty_h
@@ -77,7 +79,12 @@ module Make(C:CONFIG)(Dummy : sig end) : sig
 
     val make : ID.t -> cst_kind -> t
     val make_bool : ID.t -> t
-    val make_undef : ?parent:(t * term) lazy_t -> ID.t -> Ty.t -> t
+    val make_undef :
+      ?can_use:term list ->
+      ?env:Ty.t db_env ->
+      ?parent:(t * term) lazy_t ->
+      ID.t ->
+      Ty.t -> t
     val make_cstor : ID.t -> Ty.t -> t
     val make_defined: ID.t -> Ty.t -> term lazy_t -> t
 
@@ -102,6 +109,7 @@ module Make(C:CONFIG)(Dummy : sig end) : sig
 
     val db : DB.t -> t
     val const : cst -> t
+    val const_with_env : term db_env -> cst -> t
     val app : t -> t list -> t
     val fun_ : Ty.t -> t -> t
     val match_ : t -> (Ty.t list * t) ID.Map.t -> t
