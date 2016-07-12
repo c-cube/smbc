@@ -51,3 +51,12 @@
           (nil true)
           ((cons y l3)
            (and (leq x y) (sorted (cons y l3))))))))))
+
+(define
+  (map (-> (-> nat nat) list list)
+    (fun (f (-> nat nat))
+      (fun (l list)
+        (match l
+          (nil nil)
+          ((cons x tail) (cons (f x) (map f tail))))))))
+
