@@ -2296,15 +2296,12 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
                    status: %a"
                   ID.pp cur_depth pp_proof_status status);
             match status with
-              | PS_depth_limited _ ->
+              | PS_depth_limited _
+              | PS_incomplete ->
                 (* negation of the previous limit *)
                 M.pop base_level;
                 push_clause (Clause.make [Lit.neg cur_lit]);
                 iter (ID.next ()) (* deeper! *)
-              | PS_incomplete ->
-                do_on_exit ~on_exit;
-                M.pop base_level;
-                Unknown U_incomplete
               | PS_complete ->
                 do_on_exit ~on_exit;
                 M.pop base_level;
