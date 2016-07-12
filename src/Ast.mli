@@ -9,6 +9,8 @@ type 'a to_sexp = 'a -> sexp
 
 (** {2 Types} *)
 
+exception Ill_typed of string
+
 module Var : sig
   type 'ty t = private {
     id: ID.t;
@@ -58,8 +60,6 @@ module Ty : sig
   val data_to_sexp : data -> sexp
 
   (** {2 Error Handling} *)
-
-  exception Ill_typed of string
 
   val ill_typed : ('a, Format.formatter, unit, 'b) format4 -> 'a
 end

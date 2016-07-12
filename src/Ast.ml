@@ -11,6 +11,18 @@ module S = CCSexp
 
 let (<?>) = CCOrd.(<?>)
 
+exception Error of string
+
+exception Ill_typed of string
+
+let () = Printexc.register_printer
+    (function
+      | Error msg -> Some ("ast error: " ^ msg)
+      | Ill_typed msg -> Some ("ill-typed: " ^ msg)
+      | _ -> None)
+
+let errorf msg = CCFormat.ksprintf ~f:(fun e -> raise (Error e)) msg
+
 (** {2 Types} *)
 
 module Var = struct
@@ -96,8 +108,6 @@ module Ty = struct
         d.data_cstors []
     in
     S.of_list (ID.to_sexp d.data_id :: cstors)
-
-  exception Ill_typed of string
 
   let ill_typed fmt =
     CCFormat.ksprintf
@@ -292,15 +302,6 @@ module StrTbl = CCHashtbl.Make(struct
     let equal = CCString.equal
     let hash = CCString.hash
   end)
-
-exception Error of string
-
-let () = Printexc.register_printer
-    (function
-      | Error msg -> Some ("ast error: " ^ msg)
-      | _ -> None)
-
-let errorf msg = CCFormat.ksprintf ~f:(fun e -> raise (Error e)) msg
 
 module Ctx = struct
   type kind =
