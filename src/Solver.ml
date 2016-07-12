@@ -73,16 +73,11 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     | B_or of term * term
     | B_imply of term * term
 
-  (* explain why the normal form *)
-  and explanation_atom =
-    | E_choice of cst * term (* assertion [c --> t] *)
-    | E_lit of term * bool (* decision [lit =/!= true] *)
-
   (* bag of atomic explanations. It is optimized for traversal
      and fast cons/snoc/append *)
   and explanation=
     | E_empty
-    | E_leaf of explanation_atom
+    | E_leaf of term
     | E_append of explanation * explanation
 
   and cst = {
@@ -539,6 +534,8 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       mk_term_ ~deps:Dep_none (Fun (ty, body))
         ~ty:(DTy_lazy (fun () -> Ty.arrow ty body.term_ty))
 
+    let fun_l = List.fold_right fun_
+
     (* TODO: check types *)
 
     let match_ u m =
@@ -823,17 +820,15 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       | E_leaf x -> yield x
       | E_append (a,b) -> to_seq a yield; to_seq b yield
 
-    let pp_explanation_atom out = function
-      | E_choice (c,t) ->
-        Format.fprintf out
-          "(@[choice@ %a@ %a@])" Typed_cst.pp c Term.pp t
-      | E_lit (t,b) ->
-        Format.fprintf out "(@[assert_lit@ %a@ %B@])" Term.pp t b
+    let to_list_uniq e =
+      to_seq e
+      |> Sequence.to_rev_list
+      |> CCList.sort_uniq ~cmp:Term.compare
 
     let pp out e =
       Format.fprintf out "(@[%a@])"
-        (CCFormat.seq ~start:"" ~stop:"" ~sep:" " pp_explanation_atom)
-        (to_seq e)
+        (Utils.pp_list Term.pp)
+        (to_list_uniq e)
   end
 
   (** {2 Literals} *)
@@ -1187,7 +1182,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         t.term_nf <- Some (new_t, e);
         Log.debugf 5
           (fun k->k
-              "(@[<hv1>set_nf@ @[%a@]@ @[%a@]@ :explanation @[<v>%a@}@])"
+              "(@[<hv1>set_nf@ @[%a@]@ @[%a@]@ :explanation @[<hv>%a@]@])"
               Term.pp t Term.pp new_t Explanation.pp e);
       )
 
@@ -1379,16 +1374,11 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         end
   end
 
-  let lit_of_exp_ (e:explanation_atom): Lit.t = match e with
-    | E_lit (t, b) -> Lit.atom ~sign:b t
-    | E_choice (cst, t) -> Lit.cst_choice cst t
-
   (* from explanation [e1, e2, ..., en] build the guard
          [e1 & e2 & ... & en => …], that is, the clause
          [not e1 | not e2 | ... | not en] *)
   let clause_guard_of_exp_ (e:explanation): Lit.t list =
     Explanation.to_seq e
-    |> Sequence.map lit_of_exp_
     |> Sequence.map Lit.neg (* this is a guard! *)
     |> Sequence.to_rev_list
     |> CCList.sort_uniq ~cmp:Lit.compare
@@ -1774,7 +1764,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
                let pp_dep out c =
                  let _, nf = Reduce.get_nf (Term.const c) in
                  Format.fprintf out
-                   "(@[%a@ nf:%a@ xpanded: %B@])"
+                   "(@[%a@ nf:%a@ :expanded %B@])"
                    Typed_cst.pp c Term.pp nf
                    (match Typed_cst.as_undefined c with
                      | None -> assert false
