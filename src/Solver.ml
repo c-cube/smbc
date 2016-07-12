@@ -104,8 +104,12 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
        a given case *)
     mutable cst_cases : term list option;
     (* cover set (lazily evaluated) *)
+    mutable cst_complete: bool;
+    (* does [cst_cases] cover all possible cases, or only
+       a subset? Affects completeness *)
     cst_watched: term Hash_set.t;
-    (* set of (bool) literals terms that depend on this constant for evaluation.
+    (* set of (bool) literals terms that depend on this constant
+       for evaluation.
 
        A literal [lit] can watch several typed constants. If
        [lit.nf = t], and [t]'s evaluation is blocked by [c1,...,ck],
@@ -271,6 +275,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         ) in
         { cst_depth; cst_parent=parent;
           cst_cases=None;
+          cst_complete=false;
           cst_watched=
             Hash_set.create ~eq:term_equal_ ~hash:term_hash_ 16;
         }
@@ -1100,6 +1105,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     let l = match Ty.view ty with
       | Atomic (_, Data cstors) ->
         (* datatype: refine by picking the head constructor *)
+        info.cst_complete <- true;
         List.map
           (fun (lazy c) ->
              let rec case = lazy (
@@ -1945,6 +1951,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
   type unknown =
     | U_timeout
     | U_max_depth
+    | U_incomplete
 
   type model = term Typed_cst.Map.t
   (** Map from constants to their value *)
@@ -2028,12 +2035,53 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       | M.Proof.Hypothesis -> CCFormat.string out "hypothesis"
       | M.Proof.Lemma () -> Format.fprintf out "(@[<1>lemma@ ()@])"
       | M.Proof.Resolution (p1, p2, _) ->
-        Format.fprintf out "(@[<1>resolution@ %a@ %a@])" pp_proof p1 pp_proof p2
+        Format.fprintf out "(@[<1>resolution@ %a@ %a@])"
+          pp_proof p1 pp_proof p2
     in
     let {M.Proof.conclusion; step } = M.Proof.expand p in
     let conclusion = clause_of_mclause conclusion in
     Format.fprintf out "(@[<hv1>step@ %a@ @[<1>from:@ %a@]@])"
       Clause.pp conclusion pp_step step
+
+  type proof_status =
+    | PS_depth_limited of Lit.t
+    | PS_complete
+    | PS_incomplete
+
+  let pp_proof_status out = function
+    | PS_depth_limited lit ->
+      Format.fprintf out "(@[depth_limited@ by: %a@])" Lit.pp lit
+    | PS_complete -> CCFormat.string out "complete"
+    | PS_incomplete -> CCFormat.string out "incomplete"
+
+  (* check dependencies of the unsat-core:
+     - if it depends on depth-limit, not UNSAT
+     - if some constant has been refined incompletely, UNKNOWN
+     - otherwise, truly UNSAT
+  *)
+  let proof_status depth_lit core: proof_status =
+    let s = ref PS_complete in
+    try
+      clauses_of_unsat_core core
+      |> Sequence.flat_map Clause.to_seq
+      |> Sequence.iter
+        (fun lit ->
+           if Lit.equal depth_lit (Lit.abs lit)
+           then (
+             s := PS_depth_limited depth_lit;
+             raise Exit
+           ) else match Lit.view (Lit.abs lit) with
+             | Lit.V_cst_choice (c,_) ->
+               begin match c.cst_kind with
+                 | Cst_undef (_, i) when not i.cst_complete ->
+                   s := PS_incomplete
+                 | _ -> ()
+               end
+             | _ -> ()
+        );
+      !s
+    with Exit ->
+      !s
 
   let check ?(on_exit=[]) () =
     let module ID = Iterative_deepening in
@@ -2066,29 +2114,26 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
             *)
             let core = M.get_proof () |> M.unsat_core in
             assert (Lit.equal (Lit.abs cur_lit) cur_lit);
-            let depth_limited =
-              clauses_of_unsat_core core
-              |> Sequence.flat_map Clause.to_seq
-              |> Sequence.exists
-                (fun lit -> Lit.equal cur_lit (Lit.abs lit ))
-            in
+            let status = proof_status cur_lit core in
             Log.debugf 1
               (fun k->k
                   "@{<Yellow>** found Unsat@} at depth %a;@ \
-                   depends on %a: %B"
-                  ID.pp cur_depth Lit.pp cur_lit depth_limited);
-            if depth_limited
-            then (
-              (* negation of the previous limit *)
-              M.pop base_level;
-              push_clause (Clause.make [Lit.neg cur_lit]);
-              iter (ID.next ()) (* deeper! *)
-            )
-            else (
-              do_on_exit ~on_exit;
-              M.pop base_level;
-              Unsat
-            )
+                   status: %a"
+                  ID.pp cur_depth pp_proof_status status);
+            match status with
+              | PS_depth_limited _ ->
+                (* negation of the previous limit *)
+                M.pop base_level;
+                push_clause (Clause.make [Lit.neg cur_lit]);
+                iter (ID.next ()) (* deeper! *)
+              | PS_incomplete ->
+                do_on_exit ~on_exit;
+                M.pop base_level;
+                Unknown U_incomplete
+              | PS_complete ->
+                do_on_exit ~on_exit;
+                M.pop base_level;
+                Unsat
     in
     ID.reset ();
     Backtrack.backtrack 0;

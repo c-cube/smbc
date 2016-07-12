@@ -149,6 +149,7 @@ module Make(C:CONFIG)(Dummy : sig end) : sig
   type unknown =
     | U_timeout
     | U_max_depth
+    | U_incomplete
 
   type res =
     | Sat of model
