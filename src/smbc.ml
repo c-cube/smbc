@@ -11,6 +11,7 @@ type config = {
 }
 
 let parse_file file =
+  Log.debugf 2 (fun k->k "(@[parse_file@ %S@])" file);
   let res = CCSexpM.parse_file_list file in
   match res with
     | `Error msg -> print_endline msg; exit 1
@@ -99,7 +100,7 @@ let () =
   (* parse *)
   let ast = parse_file !file in
   if !print_input_
-  then 
+  then
     Format.printf "@[parsed:@ @[<v>%a@]@]@."
       (CCFormat.list ~start:"" ~stop:"" ~sep:"" Ast.pp_statement) ast;
   (* solve *)

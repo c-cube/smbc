@@ -24,6 +24,10 @@ let combine4 a b c d =
 
 let pair f g (x,y) = combine2 (f x) (g y)
 
+let opt f = function
+  | None -> 42
+  | Some x -> combine2 43 (f x)
+
 let list f l = List.fold_left (combine f) 0x42 l
 let seq f seq =
   let h = ref 0x43 in

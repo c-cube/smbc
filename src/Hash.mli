@@ -10,6 +10,7 @@ val combine : 'a t -> int -> 'a -> int
 
 val pair : 'a t -> 'b t -> ('a * 'b) t
 
+val opt : 'a t -> 'a option t
 val list : 'a t -> 'a list t
 val seq : 'a t -> 'a Sequence.t t
 

@@ -490,6 +490,7 @@ and conv_statement_aux ctx s : statement list = match s with
       | Some s' ->
         (* put in cache *)
         StrTbl.add ctx.Ctx.included s' ();
+        Log.debugf 2 (fun k->k "(@[parse_include@ %S@])" s');
         let sexp = match CCSexpM.parse_file_list s' with
           | `Ok l -> l
           | `Error msg -> errorf "could not parse `%s`: %s" s' msg
