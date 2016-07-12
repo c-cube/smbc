@@ -17,7 +17,7 @@ timeout = "TIMEOUT"
 
 [test]
 
-timeout=5
+timeout=30
 problems = ".*.lisp"
 provers = [ "smbc-5", "smbc-30" ]
 dir = [ "examples" ]
