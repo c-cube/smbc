@@ -202,8 +202,10 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     let rec pp out t = match t.ty_cell with
       | Prop -> CCFormat.string out "prop"
       | Atomic (id, _) -> ID.pp out id
-      | Arrow (a, b) ->
-        Format.fprintf out "(@[->@ %a@ %a@])" pp a pp b
+      | Arrow _ ->
+        let args, ret = unfold t in
+        Format.fprintf out "(@[->@ %a@ %a@])"
+          (Utils.pp_list pp) args pp ret
 
     (* representation as a single identifier *)
     let rec mangle t : string = match t.ty_cell with
