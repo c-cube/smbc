@@ -118,8 +118,8 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     cst_db_ctx: ty_h db_env;
     (* De Bruijn variables (their type) available in context. *)
     cst_can_use: term list;
-    (* other terms that can be used to refine this constant or its own
-       sub-constants. This is useful for controlling recursion. *)
+    (* terms available in context (possibly non-closed; can use
+       De Bruijn indices from [0] to [cst_db_ctx_size-1]) *)
   }
 
   and 'a db_env = {
@@ -241,7 +241,6 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     let equal eq_x e1 e2 =
       e1.db_size = e2.db_size
       && CCList.equal (CCOpt.equal eq_x) e1.db_st e2.db_st
-    let to_list e = e.db_st
     let hash h e = Hash.(list (opt h)) e.db_st
     let push x env = { db_size=env.db_size+1; db_st=Some x :: env.db_st }
     let push_l l env = List.fold_left (fun e x -> push x e) env l
@@ -249,6 +248,9 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       { db_size=env.db_size+1; db_st=None::env.db_st }
     let push_none_l l env = List.fold_left (fun e _ -> push_none e) env l
     let map f e = {e with db_st = List.map f e.db_st }
+    let map_some f e = {e with db_st = List.map (CCOpt.map f) e.db_st}
+    let mapi_some f e =
+      {e with db_st = List.mapi (fun i -> (CCOpt.map (f i))) e.db_st}
     let mapi f e = {e with db_st = List.mapi f e.db_st }
     let empty = {db_st=[]; db_size=0}
     let of_list l = push_l l empty
@@ -261,6 +263,11 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     let size env = env.db_size
     let get ((n,_):DB.t) env : _ option =
       if n < env.db_size then List.nth env.db_st n else None
+    let set e i v : _ t =
+      assert (i>=0);
+      if i<e.db_size
+      then {e with db_st=CCList.Idx.set e.db_st i v}
+      else e
 
     let pp pp_x out e =
       let l =
@@ -295,10 +302,11 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
 
     let ty t = ty_of_kind t.cst_kind
 
-    let size_ctx c = match c.cst_kind with
-      | Cst_undef (_, info) ->
-        DB_env.size info.cst_db_ctx
-      | Cst_cstor _ | Cst_defined _ | Cst_bool -> 0
+    let db_ctx c = match c.cst_kind with
+      | Cst_undef (_, info) -> info.cst_db_ctx
+      | Cst_cstor _ | Cst_defined _ | Cst_bool -> DB_env.empty
+
+    let size_ctx c = DB_env.size (db_ctx c)
 
     let make cst_id cst_kind = {cst_id; cst_kind}
     let make_bool id = make id Cst_bool
@@ -308,23 +316,27 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       make id (Cst_cstor ty)
     let make_defined id ty t = make id (Cst_defined (ty, t))
 
-    let make_undef ?(can_use=[]) ?(env=DB_env.empty) ?parent id ty =
+    let make_undef
+        ?(depth_incr=1) ?(db_ctx=DB_env.empty) ?(can_use=[]) ?parent id ty =
+      assert (depth_incr >= 1);
       let info =
         let cst_depth = lazy (match parent with
           | Some (lazy ({cst_kind=Cst_undef (_, i); _}, _)) ->
-            Lazy.force i.cst_depth + 1
+            Lazy.force i.cst_depth + depth_incr
           | Some _ ->
             invalid_arg "make_const: parent should be a constant"
           | None -> 0
         ) in
+        (* if [can_use] is empty, no need for a De Bruijn context *)
+        let cst_db_ctx = if can_use=[] then DB_env.empty else db_ctx in
         { cst_depth; cst_parent=parent;
           cst_cases=None;
           cst_complete=false;
           cst_cur_case=None;
           cst_watched=
             Hash_set.create ~eq:term_equal_ ~hash:term_hash_ 16;
+          cst_db_ctx;
           cst_can_use=can_use;
-          cst_db_ctx=env;
         }
       in
       make id (Cst_undef (ty, info))
@@ -551,10 +563,8 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
 
     (* initial term environment, built from De Bruijn indices *)
     let env_of_ty_env (e:ty_h DB_env.t): term DB_env.t =
-      DB_env.mapi
-        (fun i o -> match o with
-           | None -> None
-           | Some ty -> Some (db (DB.make i ty)))
+      DB_env.mapi_some
+        (fun i ty -> db (DB.make i ty))
         e
 
     let const_with_env env c =
@@ -565,10 +575,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       mk_term_ ~deps (Const (c,env)) ~ty:(DTy_direct (Typed_cst.ty c))
 
     let const c =
-      let env = match Typed_cst.as_undefined c with
-        | None -> DB_env.empty
-        | Some (_,_,info) -> env_of_ty_env info.cst_db_ctx
-      in
+      let env = env_of_ty_env (Typed_cst.db_ctx c) in
       const_with_env env c
 
     (* type of an application *)
@@ -714,6 +721,36 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     let hash = term_hash_
     let compare a b = CCOrd.int_ a.term_id b.term_id
 
+    (* shift every {b free} De Bruijn index in [t] by the amount [by] *)
+    let shift_db (by:int) (t:term): term =
+      (* by: how much to shift
+         k: current depth *)
+      let rec aux k t = match t.term_cell with
+        | DB d ->
+          let lev = DB.level d in
+          if lev < k then t
+          else db (DB.make (lev+by) (DB.ty d))
+        | Const (c,env) ->
+          let env' = DB_env.map_some (aux k) env in
+          const_with_env env' c
+        | True | False -> t
+        | App (f,l) -> app (aux k f) (List.map (aux k) l)
+        | If (a,b,c) -> if_ (aux k a) (aux k b) (aux k c)
+        | Builtin b -> builtin (map_builtin (aux k) b)
+        | Match (u, m) ->
+          let m' =
+            ID.Map.map
+               (fun (tys, rhs) -> tys, aux (k+List.length tys) rhs)
+               m
+          in
+          match_ (aux k u) m'
+        | Mu body -> mu (aux (k+1) body)
+        | Fun (ty,body) ->
+          fun_ ty (aux (k+1) body)
+      in
+      assert (by >= 0);
+      if by > 0 then aux 0 t else t
+
     module As_key = struct
         type t = term
         let compare = compare
@@ -777,9 +814,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           let pp_cst out c =
             if ids then Typed_cst.pp out c else ID.pp_name out c.cst_id
           in
-          if DB_env.is_empty e
-          then pp_cst out c
-          else Format.fprintf out "@[%a[%a]@]" pp_cst c (DB_env.pp pp) e
+          Format.fprintf out "%a%a" pp_cst c pp_env e
         | App (f,l) ->
           fpf out "(@[<1>%a@ %a@])" pp f (Utils.pp_list pp) l
         | Fun (ty,f) ->
@@ -805,6 +840,24 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           fpf out "(@[<hv1>=>@ %a@ %a@])" pp a pp b
         | Builtin (B_eq (a,b)) ->
           fpf out "(@[<hv1>=@ %a@ %a@])" pp a pp b
+
+      (* special printer for constant closures *)
+      and pp_env out e =
+        let n = ref 0 in
+        (* remove trivial bindings *)
+        let db_st =
+          e.db_st
+          |> List.mapi
+            (fun i o -> match o with
+               | None -> None
+               | Some {term_cell=DB (j,_);_} when j=i -> None (* trivial *)
+               | Some t -> incr n; Some t)
+        in
+        let e' = { e with db_st } in
+        let len = DB_env.size e in
+        if !n > 0
+        then Format.fprintf out "[%d][@[<hv>%a@]]" len (DB_env.pp pp) e'
+        else if len>0  then Format.fprintf out "[%d]" len
       in
       pp out t
 
@@ -1200,18 +1253,20 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
   (* make a fresh constant, with a unique name *)
   let new_cst_ =
     let n = ref 0 in
-    fun ?can_use ?env ~parent name ty ->
+    fun ?depth_incr ?db_ctx ?can_use ~parent name ty ->
       let id = ID.makef "?%s_%d" name !n in
       incr n;
-      Typed_cst.make_undef ?can_use ?env ~parent id ty
+      Typed_cst.make_undef ?depth_incr ?can_use ?db_ctx ~parent id ty
+
+  (* TODO: max depth of arrow expansion, independently of cst_depth *)
 
   (* build the disjunction [l] of cases for [info]. No side effect. *)
   let expand_cases (cst:cst) (ty:Ty.t) (info:cst_info): term list =
     assert (info.cst_cases = None);
     (* make a sub-constant with given type *)
-    let mk_sub_cst ~can_use ~env ~parent ty_arg =
+    let mk_sub_cst ?depth_incr ~can_use ~db_ctx ~parent ty_arg =
       let basename = Ty.mangle ty_arg in
-      let c = new_cst_ basename ~can_use ~env ty_arg ~parent in
+      let c = new_cst_ ?depth_incr basename ~can_use ~db_ctx ty_arg ~parent in
       Term.const c
     in
     (* expand constant depending on its *)
@@ -1228,8 +1283,8 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
                  List.map
                    (fun ty_arg ->
                       mk_sub_cst ty_arg
+                        ~db_ctx:info.cst_db_ctx
                         ~can_use:info.cst_can_use
-                        ~env:info.cst_db_ctx
                         ~parent)
                    ty_args
                in
@@ -1243,14 +1298,21 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       | Arrow _ ->
         let ty_args, ty_ret = Ty.unfold ty in
         assert (ty_args<>[]);
+        let n_ty_args = List.length ty_args in
         (* just create one case, which is [fun x y z. ?body[x,y,z]] *)
-        let env = DB_env.push_l ty_args info.cst_db_ctx in
-        (* TODO: add recursion? *)
-        let can_use = info.cst_can_use in
+        let db_ctx = DB_env.push_l ty_args info.cst_db_ctx in
+        (* shift old [can_use]; push the function's parameter into [can_use] *)
+        let can_use =
+          List.mapi
+            (fun i ty_arg -> Term.db (DB.make (n_ty_args-i-1) ty_arg))
+            ty_args
+          @
+            List.map (Term.shift_db n_ty_args) info.cst_can_use
+        in
         let rec fun_ = lazy (
           let parent = lazy (cst, Lazy.force fun_) in
-          mk_sub_cst ty_ret ~can_use ~env ~parent
-          |> Term.fun_l ty_args
+          Term.fun_l ty_args
+            (mk_sub_cst ty_ret ~can_use ~parent ~db_ctx)
         ) in
         let fun_ = Lazy.force fun_ in
         [fun_]
@@ -1260,42 +1322,103 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
 
     (* terms built from variables available in the context *)
     and by_ctx =
-      let env = info.cst_db_ctx in
-      env
-      |> DB_env.to_list
-      |> List.mapi
-        (fun i o -> match o with
-           | None -> None
-           | Some ty_o ->
-             let ty_args, ty_ret = Ty.unfold ty_o in
+      info.cst_can_use
+      |> CCList.flat_map
+        (fun the_param ->
+           let ty_args, ty_ret = Ty.unfold the_param.term_ty in
+
+           (* just return the parameter, if it has the proper type *)
+           let by_return =
              if Ty.equal ty_ret ty
              then (
-               let hd = Term.db (DB.make i ty_o) in
                let rec case = lazy (
                  let parent = lazy (cst, Lazy.force case) in
                  let args =
                    List.map
                      (fun ty_arg ->
                         mk_sub_cst ty_arg
-                          ~env:info.cst_db_ctx
-                          ~can_use:info.cst_can_use ~parent)
+                          ~db_ctx:info.cst_db_ctx
+                          ~can_use:info.cst_can_use
+                          ~parent)
                      ty_args
                  in
-                 Term.app hd args
+                 Term.app the_param args
                ) in
-               Some (Lazy.force case)
+               [Lazy.force case]
              )
-             else None
-        )
-      |> CCList.filter_map (fun o->o)
+             else []
 
-    (* terms available for refinement, if they have the proper type *)
-    and by_usable_terms =
-      List.filter
-        (fun t -> Ty.equal t.term_ty ty)
-        info.cst_can_use
+           (* can we match/test on the parameter? *)
+           and by_destruct =
+             (* remove the destructed parameter, to avoid doing
+                this several times *)
+             let can_use =
+               info.cst_can_use
+               |> List.filter (fun sub -> not (Term.equal sub the_param))
+             in
+             match Ty.view ty_ret with
+               | Prop ->
+                 (* make a test *)
+                 let rec test = lazy (
+                   let parent = lazy (cst, Lazy.force test) in
+                   let then_ =
+                     mk_sub_cst ty
+                       ~db_ctx:info.cst_db_ctx ~can_use ~parent
+                   and else_ =
+                     mk_sub_cst ty
+                       ~db_ctx:info.cst_db_ctx ~can_use ~parent
+                   in
+                   Term.if_ the_param then_ else_
+                 ) in
+                 [Lazy.force test]
+               | Atomic (_, Data cstors) ->
+                 (* match without recursion on some parameter *)
+                 let rec test = lazy (
+                   let parent = lazy (cst, Lazy.force test) in
+                   let m =
+                     cstors
+                     |> List.map
+                       (fun (lazy cstor) ->
+                          let ty_args, _ =
+                            Typed_cst.ty cstor |> Ty.unfold
+                          in
+                          let n_ty_args = List.length ty_args in
+                          (* push the cstor arguments into the context *)
+                          let db_ctx = DB_env.push_l ty_args info.cst_db_ctx in
+                          let sub_params =
+                            List.mapi
+                              (fun i ty_arg ->
+                                 let db_arg = DB.make (n_ty_args-i-1) ty_arg in
+                                 Term.db db_arg)
+                              ty_args
+                          in
+                          let can_use =
+                            sub_params
+                            @
+                            List.map (Term.shift_db n_ty_args) can_use
+                            (* account for the additional binders in [can_use] *)
+                          in
+                          let rhs =
+                            mk_sub_cst ty
+                              (* FIXME ~depth_incr:5 (* fold=costly! *) *)
+                              ~can_use
+                              ~db_ctx
+                              ~parent
+                          in
+                          cstor.cst_id, (ty_args, rhs)
+                       )
+                     |> ID.Map.of_list
+                   in
+                   Term.match_ the_param m
+                 ) in
+                 [Lazy.force test]
+               | Atomic (_, Uninterpreted)
+               | Arrow _ -> []
+           in
+           by_destruct @ by_return
+        )
     in
-    by_usable_terms @ by_ctx @ by_ty
+    by_ctx @ by_ty
 
   (** {2 Reduction to Normal Form} *)
 
@@ -1305,8 +1428,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
 
     (* TODO: add a cache to {!eval_db}? *)
 
-    (* just evaluate the De Bruijn indices, and return
-       the explanations used to evaluate subterms *)
+    (* just evaluate the De Bruijn indices that occur in [env] *)
     let eval_db (env:eval_env) (t:term) : term =
       if DB_env.size env = 0
       then t (* trivial *)
@@ -1323,9 +1445,8 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
                 all variables in [c] *)
             assert (DB_env.size clos = Typed_cst.size_ctx c);
             (* evaluate [env'] in the current environment *)
-            let new_env =
-              DB_env.map (fun o -> CCOpt.map (aux env) o) clos
-            in
+            (* evaluate [env'] in the current environment *)
+            let new_env = DB_env.map_some (aux env) clos in
             Term.const_with_env new_env c
           | True
           | False -> t
@@ -1449,7 +1570,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
                   if List.length tys = List.length l
                   then (
                     (* evaluate arguments *)
-                    let env = DB_env.push_l l DB_env.empty in
+                    let env = DB_env.of_list l in
                     (* replace in [rhs] *)
                     let rhs = eval_db env rhs in
                     (* evaluate new [rhs] *)
@@ -1625,6 +1746,10 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
             Lit.pp l Lit.pp (snd (Reduce.compute_nf l)) Clause.pp c);
       Clause.push_new c;
       ()
+
+    (* FIXME: fix the constraint, if depth is not consecutive
+       (need to search biggest [d] where [c.depth <= d < c'.depth]
+        for sub-constants [c'] of [c] *)
 
     (* build clause(s) that explains that [c] must be one of its
        cases *)
