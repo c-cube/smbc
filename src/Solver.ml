@@ -1,8 +1,6 @@
 
 (* This file is free software. See file "license" for more details. *)
 
-let (<?>) = CCOrd.(<?>)
-
 let get_time : unit -> float =
   let start = Unix.gettimeofday() in
   fun () ->
@@ -262,15 +260,19 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       if n < env.db_size then List.nth env.db_st n else None
 
     let pp pp_x out e =
-      if e.db_size=0 then ()
-      else (
-        let pp_pair out (i,o) = match o with
-          | None -> ()
-          | Some x -> Format.fprintf out "@[%d: %a@]" i pp_x x
-        in
-        CCFormat.seq ~start:"" ~stop:"" ~sep:"," pp_pair out
-          (e.db_st |> Sequence.of_list |> Sequence.zip_i |> Sequence.zip)
-      )
+      let l =
+        e.db_st
+        |> List.mapi (fun i o -> i,o)
+        |> CCList.filter_map
+          (function (_,None) -> None | (i,Some x) -> Some (i,x))
+      in
+      match l with
+        | [] -> ()
+        | _ ->
+          let pp_pair out (i,x) =
+            Format.fprintf out "@[%d: %a@]" i pp_x x
+          in
+          CCFormat.list ~start:"" ~stop:"" ~sep:"," pp_pair out l
   end
 
   let term_equal_ a b = a==b
@@ -278,10 +280,6 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
 
   module Typed_cst = struct
     type t = cst
-    type _cst_kind = cst_kind
-    type _cst_info = cst_info
-    type cst_kind = _cst_kind
-    type cst_info = _cst_info
 
     let id t = t.cst_id
     let kind t = t.cst_kind
@@ -907,7 +905,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
 
   module Explanation = struct
     type t = explanation
-    let empty = E_empty
+    let empty : t = E_empty
     let return e = E_leaf e
     let append s1 s2 = match s1, s2 with
       | E_empty, _ -> s2
@@ -1406,7 +1404,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           Explanation.empty, t (* always trivial *)
         | Const (c,env) ->
           begin match c.cst_kind with
-            | Cst_defined (ty, rhs) when not (Ty.is_arrow ty) ->
+            | Cst_defined (_, rhs) ->
               (* expand defined constants *)
               compute_nf (Lazy.force rhs)
             | Cst_undef (_, {cst_cur_case=Some (e,new_t); _}) ->
@@ -1414,7 +1412,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
                  evaluate [new_t] using env *)
               let new_t = eval_db env new_t in
               compute_nf_add e new_t
-            | Cst_undef _ | Cst_defined _
+            | Cst_undef _
             | Cst_cstor _ | Cst_bool -> Explanation.empty, t
           end
         | Fun _ -> Explanation.empty, t (* no eval under lambda *)
@@ -1598,7 +1596,6 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
 
     val watch : t -> unit
     val update_watches_of : t -> unit
-    val update_all : unit -> unit
     val is_watched : t -> bool
     val size : unit -> int
     val to_seq : t Sequence.t
@@ -1726,10 +1723,11 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
              blocking constant *)
           Log.debugf 4
             (fun k->k
-                "(@[<1>update_watches@ %a@ :normal_form %a@ \
-                 :deps (@[%a@])@])"
+                "(@[<1>update_watches@ %a@ @[<1>:normal_form@ %a@]@ \
+                 :deps (@[%a@])@ :exp @[<hv>%a@]@])"
                 Term.pp t Term.pp new_t
-                (Utils.pp_list Typed_cst.pp) new_t.term_deps);
+                (Utils.pp_list Typed_cst.pp) new_t.term_deps
+                Explanation.pp e);
           List.iter (fun c -> watch_cst_ c t) new_t.term_deps;
       end;
       ()
@@ -1757,9 +1755,6 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     let to_seq = Lit.Tbl.keys watched_
 
     let size () = Lit.Tbl.length watched_
-
-    let update_all (): unit =
-      to_seq |> Sequence.iter update_watches_of
   end
 
   (** {2 Sat Solver} *)
@@ -1830,7 +1825,6 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           let c = Queue.pop Clause.lemma_queue in
           Log.debugf 5 (fun k->k "(@[<2>push_lemma@ %a@])" Clause.pp c);
           let lits = Clause.lits c in
-          List.iter Watched_lit.watch lits;
           slice.push lits ();
         done
       else (
@@ -1856,7 +1850,6 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     let assume_lit (lit:Lit.t) : unit =
       Log.debugf 2
         (fun k->k "(@[<1>@{<green>assume_lit@}@ @[%a@]@])" Lit.pp lit);
-      Watched_lit.watch lit;
       (* check consistency first *)
       let e, lit' = Reduce.compute_nf lit in
       begin match lit'.term_cell with
