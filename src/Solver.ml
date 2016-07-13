@@ -1229,7 +1229,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       let c = new_cst_ basename ~can_use ~env ty_arg ~parent in
       Term.const c
     in
-    (* expand the given type *)
+    (* expand constant depending on its *)
     let by_ty = match Ty.view ty with
       | Atomic (_, Data cstors) ->
         (* datatype: refine by picking the head constructor *)
@@ -1270,7 +1270,8 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         let fun_ = Lazy.force fun_ in
         [fun_]
       | Prop ->
-        assert false (* TODO: try true or false? *)
+        (* simple try true/false *)
+        [Term.true_; Term.false_]
 
     (* terms built from variables available in the context *)
     and by_ctx =
