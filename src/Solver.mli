@@ -80,8 +80,9 @@ module Make(C:CONFIG)(Dummy : sig end) : sig
     val make : ID.t -> cst_kind -> t
     val make_bool : ID.t -> t
     val make_undef :
+      ?depth_incr:int ->
+      ?db_ctx:ty_h db_env ->
       ?can_use:term list ->
-      ?env:Ty.t db_env ->
       ?parent:(t * term) lazy_t ->
       ID.t ->
       Ty.t -> t
