@@ -83,6 +83,7 @@ and term_cell =
   | If of term * term * term
   | Match of term * (var list * term) ID.Map.t
   | Fun of var * term
+  | Mu of var * term
   | Not of term
   | Binop of binop * term * term
   | True
@@ -111,6 +112,7 @@ val if_ : term -> term -> term -> term
 val match_ : term -> (var list * term) ID.Map.t -> term
 val fun_ : var -> term -> term
 val fun_l : var list -> term -> term
+val mu : var -> term -> term
 val eq : term -> term -> term
 val not_ : term -> term
 val binop : binop -> term -> term -> term

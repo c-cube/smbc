@@ -60,6 +60,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     | Const of cst * term db_env (* explicit closures *)
     | App of term * term list
     | Fun of ty_h * term
+    | Mu of term
     | If of term * term * term
     | Match of term * (ty_h list * term) ID.Map.t
     | Builtin of builtin
@@ -445,6 +446,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           | Builtin (B_or (t1,t2)) -> Hash.combine3 22 t1.term_id t2.term_id
           | Builtin (B_imply (t1,t2)) -> Hash.combine3 23 t1.term_id t2.term_id
           | Builtin (B_eq (t1,t2)) -> Hash.combine3 24 t1.term_id t2.term_id
+          | Mu sub -> Hash.combine sub_hash 30 sub
 
         (* equality that relies on physical equality of subterms *)
         let equal t1 t2 : bool = match t1.term_cell, t2.term_cell with
@@ -477,6 +479,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
               | B_not _, _ | B_and _, _ | B_eq _, _
               | B_or _, _ | B_imply _, _ -> false
             end
+          | Mu t1, Mu t2 -> t1==t2
           | True, _
           | False, _
           | DB _, _
@@ -485,7 +488,8 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           | Fun _, _
           | If _, _
           | Match _, _
-          | Builtin _, _ -> false
+          | Builtin _, _
+          | Mu _, _ -> false
       end)
 
     (* hashconsing function + iterating on all terms *)
@@ -618,6 +622,9 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
 
     let fun_l = List.fold_right fun_
 
+    let mu t =
+      mk_term_ ~deps:Dep_none (Mu t) ~ty:(DTy_direct t.term_ty)
+
     (* TODO: check types *)
 
     let match_ u m =
@@ -741,6 +748,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
             aux t;
             ID.Map.iter (fun _ (_,rhs) -> aux rhs) m
           | Builtin b -> builtin_to_seq b aux
+          | Mu body
           | Fun (_, body) -> aux body
       in
       aux t
@@ -788,7 +796,8 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         | App (f,l) ->
           fpf out "(@[<1>%a@ %a@])" pp f (Utils.pp_list pp) l
         | Fun (ty,f) ->
-          fpf out "(@[fun %a.@ %a@])" Ty.pp ty pp f
+          fpf out "(@[fun (%a)@ %a@])" Ty.pp ty pp f
+        | Mu sub -> fpf out "(@[mu@ %a@])" pp sub
         | If (a, b, c) ->
           fpf out "(@[if %a@ %a@ %a@])" pp a pp b pp c
         | Match (t,m) ->
@@ -827,6 +836,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
                | True | False | Const _ | DB _ -> Sequence.empty
                | App (f,l) when is_const f -> Sequence.of_list l
                | App (f,l) -> Sequence.cons f (Sequence.of_list l)
+               | Mu body
                | Fun (_, body) -> Sequence.return body
                | If (a,b,c) -> Sequence.of_list [a;b;c]
                | Builtin b -> builtin_to_seq b
@@ -863,6 +873,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         | If _ -> CCFormat.string out "if"
         | Match _ -> CCFormat.string out "match"
         | Fun (ty,_) -> Format.fprintf out "fun %a" Ty.pp ty
+        | Mu _ -> CCFormat.string out "mu"
         | Builtin b ->
           CCFormat.string out
             begin match b with
@@ -1306,6 +1317,8 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     (* environment for evaluation: not-yet-evaluated terms *)
     type eval_env = term DB_env.t
 
+    (* TODO: add a cache to {!eval_db}? *)
+
     (* just evaluate the De Bruijn indices, and return
        the explanations used to evaluate subterms *)
     let eval_db (env:eval_env) (t:term) : term =
@@ -1332,6 +1345,9 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           | Fun (ty, body) ->
             let body' = aux (DB_env.push_none env) body in
             Term.fun_ ty body'
+          | Mu body ->
+            let body' = aux (DB_env.push_none env) body in
+            Term.mu body'
           | Match (u, m) ->
             let u = aux env u in
             let m =
@@ -1401,6 +1417,10 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
             | Cst_cstor _ | Cst_bool -> Explanation.empty, t
           end
         | Fun _ -> Explanation.empty, t (* no eval under lambda *)
+        | Mu body ->
+          (* [mu x. body] becomes [body[x := mu x. body]] *)
+          let env = DB_env.singleton t in
+          Explanation.empty, eval_db env body
         | Builtin b ->
           let e, b' =
             Term.fold_map_builtin compute_nf_add Explanation.empty b
@@ -2008,6 +2028,9 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         let body = conv_term ((v,None)::env) body in
         let ty = Ast.Var.ty v |> conv_ty in
         Term.fun_ ty body
+      | Ast.Mu (v,body) ->
+        let body = conv_term ((v,None)::env) body in
+        Term.mu body
       | Ast.Match (u,m) ->
         let u = conv_term env u in
         let m =
@@ -2162,6 +2185,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           let m = ID.Map.map (fun (tys,rhs) -> tys, aux rhs) m in
           Term.match_ (aux u) m
         | Fun (ty,body) -> Term.fun_ ty (aux body)
+        | Mu body -> Term.mu (aux body)
         | Builtin b -> Term.builtin (Term.map_builtin aux b)
     in
     aux t

@@ -135,6 +135,7 @@ and term_cell =
   | If of term * term * term
   | Match of term * (var list * term) ID.Map.t
   | Fun of var * term
+  | Mu of var * term
   | Not of term
   | Binop of binop * term * term
   | True
@@ -175,6 +176,8 @@ let rec term_to_sexp t = match t.term with
     |> S.of_list
   | Fun (v,t) ->
     S.of_list [S.atom "fun"; typed_var_to_sexp v; term_to_sexp t]
+  | Mu (v,t) ->
+    S.of_list [S.atom "mu"; typed_var_to_sexp v; term_to_sexp t]
   | Not t -> S.of_list [S.atom "not"; term_to_sexp t]
   | Binop (Eq, a, b) ->
     S.of_list [S.atom "="; term_to_sexp a; term_to_sexp b]
@@ -258,6 +261,13 @@ let match_ t m =
   mk_ (Match (t,m)) rhs.ty
 
 let fun_ v t =
+  let ty = Ty.arrow (Var.ty v) t.ty in
+  mk_ (Fun (v,t)) ty
+
+let mu v t =
+  if not (Ty.equal (Var.ty v) t.ty)
+  then Ty.ill_typed "mu-term: var has type %a,@ body %a"
+      Ty.pp (Var.ty v) Ty.pp t.ty;
   let ty = Ty.arrow (Var.ty v) t.ty in
   mk_ (Fun (v,t)) ty
 
@@ -407,6 +417,14 @@ let rec conv_term ctx s = match s with
          fun_ var body)
   | `List (`Atom "fun" :: _) ->
     errorf "invalid syntax for fun@ in `%a`" CCSexpM.print s
+  | `List [`Atom "mu"; `List [`Atom x; ty]; body] ->
+    let ty = conv_ty ctx ty in
+    Ctx.with_var ctx x ty
+      (fun var ->
+         let body = conv_term ctx body in
+         mu var body)
+  | `List (`Atom "mu" :: _) ->
+    errorf "invalid syntax for mu@ in `%a`" CCSexpM.print s
   | `List (`Atom "and" :: l) ->
     let l = List.map (conv_term ctx) l in
     and_l l
