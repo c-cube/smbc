@@ -1071,9 +1071,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     let push_new (c:t): unit =
       begin match c.lits with
         | [a;b] when Lit.equal (Lit.neg a) b -> () (* trivial *)
-          (*
         | _ when Tbl.mem all_lemmas_ c -> () (* already asserted *)
-             *)
         | _ ->
           Log.debugf 3
             (fun k->k "(@[<1>@{<green>new_tautology@}@ @[%a@]@])" pp c);
