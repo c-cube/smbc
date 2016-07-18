@@ -1387,8 +1387,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       (* follow the "normal form" pointer *)
       match t.term_nf with
         | Some (t', e) ->
-          let e', nf = compute_nf t' in
-          let exp = Explanation.append e e' in
+          let exp, nf = compute_nf_add e t' in
           (* path compression here *)
           set_nf_ t nf exp;
           exp, nf
