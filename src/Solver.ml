@@ -44,7 +44,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     mutable term_ty: ty_h;
     term_cell: term_cell;
     mutable term_nf: (term * explanation) option;
-      (* normal form + explanation of why *)
+    (* normal form + explanation of why *)
     mutable term_deps: cst list;
     (* set of undefined constants
        that can make evaluation go further *)
@@ -73,11 +73,20 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     | B_imply of term * term
 
   (* bag of atomic explanations. It is optimized for traversal
-     and fast cons/snoc/append *)
+     and fast cons/snoc/append.
+     It is a monoid for `empty, append` *)
   and explanation=
     | E_empty
-    | E_leaf of term
+    | E_atom of explanation_atom
     | E_append of explanation * explanation
+
+  and explanation_atom =
+    | E_left (* left side of parallel *)
+    | E_right (* right side of parallel *)
+    | E_both (* both sides of a parallel *)
+    | E_stop (* separator *)
+    | E_choice of term
+    | E_parallel of explanation * explanation (* parallel sub-explanations *)
 
   and cst = {
     cst_id: ID.t;
@@ -906,26 +915,95 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
   module Explanation = struct
     type t = explanation
     let empty : t = E_empty
-    let return e = E_leaf e
+
+    let return t = E_atom (E_choice t)
+
+    let parallel a b = match a, b with
+      | E_empty, E_empty -> empty
+      | _ -> E_atom (E_parallel (a,b))
+
+    (* fast append.
+       NOTE: not commutative!! *)
     let append s1 s2 = match s1, s2 with
       | E_empty, _ -> s2
       | _, E_empty -> s1
       | _ -> E_append (s1, s2)
 
-    let is_empty = function
-      | E_empty -> true
-      | E_leaf _
-      | E_append _ -> false (* by smart cstor *)
+    let left_ = E_atom E_left
+    let right_ = E_atom E_right
+    let both_ = E_atom E_both
+    let stop_ = E_atom E_stop
 
-    let rec to_seq e yield = match e with
-      | E_empty -> ()
-      | E_leaf x -> yield x
-      | E_append (a,b) -> to_seq a yield; to_seq b yield
+    let append_if_non_empty_ a e = match e with
+      | E_empty -> empty
+      | _ -> append a e
+
+    let left e = append_if_non_empty_ left_ (parallel e empty)
+    let right e = append_if_non_empty_ right_ (parallel empty e)
+    let both e1 e2 = append_if_non_empty_ both_ (parallel e1 e2)
+    let stop e = append_if_non_empty_ stop_ e
+
+    type path =
+      | P_left
+      | P_right
+      | P_both
+
+    (* sequence of choices for this explanation *)
+    let to_seq (e:t) : term Sequence.t =
+      let rec aux (st:t list) yield = match st with
+        | [] -> ()
+        | E_empty :: st' -> aux st' yield
+        | E_append (a, b) :: st' -> aux (a :: b :: st') yield
+        | E_atom (E_choice c) :: st' ->
+          yield c;
+          aux st' yield
+        | E_atom E_stop :: st' -> aux st' yield
+        | E_atom E_left :: st' -> aux (aux_path P_left st') yield
+        | E_atom E_right :: st' -> aux (aux_path P_right st') yield
+        | E_atom E_both :: st' -> aux (aux_path P_both st') yield
+        | E_atom (E_parallel (a,b)) :: st' -> assert false (* FIXME *)
+      and aux_path (p:path) (st:t list): t list = match st with
+        | E_atom (E_parallel (a,b)) :: st' ->
+          begin match p with
+            | P_left -> a :: aux_path p st'
+            | P_right -> b :: aux_path p st'
+            | P_both -> a :: E_atom E_stop :: b :: aux_path p st'
+          end
+        | E_atom E_stop :: st' -> st'
+        | E_empty :: st' -> aux_path p st'
+        | E_append (a,b) :: st' -> aux_path p (a :: b :: st')
+        | E_atom _ :: _ -> st
+        | [] -> []
+      in
+      aux [e]
 
     let to_list_uniq e =
       to_seq e
       |> Sequence.to_rev_list
       |> CCList.sort_uniq ~cmp:Term.compare
+
+    let rec unroll_ e acc = match e with
+      | E_empty -> acc
+      | E_atom c -> c :: acc
+      | E_append (a,b) -> unroll_ a (unroll_ b acc)
+
+    let pp_debug out e =
+      let rec pp_step out = function
+        | E_choice c -> Term.pp out c
+        | E_left -> CCFormat.string out "left"
+        | E_right -> CCFormat.string out "right"
+        | E_both -> CCFormat.string out "both"
+        | E_stop -> CCFormat.string out "stop"
+        | E_parallel (a,b) ->
+          Format.fprintf out "(@[<hv1>par@ (@[%a@])@ (@[%a@])@])" pp a pp b
+      and pp out = function
+        | E_empty -> ()
+        | E_append _ as e ->
+          let l = unroll_ e [] in
+          Format.fprintf out "(@[<hv1>app@ %a@])" (Utils.pp_list pp_step) l
+        | E_atom a -> pp_step out a
+      in
+      pp out e
 
     let pp out e =
       Format.fprintf out "(@[%a@])"
@@ -1373,7 +1451,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         Log.debugf 5
           (fun k->k
               "(@[<hv1>set_nf@ @[%a@]@ @[%a@]@ :explanation @[<hv>%a@]@])"
-              Term.pp t Term.pp new_t Explanation.pp e);
+              Term.pp t Term.pp new_t Explanation.pp_debug e);
       )
 
     let get_nf t : explanation * term =
@@ -1418,12 +1496,8 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           let env = DB_env.singleton t in
           Explanation.empty, eval_db env body
         | Builtin b ->
-          let e, b' =
-            Term.fold_map_builtin compute_nf_add Explanation.empty b
-          in
           (* try boolean reductions *)
-          let e', t' = compute_builtin b' in
-          let e = Explanation.append e' e in
+          let e, t' = compute_builtin b in
           set_nf_ t t' e;
           e, t'
         | If (a,b,c) ->
@@ -1437,7 +1511,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           in
           (* merge evidence from [a]'s normal form and [b/c]'s
              normal form *)
-          let e = Explanation.append e_a e_branch in
+          let e = Explanation.append e_branch e_a in
           set_nf_ t t' e;
           e, t'
         | Match (u, m) ->
@@ -1462,7 +1536,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
               end
             | None -> Explanation.empty, default()
           in
-          let e = Explanation.append e_u e_branch in
+          let e = Explanation.append e_branch e_u in
           set_nf_ t t' e;
           e, t'
         | App (f, l) ->
@@ -1492,7 +1566,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       | _ ->
         (* cannot reduce, unless [f] reduces to something else. *)
         let e_f, f' = eval_db env f |> compute_nf in
-        let exp = Explanation.append e e_f in
+        let exp = Explanation.append e_f e in
         if Term.equal f f'
         then (
           (* no more reduction *)
@@ -1506,56 +1580,67 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     (* compute nf of [t], append [e] to the explanation *)
     and compute_nf_add (e : explanation) (t:term) : explanation * term =
       let e', t' = compute_nf t in
-      Explanation.append e e', t'
+      (* careful, with the order: [e' · e], not the opposite *)
+      Explanation.append e' e, t'
 
-    (* compute the builtin, assuming its components are
-       already reduced *)
+    (* compute the builtin. In some cases (short-circuiting operators)
+       we have to use left/right/both to only retain part of the explanations *)
     and compute_builtin bu: explanation * term = match bu with
       | B_not a ->
-        begin match a.term_cell with
-          | True -> Explanation.empty, Term.false_
-          | False -> Explanation.empty, Term.true_
-          | _ -> Explanation.empty, Term.not_ a
+        let e_a, a' = compute_nf a in
+        begin match a'.term_cell with
+          | True -> e_a, Term.false_
+          | False -> e_a, Term.true_
+          | _ -> e_a, Term.not_ a'
         end
       | B_and (a,b) ->
-        begin match a.term_cell, b.term_cell with
-          | True, _ -> Explanation.empty, b
-          | _, True -> Explanation.empty, a
-          | False, _
-          | _, False -> Explanation.empty, Term.false_
-          | _ -> Explanation.empty, Term.and_ a b
+        let e_a, a' = compute_nf a in
+        let e_b, b' = compute_nf b in
+        (* shortcut: if [false], only use the false sub-term's explanations *)
+        begin match a'.term_cell, b'.term_cell with
+          | True, True -> Explanation.both e_a e_b, Term.true_
+          | False, _ -> Explanation.left e_a, Term.false_
+          | _, False -> Explanation.right e_b, Term.false_
+          | _ -> Explanation.parallel e_a e_b, Term.and_ a' b'
         end
       | B_or (a,b) ->
-        begin match a.term_cell, b.term_cell with
-          | True, _
-          | _, True -> Explanation.empty, Term.true_
-          | False, _ -> Explanation.empty, b
-          | _, False -> Explanation.empty, a
-          | _ -> Explanation.empty, Term.or_ a b
+        let e_a, a' = compute_nf a in
+        let e_b, b' = compute_nf b in
+        (* shortcut: if [true], only use the true sub-term's explanations *)
+        begin match a'.term_cell, b'.term_cell with
+          | True, _ -> Explanation.left e_a, Term.true_
+          | _, True -> Explanation.right e_b, Term.true_
+          | False, False -> Explanation.both e_a e_b, Term.false_
+          | _ -> Explanation.parallel e_a e_b, Term.or_ a' b'
         end
       | B_imply (a,b) ->
-        begin match a.term_cell, b.term_cell with
-          | _, True
-          | False, _ -> Explanation.empty, Term.true_
-          | True, _ -> Explanation.empty, b
-          | _, False -> Explanation.empty, Term.not_ a
-          | _ -> Explanation.empty, Term.imply a b
+        let e_a, a' = compute_nf a in
+        let e_b, b' = compute_nf b in
+        (* shortcut *)
+        begin match a'.term_cell, b'.term_cell with
+          | _, True -> Explanation.right e_b, Term.true_
+          | False, _ -> Explanation.left e_a, Term.true_
+          | True, False -> Explanation.both e_a e_b, Term.false_
+          | _ -> Explanation.parallel e_a e_b, Term.imply a' b'
         end
       | B_eq (a,b) ->
-        begin match a.term_cell, b.term_cell with
+        let e_a, a' = compute_nf a in
+        let e_b, b' = compute_nf b in
+        let e_ab = Explanation.append e_a e_b in
+        begin match a'.term_cell, b'.term_cell with
           | False, False
-          | True, True -> Explanation.empty, Term.true_
+          | True, True -> e_ab, Term.true_
           | True, False
-          | False, True -> Explanation.empty, Term.false_
-          | _ when Term.equal a b -> Explanation.empty, Term.true_ (* syntactic *)
+          | False, True -> e_ab, Term.false_
+          | _ when Term.equal a' b' -> e_ab, Term.true_ (* syntactic *)
           | _ ->
-            begin match Term.as_cstor_app a, Term.as_cstor_app b with
+            begin match Term.as_cstor_app a', Term.as_cstor_app b' with
               | Some (c1,ty1,l1), Some (c2,_,l2) ->
                 if not (Typed_cst.equal c1 c2)
                 then
                   (* [c1 ... = c2 ...] --> false, as distinct constructors
                      can never be equal *)
-                  Explanation.empty, Term.false_
+                  e_ab, Term.false_
                 else if Typed_cst.equal c1 c2
                      && List.length l1 = List.length l2
                      && List.length l1 = List.length (fst (Ty.unfold ty1))
@@ -1566,10 +1651,10 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
                      if they start with constructors) *)
                   List.map2 Term.eq l1 l2
                   |> Term.and_l
-                  |> compute_nf
+                  |> compute_nf_add (Explanation.stop e_ab)
                 )
-                else Explanation.empty, Term.eq a b
-              | _ -> Explanation.empty, Term.eq a b
+                else e_ab, Term.eq a' b'
+              | _ -> e_ab, Term.eq a' b'
             end
         end
   end
@@ -1724,7 +1809,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
                  :deps (@[%a@])@ :exp @[<hv>%a@]@])"
                 Term.pp t Term.pp new_t
                 (Utils.pp_list Typed_cst.pp) new_t.term_deps
-                Explanation.pp e);
+                Explanation.pp_debug e);
           List.iter (fun c -> watch_cst_ c t) new_t.term_deps;
       end;
       ()
