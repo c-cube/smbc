@@ -15,10 +15,11 @@ let debug_fmt_ = ref Format.std_formatter
 let set_debug_out f = debug_fmt_ := f
 
 let debug_real_ l k =
-  CCFormat.fprintf !debug_fmt_ "@[<2>@{<Blue>[debug %d]@}@ " l;
-  k (Format.kfprintf
+  k (fun fmt ->
+    CCFormat.fprintf !debug_fmt_ "@[<2>@{<Blue>[debug %d]@}@ " l;
+    Format.kfprintf
       (fun fmt -> Format.fprintf fmt "@]@.")
-      !debug_fmt_)
+      !debug_fmt_ fmt)
 
 let debugf l k =
   if l <= !debug_level_
