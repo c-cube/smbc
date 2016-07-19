@@ -1389,7 +1389,8 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         | Some (t', e) ->
           let exp, nf = compute_nf_add e t' in
           (* path compression here *)
-          set_nf_ t nf exp;
+          if not (Term.equal t' nf)
+          then set_nf_ t nf exp;
           exp, nf
         | None -> compute_nf_noncached t
 
