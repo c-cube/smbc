@@ -1840,6 +1840,9 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           info.cst_cur_case <- Some (e, new_t);
           Hash_set.iter Watched_lit.update_watches_of info.cst_watched
         | Some (_,new_t') ->
+          Log.debugf 1
+            (fun k->k "(@[<hv1>assert_choice %a@ :to %a@ :cur %a@])"
+                Typed_cst.pp c Term.pp new_t Term.pp new_t');
           assert (Term.equal new_t new_t');
       end
 
