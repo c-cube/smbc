@@ -676,7 +676,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     let neq a b = not_ (eq a b)
 
     let and_l = function
-      | [] -> false_
+      | [] -> true_
       | [t] -> t
       | a :: l -> List.fold_left and_ a l
 
@@ -1913,6 +1913,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
 
   module Main_loop : sig
     val push_toplevel_goal : Lit.t -> unit
+    val toplevel_goal_seq : Lit.t Sequence.t
     val solve : unit -> M.res
   end = struct
     (* list of terms to fully evaluate *)
@@ -1922,6 +1923,8 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     let push_toplevel_goal (t:term): unit =
       toplevel_goals_ := t :: !toplevel_goals_;
       ()
+
+    let toplevel_goal_seq k = List.iter k !toplevel_goals_
 
     (* check that this term fully evaluates to [true] *)
     let is_true_ (t:term): bool =
@@ -2148,23 +2151,175 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     | U_max_depth
     | U_incomplete
 
-  type model = term Typed_cst.Map.t
-  (** Map from constants to their value *)
+  module Model = struct
+    type t = term Typed_cst.Map.t
+
+    let pp out m =
+      let pp_pair out (c,t) =
+        Format.fprintf out "(@[%a %a@])"
+          ID.pp_name (Typed_cst.id c)
+          (Term.pp_top ~ids:false) t
+      in
+      Format.fprintf out "(@[<v>%a@])"
+        (Utils.pp_list pp_pair)
+        (Typed_cst.Map.to_list m)
+
+    exception Bad_model of t * term * term
+
+    let () = Printexc.register_printer
+        (function
+          | Bad_model (m,t,t') ->
+            let msg = CCFormat.sprintf
+                "@[<hv2>Bad model:@ goal `@[%a@]`@ evaluates to `@[%a@]`,@ \
+                 not true,@ in model @[%a@]@."
+                Term.pp t Term.pp t' pp m
+            in
+            Some msg
+          | _ -> None)
+
+    (* eval term [t] under model [m] *)
+    let eval_ m t =
+      let rec aux env t =
+        (*
+        Format.printf "@[<2>eval %a@ in [@[<hv>%a@]]@]@."
+          Term.pp t (DB_env.pp Term.pp) env;
+           *)
+        match t.term_cell with
+        | True
+        | False -> t
+        | DB n ->
+          begin match DB_env.get n env with
+            | None -> t
+            | Some t' -> aux env t'
+          end
+        | Const ({cst_kind=Cst_defined(_,lazy t'); _},_) -> aux env t'
+        | Const ({cst_kind=Cst_undef(_,_); _} as c, clos) ->
+          assert (DB_env.is_empty clos);
+          begin match Typed_cst.Map.get c m with
+            | None -> t
+            | Some t' -> aux env t'
+          end
+        | Const _ -> t
+        | App (f,l) ->
+          (* here, call by value *)
+          let l = List.map (aux env) l in
+          aux_app env f l
+        | If (a,b,c) ->
+          let a = aux env a in
+          begin match a.term_cell with
+            | True -> aux env b
+            | False -> aux env c
+            | _ -> Term.if_ a b c
+          end
+        | Fun _ -> t
+        | Match (u, m) ->
+          let u = aux env u in
+          begin match Term.as_cstor_app u with
+            | None -> Term.match_ u m
+            | Some (c, _, args) ->
+              match ID.Map.get c.cst_id m with
+                | None -> Term.match_ u m
+                | Some (tys, rhs) ->
+                  assert (List.length tys = List.length args);
+                  let args = List.map (aux env) args in
+                  let env = DB_env.push_l args env in
+                  aux env rhs
+          end
+        | Mu f ->
+          let env = DB_env.push f env in
+          aux env f
+        | Builtin (B_not f) ->
+          let f = aux env f in
+          begin match f.term_cell with
+            | True -> Term.false_
+            | False -> Term.true_
+            | _ -> Term.not_ f
+          end
+        | Builtin (B_and (a,b,_)) ->
+          let a = aux env a in
+          let b = aux env b in
+          begin match a.term_cell, b.term_cell with
+            | True, True -> Term.true_
+            | False, _
+            | _, False -> Term.false_
+            | _ -> Term.and_ a b
+          end
+        | Builtin (B_or (a,b,_)) ->
+          let a = aux env a in
+          let b = aux env b in
+          begin match a.term_cell, b.term_cell with
+            | True, _
+            | _, True -> Term.true_
+            | False, False -> Term.false_
+            | _ -> Term.or_ a b
+          end
+        | Builtin (B_imply (a,b,_)) ->
+          let a = aux env a in
+          let b = aux env b in
+          begin match a.term_cell, b.term_cell with
+            | _, True
+            | False, _  -> Term.true_
+            | True, False -> Term.false_
+            | _ -> Term.imply a b
+          end
+        | Builtin (B_equiv (a,b,_)) ->
+          let a = aux env a in
+          let b = aux env b in
+          begin match a.term_cell, b.term_cell with
+            | True, True
+            | False, False -> Term.true_
+            | False, True
+            | True, False -> Term.false_
+            | _ -> Term.equiv a b
+          end
+        | Builtin (B_eq (a,b)) ->
+          let a = aux env a in
+          let b = aux env b in
+          begin match Term.as_cstor_app a, Term.as_cstor_app b with
+            | Some (c1,_,l1), Some (c2,_,l2) ->
+              if Typed_cst.equal c1 c2 then (
+                assert (List.length l1 = List.length l2);
+                aux env (Term.and_l (List.map2 Term.eq l1 l2))
+              ) else Term.false_
+            | _ -> Term.eq a b
+          end
+      and aux_app env f l = match l with
+        | [] -> aux env f
+        | arg :: tail ->
+          let f = aux env f in
+          begin match f.term_cell with
+            | Fun (_, body) ->
+              let env = DB_env.push arg env in
+              aux_app env body tail
+            | _ ->
+              Term.app (Reduce.eval_db env f) l
+          end
+      in
+      aux DB_env.empty t
+
+    (* check model *)
+    let check m =
+      let bad =
+        Main_loop.toplevel_goal_seq
+        |> Sequence.find
+          (fun t ->
+             let t' = eval_ m t in
+             match t'.term_cell with
+               | True -> None
+               | _ -> Some (t, t'))
+      in
+      match bad with
+        | None -> ()
+        | Some (t,t') -> raise (Bad_model (m, t, t'))
+  end
+
+  type model = Model.t
+  let pp_model = Model.pp
 
   type res =
     | Sat of model
     | Unsat (* TODO: proof *)
     | Unknown of unknown
-
-  let pp_model out m =
-    let pp_pair out (c,t) =
-      Format.fprintf out "(@[%a %a@])"
-        ID.pp_name (Typed_cst.id c)
-        (Term.pp_top ~ids:false) t
-    in
-    Format.fprintf out "(@[<v>%a@])"
-      (Utils.pp_list pp_pair)
-      (Typed_cst.Map.to_list m)
 
   (* follow "normal form" pointers deeply in the term *)
   let deref_deep (t:term) : term =
@@ -2279,7 +2434,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     with Exit ->
       !s
 
-  let check ?(on_exit=[]) () =
+  let solve ?(on_exit=[]) ?(check=true) () =
     let module ID = Iterative_deepening in
     (* create a base level, just to be sure *)
     let base_level =
@@ -2302,6 +2457,10 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
               (fun k->k "@{<Yellow>** found SAT@} at depth %a"
                   ID.pp cur_depth);
             do_on_exit ~on_exit;
+            if check then (
+              Log.debugf 1 (fun k->k "checking model…");
+              Model.check m
+            );
             Sat m
           | M.Unsat ->
             (* check if [max depth] literal involved in proof;

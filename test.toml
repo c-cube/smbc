@@ -1,7 +1,7 @@
 
 [smbc-5]
 
-cmd = "./smbc.native --depth-step 5 -nc $file"
+cmd = "./smbc.native --check --depth-step 5 -nc $file"
 unsat = "result UNSAT"
 sat = "result SAT"
 unknown = "TIMEOUT|UNKNOWN"
@@ -9,7 +9,7 @@ timeout = "TIMEOUT"
 
 [smbc-30]
 
-cmd = "./smbc.native --depth-step 30 -nc $file"
+cmd = "./smbc.native --check --depth-step 30 -nc $file"
 unsat = "result UNSAT"
 sat = "result SAT"
 unknown = "TIMEOUT|UNKNOWN"

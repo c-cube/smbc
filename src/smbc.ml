@@ -8,6 +8,7 @@ type config = {
   pp_hashcons: bool;
   progress : bool;
   deepening_step: int option;
+  check: bool;
 }
 
 let parse_file file =
@@ -48,7 +49,7 @@ let solve ~config (ast:Ast.statement list) : unit =
   in
   (* solve *)
   S.add_statement_l ast;
-  let res = S.check ~on_exit () in
+  let res = S.solve ~on_exit ~check:config.check () in
   if config.print_stat then Format.printf "%a@." S.pp_stats ();
   match res with
     | S.Sat m ->
@@ -68,6 +69,7 @@ let progress_  = ref false
 let pp_hashcons_ = ref false
 let max_depth_ = ref 60
 let depth_step_ = ref 0
+let check_ = ref false
 
 let file = ref ""
 let set_file s =
@@ -84,6 +86,8 @@ let options =
     "--print-input", Arg.Set print_input_, " print input";
     "--max-depth", Arg.Set_int max_depth_, " set max depth";
     "--dot-term-graph", Arg.Set_string dot_term_graph_, " print term graph in file";
+    "--check", Arg.Set check_, " check model";
+    "--no-check", Arg.Clear check_, " do not check model";
     "-nc", Arg.Clear color_, " do not use colors";
     "-p", Arg.Set progress_, " progress bar";
     "--pp-hashcons", Arg.Set pp_hashcons_, " print hashconsing IDs";
@@ -113,5 +117,6 @@ let () =
       (if !depth_step_ = 0 then None else Some !depth_step_);
     dot_term_graph =
       (if !dot_term_graph_ = "" then None else Some !dot_term_graph_);
+    check= !check_;
   } in
   solve ~config ast

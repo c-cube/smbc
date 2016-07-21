@@ -170,10 +170,12 @@ module Make(C:CONFIG)(Dummy : sig end) : sig
 
   val add_statement_l : Ast.statement list -> unit
 
-  val check :
+  val solve :
     ?on_exit:(unit -> unit) list ->
+    ?check:bool ->
     unit ->
     res
-  (** [check ()] checks the satisfiability of the statement added so far
+  (** [solve ()] checks the satisfiability of the statement added so far
+      @param check if true, the model is checked before returning
       @param on_exit functions to be run before this returns *)
 end
