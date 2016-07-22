@@ -357,61 +357,40 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     let dummy_level = -1
 
     type stack_cell =
-      | S_nil
-      | S_level of level * stack_cell
       | S_set_nf of
-          term * (term * explanation) option * stack_cell
+          term * (term * explanation) option
           (* t1.nf <- t2 *)
       | S_set_cst_case of
-          cst_info * (explanation * term) option * stack_cell
+          cst_info * (explanation * term) option
           (* c1.cst_case <- t2 *)
 
-    type stack = {
-      mutable stack_level: int;
-      mutable stack: stack_cell;
-    }
+    type stack = stack_cell CCVector.vector
 
     (* the global stack *)
-    let st_ : stack = {
-      stack_level = 0;
-      stack = S_nil;
-    }
+    let st_ : stack = CCVector.create()
 
     let backtrack (l:level): unit =
-      let rec aux l st = match st with
-        | S_nil -> st
-        | S_level (l', st') ->
-          if l=l'
-          then st (* stop *)
-          else aux l st' (* continue *)
-        | S_set_nf (t, nf, st') ->
-          t.term_nf <- nf;
-          aux l st'
-        | S_set_cst_case (info, c, st') ->
-          info.cst_cur_case <- c;
-          aux l st'
-      in
       Log.debugf 2
         (fun k->k "@{<Yellow>** now at level %d (backtrack)@}" l);
-      let st' = aux l st_.stack in
-      st_.stack <- st';
-      st_.stack_level <- l;
+      while CCVector.length st_ > l do
+        match CCVector.pop_exn st_ with
+          | S_set_nf (t, nf) -> t.term_nf <- nf;
+          | S_set_cst_case (info, c) -> info.cst_cur_case <- c;
+      done;
       ()
 
-    let cur_level () = st_.stack_level
+    let cur_level () = CCVector.length st_
 
     let push_level () : unit =
-      let l = st_.stack_level + 1 in
-      st_.stack_level <- l;
-      st_.stack <- S_level (l, st_.stack);
+      let l = cur_level() in
       Log.debugf 2 (fun k->k "@{<Yellow>** now at level %d (push)@}" l);
       ()
 
     let push_set_nf_ (t:term) =
-      st_.stack <- S_set_nf (t, t.term_nf, st_.stack)
+      CCVector.push st_ (S_set_nf (t, t.term_nf))
 
     let push_set_cst_case_ (i:cst_info) =
-      st_.stack <- S_set_cst_case (i, i.cst_cur_case, st_.stack)
+      CCVector.push st_ (S_set_cst_case (i, i.cst_cur_case))
   end
 
   module Term = struct
@@ -1682,28 +1661,20 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         | Cst_bool | Cst_defined _ | Cst_cstor _ -> assert false
       in
       Hash_set.add info.cst_watched t;
-      (* ensure [c] is expanded, unless it is currently too deep *)
-      let not_too_deep l : bool =
-        l <= (Iterative_deepening.current_depth() :> int)
-      in
+      (* we should never have to expand a meta that is too deep *)
+      let depth = Lazy.force info.cst_depth in
+      assert (depth <= (Iterative_deepening.current_depth() :> int));
       (* check whether [c] is expanded *)
       begin match info.cst_cases with
         | None ->
-          let depth = Lazy.force info.cst_depth in
-          if not_too_deep depth
-          then (
-            (* [c] is blocking, not too deep, but not expanded *)
-            let l = expand_cases c ty info in
-            Log.debugf 4
-              (fun k->k "(@[<1>expand_cases@ @[%a@]@ :into (@[%a@])@])"
-                  Typed_cst.pp c (Utils.pp_list Term.pp) l);
-            info.cst_cases <- Some l;
-            incr stat_num_cst_expanded;
-            Clause.push_new_l (clauses_of_cases c l depth)
-          ) else (
-            Log.debugf 3
-              (fun k->k "cannot expand %a: too deep" Typed_cst.pp c);
-          );
+          (* [c] is blocking, not too deep, but not expanded *)
+          let l = expand_cases c ty info in
+          Log.debugf 2
+            (fun k->k "(@[<1>expand_cases@ @[%a@]@ :into (@[%a@])@])"
+                Typed_cst.pp c (Utils.pp_list Term.pp) l);
+          info.cst_cases <- Some l;
+          incr stat_num_cst_expanded;
+          Clause.push_new_l (clauses_of_cases c l depth)
         | Some _ -> ()
       end;
       ()
