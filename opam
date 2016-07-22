@@ -14,7 +14,7 @@ depends: [
   "base-bytes"
   "containers" { > "0.16" }
   "sequence" { >= "0.4" }
-  "msat" { = "0.3" }
+  "msat" { >= "0.4" & <= "0.5" }
 ]
 available: [
     ocaml-version >= "4.00.1"

@@ -6,6 +6,9 @@ let get_time : unit -> float =
   fun () ->
     Unix.gettimeofday() -. start
 
+module FI = Msat.Formula_intf
+module TI = Msat.Theory_intf
+
 (** {1 Solver} *)
 
 module type CONFIG = sig
@@ -998,9 +1001,9 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     (** {6 Normalization} *)
 
     let norm l = match l.term_cell with
-      | False -> Term.true_, true
-      | Builtin (B_not t') -> t', true
-      | _ -> l, false
+      | False -> Term.true_, FI.Negated
+      | Builtin (B_not t') -> t', FI.Negated
+      | _ -> l, FI.Same_sign
   end
 
   (** {2 Clauses} *)
@@ -1765,8 +1768,6 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
   = struct
     include Lit
     type proof = unit (* TODO later *)
-    let label _ = assert false
-    let add_label _ _ = assert false
     let print = Lit.pp
   end
 
@@ -1792,18 +1793,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     type formula = M_expr.t
     type proof = M_expr.proof
 
-    type slice = {
-      start : int;
-      length : int;
-      get : int -> formula;
-      push : formula list -> proof -> unit;
-    }
-
     type level = Backtrack.level
-
-    type res =
-      | Sat of level
-      | Unsat of formula list * proof
 
     let dummy = Backtrack.dummy_level
 
@@ -1823,7 +1813,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           let c = Queue.pop Clause.lemma_queue in
           Log.debugf 5 (fun k->k "(@[<2>push_lemma@ %a@])" Clause.pp c);
           let lits = Clause.lits c in
-          slice.push lits ();
+          slice.TI.push lits ();
         done
       else (
         let c = Queue.pop Clause.conflicts in
@@ -1871,25 +1861,27 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
 
     (* propagation from the bool solver *)
     let assume slice =
-      let start = slice.start in
-      assert (slice.length > 0);
+      let start = slice.TI.start in
+      assert (slice.TI.length > 0);
       (* do the propagations in a local frame *)
       if Config.progress then print_progress();
       try
         (* first, empty the tautology queue *)
         flush_new_clauses_into_slice slice;
-        for i = start to start + slice.length - 1 do
-          let lit = slice.get i in
+        for i = start to start + slice.TI.length - 1 do
+          let lit = slice.TI.get i in
           assume_lit lit;
         done;
         flush_new_clauses_into_slice slice;
-        let lev = Backtrack.cur_level () in
-        Sat lev
+        TI.Sat
       with Conflict conflict_clause ->
         Log.debugf 3
           (fun k->k "(@[<1>raise_inconsistent@ %a@])"
               Clause.pp conflict_clause);
-        Unsat (Clause.lits conflict_clause, ())
+        TI.Unsat (Clause.lits conflict_clause, ())
+
+    (* TODO: move checking code from Main_loop here? *)
+    let if_sat _slice = ()
   end
 
   module M = Msat.Solver.Make(M_expr)(M_th)(struct end)
@@ -2235,7 +2227,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
             | False -> Term.true_
             | _ -> Term.not_ f
           end
-        | Builtin (B_and (a,b,_)) ->
+        | Builtin (B_and (a,b)) ->
           let a = aux env a in
           let b = aux env b in
           begin match a.term_cell, b.term_cell with
@@ -2244,7 +2236,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
             | _, False -> Term.false_
             | _ -> Term.and_ a b
           end
-        | Builtin (B_or (a,b,_)) ->
+        | Builtin (B_or (a,b)) ->
           let a = aux env a in
           let b = aux env b in
           begin match a.term_cell, b.term_cell with
@@ -2253,7 +2245,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
             | False, False -> Term.false_
             | _ -> Term.or_ a b
           end
-        | Builtin (B_imply (a,b,_)) ->
+        | Builtin (B_imply (a,b)) ->
           let a = aux env a in
           let b = aux env b in
           begin match a.term_cell, b.term_cell with
@@ -2261,16 +2253,6 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
             | False, _  -> Term.true_
             | True, False -> Term.false_
             | _ -> Term.imply a b
-          end
-        | Builtin (B_equiv (a,b,_)) ->
-          let a = aux env a in
-          let b = aux env b in
-          begin match a.term_cell, b.term_cell with
-            | True, True
-            | False, False -> Term.true_
-            | False, True
-            | True, False -> Term.false_
-            | _ -> Term.equiv a b
           end
         | Builtin (B_eq (a,b)) ->
           let a = aux env a in
