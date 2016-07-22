@@ -71,7 +71,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
   and builtin =
     | B_not of term
     | B_eq of term * term
-    | B_and of term * term
+    | B_and of term * term * term * term (* parallel and *)
     | B_or of term * term
     | B_imply of term * term
 
@@ -422,7 +422,8 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
             in
             Hash.combine3 8 u.term_id hash_m
           | Builtin (B_not a) -> Hash.combine2 20 a.term_id
-          | Builtin (B_and (t1,t2)) -> Hash.combine3 21 t1.term_id t2.term_id
+          | Builtin (B_and (t1,t2,t3,t4)) ->
+            Hash.list sub_hash [t1;t2;t3;t4]
           | Builtin (B_or (t1,t2)) -> Hash.combine3 22 t1.term_id t2.term_id
           | Builtin (B_imply (t1,t2)) -> Hash.combine3 23 t1.term_id t2.term_id
           | Builtin (B_eq (t1,t2)) -> Hash.combine3 24 t1.term_id t2.term_id
@@ -452,7 +453,8 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           | Builtin b1, Builtin b2 ->
             begin match b1, b2 with
               | B_not a1, B_not a2 -> a1 == a2
-              | B_and (a1,b1), B_and (a2,b2)
+              | B_and (a1,b1,c1,d1), B_and (a2,b2,c2,d2) ->
+                a1 == a2 && b1 == b2 && c1 == c2 && d1 == d2
               | B_or (a1,b1), B_or (a2,b2)
               | B_eq (a1,b1), B_eq (a2,b2)
               | B_imply (a1,b1), B_imply (a2,b2) -> a1 == a2 && b1 == b2
@@ -630,7 +632,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       (* normalize a bit *)
       let b = match b with
         | B_eq (a,b) when a.term_id > b.term_id -> B_eq (b,a)
-        | B_and (a,b) when a.term_id > b.term_id -> B_and (b,a)
+        | B_and (a,b,c,d) when a.term_id > b.term_id -> B_and (b,a,d,c)
         | B_or (a,b) when a.term_id > b.term_id -> B_or (b,a)
         | _ -> b
       in
@@ -640,7 +642,8 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     let builtin b =
       let deps = match b with
         | B_not u -> Dep_sub u
-        | B_and (a,b) | B_or (a,b)
+        | B_and (_,_,a,b)
+        | B_or (a,b)
         | B_eq (a,b) | B_imply (a,b) -> Dep_subs [a;b]
       in
       builtin_ ~deps b
@@ -651,11 +654,14 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       | Builtin (B_not t') -> t'
       | _ -> builtin_ ~deps:(Dep_sub t) (B_not t)
 
-    let and_ a b = builtin_ ~deps:(Dep_subs [a;b]) (B_and (a,b))
+    let and_ a b = builtin_ ~deps:(Dep_subs [a;b]) (B_and (a,b,a,b))
     let or_ a b = builtin_ ~deps:(Dep_subs [a;b]) (B_or (a,b))
     let imply a b = builtin_ ~deps:(Dep_subs [a;b]) (B_imply (a,b))
     let eq a b = builtin_ ~deps:(Dep_subs [a;b]) (B_eq (a,b))
     let neq a b = not_ (eq a b)
+
+    let and_par a b c d =
+      builtin_ ~deps:(Dep_subs [c;d]) (B_and (a,b,c,d))
 
     let and_l = function
       | [] -> true_
@@ -673,9 +679,10 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         | B_not t ->
           let acc, t' = f acc t in
           acc, B_not t'
-        | B_and (a,b) ->
+        | B_and (a,b,c,d) ->
           let acc, a, b = fold_binary acc a b in
-          acc, B_and (a, b)
+          let acc, c, d = fold_binary acc c d in
+          acc, B_and (a,b,c,d)
         | B_or (a,b) ->
           let acc, a, b = fold_binary acc a b in
           acc, B_or (a, b)
@@ -696,10 +703,10 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
 
     let builtin_to_seq b yield = match b with
       | B_not t -> yield t
-      | B_and (a,b)
       | B_or (a,b)
       | B_imply (a,b)
       | B_eq (a,b) -> yield a; yield b
+      | B_and (a,b,c,d) -> yield a; yield b; yield c; yield d
 
     let ty t = t.term_ty
 
@@ -790,7 +797,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           fpf out "(@[match %a@ (@[<hv>%a@])@])"
             pp t print_map (ID.Map.to_seq m)
         | Builtin (B_not t) -> fpf out "(@[<hv1>not@ %a@])" pp t
-        | Builtin (B_and (a,b)) ->
+        | Builtin (B_and (_, _, a,b)) ->
           fpf out "(@[<hv1>and@ %a@ %a@])" pp a pp b
         | Builtin (B_or (a,b)) ->
           fpf out "(@[<hv1>or@ %a@ %a@])" pp a pp b
@@ -1401,12 +1408,8 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           let env = DB_env.singleton t in
           Explanation.empty, eval_db env body
         | Builtin b ->
-          let e, b' =
-            Term.fold_map_builtin compute_nf_add Explanation.empty b
-          in
           (* try boolean reductions *)
-          let e', t' = compute_builtin b' in
-          let e = Explanation.append e' e in
+          let e, t' = compute_builtin b in
           set_nf_ t t' e;
           e, t'
         | If (a,b,c) ->
@@ -1494,65 +1497,76 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
        already reduced *)
     and compute_builtin bu: explanation * term = match bu with
       | B_not a ->
-        begin match a.term_cell with
-          | True -> Explanation.empty, Term.false_
-          | False -> Explanation.empty, Term.true_
-          | _ -> Explanation.empty, Term.not_ a
-        end
-      | B_and (a,b) ->
-        begin match a.term_cell, b.term_cell with
-          | True, _ -> Explanation.empty, b
-          | _, True -> Explanation.empty, a
-          | False, _
-          | _, False -> Explanation.empty, Term.false_
-          | _ -> Explanation.empty, Term.and_ a b
+        let e_a, a' = compute_nf a in
+        begin match a'.term_cell with
+          | True -> e_a, Term.false_
+          | False -> e_a, Term.true_
+          | _ -> e_a, Term.not_ a'
         end
       | B_or (a,b) ->
-        begin match a.term_cell, b.term_cell with
-          | True, _
-          | _, True -> Explanation.empty, Term.true_
-          | False, _ -> Explanation.empty, b
-          | _, False -> Explanation.empty, a
-          | _ -> Explanation.empty, Term.or_ a b
-        end
+        (* [a or b] becomes [not (not a and not b)] *)
+        let a' = Term.not_ a in
+        let b' = Term.not_ b in
+        compute_nf (Term.not_ (Term.and_par a' b' a' b'))
       | B_imply (a,b) ->
-        begin match a.term_cell, b.term_cell with
-          | _, True
-          | False, _ -> Explanation.empty, Term.true_
-          | True, _ -> Explanation.empty, b
-          | _, False -> Explanation.empty, Term.not_ a
-          | _ -> Explanation.empty, Term.imply a b
+        (* [a => b] becomes [not [a and not b]] *)
+        let b' = Term.not_ b in
+        compute_nf (Term.not_ (Term.and_par a b' a b'))
+      | B_eq (a,b) when Ty.is_prop a.term_ty ->
+        (* [a <=> b] is expressed as double implication *)
+        let t' = Term.and_ (Term.imply a b) (Term.imply b a) in
+        compute_nf t'
+      | B_and (a,b,c,d) ->
+        (* evaluate [c] and [d], but only provide some explanation
+           once their conjunction reduces to [true] or [false] *)
+        let _, c' = compute_nf c in
+        let _, d' = compute_nf d in
+        begin match c'.term_cell, d'.term_cell with
+          | False, _ ->
+            let e, c'' = compute_nf a in
+            assert (Term.equal c' c'');
+            e, Term.false_
+          | _, False ->
+            let e, d'' = compute_nf b in
+            assert (Term.equal d' d'');
+            e, Term.false_
+          | True, True ->
+            let e1, c'' = compute_nf a in
+            let e2, d'' = compute_nf b in
+            assert (Term.equal c' c'');
+            assert (Term.equal d' d'');
+            let e = Explanation.append e1 e2 in
+            e, Term.true_
+          | _ ->
+            Explanation.empty, Term.and_par a b c' d'
         end
       | B_eq (a,b) ->
-        begin match a.term_cell, b.term_cell with
-          | False, False
-          | True, True -> Explanation.empty, Term.true_
-          | True, False
-          | False, True -> Explanation.empty, Term.false_
-          | _ when Term.equal a b -> Explanation.empty, Term.true_ (* syntactic *)
-          | _ ->
-            begin match Term.as_cstor_app a, Term.as_cstor_app b with
-              | Some (c1,ty1,l1), Some (c2,_,l2) ->
-                if not (Typed_cst.equal c1 c2)
-                then
-                  (* [c1 ... = c2 ...] --> false, as distinct constructors
-                     can never be equal *)
-                  Explanation.empty, Term.false_
-                else if Typed_cst.equal c1 c2
-                     && List.length l1 = List.length l2
-                     && List.length l1 = List.length (fst (Ty.unfold ty1))
-                then (
-                  (* same constructor, fully applied -> injectivity:
-                     arguments are pairwise equal.
-                     We need to evaluate the arguments further (e.g.
-                     if they start with constructors) *)
-                  List.map2 Term.eq l1 l2
-                  |> Term.and_l
-                  |> compute_nf
-                )
-                else Explanation.empty, Term.eq a b
-              | _ -> Explanation.empty, Term.eq a b
-            end
+        let e_a, a' = compute_nf a in
+        let e_b, b' = compute_nf b in
+        let e_ab = Explanation.append e_a e_b in
+        if Term.equal a' b'
+        then e_ab, Term.true_ (* syntactic *)
+        else begin match Term.as_cstor_app a', Term.as_cstor_app b' with
+          | Some (c1,ty1,l1), Some (c2,_,l2) ->
+            if not (Typed_cst.equal c1 c2)
+            then
+              (* [c1 ... = c2 ...] --> false, as distinct constructors
+                 can never be equal *)
+              e_ab, Term.false_
+            else if Typed_cst.equal c1 c2
+                 && List.length l1 = List.length l2
+                 && List.length l1 = List.length (fst (Ty.unfold ty1))
+            then (
+              (* same constructor, fully applied -> injectivity:
+                 arguments are pairwise equal.
+                 We need to evaluate the arguments further (e.g.
+                 if they start with constructors) *)
+              List.map2 Term.eq l1 l2
+              |> Term.and_l
+              |> compute_nf_add e_ab
+            )
+            else e_ab, Term.eq a' b'
+          | _ -> e_ab, Term.eq a' b'
         end
   end
 
@@ -2181,7 +2195,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
             | False -> Term.true_
             | _ -> Term.not_ f
           end
-        | Builtin (B_and (a,b)) ->
+        | Builtin (B_and (_,_,a,b)) ->
           let a = aux a in
           let b = aux b in
           begin match a.term_cell, b.term_cell with
