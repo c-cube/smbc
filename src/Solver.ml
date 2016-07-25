@@ -1866,27 +1866,25 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     incr stat_num_clause_push;
     M.assume [Clause.lits c]
 
-  (** {2 Main Loop}
+  (** {2 Toplevel Goals}
 
-      - expand constants that block some literal
-      - do some SAT solving
-      - if there remain non-true goals, repeat
+      List of toplevel goals to satisfy
   *)
 
-  module Main_loop : sig
-    val push_toplevel_goal : Lit.t -> unit
-    val toplevel_goal_seq : Lit.t Sequence.t
-    val solve : unit -> M.res
+  module Top_goals: sig
+    val push : Lit.t -> unit
+    val to_seq : Lit.t Sequence.t
+    val check: unit -> unit
   end = struct
     (* list of terms to fully evaluate *)
     let toplevel_goals_ : term list ref = ref []
 
     (* add [t] to the set of terms that must be evaluated *)
-    let push_toplevel_goal (t:term): unit =
+    let push (t:term): unit =
       toplevel_goals_ := t :: !toplevel_goals_;
       ()
 
-    let toplevel_goal_seq k = List.iter k !toplevel_goals_
+    let to_seq k = List.iter k !toplevel_goals_
 
     (* check that this term fully evaluates to [true] *)
     let is_true_ (t:term): bool =
@@ -1896,41 +1894,32 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         | True -> true
         | _ -> false
 
-    (* main solve function *)
-    let solve () : M.res = match M.solve () with
-      | M.Unsat ->
+    let check () =
+      if not (List.for_all is_true_ !toplevel_goals_)
+      then (
         if Config.progress then flush_progress();
-        M.Unsat
-      | M.Sat ->
-        assert (List.for_all Watched_lit.is_watched !toplevel_goals_);
-        if List.for_all is_true_ !toplevel_goals_
-        then (
-          if Config.progress then flush_progress();
-          M.Sat
-        )
-        else (
-          Log.debugf 4
-            (fun k->
-               let pp_dep out c =
-                 let _, nf = Reduce.get_nf (Term.const c) in
-                 Format.fprintf out
-                   "(@[%a@ nf:%a@ :expanded %B@])"
-                   Typed_cst.pp c Term.pp nf
-                   (match Typed_cst.as_undefined c with
-                     | None -> assert false
-                     | Some (_,_,i) -> i.cst_cases <> None)
-               in
-               let pp_lit out l =
-                 let e, nf = Reduce.get_nf l in
-                 Format.fprintf out
-                   "(@[<hv1>%a@ nf: %a@ exp: %a@ deps: (@[<hv>%a@])@])"
-                   Lit.pp l Lit.pp nf Explanation.pp e
-                   (Utils.pp_list pp_dep) nf.term_deps
-               in
-               k "(@[<hv1>status_watched_lit@ (@[<v>%a@])@])"
-                 (Utils.pp_list pp_lit) !toplevel_goals_);
-          assert false;
-        )
+        Log.debugf 1
+          (fun k->
+             let pp_dep out c =
+               let _, nf = Reduce.get_nf (Term.const c) in
+               Format.fprintf out
+                 "(@[%a@ nf:%a@ :expanded %B@])"
+                 Typed_cst.pp c Term.pp nf
+                 (match Typed_cst.as_undefined c with
+                   | None -> assert false
+                   | Some (_,_,i) -> i.cst_cases <> None)
+             in
+             let pp_lit out l =
+               let e, nf = Reduce.get_nf l in
+               Format.fprintf out
+                 "(@[<hv1>%a@ nf: %a@ exp: %a@ deps: (@[<hv>%a@])@])"
+                 Lit.pp l Lit.pp nf Explanation.pp e
+                 (Utils.pp_list pp_dep) nf.term_deps
+             in
+             k "(@[<hv1>status_watched_lit@ (@[<v>%a@])@])"
+               (Utils.pp_list pp_lit) !toplevel_goals_);
+        assert false;
+      )
   end
 
   (** {2 Conversion} *)
@@ -2024,7 +2013,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       match st with
         | Ast.Assert t ->
           let t = conv_term [] t in
-          Main_loop.push_toplevel_goal t;
+          Top_goals.push t;
           push_clause (Clause.make [t])
         | Ast.Goal (vars, t) ->
           (* skolemize *)
@@ -2040,7 +2029,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           (* model should contain values of [consts] *)
           List.iter add_cst_support_ consts;
           let t = conv_term env t in
-          Main_loop.push_toplevel_goal t;
+          Top_goals.push t;
           push_clause (Clause.make [t])
         | Ast.TyDecl id ->
           let ty = Ty.atomic id Uninterpreted in
@@ -2249,7 +2238,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     (* check model *)
     let check m =
       let bad =
-        Main_loop.toplevel_goal_seq
+        Top_goals.to_seq
         |> Sequence.find
           (fun t ->
              let t' = eval_ m t in
@@ -2399,7 +2388,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         let sub_level = M.push () in
         (* restrict depth *)
         push_clause (Clause.make [cur_lit]);
-        match Main_loop.solve () with
+        match M.solve () with
           | M.Sat ->
             let m = compute_model_ () in
             Log.debugf 1
@@ -2425,12 +2414,14 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
                    status: %a"
                   ID.pp cur_depth pp_proof_status status);
             match status with
-              | PS_depth_limited _
-              | PS_incomplete ->
+              | PS_depth_limited _ ->
                 (* negation of the previous limit *)
                 M.pop sub_level;
                 push_clause (Clause.make [Lit.neg cur_lit]);
                 iter (ID.next ()) (* deeper! *)
+              | PS_incomplete ->
+                do_on_exit ~on_exit;
+                Unknown U_incomplete
               | PS_complete ->
                 do_on_exit ~on_exit;
                 Unsat
