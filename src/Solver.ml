@@ -1317,23 +1317,24 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
               | None -> t
               | Some t' -> t'
             end
-          | Const (c,env') ->
+          | Const (_,clos) when DB_env.is_empty clos -> t
+          | Const (c,clos) ->
             (* [env'] should be a complete closure over
                 all variables in [c] *)
-            assert (DB_env.size env' = Typed_cst.size_ctx c);
+            assert (DB_env.size clos = Typed_cst.size_ctx c);
             (* evaluate [env'] in the current environment *)
             let new_env =
-              DB_env.map (fun o -> CCOpt.map (aux env) o) env'
+              DB_env.map (fun o -> CCOpt.map (aux env) o) clos
             in
             Term.const_with_env new_env c
           | True
           | False -> t
           | Fun (ty, body) ->
             let body' = aux (DB_env.push_none env) body in
-            Term.fun_ ty body'
+            if body==body' then t else Term.fun_ ty body'
           | Mu body ->
             let body' = aux (DB_env.push_none env) body in
-            Term.mu body'
+            if body==body' then t else Term.mu body'
           | Match (u, m) ->
             let u = aux env u in
             let m =
@@ -1344,8 +1345,15 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
             in
             Term.match_ u m
           | If (a,b,c) ->
-            Term.if_ (aux env a) (aux env b) (aux env c)
-          | App (f, l) -> Term.app (aux env f) (aux_l env l)
+            let a' = aux env a in
+            let b' = aux env b in
+            let c' = aux env c in
+            if a==a' && b==b' && c==c' then t else Term.if_ a' b' c'
+          | App (_,[]) -> assert false
+          | App (f, l) ->
+            let f' = aux env f in
+            let l' = aux_l env l in
+            if f==f' && CCList.equal (==) l l' then t else Term.app f' l'
           | Builtin b -> Term.builtin (Term.map_builtin (aux env) b)
         and aux_l env l =
           List.map (aux env) l
@@ -1389,7 +1397,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         | DB _ -> Explanation.empty, t
         | True | False ->
           Explanation.empty, t (* always trivial *)
-        | Const (c,env) ->
+        | Const (c,clos) ->
           begin match c.cst_kind with
             | Cst_defined (_, rhs) ->
               (* expand defined constants *)
@@ -1397,7 +1405,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
             | Cst_undef (_, {cst_cur_case=Some (e,new_t); _}) ->
               (* c := new_t, we can reduce; but first,
                  evaluate [new_t] using env *)
-              let new_t = eval_db env new_t in
+              let new_t = eval_db clos new_t in
               compute_nf_add e new_t
             | Cst_undef _
             | Cst_cstor _ | Cst_bool -> Explanation.empty, t
@@ -1409,13 +1417,15 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           Explanation.empty, eval_db env body
         | Builtin b ->
           (* try boolean reductions *)
-          let e, t' = compute_builtin b in
+          let e, t' = compute_builtin ~old:t b in
           set_nf_ t t' e;
           e, t'
         | If (a,b,c) ->
           let e_a, a' = compute_nf a in
           assert (not (Term.equal a a'));
-          let default() = Term.if_ a' b c in
+          let default() =
+            if a==a' then t else Term.if_ a' b c
+          in
           let e_branch, t' = match a'.term_cell with
             | True -> compute_nf b
             | False -> compute_nf c
@@ -1428,7 +1438,9 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           e, t'
         | Match (u, m) ->
           let e_u, u' = compute_nf u in
-          let default() = Term.match_ u' m in
+          let default() =
+            if u==u' then t else Term.match_ u' m
+          in
           let e_branch, t' = match Term.as_cstor_app u' with
             | Some (c, _, l) ->
               begin
@@ -1451,6 +1463,8 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           let e = Explanation.append e_u e_branch in
           set_nf_ t t' e;
           e, t'
+        | App ({term_cell=Const ({cst_kind=Cst_cstor _; _}, _); _}, _) ->
+          Explanation.empty, t (* do not reduce under cstors *)
         | App (f, l) ->
           let e_f, f' = compute_nf f in
           (* now beta-reduce if needed *)
@@ -1495,13 +1509,15 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
 
     (* compute the builtin, assuming its components are
        already reduced *)
-    and compute_builtin bu: explanation * term = match bu with
+    and compute_builtin ~(old:term) (bu:builtin): explanation * term = match bu with
       | B_not a ->
         let e_a, a' = compute_nf a in
         begin match a'.term_cell with
           | True -> e_a, Term.false_
           | False -> e_a, Term.true_
-          | _ -> e_a, Term.not_ a'
+          | _ ->
+            let t' = if a==a' then old else Term.not_ a' in
+            e_a, t'
         end
       | B_or (a,b) ->
         (* [a or b] becomes [not (not a and not b)] *)
@@ -1538,12 +1554,18 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
             let e = Explanation.append e1 e2 in
             e, Term.true_
           | _ ->
-            Explanation.empty, Term.and_par a b c' d'
+            let t' =
+              if c==c' && d==d' then old else Term.and_par a b c' d'
+            in
+            Explanation.empty, t'
         end
       | B_eq (a,b) ->
         let e_a, a' = compute_nf a in
         let e_b, b' = compute_nf b in
         let e_ab = Explanation.append e_a e_b in
+        let default() =
+          if a==a' && b==b' then old else Term.eq a' b'
+        in
         if Term.equal a' b'
         then e_ab, Term.true_ (* syntactic *)
         else begin match Term.as_cstor_app a', Term.as_cstor_app b' with
@@ -1565,8 +1587,8 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
               |> Term.and_l
               |> compute_nf_add e_ab
             )
-            else e_ab, Term.eq a' b'
-          | _ -> e_ab, Term.eq a' b'
+            else e_ab, default()
+          | _ -> e_ab, default()
         end
   end
 
