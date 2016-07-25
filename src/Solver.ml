@@ -1462,7 +1462,6 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     (* apply [f] to [l], until no beta-redex is found *)
     and compute_nf_app env e f l = match f.term_cell, l with
       | Const ({cst_kind=Cst_defined (_, lazy def_f); _}, local_env), l ->
-        assert (l <> []);
         assert (DB_env.is_empty local_env);
         (* reduce [f l] into [def_f l] when [f := def_f] *)
         compute_nf_app env e def_f l
@@ -2142,41 +2141,36 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
 
     (* eval term [t] under model [m] *)
     let eval_ m t =
-      let rec aux env t =
+      let rec aux t =
         (*
         Format.printf "@[<2>eval %a@ in [@[<hv>%a@]]@]@."
           Term.pp t (DB_env.pp Term.pp) env;
            *)
         match t.term_cell with
         | True
-        | False -> t
-        | DB n ->
-          begin match DB_env.get n env with
-            | None -> t
-            | Some t' -> aux env t'
-          end
-        | Const ({cst_kind=Cst_defined(_,lazy t'); _},_) -> aux env t'
+        | False
+        | DB _ -> t
+        | Const ({cst_kind=Cst_defined(_,lazy t'); _},_) -> aux t'
         | Const ({cst_kind=Cst_undef(_,_); _} as c, clos) ->
-          assert (DB_env.is_empty clos);
           begin match Typed_cst.Map.get c m with
             | None -> t
-            | Some t' -> aux env t'
+            | Some t' -> aux (Reduce.eval_db clos t')
           end
         | Const _ -> t
         | App (f,l) ->
           (* here, call by value *)
-          let l = List.map (aux env) l in
-          aux_app env f l
+          let l = List.map aux l in
+          aux_app DB_env.empty f l
         | If (a,b,c) ->
-          let a = aux env a in
+          let a = aux a in
           begin match a.term_cell with
-            | True -> aux env b
-            | False -> aux env c
+            | True -> aux b
+            | False -> aux c
             | _ -> Term.if_ a b c
           end
         | Fun _ -> t
         | Match (u, m) ->
-          let u = aux env u in
+          let u = aux u in
           begin match Term.as_cstor_app u with
             | None -> Term.match_ u m
             | Some (c, _, args) ->
@@ -2184,23 +2178,23 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
                 | None -> Term.match_ u m
                 | Some (tys, rhs) ->
                   assert (List.length tys = List.length args);
-                  let args = List.map (aux env) args in
-                  let env = DB_env.push_l args env in
-                  aux env rhs
+                  let env = DB_env.push_l args DB_env.empty in
+                  let rhs = Reduce.eval_db env rhs in
+                  aux rhs
           end
         | Mu f ->
-          let env = DB_env.push f env in
-          aux env f
+          let env = DB_env.singleton f in
+          aux (Reduce.eval_db env f)
         | Builtin (B_not f) ->
-          let f = aux env f in
+          let f = aux f in
           begin match f.term_cell with
             | True -> Term.false_
             | False -> Term.true_
             | _ -> Term.not_ f
           end
         | Builtin (B_and (a,b)) ->
-          let a = aux env a in
-          let b = aux env b in
+          let a = aux a in
+          let b = aux b in
           begin match a.term_cell, b.term_cell with
             | True, True -> Term.true_
             | False, _
@@ -2208,8 +2202,8 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
             | _ -> Term.and_ a b
           end
         | Builtin (B_or (a,b)) ->
-          let a = aux env a in
-          let b = aux env b in
+          let a = aux a in
+          let b = aux b in
           begin match a.term_cell, b.term_cell with
             | True, _
             | _, True -> Term.true_
@@ -2217,8 +2211,8 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
             | _ -> Term.or_ a b
           end
         | Builtin (B_imply (a,b)) ->
-          let a = aux env a in
-          let b = aux env b in
+          let a = aux a in
+          let b = aux b in
           begin match a.term_cell, b.term_cell with
             | _, True
             | False, _  -> Term.true_
@@ -2226,29 +2220,31 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
             | _ -> Term.imply a b
           end
         | Builtin (B_eq (a,b)) ->
-          let a = aux env a in
-          let b = aux env b in
+          let a = aux a in
+          let b = aux b in
           begin match Term.as_cstor_app a, Term.as_cstor_app b with
             | Some (c1,_,l1), Some (c2,_,l2) ->
               if Typed_cst.equal c1 c2 then (
                 assert (List.length l1 = List.length l2);
-                aux env (Term.and_l (List.map2 Term.eq l1 l2))
+                aux (Term.and_l (List.map2 Term.eq l1 l2))
               ) else Term.false_
             | _ -> Term.eq a b
           end
-      and aux_app env f l = match l with
-        | [] -> aux env f
-        | arg :: tail ->
-          let f = aux env f in
-          begin match f.term_cell with
-            | Fun (_, body) ->
-              let env = DB_env.push arg env in
-              aux_app env body tail
-            | _ ->
-              Term.app (Reduce.eval_db env f) l
-          end
+      and aux_app env f l = match f.term_cell, l with
+        | Const ({cst_kind=Cst_defined(_, lazy def_f); _}, clos), _ ->
+          assert (DB_env.is_empty clos);
+          aux_app env def_f l
+        | Fun (_, body), arg :: tail ->
+          let env = DB_env.push arg env in
+          aux_app env body tail
+        | _, _ ->
+          (* see if [f] reduces in [env] *)
+          let f' = aux (Reduce.eval_db env f) in
+          if Term.equal f f'
+          then Term.app f l
+          else aux_app DB_env.empty f' l
       in
-      aux DB_env.empty t
+      aux t
 
     (* check model *)
     let check m =
