@@ -2400,7 +2400,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         do_on_exit ~on_exit;
         Unknown U_max_depth
       | ID.At (cur_depth, cur_lit) ->
-        let _ = M.push () in
+        let sub_level = M.push () in
         (* restrict depth *)
         push_clause (Clause.make [cur_lit]);
         match Main_loop.solve () with
@@ -2432,18 +2432,17 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
               | PS_depth_limited _
               | PS_incomplete ->
                 (* negation of the previous limit *)
-                M.pop base_level;
+                M.pop sub_level;
                 push_clause (Clause.make [Lit.neg cur_lit]);
                 iter (ID.next ()) (* deeper! *)
               | PS_complete ->
                 do_on_exit ~on_exit;
-                M.pop base_level;
                 Unsat
     in
     ID.reset ();
     Backtrack.backtrack 0;
     CCFun.finally
-      ~h:(fun () -> M.pop M.base_level)
+      ~h:(fun () -> M.pop base_level)
       ~f:(fun () -> iter (ID.current ()))
 end
 
