@@ -1361,6 +1361,18 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         aux env t
       )
 
+    (* [cycle_check sub into] checks whether [sub] occurs in [into] under
+       a non-empty path traversing only constructors. *)
+    let cycle_check ~(sub:term) (into:term): bool =
+      let rec aux u =
+        Term.equal sub u
+        ||
+        match Term.as_cstor_app u with
+        | None -> false
+        | Some (_, _, l) -> List.exists aux l
+      in
+      aux into
+
     (* set the normal form of [t], propagate to watchers *)
     let set_nf_ t new_t (e:explanation) : unit =
       if Term.equal t new_t then ()
@@ -1588,6 +1600,11 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
               |> compute_nf_add e_ab
             )
             else e_ab, default()
+          | Some (_, _, l), None when List.exists (cycle_check ~sub:b') l ->
+            (* acyclicity rule *)
+            e_ab, Term.false_
+          | None, Some (_, _, l) when List.exists (cycle_check ~sub:a') l ->
+            e_ab, Term.false_
           | _ -> e_ab, default()
         end
   end
