@@ -1363,15 +1363,25 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
 
     (* [cycle_check sub into] checks whether [sub] occurs in [into] under
        a non-empty path traversing only constructors. *)
-    let cycle_check ~(sub:term) (into:term): bool =
+    let cycle_check_l ~(sub:term) (l:term list): bool =
+      let tbl_ : unit Term.Tbl.t = Term.Tbl.create 16 in
       let rec aux u =
         Term.equal sub u
         ||
-        match Term.as_cstor_app u with
-        | None -> false
-        | Some (_, _, l) -> List.exists aux l
+        begin
+          if Term.Tbl.mem tbl_ u then false
+          else (
+            Term.Tbl.add tbl_ u ();
+            match Term.as_cstor_app u with
+              | None -> false
+              | Some (_, _, l) -> List.exists aux l
+          )
+        end
       in
-      aux into
+      List.exists aux l
+
+    let cycle_check ~(sub:term) (into:term): bool =
+      cycle_check_l ~sub [into]
 
     (* set the normal form of [t], propagate to watchers *)
     let set_nf_ t new_t (e:explanation) : unit =
@@ -1600,10 +1610,10 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
               |> compute_nf_add e_ab
             )
             else e_ab, default()
-          | Some (_, _, l), None when List.exists (cycle_check ~sub:b') l ->
+          | Some (_, _, l), None when cycle_check_l ~sub:b' l ->
             (* acyclicity rule *)
             e_ab, Term.false_
-          | None, Some (_, _, l) when List.exists (cycle_check ~sub:a') l ->
+          | None, Some (_, _, l) when cycle_check_l ~sub:a' l ->
             e_ab, Term.false_
           | _ -> e_ab, default()
         end
