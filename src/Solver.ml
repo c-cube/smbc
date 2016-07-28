@@ -8,6 +8,7 @@ let get_time : unit -> float =
 
 module FI = Msat.Formula_intf
 module TI = Msat.Theory_intf
+module SI = Msat.Solver_intf
 
 (** {1 Solver} *)
 
@@ -2437,22 +2438,15 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
 
   let solve ?(on_exit=[]) ?(check=true) () =
     let module ID = Iterative_deepening in
-    (* create a base level, just to be sure *)
-    let base_level =
-      ignore (M.push ());
-      M.current_level ()
-    in
     (* iterated deepening *)
     let rec iter state = match state with
       | ID.Exhausted ->
         do_on_exit ~on_exit;
         Unknown U_max_depth
       | ID.At (cur_depth, cur_lit) ->
-        let sub_level = M.push () in
         (* restrict depth *)
-        push_clause (Clause.make [cur_lit]);
-        match M.solve () with
-          | M.Sat ->
+        match M.solve ~assumptions:[cur_lit] () with
+          | M.Sat _ ->
             let m = compute_model_ () in
             Log.debugf 1
               (fun k->k "@{<Yellow>** found SAT@} at depth %a"
@@ -2463,12 +2457,14 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
               Model.check m
             );
             Sat m
-          | M.Unsat ->
+          | M.Unsat us ->
             (* check if [max depth] literal involved in proof;
                - if not, truly UNSAT
                - if yes, try next level
             *)
-            let core = M.get_proof () |> M.unsat_core in
+            let p = us.SI.get_proof () in
+            Log.debugf 4 (fun k->k "proof: @[%a@]@." pp_proof p);
+            let core = p |> M.unsat_core in
             assert (Lit.equal (Lit.abs cur_lit) cur_lit);
             let status = proof_status cur_lit core in
             Log.debugf 1
@@ -2479,7 +2475,6 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
             match status with
               | PS_depth_limited _ ->
                 (* negation of the previous limit *)
-                M.pop sub_level;
                 push_clause (Clause.make [Lit.neg cur_lit]);
                 iter (ID.next ()) (* deeper! *)
               | PS_incomplete ->
@@ -2490,9 +2485,6 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
                 Unsat
     in
     ID.reset ();
-    Backtrack.backtrack 0;
-    CCFun.finally
-      ~h:(fun () -> M.pop base_level)
-      ~f:(fun () -> iter (ID.current ()))
+    iter (ID.current ())
 end
 
