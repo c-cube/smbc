@@ -7,7 +7,6 @@ type 'a t
 
 val create :
   eq:('a -> 'a -> bool) ->
-  hash:('a -> int) ->
   int ->
   'a t
 (** [create ~eq ~hash size] makes a new set of initial size [size] *)

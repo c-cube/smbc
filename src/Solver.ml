@@ -107,7 +107,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
        a subset? Affects completeness *)
     mutable cst_cur_case: (explanation * term) option;
     (* current choice of normal form *)
-    cst_watched: term Hash_set.t;
+    cst_watched: term Poly_set.t;
     (* set of (bool) literals terms that depend on this constant
        for evaluation.
 
@@ -326,7 +326,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           cst_complete=false;
           cst_cur_case=None;
           cst_watched=
-            Hash_set.create ~eq:term_equal_ ~hash:term_hash_ 16;
+            Poly_set.create ~eq:term_equal_ 16;
           cst_can_use=can_use;
           cst_db_ctx=env;
         }
@@ -1726,7 +1726,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         | Cst_undef (ty,i) -> ty,i
         | Cst_bool | Cst_defined _ | Cst_cstor _ -> assert false
       in
-      Hash_set.add info.cst_watched t;
+      Poly_set.add info.cst_watched t;
       (* we should never have to expand a meta that is too deep *)
       let depth = Lazy.force info.cst_depth in
       assert (depth <= (Iterative_deepening.current_depth() :> int));
@@ -1866,7 +1866,8 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           let e = Explanation.return (Lit.cst_choice c new_t) in
           Backtrack.push_set_cst_case_ info;
           info.cst_cur_case <- Some (e, new_t);
-          Hash_set.iter Watched_lit.update_watches_of info.cst_watched
+          (* TODO: only update if the current NF is blocked by [c] *)
+          Poly_set.iter Watched_lit.update_watches_of info.cst_watched
         | Some (_,new_t') ->
           Log.debugf 1
             (fun k->k "(@[<hv1>assert_choice %a@ :to %a@ :cur %a@])"
