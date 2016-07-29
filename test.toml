@@ -1,4 +1,14 @@
 
+[smbc-1]
+
+binary = "./smbc.native"
+cmd = "ulimit -t $timeout; ./smbc.native --check --depth-step 1 -nc $file"
+unsat = "result UNSAT"
+sat = "result SAT"
+unknown = "TIMEOUT|UNKNOWN"
+timeout = "TIMEOUT"
+
+
 [smbc-5]
 
 binary = "./smbc.native"
@@ -21,7 +31,7 @@ timeout = "TIMEOUT"
 
 timeout=30
 problems = ".*.lisp"
-provers = [ "smbc-5", "smbc-30" ]
+provers = [ "smbc-1", "smbc-5", "smbc-30" ]
 dir = [ "examples" ]
 
 
