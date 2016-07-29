@@ -312,8 +312,11 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     let make_undef ?(can_use=[]) ?(env=DB_env.empty) ?parent id ty =
       let info =
         let cst_depth = lazy (match parent with
-          | Some (lazy ({cst_kind=Cst_undef (_, i); _}, _)) ->
-            Lazy.force i.cst_depth + 1
+          | Some (lazy ({cst_kind=Cst_undef (ty, i); _}, _)) ->
+            begin match Ty.view ty with
+              | Arrow _ -> Lazy.force i.cst_depth
+              | Atomic _ | Prop -> Lazy.force i.cst_depth + 1
+            end
           | Some _ ->
             invalid_arg "make_const: parent should be a constant"
           | None -> 0
