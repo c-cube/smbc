@@ -3,6 +3,6 @@
               package(containers.sexp), package(containers.data), \
               package(sequence), package(unix)
 
-true: safe_string, annot, bin_annot, color(always), optimize(3)
+true: safe_string, annot, bin_annot, color(always), optimize(3), inline(100)
 true: warn(+a-4-44-58)
 true: use_menhir
