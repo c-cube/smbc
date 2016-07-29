@@ -1366,10 +1366,13 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         aux env t
       )
 
+    let cycle_check_tbl : unit Term.Tbl.t = Term.Tbl.create 32
+
     (* [cycle_check sub into] checks whether [sub] occurs in [into] under
        a non-empty path traversing only constructors. *)
     let cycle_check_l ~(sub:term) (l:term list): bool =
-      let tbl_ : unit Term.Tbl.t = Term.Tbl.create 16 in
+      let tbl_ = cycle_check_tbl in
+      Term.Tbl.clear tbl_;
       let rec aux u =
         Term.equal sub u
         ||
