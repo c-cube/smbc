@@ -513,11 +513,13 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       | Dep_cst of cst (* the term itself is a constant *)
       | Dep_none
       | Dep_sub of term
-      | Dep_subs of term list
+      | Dep_sub2 of term * term
 
     type delayed_ty =
       | DTy_direct of ty_h
       | DTy_lazy of (unit -> ty_h)
+
+    let sorted_merge_ l1 l2 = CCList.sorted_merge_uniq ~cmp:compare l1 l2
 
     (* build a term. If it's new, add it to the watchlist
        of every member of [watching] *)
@@ -541,10 +543,9 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           | Dep_none -> []
           | Dep_cst c -> [c]
           | Dep_sub t -> t.term_deps
-          | Dep_subs l ->
-            l
-            |> CCList.flat_map (fun sub -> sub.term_deps)
-            |> CCList.sort_uniq ~cmp:Typed_cst.compare
+          | Dep_sub2 (a,b) ->
+            CCList.sorted_merge_uniq
+              ~cmp:Typed_cst.compare a.term_deps b.term_deps
         in
         t'.term_deps <- deps
       );
@@ -648,7 +649,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         | B_not u -> Dep_sub u
         | B_and (_,_,a,b)
         | B_or (a,b)
-        | B_eq (a,b) | B_imply (a,b) -> Dep_subs [a;b]
+        | B_eq (a,b) | B_imply (a,b) -> Dep_sub2 (a,b)
       in
       builtin_ ~deps b
 
@@ -658,14 +659,14 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       | Builtin (B_not t') -> t'
       | _ -> builtin_ ~deps:(Dep_sub t) (B_not t)
 
-    let and_ a b = builtin_ ~deps:(Dep_subs [a;b]) (B_and (a,b,a,b))
-    let or_ a b = builtin_ ~deps:(Dep_subs [a;b]) (B_or (a,b))
-    let imply a b = builtin_ ~deps:(Dep_subs [a;b]) (B_imply (a,b))
-    let eq a b = builtin_ ~deps:(Dep_subs [a;b]) (B_eq (a,b))
+    let and_ a b = builtin_ ~deps:(Dep_sub2 (a,b)) (B_and (a,b,a,b))
+    let or_ a b = builtin_ ~deps:(Dep_sub2 (a,b)) (B_or (a,b))
+    let imply a b = builtin_ ~deps:(Dep_sub2 (a,b)) (B_imply (a,b))
+    let eq a b = builtin_ ~deps:(Dep_sub2 (a,b)) (B_eq (a,b))
     let neq a b = not_ (eq a b)
 
     let and_par a b c d =
-      builtin_ ~deps:(Dep_subs [c;d]) (B_and (a,b,c,d))
+      builtin_ ~deps:(Dep_sub2 (c,d)) (B_and (a,b,c,d))
 
     let and_l = function
       | [] -> true_
