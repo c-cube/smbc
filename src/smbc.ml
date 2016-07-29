@@ -11,17 +11,13 @@ type config = {
   check: bool;
 }
 
-let parse_file file =
+let parse_file file : Ast.statement list =
   Log.debugf 2 (fun k->k "(@[parse_file@ %S@])" file);
-  let res = CCSexpM.parse_file_list file in
+  let dir = Filename.dirname file in
+  let res = Ast.parse ~include_dir:dir ~file in
   match res with
-    | `Error msg -> print_endline msg; exit 1
-    | `Ok l ->
-      let dir = Filename.dirname file in
-      let ctx = Ast.Ctx.create ~include_dir:dir () in
-      match Ast.statements_of_sexps ctx l with
-        | Result.Error msg -> print_endline msg; exit 1
-        | Result.Ok ast -> ast
+    | Result.Error msg -> print_endline msg; exit 1
+    | Result.Ok l -> l
 
 let solve ~config (ast:Ast.statement list) : unit =
   let module Conf = struct

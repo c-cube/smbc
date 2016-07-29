@@ -140,9 +140,11 @@ module Ctx : sig
   include Intf.PRINT with type t := t
 end
 
-val term_of_sexp : Ctx.t -> sexp -> term or_error
+val term_of_sexp : Ctx.t -> Parse_ast.t -> term or_error
 
-val statement_of_sexp : Ctx.t -> sexp -> statement list or_error
+val statement_of_ast : Ctx.t -> Parse_ast.t -> statement list or_error
 
-val statements_of_sexps : Ctx.t -> sexp list -> statement list or_error
+val statement_l_of_ast_l : Ctx.t -> Parse_ast.t list -> statement list or_error
 
+val parse : include_dir:string -> file:string -> statement list or_error
+(** Parse the given file, type-check, etc.  *)
