@@ -66,6 +66,7 @@ let pp_hashcons_ = ref false
 let max_depth_ = ref 60
 let depth_step_ = ref 0
 let check_ = ref false
+let timeout_ = ref ~-1
 
 let file = ref ""
 let set_file s =
@@ -91,12 +92,22 @@ let options =
     "--stats", Arg.Set stats_, " print stats";
     "--backtrace", Arg.Unit (fun () -> Printexc.record_backtrace true), " enable backtrace";
     "--depth-step", Arg.Set_int depth_step_, " increment for iterative deepening";
+    "--timeout", Arg.Set_int timeout_, " timeout (in s)";
+    "-t", Arg.Set_int timeout_, " alias to --timeout";
   ]
+
+let setup_timeout_ t =
+  assert (t >= 1);
+  Sys.set_signal Sys.sigalrm
+    (Sys.Signal_handle (fun _ -> print_endline "(TIMEOUT)"; exit 0));
+  ignore (Unix.alarm !timeout_);
+  ()
 
 let () =
   Arg.parse options set_file "experimental SMT solver";
   if !file = "" then failwith "provide one file";
   CCFormat.set_color_default !color_;
+  if !timeout_ >= 1 then setup_timeout_ !timeout_;
   (* parse *)
   let ast = parse_file !file in
   if !print_input_
