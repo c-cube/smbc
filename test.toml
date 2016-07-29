@@ -2,7 +2,7 @@
 [smbc-1]
 
 binary = "./smbc.native"
-cmd = "ulimit -t $timeout; ./smbc.native --check --depth-step 1 -nc $file"
+cmd = "ulimit ; ./smbc.native --check --depth-step 1 -t $timeout -nc $file"
 unsat = "result UNSAT"
 sat = "result SAT"
 unknown = "TIMEOUT|UNKNOWN"
@@ -12,7 +12,7 @@ timeout = "TIMEOUT"
 [smbc-5]
 
 binary = "./smbc.native"
-cmd = "ulimit -t $timeout; ./smbc.native --check --depth-step 5 -nc $file"
+cmd = "./smbc.native --check --depth-step 5 -t $timeout -nc $file"
 unsat = "result UNSAT"
 sat = "result SAT"
 unknown = "TIMEOUT|UNKNOWN"
@@ -21,7 +21,7 @@ timeout = "TIMEOUT"
 [smbc-30]
 
 binary = "./smbc.native"
-cmd = "ulimit -t $timeout; ./smbc.native --check --depth-step 30 -nc $file"
+cmd = "./smbc.native --check --depth-step 30 -t $timeout -nc $file"
 unsat = "result UNSAT"
 sat = "result SAT"
 unknown = "TIMEOUT|UNKNOWN"
