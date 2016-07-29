@@ -2071,6 +2071,10 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
             m
         in
         Term.match_ u m
+      | Ast.Let (v,t,u) ->
+        (* substitute on the fly *)
+        let t = conv_term env t in
+        conv_term ((v, Some t)::env) u
       | Ast.If (a,b,c) ->
         Term.if_ (conv_term env a)(conv_term env b) (conv_term env c)
       | Ast.Not t -> Term.not_ (conv_term env t)

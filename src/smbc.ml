@@ -11,10 +11,10 @@ type config = {
   check: bool;
 }
 
-let parse_file file : Ast.statement list =
+let parse_file (syn:Ast.syntax) (file:string) : Ast.statement list =
   Log.debugf 2 (fun k->k "(@[parse_file@ %S@])" file);
   let dir = Filename.dirname file in
-  let res = Ast.parse ~include_dir:dir ~file in
+  let res = Ast.parse ~include_dir:dir ~file syn in
   match res with
     | Result.Error msg -> print_endline msg; exit 1
     | Result.Ok l -> l
@@ -67,11 +67,20 @@ let max_depth_ = ref 60
 let depth_step_ = ref 0
 let check_ = ref false
 let timeout_ = ref ~-1
+let syntax_ = ref Ast.Auto
 
 let file = ref ""
 let set_file s =
   if !file = "" then file := s
   else failwith "provide at most one file"
+
+let set_syntax_ s =
+  syntax_ :=
+    begin match String.uncapitalize s with
+      | "smbc" -> Ast.Smbc
+      | "tip" -> Ast.Tip
+      | _ -> failwith ("unknown syntax " ^ s) (* TODO list *)
+    end
 
 let set_debug_ d =
   Log.set_debug d;
@@ -87,6 +96,8 @@ let options =
     "--no-check", Arg.Clear check_, " do not check model";
     "-nc", Arg.Clear color_, " do not use colors";
     "-p", Arg.Set progress_, " progress bar";
+    "--input", Arg.String set_syntax_, " input format";
+    "-i", Arg.String set_syntax_, " alias to --input";
     "--pp-hashcons", Arg.Set pp_hashcons_, " print hashconsing IDs";
     "--debug", Arg.Int set_debug_, " set debug level";
     "--stats", Arg.Set stats_, " print stats";
@@ -117,7 +128,7 @@ let () =
   if !timeout_ >= 1 then setup_timeout_ !timeout_;
   setup_gc ();
   (* parse *)
-  let ast = parse_file !file in
+  let ast = parse_file !syntax_ !file in
   if !print_input_
   then
     Format.printf "@[parsed:@ @[<v>%a@]@]@."

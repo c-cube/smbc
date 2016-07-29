@@ -6,7 +6,7 @@
 {
   module A = Parse_ast
   module Loc = A.Loc
-  open Parser (* for tokens *)
+  open Parser_smbc (* for tokens *)
 
 }
 
@@ -26,6 +26,25 @@ rule token = parse
   | comment_line { token lexbuf }
   | '(' { LEFT_PAREN }
   | ')' { RIGHT_PAREN }
+  | "prop" { PROP }
+  | "->" { ARROW }
+  | "true" { TRUE }
+  | "false" { FALSE }
+  | "if" { IF }
+  | "match" { MATCH }
+  | "fun" { FUN }
+  | "mu" { MU }
+  | "and" { AND }
+  | "or" { OR }
+  | "not" { NOT }
+  | "=>" { IMPLY }
+  | "=" { EQ }
+  | "data" { DATA }
+  | "assert" { ASSERT }
+  | "goal" { GOAL }
+  | "decl" { DECL }
+  | "define" { DEFINE }
+  | "include" { INCLUDE }
   | ident { IDENT(Lexing.lexeme lexbuf) }
   | quoted {
       (* TODO: unescape *)

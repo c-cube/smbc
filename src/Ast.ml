@@ -132,6 +132,7 @@ and term_cell =
   | App of term * term list
   | If of term * term * term
   | Match of term * (var list * term) ID.Map.t
+  | Let of var * term * term
   | Fun of var * term
   | Mu of var * term
   | Not of term
@@ -172,6 +173,8 @@ let rec term_to_sexp t = match t.term with
                   term_to_sexp rhs]
          )))
     |> S.of_list
+  | Let (v,t,u) ->
+    S.of_list [S.atom "let"; var_sexp_ v; term_to_sexp t; term_to_sexp u]
   | Fun (v,t) ->
     S.of_list [S.atom "fun"; typed_var_to_sexp v; term_to_sexp t]
   | Mu (v,t) ->
@@ -253,10 +256,24 @@ let if_ a b c =
       Ty.pp b.ty Ty.pp c.ty;
   mk_ (If (a,b,c)) b.ty
 
-(* TODO: check types *)
 let match_ t m =
-  let _, (_, rhs) = ID.Map.choose m in
-  mk_ (Match (t,m)) rhs.ty
+  let c1, (_, rhs1) = ID.Map.choose m in
+  ID.Map.iter
+    (fun c (_, rhs) ->
+       if not (Ty.equal rhs1.ty rhs.ty)
+       then Ty.ill_typed
+           "match: cases %a and %a disagree on return type,@ \
+           between %a and %a"
+           ID.pp c1 ID.pp c Ty.pp rhs1.ty Ty.pp rhs.ty;
+    ) m;
+  mk_ (Match (t,m)) rhs1.ty
+
+let let_ v t u =
+  if not (Ty.equal (Var.ty v) t.ty)
+  then Ty.ill_typed
+      "let: variable %a : @[%a@]@ and bounded term : %a@ should have same type"
+      Var.pp v Ty.pp (Var.ty v) Ty.pp t.ty;
+  mk_ (Let (v,t,u)) u.ty
 
 let fun_ v t =
   let ty = Ty.arrow (Var.ty v) t.ty in
@@ -307,8 +324,15 @@ let not_ t =
 
 module A = Parse_ast
 
-let errorf_at ?loc msg =
-  errorf ("at %a:@ " ^^ msg) Parse_ast.Loc.pp_opt loc
+type syntax =
+  | Auto
+  | Smbc
+  | Tip
+
+let string_of_syntax = function
+  | Auto -> "auto"
+  | Smbc -> "smbc"
+  | Tip -> "tip"
 
 module StrTbl = CCHashtbl.Make(struct
     type t = string
@@ -328,6 +352,7 @@ module Ctx = struct
     kinds: kind ID.Tbl.t;
     included: unit StrTbl.t; (* included paths *)
     include_dir: string; (* where to look for includes *)
+    mutable loc: A.Loc.t option; (* current loc *)
   }
 
   let create ~include_dir () : t = {
@@ -335,7 +360,11 @@ module Ctx = struct
     kinds=ID.Tbl.create 64;
     included=StrTbl.create 8;
     include_dir;
+    loc=None;
   }
+
+  let loc t = t.loc
+  let set_loc ?loc t = t.loc <- loc
 
   let add_id t (s:string) (k:kind): ID.t =
     let id = ID.make s in
@@ -376,140 +405,111 @@ module Ctx = struct
       (ID.Tbl.print ID.pp pp_kind) t.kinds
 end
 
-let find_id_ ?loc ctx (s:string): ID.t =
-  try StrTbl.find ctx.Ctx.names s
-  with Not_found -> errorf_at ?loc "name `%s` not in scope" s
+let errorf_ctx ctx msg =
+  errorf ("at %a:@ " ^^ msg) Parse_ast.Loc.pp_opt (Ctx.loc ctx)
 
-let rec conv_ty ctx (t:A.t) =
+let find_id_ ctx (s:string): ID.t =
+  try StrTbl.find ctx.Ctx.names s
+  with Not_found -> errorf_ctx ctx "name `%s` not in scope" s
+
+let rec conv_ty ctx (t:A.ty) =
   try conv_ty_aux ctx t
   with Ill_typed msg ->
-    Ty.ill_typed "at %a:@ %s" A.Loc.pp_opt (A.loc t) msg
+    Ty.ill_typed "at %a:@ %s" A.Loc.pp_opt (Ctx.loc ctx) msg
 
-and conv_ty_aux ctx t = match A.view t with
-  | A.Atom "prop" -> Ty.prop
-  | A.Atom s -> let id = find_id_ ctx s in Ty.const id
-  | A.List ({A.cell=A.Atom "->";_} :: a :: ((_::_) as rest)) ->
-    let rec aux_arr a rest = match rest with
-      | [] -> a
-      | b :: rest' ->
-        let b = conv_ty ctx b in
-        Ty.arrow a (aux_arr b rest')
-    in
-    let a = conv_ty ctx a in
-    aux_arr a rest
-  | _ -> errorf_at ?loc:(A.loc t) "expected type, got `@[%a@]`" A.pp t
+and conv_ty_aux ctx t = match t with
+  | A.Ty_bool -> Ty.prop
+  | A.Ty_const s -> let id = find_id_ ctx s in Ty.const id
+  | A.Ty_arrow (args, ret) ->
+    let args = List.map (conv_ty ctx) args in
+    let ret = conv_ty ctx ret in
+    Ty.arrow_l args ret
 
-let rec conv_term ctx (t:A.t) : term =
+let rec conv_term ctx (t:A.term) : term =
   try conv_term_aux ctx t
   with Ill_typed msg ->
-    Ty.ill_typed "at %a:@ %s" A.Loc.pp_opt (A.loc t) msg
+    Ty.ill_typed "at %a:@ %s" A.Loc.pp_opt (Ctx.loc ctx) msg
 
-and conv_term_aux ctx t = match A.view t with
-  | A.Atom "true" -> true_
-  | A.Atom "false" -> false_
-  | A.Atom s ->
+and conv_term_aux ctx t = match t with
+  | A.True -> true_
+  | A.False -> false_
+  | A.Const s ->
     let id = find_id_ ctx s in
     begin match Ctx.find_kind ctx id with
       | Ctx.K_var v -> var v
       | Ctx.K_fun ty
       | Ctx.K_cstor ty -> const id ty
       | Ctx.K_ty ->
-        errorf_at ?loc:(A.loc t) "expected term, not type; got `%a`" ID.pp id
+        errorf_ctx ctx "expected term, not type; got `%a`" ID.pp id
     end
-  | A.List [{A.cell=A.Atom "if";_}; a; b; c] ->
+  | A.If (a,b,c) ->
     let a = conv_term ctx a in
     let b = conv_term ctx b in
     let c = conv_term ctx c in
     if_ a b c
-  | A.List ({A.cell=A.Atom "if";_} :: _) ->
-    errorf_at ?loc:(A.loc t) "invalid syntax for if@ in @[%a@]" A.pp t
-  | A.List [{A.cell=A.Atom "fun";_}; {A.cell=A.List [{A.cell=A.Atom x;_}; ty];_}; body] ->
+  | A.Fun ((v,ty), body) ->
     let ty = conv_ty ctx ty in
-    Ctx.with_var ctx x ty
+    Ctx.with_var ctx v ty
       (fun var ->
          let body = conv_term ctx body in
          fun_ var body)
-  | A.List ({A.cell=A.Atom "fun";_} :: _) ->
-    errorf_at ?loc:(A.loc t) "invalid syntax for fun@ in `@[%a@]`." A.pp t
-  | A.List [
-      {A.cell=A.Atom "mu";_};
-      {A.cell=A.List [{A.cell=A.Atom x;_}; ty];_};
-      body] ->
+  | A.Let (v,t,u) ->
+    let t = conv_term ctx t in
+    Ctx.with_var ctx v t.ty
+      (fun var ->
+         let u = conv_term ctx u in
+         let_ var t u)
+  | A.Mu ((x,ty), body) ->
     let ty = conv_ty ctx ty in
     Ctx.with_var ctx x ty
       (fun var ->
          let body = conv_term ctx body in
          mu var body)
-  | A.List ({A.cell=A.Atom "mu";_} :: _) ->
-    errorf_at ?loc:(A.loc t) "invalid syntax for mu@ in `@[%a@]`." A.pp t
-  | A.List ({A.cell=A.Atom "and"; _} :: l) ->
+  | A.And l ->
     let l = List.map (conv_term ctx) l in
     and_l l
-  | A.List ({A.cell=A.Atom "or";_} :: l) ->
+  | A.Or l ->
     let l = List.map (conv_term ctx) l in
     or_l l
-  | A.List [{A.cell=A.Atom "not";_}; a] ->
+  | A.Not a ->
     let a = conv_term ctx a in
     not_ a
-  | A.List [{A.cell=A.Atom "=";_}; a; b] ->
+  | A.Eq (a,b) ->
     let a = conv_term ctx a in
     let b = conv_term ctx b in
     eq a b
-  | A.List [{A.cell=A.Atom "imply";_}; a; b] ->
+  | A.Imply (a,b) ->
     let a = conv_term ctx a in
     let b = conv_term ctx b in
     imply a b
-  | A.List ({A.cell=A.Atom "match";_} :: lhs :: cases) ->
-    let parse_case t' = match A.view t' with
-      | A.List [{A.cell=A.Atom c;_}; rhs] ->
-        let c_id = find_id_ ctx c in
-        let rhs = conv_term ctx rhs in
-        c_id, ([], rhs)
-      | A.List [{A.cell=A.List ({A.cell=A.Atom c;_} :: vars);_}; rhs] ->
-        let c_id = find_id_ ctx c in
-        (* obtain the type *)
-        let ty_args, _ty_ret = match Ctx.find_kind ctx c_id with
-          | Ctx.K_cstor ty -> Ty.unfold ty
-          | _ ->
-            errorf_at ?loc:(A.loc t') "expected `@[%a@]`@ to be a constructor" ID.pp c_id
-        in
-        (* pair variables with their type *)
-        if List.length vars <> List.length ty_args
-        then
-          errorf_at ?loc:(A.loc t')
-            "in @[%a@] for case %a,@ wrong number of arguments (expected %d)"
-            A.pp t' ID.pp c_id (List.length ty_args);
-        let vars =
-          List.map2
-            (fun sub_t ty -> match A.view sub_t with
-              | A.Atom name -> name, ty
-              | _ ->
-                errorf_at ?loc:(A.loc t')
-                  "expected variable in case `@[%a@]`,@ got `@[%a@]`"
-                  ID.pp c_id A.pp t')
-            vars ty_args
-        in
-        Ctx.with_vars ctx vars
-          (fun vars ->
-             let rhs = conv_term ctx rhs in
-             c_id, (vars, rhs))
-      | _ ->
-        errorf_at ?loc:(A.loc t')
-          "expected match-branch,@ got `@[%a@]`" A.pp t'
+  | A.Match (lhs, cases) ->
+    let conv_case (c, vars, rhs) =
+      let c_id = find_id_ ctx c in
+      (* obtain the type *)
+      let ty_args, _ty_ret = match Ctx.find_kind ctx c_id with
+        | Ctx.K_cstor ty -> Ty.unfold ty
+        | _ ->
+          errorf_ctx ctx "expected `@[%a@]`@ to be a constructor" ID.pp c_id
+      in
+      (* pair variables with their type *)
+      if List.length vars <> List.length ty_args
+      then
+        errorf_ctx ctx
+          "in @[%a@] for case %a,@ wrong number of arguments (expected %d)"
+          A.pp_term t ID.pp c_id (List.length ty_args);
+      let vars = List.combine vars ty_args in
+      Ctx.with_vars ctx vars
+        (fun vars ->
+           let rhs = conv_term ctx rhs in
+           c_id, (vars, rhs))
     in
     let lhs = conv_term ctx lhs in
-    let cases = List.map parse_case cases |> ID.Map.of_list in
+    let cases = List.map conv_case cases |> ID.Map.of_list in
     match_ lhs cases
-  | A.List ({A.cell=A.Atom "match";_} :: _) ->
-    errorf_at ?loc:(A.loc t)
-      "invalid syntax for match@ in `@[%a@]`" A.pp t
-  | A.List (f :: ((_::_) as args)) ->
+  | A.App (f, args) ->
     let f = conv_term ctx f in
     let args = List.map (conv_term ctx) args in
     app f args
-  | _ ->
-    errorf_at ?loc:(A.loc t)
-      "expected term,@ got `@[%a@]`" A.pp t
 
 let find_file_ name ~dir : string option =
   Log.debugf 2 (fun k->k "search A.%sA. in A.%sA." name dir);
@@ -518,12 +518,13 @@ let find_file_ name ~dir : string option =
   then Some abs_path
   else None
 
-let rec conv_statement ctx s =
-  Log.debugf 2 (fun k->k "(@[<1>statement_of_ast@ `@[%a@]`@])" A.pp s);
-  conv_statement_aux ctx s
+let rec conv_statement ctx (syn:syntax) (s:A.statement): statement list =
+  Log.debugf 2 (fun k->k "(@[<1>statement_of_ast@ `@[%a@]`@])" A.pp_stmt s);
+  Ctx.set_loc ctx ?loc:s.A.loc;
+  conv_statement_aux ctx syn s
 
-and conv_statement_aux ctx (t:A.t) : statement list = match A.view t with
-  | A.List [{A.cell=A.Atom "include";_}; {A.cell=A.Atom s;_}] ->
+and conv_statement_aux ctx syn (t:A.statement) : statement list = match A.view t with
+  | A.Stmt_include s ->
     (* include now! *)
     let dir = ctx.Ctx.include_dir in
     begin match find_file_ s ~dir with
@@ -534,22 +535,18 @@ and conv_statement_aux ctx (t:A.t) : statement list = match A.view t with
         (* put in cache *)
         StrTbl.add ctx.Ctx.included s' ();
         Log.debugf 2 (fun k->k "(@[parse_include@ %S@])" s');
-        parse_file_exn ctx ~file:s'
+        parse_file_exn ctx syn ~file:s'
     end
-  | A.List [{A.cell=A.Atom "decl";_}; {A.cell=A.Atom s;_}; ty] ->
+  | A.Stmt_decl (s, ty) ->
     let ty = conv_ty ctx ty in
     let id = Ctx.add_id ctx s (Ctx.K_fun ty) in
     [Decl (id,ty)]
-  | A.List ({A.cell=A.Atom "data";_} :: l) ->
+  | A.Stmt_data l ->
     (* first, read and declare each datatype (it can occur in the other
        datatypes' construtors) *)
-    let pre_parse t' = match A.view t' with
-      | A.List ({A.cell=A.Atom data_name;_} :: cases) ->
-        let data_id = Ctx.add_id ctx data_name Ctx.K_ty in
-        data_id, cases
-      | _ ->
-        errorf_at ?loc:(A.loc t')
-          "expected data decl,@ got `@[%a@]`" A.pp t'
+    let pre_parse (data_name,cases) =
+      let data_id = Ctx.add_id ctx data_name Ctx.K_ty in
+      data_id, cases
     in
     let l = List.map pre_parse l in
     (* now parse constructors *)
@@ -557,18 +554,11 @@ and conv_statement_aux ctx (t:A.t) : statement list = match A.view t with
       List.map
         (fun (data_id, cstors) ->
            let data_ty = Ty.const data_id in
-           let parse_case t' = match A.view t' with
-             | A.Atom c ->
-               let id = Ctx.add_id ctx c (Ctx.K_cstor data_ty) in
-               id, data_ty
-             | A.List ({A.cell=A.Atom c;_} :: args) ->
-               let ty_args = List.map (conv_ty ctx) args in
-               let ty_c = Ty.arrow_l ty_args data_ty in
-               let id = Ctx.add_id ctx c (Ctx.K_cstor ty_c) in
-               id, ty_c
-             | _ ->
-               errorf_at ?loc:(A.loc t')
-                 "expected data decl,@ got `@[%a@]`" A.pp t'
+           let parse_case (c, ty_args) =
+             let ty_args = List.map (conv_ty ctx) ty_args in
+             let ty_c = Ty.arrow_l ty_args data_ty in
+             let id = Ctx.add_id ctx c (Ctx.K_cstor ty_c) in
+             id, ty_c
            in
            let data_cstors =
              List.map parse_case cstors
@@ -578,15 +568,12 @@ and conv_statement_aux ctx (t:A.t) : statement list = match A.view t with
         l
     in
     [Data l]
-  | A.List ({A.cell=A.Atom "define";_} :: defs) ->
+  | A.Stmt_def defs ->
     (* parse id,ty and declare them before parsing the function bodies *)
-    let preparse t' = match A.view t' with
-      | A.List [{A.cell=A.Atom name;_}; ty; rhs] ->
-        let ty = conv_ty ctx ty in
-        let id = Ctx.add_id ctx name (Ctx.K_fun ty) in
-        id, ty, rhs
-      | _ ->
-        errorf_at ?loc:(A.loc t') "expected definition,@ got `@[%a@]`" A.pp t'
+    let preparse (name, ty, rhs) =
+      let ty = conv_ty ctx ty in
+      let id = Ctx.add_id ctx name (Ctx.K_fun ty) in
+      id, ty, rhs
     in
     let defs = List.map preparse defs in
     let defs =
@@ -597,56 +584,47 @@ and conv_statement_aux ctx (t:A.t) : statement list = match A.view t with
         defs
     in
     [Define defs]
-  | A.List [{A.cell=A.Atom "assert";_}; t] ->
+  | A.Stmt_assert t ->
     let t = conv_term ctx t in
     check_prop_ t;
     [Assert t]
-  | A.List [{A.cell=A.Atom "goal";_}; {A.cell=A.List vars;_}; t] ->
+  | A.Stmt_goal (vars, t) ->
     let vars =
       List.map
-        (fun t' -> match A.view t' with
-           | A.List [{A.cell=A.Atom s;_}; ty] ->
-             let ty = conv_ty ctx ty in s, ty
-           | _ ->
-             errorf_at ?loc:(A.loc t')
-               "expected typed var,@ got `@[%a@]`" A.pp t')
+        (fun (s,ty) ->
+           let ty = conv_ty ctx ty in
+           s, ty)
         vars
     in
     Ctx.with_vars ctx vars
       (fun vars ->
          let t = conv_term ctx t in
          [Goal (vars, t)])
-  | _ ->
-    errorf_at ?loc:(A.loc t)
-      "expected statement,@ got `@[%a@]`" A.pp t
 
-and parse_file_exn ctx ~file : statement list =
-  let l =
-    CCIO.with_in file
-      (fun ic ->
-         let lexbuf = Lexing.from_channel ic in
-         A.Loc.set_file lexbuf file;
-         Parser.parse_list Lexer.token lexbuf)
+and parse_file_exn ctx (syn:syntax) ~file : statement list =
+  let syn = match syn with
+    | Tip | Smbc -> syn
+    | Auto ->
+      (* try to guess *)
+      if CCString.suffix ~suf:".smt2" file then Tip else Smbc
   in
-  CCList.flat_map (conv_statement ctx) l
+  Log.debugf 2 (fun k->k "use syntax: %s" (string_of_syntax syn));
+  let l = match syn with
+    | Auto -> assert false
+    | Tip ->
+      (* delegate parsing to [Tip_parser] *)
+      Tip_util.parse_file_exn file
+      |> CCList.filter_map A.Tip.conv_stmt
+    | Smbc ->
+      CCIO.with_in file
+        (fun ic ->
+           let lexbuf = Lexing.from_channel ic in
+           A.Loc.set_file lexbuf file;
+           Parser_smbc.parse_list Lexer_smbc.token lexbuf)
+  in
+  CCList.flat_map (conv_statement ctx syn) l
 
-let parse ~include_dir ~file =
+let parse ~include_dir ~file syn =
   let ctx = Ctx.create ~include_dir () in
-  try Result.Ok (parse_file_exn ctx ~file)
+  try Result.Ok (parse_file_exn ctx ~file syn)
   with e -> Result.Error (Printexc.to_string e)
-
-let term_of_sexp ctx s =
-  try conv_term ctx s |> CCResult.return
-  with e -> CCResult.of_exn_trace e
-
-let statement_of_ast ctx s =
-  try conv_statement ctx s |> CCResult.return
-  with e -> CCResult.of_exn_trace e
-
-let statement_l_of_ast_l ctx l =
-  try
-    CCList.flat_map (conv_statement ctx) l
-    |> CCResult.return
-  with e ->
-    CCResult.of_exn_trace e
-

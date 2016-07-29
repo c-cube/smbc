@@ -82,6 +82,7 @@ and term_cell =
   | App of term * term list
   | If of term * term * term
   | Match of term * (var list * term) ID.Map.t
+  | Let of var * term * term
   | Fun of var * term
   | Mu of var * term
   | Not of term
@@ -110,6 +111,7 @@ val const : ID.t -> Ty.t -> term
 val app : term -> term list -> term
 val if_ : term -> term -> term -> term
 val match_ : term -> (var list * term) ID.Map.t -> term
+val let_ : var -> term -> term -> term
 val fun_ : var -> term -> term
 val fun_l : var list -> term -> term
 val mu : var -> term -> term
@@ -140,11 +142,18 @@ module Ctx : sig
   include Intf.PRINT with type t := t
 end
 
-val term_of_sexp : Ctx.t -> Parse_ast.t -> term or_error
+type syntax =
+  | Auto
+  (** Guess based on file extension *)
+  | Smbc
+  (** Native syntax *)
+  | Tip
+  (** Syntax for Tip (https://github.com/tip-org/)
 
-val statement_of_ast : Ctx.t -> Parse_ast.t -> statement list or_error
+      This is a small subset of Smtlib2, so we can reuse the same S-expr
+      parser as {!Smbc} *)
 
-val statement_l_of_ast_l : Ctx.t -> Parse_ast.t list -> statement list or_error
+val string_of_syntax : syntax -> string
 
-val parse : include_dir:string -> file:string -> statement list or_error
+val parse : include_dir:string -> file:string -> syntax -> statement list or_error
 (** Parse the given file, type-check, etc.  *)
