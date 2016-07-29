@@ -1561,30 +1561,35 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         compute_nf t'
       | B_and (a,b,c,d) ->
         (* evaluate [c] and [d], but only provide some explanation
-           once their conjunction reduces to [true] or [false] *)
+           once their conjunction reduces to [true] or [false].
+
+           We first compute only [c], in case it is [False]. *)
         let _, c' = compute_nf c in
-        let _, d' = compute_nf d in
-        begin match c'.term_cell, d'.term_cell with
-          | False, _ ->
+        begin match c'.term_cell with
+          | False ->
             let e, c'' = compute_nf a in
             assert (Term.equal c' c'');
             e, Term.false_
-          | _, False ->
-            let e, d'' = compute_nf b in
-            assert (Term.equal d' d'');
-            e, Term.false_
-          | True, True ->
-            let e1, c'' = compute_nf a in
-            let e2, d'' = compute_nf b in
-            assert (Term.equal c' c'');
-            assert (Term.equal d' d'');
-            let e = Explanation.append e1 e2 in
-            e, Term.true_
           | _ ->
-            let t' =
-              if c==c' && d==d' then old else Term.and_par a b c' d'
-            in
-            Explanation.empty, t'
+            let _, d' = compute_nf d in
+            begin match c'.term_cell, d'.term_cell with
+              | _, False ->
+                let e, d'' = compute_nf b in
+                assert (Term.equal d' d'');
+                e, Term.false_
+              | True, True ->
+                let e1, c'' = compute_nf a in
+                let e2, d'' = compute_nf b in
+                assert (Term.equal c' c'');
+                assert (Term.equal d' d'');
+                let e = Explanation.append e1 e2 in
+                e, Term.true_
+              | _ ->
+                let t' =
+                  if c==c' && d==d' then old else Term.and_par a b c' d'
+                in
+                Explanation.empty, t'
+            end
         end
       | B_eq (a,b) ->
         let e_a, a' = compute_nf a in
