@@ -4,5 +4,5 @@
               package(sequence), package(tip_parser), package(unix)
 
 true: safe_string, annot, bin_annot, color(always), optimize(3), inline(100)
-true: warn(+a-4-44-58)
+true: warn(+a-4-44-58@8)
 true: use_menhir
