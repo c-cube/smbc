@@ -444,8 +444,8 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           | Match (u1, m1), Match (u2, m2) ->
             u1 == u2 &&
             ID.Map.for_all
-              (fun k1 v1 ->
-                 try v1 == ID.Map.find k1 m2
+              (fun k1 (_,rhs1) ->
+                 try rhs1 == snd (ID.Map.find k1 m2)
                  with Not_found -> false)
               m1
             &&
