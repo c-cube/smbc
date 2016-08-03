@@ -130,7 +130,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
 
   (* Hashconsed type *)
   and ty_h = {
-    ty_id: int;
+    mutable ty_id: int;
     ty_cell: ty_cell;
   }
 
@@ -152,7 +152,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     let compare a b = CCOrd.int_ a.ty_id b.ty_id
     let hash a = a.ty_id
 
-    module W = Weak.Make(struct
+    module H = Hashcons.Make(struct
         type t = ty_h
         let equal a b = match a.ty_cell, b.ty_cell with
           | Prop, Prop -> true
@@ -167,17 +167,13 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           | Prop -> 1
           | Atomic (i,_) -> Hash.combine2 2 (ID.hash i)
           | Arrow (a,b) -> Hash.combine3 3 (hash a) (hash b)
+
+        let set_id ty i = ty.ty_id <- i
       end)
 
     (* hashcons terms *)
-    let hashcons_ =
-      let tbl_ = W.create 128 in
-      let n_ = ref 0 in
-      fun ty_cell ->
-        let t = { ty_cell; ty_id = !n_; } in
-        let t' = W.merge tbl_ t in
-        if t == t' then incr n_;
-        t'
+    let hashcons_ ty_cell =
+      H.hashcons { ty_cell; ty_id = -1; }
 
     let prop = hashcons_ Prop
 
@@ -402,7 +398,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
 
     let sub_hash (t:term): int = t.term_id
 
-    module W = Weak.Make(struct
+    module H = Hashcons.Make(struct
         type t = term
 
         (* shallow hash *)
@@ -476,25 +472,9 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           | Match _, _
           | Builtin _, _
           | Mu _, _ -> false
-      end)
 
-    (* hashconsing function + iterating on all terms *)
-    let hashcons_, all_terms_ =
-      let tbl_ : W.t = W.create 1024 in
-      let term_count_ : int ref = ref 0 in
-      let hashcons t =
-        let t' = W.merge tbl_ t in
-        if t == t' then (
-          t.term_id <- !term_count_;
-          incr term_count_
-        ) else (
-          assert (t'.term_id >= 0);
-        );
-        t'
-      and iter yield =
-        W.iter yield tbl_
-      in
-      hashcons, iter
+        let set_id t i = t.term_id <- i
+      end)
 
     let mk_bool_ (b:bool) : term =
       let t = {
@@ -504,7 +484,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         term_nf=None;
         term_deps=[];
       } in
-      hashcons_ t
+      H.hashcons t
 
     let true_ = mk_bool_ true
     let false_ = mk_bool_ false
@@ -531,7 +511,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         term_nf=None;
         term_deps=[];
       } in
-      let t' = hashcons_ t in
+      let t' = H.hashcons t in
       if t==t' then (
         (* compute ty *)
         t.term_ty <- begin match ty with
@@ -894,7 +874,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       in
       Format.fprintf out "@[%a@]@." pp_ terms
 
-    let pp_dot_all out () = pp_dot out all_terms_
+    let pp_dot_all out () = pp_dot out H.to_seq
   end
 
   module Explanation = struct
