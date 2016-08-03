@@ -31,6 +31,8 @@ module Var = struct
   }
 
   let make id ty = {id;ty}
+  let makef ~ty fmt =
+    CCFormat.ksprintf fmt ~f:(fun s -> make (ID.make s) ty)
   let copy {id;ty} = {ty; id=ID.copy id}
   let id v = v.id
   let ty v = v.ty
@@ -264,8 +266,8 @@ let match_ t m =
        then Ty.ill_typed
            "match: cases %a and %a disagree on return type,@ \
            between %a and %a"
-           ID.pp c1 ID.pp c Ty.pp rhs1.ty Ty.pp rhs.ty;
-    ) m;
+           ID.pp c1 ID.pp c Ty.pp rhs1.ty Ty.pp rhs.ty)
+    m;
   mk_ (Match (t,m)) rhs1.ty
 
 let let_ v t u =
@@ -350,6 +352,7 @@ module Ctx = struct
   type t = {
     names: ID.t StrTbl.t;
     kinds: kind ID.Tbl.t;
+    data: (ID.t * Ty.t) list ID.Tbl.t; (* data -> cstors *)
     included: unit StrTbl.t; (* included paths *)
     include_dir: string; (* where to look for includes *)
     mutable loc: A.Loc.t option; (* current loc *)
@@ -358,6 +361,7 @@ module Ctx = struct
   let create ~include_dir () : t = {
     names=StrTbl.create 64;
     kinds=ID.Tbl.create 64;
+    data=ID.Tbl.create 64;
     included=StrTbl.create 8;
     include_dir;
     loc=None;
@@ -371,6 +375,9 @@ module Ctx = struct
     StrTbl.add t.names s id;
     ID.Tbl.add t.kinds id k;
     id
+
+  let add_data t (id:ID.t) cstors: unit =
+    ID.Tbl.add t.data id cstors
 
   let with_var t (s:string) (ty:Ty.t) (f:Ty.t Var.t -> 'a): 'a =
     let id = ID.make s in
@@ -390,6 +397,14 @@ module Ctx = struct
   let find_kind t (id:ID.t) : kind =
     try ID.Tbl.find t.kinds id
     with Not_found -> errorf "did not find kind of ID `%a`" ID.pp id
+
+  let as_data t (ty:Ty.t) : (ID.t * Ty.t) list = match ty with
+    | Ty.Const id ->
+      begin match ID.Tbl.get t.data id with
+        | Some l -> l
+        | None -> errorf "expected %a to be a datatype" Ty.pp ty
+      end
+    | _ -> errorf "expected %a to be a constant type" Ty.pp ty
 
   let pp_kind out = function
     | K_ty -> Format.fprintf out "type"
@@ -482,8 +497,9 @@ and conv_term_aux ctx t = match t with
     let a = conv_term ctx a in
     let b = conv_term ctx b in
     imply a b
-  | A.Match (lhs, cases) ->
-    let conv_case (c, vars, rhs) =
+  | A.Match (lhs, l) ->
+    (* convert a regular case *)
+    let conv_case c vars rhs =
       let c_id = find_id_ ctx c in
       (* obtain the type *)
       let ty_args, _ty_ret = match Ctx.find_kind ctx c_id with
@@ -501,10 +517,55 @@ and conv_term_aux ctx t = match t with
       Ctx.with_vars ctx vars
         (fun vars ->
            let rhs = conv_term ctx rhs in
-           c_id, (vars, rhs))
+           c_id, vars, rhs)
     in
+    (* convert default case, where [m] contains the partial map. We have
+       to complete this map *)
     let lhs = conv_term ctx lhs in
-    let cases = List.map conv_case cases |> ID.Map.of_list in
+    let default, cases =
+      List.fold_left
+        (fun (def,cases) branch -> match branch with
+           | A.Match_case (c,vars,rhs) ->
+             let c, vars, rhs = conv_case c vars rhs in
+             (* no duplicate *)
+             if ID.Map.mem c cases
+             then errorf_ctx ctx "constructor %a occurs twice" ID.pp c;
+             def, ID.Map.add c (vars,rhs) cases
+          | A.Match_default rhs ->
+            (* check there is only one "default" case *)
+            match def with
+              | Some _ -> errorf_ctx ctx "cannot have two `default` cases"
+              | None ->
+                let rhs = conv_term ctx rhs in
+                Some rhs, cases)
+        (None,ID.Map.empty) l
+    in
+    (* now fill the blanks, check exhaustiveness *)
+    let all_cstors = Ctx.as_data ctx lhs.ty in
+    let cases = match default with
+      | None ->
+        (* check exhaustiveness *)
+        let missing =
+          all_cstors
+          |> List.filter (fun (cstor,_) -> not (ID.Map.mem cstor cases))
+          |> List.map fst
+        in
+        if missing<>[]
+        then errorf_ctx ctx
+            "missing cases in `@[%a@]`: @[%a@]"
+            A.pp_term t (Utils.pp_list ID.pp) missing;
+        cases
+      | Some def_rhs ->
+        List.fold_left
+          (fun cases (cstor,ty_cstor) ->
+             if ID.Map.mem cstor cases then cases
+             else (
+               let args, _ = Ty.unfold ty_cstor in
+               let vars = List.mapi (fun i ty -> Var.makef ~ty "_%d" i) args in
+               ID.Map.add cstor (vars, def_rhs) cases
+             ))
+          cases all_cstors
+    in
     match_ lhs cases
   | A.App (f, args) ->
     let f = conv_term ctx f in
@@ -563,11 +624,10 @@ and conv_statement_aux ctx syn (t:A.statement) : statement list = match A.view t
              let id = Ctx.add_id ctx c (Ctx.K_cstor ty_c) in
              id, ty_c
            in
-           let data_cstors =
-             List.map parse_case cstors
-             |> ID.Map.of_list
-           in
-           {Ty.data_id; data_cstors})
+           let cstors = List.map parse_case cstors in
+           (* update info on [data] *)
+           Ctx.add_data ctx data_id cstors;
+           {Ty.data_id; data_cstors=ID.Map.of_list cstors})
         l
     in
     [Data l]

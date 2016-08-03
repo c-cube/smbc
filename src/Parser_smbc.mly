@@ -131,11 +131,11 @@ typed_var:
   | LEFT_PAREN v=IDENT ty=ty RIGHT_PAREN { v, ty }
 
 branch:
-  | LEFT_PAREN s=IDENT rhs=term RIGHT_PAREN { s, [], rhs }
+  | LEFT_PAREN s=IDENT rhs=term RIGHT_PAREN { A.Match_case (s, [], rhs) }
   | LEFT_PAREN
       LEFT_PAREN s=IDENT vars=IDENT+ RIGHT_PAREN
       rhs=term
-    RIGHT_PAREN  { s, vars, rhs }
+    RIGHT_PAREN  { A.Match_case (s, vars, rhs) }
 
 term:
   | TRUE { A.true_ }

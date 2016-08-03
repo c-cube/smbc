@@ -20,7 +20,7 @@ type term =
   | False
   | Const of string
   | App of term * term list
-  | Match of term * (string * var list * term) list
+  | Match of term * match_branch list
   | Let of var * term * term
   | If of term * term * term
   | Fun of typed_var * term
@@ -30,6 +30,10 @@ type term =
   | And of term list
   | Or of term list
   | Not of term
+
+and match_branch =
+  | Match_case of string * var list * term
+  | Match_default of term
 
 type statement = {
   stmt: stmt;
@@ -95,10 +99,13 @@ let rec pp_term out (t:term) = match t with
   | Const s -> CCFormat.string out s
   | App (f,l) -> fpf out "(@[<1>%a@ %a@])" pp_term f (Utils.pp_list pp_term) l
   | Match (lhs,cases) ->
-    let pp_case out (c,vars,rhs) =
-      if vars=[]
-      then fpf out "(@[%s@ %a@])" c pp_term rhs
-      else fpf out "(@[%s@ %a@ %a@])" c (Utils.pp_list CCFormat.string) vars pp_term rhs
+    let pp_case out = function
+      | Match_default rhs -> fpf out "(@[<2>case default@ %a@])" pp_term rhs
+      | Match_case (c,[],rhs) ->
+        fpf out "(@[<2>case %s@ %a@])" c pp_term rhs
+      | Match_case (c,vars,rhs) ->
+        fpf out "(@[<2>case@ (@[%s@ %a@])@ %a@])"
+          c (Utils.pp_list CCFormat.string) vars pp_term rhs
     in
     fpf out "(@[<1>match %a@ (@[<hv>%a@])@])" pp_term lhs
       (Utils.pp_list pp_case) cases
@@ -167,7 +174,13 @@ module Tip = struct
       | A.Cast (t, _) -> aux t
       | A.If (a,b,c) -> if_ (aux a) (aux b) (aux c)
       | A.Match (lhs,l) ->
-        let l = List.map (fun (c,vars,rhs) -> c,vars,aux rhs) l in
+        let l =
+          List.map
+            (function
+              | A.Match_default rhs -> Match_default (aux rhs)
+              | A.Match_case (c,vars,rhs) -> Match_case (c,vars,aux rhs))
+            l
+        in
         match_ (aux lhs) l
       | A.Fun (vars,body) -> fun_ (conv_typed_var vars) (aux body)
       | A.Or l -> or_ (List.map aux l)
