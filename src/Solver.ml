@@ -1452,7 +1452,6 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           e, t'
         | If (a,b,c) ->
           let e_a, a' = compute_nf a in
-          assert (not (Term.equal a a'));
           let default() =
             if a==a' then t else Term.if_ a' b c
           in
