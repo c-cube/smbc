@@ -537,6 +537,9 @@ and conv_statement_aux ctx syn (t:A.statement) : statement list = match A.view t
         Log.debugf 2 (fun k->k "(@[parse_include@ %S@])" s');
         parse_file_exn ctx syn ~file:s'
     end
+  | A.Stmt_ty_decl s ->
+    let id = Ctx.add_id ctx s Ctx.K_ty in
+    [TyDecl id]
   | A.Stmt_decl (s, ty) ->
     let ty = conv_ty ctx ty in
     let id = Ctx.add_id ctx s (Ctx.K_fun ty) in

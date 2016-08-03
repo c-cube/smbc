@@ -38,6 +38,7 @@ type statement = {
 
 and stmt =
   | Stmt_include of string
+  | Stmt_ty_decl of string
   | Stmt_decl of string * ty
   | Stmt_def of (string * ty * term) list
   | Stmt_data of (string * (string * ty list) list) list
@@ -70,6 +71,7 @@ let not_ t = Not t
 let _mk ?loc stmt = { loc; stmt }
 
 let include_ ?loc s = _mk ?loc (Stmt_include s)
+let ty_decl ?loc s = _mk ?loc (Stmt_ty_decl s)
 let decl ?loc f ty = _mk ?loc (Stmt_decl (f, ty))
 let def ?loc l = _mk ?loc (Stmt_def l)
 let data ?loc l = _mk ?loc (Stmt_data l)
@@ -117,6 +119,8 @@ let pp_stmt out (st:statement) = match view st with
   | Stmt_assert t -> fpf out "(@[assert@ %a@])" pp_term t
   | Stmt_goal (vars,t) ->
     fpf out "(@[goal@ (@[%a@])@ %a@])" (Utils.pp_list pp_typed_var) vars pp_term t
+  | Stmt_ty_decl s ->
+    fpf out "(@[ty-decl@ %s@])" s
   | Stmt_decl (s, ty) ->
     fpf out "(@[decl@ %s@ %a@])" s pp_ty ty
   | Stmt_def l ->
@@ -193,6 +197,10 @@ module Tip = struct
   let conv_stmt (st:A.statement): statement option =
     let loc = A.loc st in
     match A.view st with
+      | A.Stmt_decl_sort (s, 0) ->
+        ty_decl ?loc s |> CCOpt.return
+      | A.Stmt_decl_sort (_, _) ->
+        tip_errorf ?loc "cannot handle polymorphic type@ %a" A.pp_stmt st
       | A.Stmt_decl (s, ty) ->
         decl ?loc s (conv_ty ty) |> CCOpt.return
       | A.Stmt_assert t ->
