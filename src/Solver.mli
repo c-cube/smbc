@@ -77,17 +77,6 @@ module Make(C:CONFIG)(Dummy : sig end) : sig
   module Typed_cst : sig
     type t = cst
 
-    val make : ID.t -> cst_kind -> t
-    val make_bool : ID.t -> t
-    val make_undef :
-      ?can_use:term list ->
-      ?env:Ty.t db_env ->
-      ?parent:(t * term) lazy_t ->
-      ID.t ->
-      Ty.t -> t
-    val make_cstor : ID.t -> Ty.t -> t
-    val make_defined: ID.t -> Ty.t -> term lazy_t -> t
-
     val id : t -> ID.t
     val kind : t -> cst_kind
     val ty : t -> Ty.t

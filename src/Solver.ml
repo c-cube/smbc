@@ -95,11 +95,11 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     | Cst_defined of ty_h * term lazy_t
 
   and cst_info = {
-    cst_depth: int lazy_t;
+    cst_depth: int;
     (* refinement depth, used for iterative deepening *)
-    cst_parent: (cst * term) lazy_t option;
-    (* if const was created as argument of another const in
-       a given case *)
+    cst_parent: (cst * cst_parent_case_list) option;
+    (* if const was created as a parameter to some cases of another constant
+       (e.g., [b] might be created because [a = A1 b | A2 b | A3]) *)
     mutable cst_cases: term list option;
     (* cover set (lazily evaluated) *)
     mutable cst_complete: bool;
@@ -122,6 +122,8 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     (* other terms that can be used to refine this constant or its own
        sub-constants. This is useful for controlling recursion. *)
   }
+
+  and cst_parent_case_list = term lazy_t list ref
 
   and 'a db_env = {
     db_st: 'a option list;
@@ -307,16 +309,16 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
 
     let make_undef ?(can_use=[]) ?(env=DB_env.empty) ?parent id ty =
       let info =
-        let cst_depth = lazy (match parent with
-          | Some (lazy ({cst_kind=Cst_undef (ty, i); _}, _)) ->
+        let cst_depth = match parent with
+          | Some ({cst_kind=Cst_undef (ty, i); _}, _) ->
             begin match Ty.view ty with
-              | Arrow _ -> Lazy.force i.cst_depth
-              | Atomic _ | Prop -> Lazy.force i.cst_depth + 1
+              | Arrow _ -> i.cst_depth
+              | Atomic _ | Prop -> i.cst_depth + 1
             end
           | Some _ ->
             invalid_arg "make_const: parent should be a constant"
           | None -> 0
-        ) in
+        in
         { cst_depth; cst_parent=parent;
           cst_cases=None;
           cst_complete=false;
@@ -1196,8 +1198,38 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     (* make a sub-constant with given type *)
     let mk_sub_cst ~can_use ~env ~parent ty_arg =
       let basename = Ty.mangle ty_arg in
-      let c = new_cst_ basename ~can_use ~env ty_arg ~parent in
-      Term.const c
+      new_cst_ basename ~can_use ~env ty_arg ~parent
+    in
+    (* table of already built constants, by type *)
+    let memo : (cst * cst_parent_case_list) list Ty.Tbl.t = Ty.Tbl.create 16 in
+    (* get or create a constant that has this type *)
+    let get_or_create_cst
+        ~can_use ~env ~(parent:cst) ~(used:cst list ref) ty_arg
+        : cst * cst_parent_case_list =
+      if DB_env.is_empty env
+      then (
+        let usable =
+          Ty.Tbl.get_or ~or_:[] memo ty_arg
+          |> List.filter
+            (fun (c',_) -> not (List.exists (Typed_cst.equal c') !used))
+        in
+        match usable with
+          | [] ->
+            (* make a new constant and remember it *)
+            let plist = ref [] in
+            let cst = mk_sub_cst ~can_use ~env ~parent:(parent,plist) ty_arg in
+            Ty.Tbl.add_list memo ty_arg (cst,plist);
+            used := cst :: !used; (* cannot use it in the same case *)
+            cst, plist
+          | (cst,plist) :: _ ->
+            (* [cst] has the proper type, and is not used yet *)
+            used := cst :: !used;
+            cst, plist
+      ) else (
+        (* no caching when there is an environment *)
+        let plist = ref [] in
+        mk_sub_cst ~can_use ~env ~parent:(cst,plist) ty_arg, plist
+      )
     in
     (* expand constant depending on its *)
     let by_ty = match Ty.view ty with
@@ -1208,14 +1240,22 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           (fun (lazy c) ->
              let rec case = lazy (
                let ty_args, _ = Typed_cst.ty c |> Ty.unfold in
-               let parent = lazy (cst, Lazy.force case) in
+               (* elements of [memo] already used when generating the
+                  arguments of this particular case,
+                  so we do not use a constant twice *)
+               let used = ref [] in
                let args =
                  List.map
                    (fun ty_arg ->
-                      mk_sub_cst ty_arg
-                        ~can_use:info.cst_can_use
-                        ~env:info.cst_db_ctx
-                        ~parent)
+                      let c, plist = get_or_create_cst
+                        ty_arg
+                          ~can_use:info.cst_can_use
+                          ~env:info.cst_db_ctx
+                          ~parent:cst ~used
+                      in
+                      plist := case :: !plist;
+                      Term.const c
+                   )
                    ty_args
                in
                Term.app_cst c args
@@ -1233,9 +1273,10 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         (* TODO: add recursion? *)
         let can_use = info.cst_can_use in
         let rec fun_ = lazy (
-          let parent = lazy (cst, Lazy.force fun_) in
-          mk_sub_cst ty_ret ~can_use ~env ~parent
-          |> Term.fun_l ty_args
+          let plist = ref [fun_] in
+          let parent = cst, plist in
+          let c = mk_sub_cst ty_ret ~can_use ~env ~parent in
+          Term.fun_l ty_args (Term.const c)
         ) in
         let fun_ = Lazy.force fun_ in
         [fun_]
@@ -1257,13 +1298,17 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
              then (
                let hd = Term.db (DB.make i ty_o) in
                let rec case = lazy (
-                 let parent = lazy (cst, Lazy.force case) in
+                 let used = ref [] in
                  let args =
                    List.map
                      (fun ty_arg ->
-                        mk_sub_cst ty_arg
-                          ~env:info.cst_db_ctx
-                          ~can_use:info.cst_can_use ~parent)
+                        let c, plist =
+                          get_or_create_cst ty_arg
+                            ~env:info.cst_db_ctx
+                            ~can_use:info.cst_can_use ~parent:cst ~used
+                        in
+                        plist := case :: !plist;
+                        Term.const c)
                      ty_args
                  in
                  Term.app hd args
@@ -1645,6 +1690,13 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       Clause.push_new c;
       ()
 
+    (* [product_imply l cs] builds the list of
+       [F => cs] for each [F] in [l], or returns [cs] if [l] is empty *)
+    let product_imply guards (c:Lit.t list) : Lit.t list list =
+      match guards with
+        | [] -> [c]
+        | l -> List.map (fun f -> Lit.neg f :: c) l
+
     (* build clause(s) that explains that [c] must be one of its
        cases *)
     let clauses_of_cases (c:cst) (l:term list) (depth:int): Clause.t list =
@@ -1656,9 +1708,9 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         | Some (_,_,info) -> info
       in
       let guard_parent = match info.cst_parent with
-        | None -> None
-        | Some (lazy (par, par_case)) ->
-          Some (Lit.cst_choice par par_case |> Lit.neg)
+        | None -> []
+        | Some (par, par_cases) ->
+          List.map (fun (lazy case) -> Lit.cst_choice par case) !par_cases
       in
       (* lits with a boolean indicating whether they have
            to be depth-guarded *)
@@ -1674,7 +1726,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
                  (fun sub -> match sub.term_cell with
                     | Const ({cst_kind=Cst_undef (_,info); _}, _) ->
                       (* is [sub] a constant deeper than [d]? *)
-                      Lazy.force info.cst_depth > depth
+                      info.cst_depth > depth
                     | _ -> false)
              in
              lit, needs_guard)
@@ -1682,10 +1734,10 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       in
       (* at least one case. We only enforce that if the
          parent constant has the proper case *)
-      let c_choose : Clause.t =
+      let c_choose : Clause.t list =
         List.map fst lits
-        |> CCList.cons_maybe guard_parent
-        |> Clause.make
+        |> product_imply guard_parent
+        |> List.map Clause.make
       (* at most one case *)
       and cs_once : Clause.t list =
         CCList.diagonal lits
@@ -1703,7 +1755,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
                | _ -> [])
           lits
       in
-      c_choose :: cs_limit @ cs_once
+      c_choose @ cs_limit @ cs_once
 
     (* add [t] to the list of literals that watch the constant [c] *)
     let watch_cst_ (c:cst) (t:t): unit =
@@ -1716,7 +1768,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       in
       Poly_set.add info.cst_watched t;
       (* we should never have to expand a meta that is too deep *)
-      let depth = Lazy.force info.cst_depth in
+      let depth = info.cst_depth in
       assert (depth <= (Iterative_deepening.current_depth() :> int));
       (* check whether [c] is expanded *)
       begin match info.cst_cases with
