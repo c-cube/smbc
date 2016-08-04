@@ -41,6 +41,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
   let stat_num_cst_expanded = ref 0
   let stat_num_clause_push = ref 0
   let stat_num_clause_tautology = ref 0
+  let stat_num_equiv_lemmas = ref 0
 
   (* main term cell *)
   type term = {
@@ -683,6 +684,9 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     let is_const t = match t.term_cell with
       | Const _ -> true
       | _ -> false
+
+    let is_true t = match t.term_cell with True -> true | _ -> false
+    let is_false t = match t.term_cell with False -> true | _ -> false
 
     let map_builtin f b =
       let (), b = fold_map_builtin (fun () t -> (), f t) () b in
@@ -1790,11 +1794,26 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       end;
       ()
 
+    let clauses_equiv (a:Lit.t) (b:Lit.t) (e:explanation): Clause.t list =
+      assert (not (Lit.equal a b));
+      let guard = clause_guard_of_exp_ e in
+      let c1 = b :: Lit.neg a :: guard |> Clause.make in
+      let c2 = a :: Lit.neg b :: guard |> Clause.make in
+      [ c1; c2 ]
+
+    let watched_ : unit Lit.Tbl.t = Lit.Tbl.create 256
+
     (* ensure that [t] is on the watchlist of all the
        constants it depends on;
        also ensure those constants are expanded *)
-    let update_watches_of (t:t): unit =
+    let rec update_watches_of (t:t): unit =
       assert (Ty.is_prop t.term_ty);
+      (* is [t] a literal that has no "significant" normal form yet
+         (none that required expanding a meta)? *)
+      let intermediate_node = match t.term_nf with
+        | None -> true
+        | Some (_, e) -> Explanation.is_empty e
+      in
       let e, new_t = Reduce.compute_nf t in
       (* if [new_t = true/false], propagate literal *)
       begin match new_t.term_cell with
@@ -1812,16 +1831,18 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
                 (Utils.pp_list Typed_cst.pp) new_t.term_deps
                 Explanation.pp e);
           List.iter (fun c -> watch_cst_ c t) new_t.term_deps;
+          (* also propagate at the SAT level that [t <=> new_t], if there
+             really was a change, and watch [new_t] *)
+          if intermediate_node && new_t != t && not (Explanation.is_empty e) then (
+            let cs = clauses_equiv t new_t e in
+            Clause.push_new_l cs;
+            incr stat_num_equiv_lemmas;
+            watch new_t;
+          )
       end;
       ()
 
-    let watched_ : unit Lit.Tbl.t = Lit.Tbl.create 256
-
-      (* TODO: if [lit] is new, do on-the-fly CNF of its inner formula
-         (break not/and/or, maybe explore a bit the equalities eagerly?).
-      *)
-
-    let watch (lit:t) =
+    and watch (lit:t): unit =
       let lit = Lit.abs lit in
       if not (Lit.Tbl.mem watched_ lit) then (
         Log.debugf 3
@@ -2434,11 +2455,13 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
        :num_expanded %d@ \
        :num_clause_push %d@ \
        :num_clause_tautology %d@ \
+       :num_equiv_lemmas %d@ \
        :num_lits %d\
        @])"
       !stat_num_cst_expanded
       !stat_num_clause_push
       !stat_num_clause_tautology
+      !stat_num_equiv_lemmas
       (Watched_lit.size())
 
   let do_on_exit ~on_exit =
