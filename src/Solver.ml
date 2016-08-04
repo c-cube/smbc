@@ -278,7 +278,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           CCFormat.list ~start:"" ~stop:"" ~sep:"," pp_pair out l
   end
 
-  let term_equal_ a b = a==b
+  let term_equal_ (a:term) b = a==b
   let term_hash_ a = a.term_id
 
   module Typed_cst = struct
@@ -1420,13 +1420,13 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     let cycle_check ~(sub:term) (into:term): bool =
       cycle_check_l ~sub [into]
 
-    (* set the normal form of [t], propagate to watchers *)
+    (* set the normal form of [t] *)
     let set_nf_ t new_t (e:explanation) : unit =
       if Term.equal t new_t then ()
       else (
         Backtrack.push_set_nf_ t;
         t.term_nf <- Some (new_t, e);
-        Log.debugf 5
+        Log.debugf 2
           (fun k->k
               "(@[<hv1>set_nf@ @[%a@]@ @[%a@]@ :explanation @[<hv>%a@]@])"
               Term.pp t Term.pp new_t Explanation.pp e);
@@ -1440,13 +1440,24 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     (* compute the normal form of this term. We know at least one of its
        subterm(s) has been reduced *)
     let rec compute_nf (t:term) : explanation * term =
+      (* FIXME
+
+         ./smbc.native --debug 2 --stats --check examples/ty_infer.lisp
+
+
+      Format.printf "compute_nf `@[%a@]`@." Term.pp t;
+         *)
       (* follow the "normal form" pointer *)
       match t.term_nf with
-        | Some (t', e) ->
-          let exp, nf = compute_nf_add e t' in
+        | Some (t', e') ->
+          assert (not (Term.equal t t'));
+          let e_nf, nf = compute_nf t' in
+          let exp = Explanation.append e_nf e' in
+          (* FIXME
           (* path compression here *)
           if not (Term.equal t' nf)
           then set_nf_ t nf exp;
+             *)
           exp, nf
         | None -> compute_nf_noncached t
 
