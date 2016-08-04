@@ -1583,9 +1583,21 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         let b' = Term.not_ b in
         compute_nf (Term.not_ (Term.and_par a b' a b'))
       | B_eq (a,b) when Ty.is_prop a.term_ty ->
-        (* [a <=> b] is expressed as double implication *)
-        let t' = Term.and_ (Term.imply a b) (Term.imply b a) in
-        compute_nf t'
+        let e_a, a' = compute_nf a in
+        let e_b, b' = compute_nf b in
+        let e_ab = Explanation.append e_a e_b in
+        begin match a'.term_cell, b'.term_cell with
+          | True, True
+          | False, False -> e_ab, Term.true_
+          | True, False
+          | False, True -> e_ab, Term.false_
+          | _ when Term.equal a' b' -> e_ab, Term.true_
+          | _ ->
+            let t' =
+              if a==a' && b==b' then old else Term.eq a' b'
+            in
+            e_ab, t'
+        end
       | B_and (a,b,c,d) ->
         (* evaluate [c] and [d], but only provide some explanation
            once their conjunction reduces to [true] or [false].
@@ -2319,6 +2331,17 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
             | False, _  -> Term.true_
             | True, False -> Term.false_
             | _ -> Term.imply a b
+          end
+        | Builtin (B_eq (a,b)) when Ty.is_prop a.term_ty ->
+          let a = aux a in
+          let b = aux b in
+          begin match a.term_cell, b.term_cell with
+            | True, True
+            | False, False -> Term.true_
+            | True, False
+            | False, True -> Term.false_
+            | _ when Term.equal a b -> Term.true_
+            | _ -> Term.eq a b
           end
         | Builtin (B_eq (a,b)) ->
           let a = aux a in
