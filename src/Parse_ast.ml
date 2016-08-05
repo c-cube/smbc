@@ -170,7 +170,9 @@ module Tip = struct
       | A.True -> true_
       | A.False -> false_
       | A.Const s -> const s
-      | A.App (f, l) -> app (aux f) (List.map aux l)
+      | A.App (f, l) ->
+        app (aux (A.Const f)) (List.map aux l)
+      | A.HO_app (a,b) -> app (aux a) [aux b]
       | A.Cast (t, _) -> aux t
       | A.If (a,b,c) -> if_ (aux a) (aux b) (aux c)
       | A.Match (lhs,l) ->
