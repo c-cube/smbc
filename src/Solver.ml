@@ -73,7 +73,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
   and builtin =
     | B_not of term
     | B_eq of term * term
-    | B_and of term * term * term * term (* parallel and *)
+    | B_and of term * term (* parallel and *)
     | B_or of term * term
     | B_imply of term * term
 
@@ -425,8 +425,8 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
             in
             Hash.combine3 8 u.term_id hash_m
           | Builtin (B_not a) -> Hash.combine2 20 a.term_id
-          | Builtin (B_and (t1,t2,t3,t4)) ->
-            Hash.list sub_hash [t1;t2;t3;t4]
+          | Builtin (B_and (t1,t2)) ->
+            Hash.list sub_hash [t1;t2]
           | Builtin (B_or (t1,t2)) -> Hash.combine3 22 t1.term_id t2.term_id
           | Builtin (B_imply (t1,t2)) -> Hash.combine3 23 t1.term_id t2.term_id
           | Builtin (B_eq (t1,t2)) -> Hash.combine3 24 t1.term_id t2.term_id
@@ -456,8 +456,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           | Builtin b1, Builtin b2 ->
             begin match b1, b2 with
               | B_not a1, B_not a2 -> a1 == a2
-              | B_and (a1,b1,c1,d1), B_and (a2,b2,c2,d2) ->
-                a1 == a2 && b1 == b2 && c1 == c2 && d1 == d2
+              | B_and (a1,b1), B_and (a2,b2) -> a1 == a2 && b1 == b2
               | B_or (a1,b1), B_or (a2,b2)
               | B_eq (a1,b1), B_eq (a2,b2)
               | B_imply (a1,b1), B_imply (a2,b2) -> a1 == a2 && b1 == b2
@@ -620,7 +619,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       (* normalize a bit *)
       let b = match b with
         | B_eq (a,b) when a.term_id > b.term_id -> B_eq (b,a)
-        | B_and (a,b,c,d) when a.term_id > b.term_id -> B_and (b,a,d,c)
+        | B_and (a,b) when a.term_id > b.term_id -> B_and (b,a)
         | B_or (a,b) when a.term_id > b.term_id -> B_or (b,a)
         | _ -> b
       in
@@ -630,7 +629,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     let builtin b =
       let deps = match b with
         | B_not u -> Dep_sub u
-        | B_and (_,_,a,b)
+        | B_and (a,b)
         | B_or (a,b)
         | B_eq (a,b) | B_imply (a,b) -> Dep_sub2 (a,b)
       in
@@ -642,14 +641,11 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       | Builtin (B_not t') -> t'
       | _ -> builtin_ ~deps:(Dep_sub t) (B_not t)
 
-    let and_ a b = builtin_ ~deps:(Dep_sub2 (a,b)) (B_and (a,b,a,b))
+    let and_ a b = builtin_ ~deps:(Dep_sub2 (a,b)) (B_and (a,b))
     let or_ a b = builtin_ ~deps:(Dep_sub2 (a,b)) (B_or (a,b))
     let imply a b = builtin_ ~deps:(Dep_sub2 (a,b)) (B_imply (a,b))
     let eq a b = builtin_ ~deps:(Dep_sub2 (a,b)) (B_eq (a,b))
     let neq a b = not_ (eq a b)
-
-    let and_par a b c d =
-      builtin_ ~deps:(Dep_sub2 (c,d)) (B_and (a,b,c,d))
 
     let and_l = function
       | [] -> true_
@@ -667,10 +663,9 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         | B_not t ->
           let acc, t' = f acc t in
           acc, B_not t'
-        | B_and (a,b,c,d) ->
+        | B_and (a,b) ->
           let acc, a, b = fold_binary acc a b in
-          let acc, c, d = fold_binary acc c d in
-          acc, B_and (a,b,c,d)
+          acc, B_and (a,b)
         | B_or (a,b) ->
           let acc, a, b = fold_binary acc a b in
           acc, B_or (a, b)
@@ -697,7 +692,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       | B_or (a,b)
       | B_imply (a,b)
       | B_eq (a,b) -> yield a; yield b
-      | B_and (a,b,c,d) -> yield a; yield b; yield c; yield d
+      | B_and (a,b) -> yield a; yield b
 
     let ty t = t.term_ty
 
@@ -788,7 +783,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           fpf out "(@[match %a@ (@[<hv>%a@])@])"
             pp t print_map (ID.Map.to_seq m)
         | Builtin (B_not t) -> fpf out "(@[<hv1>not@ %a@])" pp t
-        | Builtin (B_and (_, _, a,b)) ->
+        | Builtin (B_and (a,b)) ->
           fpf out "(@[<hv1>and@ %a@ %a@])" pp a pp b
         | Builtin (B_or (a,b)) ->
           fpf out "(@[<hv1>or@ %a@ %a@])" pp a pp b
@@ -1426,7 +1421,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       else (
         Backtrack.push_set_nf_ t;
         t.term_nf <- Some (new_t, e);
-        Log.debugf 2
+        Log.debugf 3
           (fun k->k
               "(@[<hv1>set_nf@ @[%a@]@ @[%a@]@ :explanation @[<hv>%a@]@])"
               Term.pp t Term.pp new_t Explanation.pp e);
@@ -1440,13 +1435,6 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     (* compute the normal form of this term. We know at least one of its
        subterm(s) has been reduced *)
     let rec compute_nf (t:term) : explanation * term =
-      (* FIXME
-
-         ./smbc.native --debug 2 --stats --check examples/ty_infer.lisp
-
-
-      Format.printf "compute_nf `@[%a@]`@." Term.pp t;
-         *)
       (* follow the "normal form" pointer *)
       match t.term_nf with
         | Some (t', e') ->
@@ -1592,11 +1580,11 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         (* [a or b] becomes [not (not a and not b)] *)
         let a' = Term.not_ a in
         let b' = Term.not_ b in
-        compute_nf (Term.not_ (Term.and_par a' b' a' b'))
+        compute_nf (Term.not_ (Term.and_ a' b'))
       | B_imply (a,b) ->
         (* [a => b] becomes [not [a and not b]] *)
         let b' = Term.not_ b in
-        compute_nf (Term.not_ (Term.and_par a b' a b'))
+        compute_nf (Term.not_ (Term.and_ a b'))
       | B_eq (a,b) when Ty.is_prop a.term_ty ->
         let e_a, a' = compute_nf a in
         let e_b, b' = compute_nf b in
@@ -1613,29 +1601,25 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
             in
             e_ab, t'
         end
-      | B_and (a,b,c,d) ->
-        (* evaluate [c] and [d], but only provide some explanation
-           once their conjunction reduces to [true] or [false].
-
-           We first compute only [c], in case it is [False]. *)
-        let e_a, c' = compute_nf a in
-        begin match c'.term_cell with
+      | B_and (a,b) ->
+        (** We first compute only [a], in case it is [False]. *)
+        let e_a, a' = compute_nf a in
+        begin match a'.term_cell with
           | False ->
             e_a, Term.false_
           | _ ->
-            let e_b, d' = compute_nf b in
-            begin match c'.term_cell, d'.term_cell with
+            let e_b, b' = compute_nf b in
+            let e_ab = Explanation.append e_a e_b in
+            begin match a'.term_cell, b'.term_cell with
               | _, False ->
                 e_b, Term.false_
               | True, True ->
-                let e_ab = Explanation.append e_a e_b in
                 e_ab, Term.true_
               | _ ->
                 let t' =
-                  if c==c' && d==d' then old else Term.and_par a b c' d'
+                  if a==a' && b==b' then old else Term.and_ a' b'
                 in
-                (* keep the explanations for when the value is true/false *)
-                Explanation.empty, t'
+                e_ab, t'
             end
         end
       | B_eq (a,b) ->
@@ -1780,7 +1764,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     (* add [t] to the list of literals that watch the constant [c] *)
     let watch_cst_ (c:cst) (t:t): unit =
       assert (Ty.is_prop t.term_ty);
-      Log.debugf 2
+      Log.debugf 3
         (fun k->k "(@[<1>watch_cst@ %a@ %a@])" Typed_cst.pp c Term.pp t);
       let ty, info = match c.cst_kind with
         | Cst_undef (ty,i) -> ty,i
@@ -1823,7 +1807,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
          (none that required expanding a meta)? *)
       let intermediate_node = match t.term_nf with
         | None -> true
-        | Some (_, e) -> Explanation.is_empty e
+        | Some (_, e') -> Explanation.is_empty e'
       in
       let e, new_t = Reduce.compute_nf t in
       (* if [new_t = true/false], propagate literal *)
@@ -1856,7 +1840,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     and watch (lit:t): unit =
       let lit = Lit.abs lit in
       if not (Lit.Tbl.mem watched_ lit) then (
-        Log.debugf 3
+        Log.debugf 2
           (fun k->k "(@[<1>@{<green>watch_lit@}@ %a@])" Lit.pp lit);
         Lit.Tbl.add watched_ lit ();
         (* also ensure it is watched properly *)
@@ -2330,7 +2314,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
             | False -> Term.true_
             | _ -> Term.not_ f
           end
-        | Builtin (B_and (_,_,a,b)) ->
+        | Builtin (B_and (a,b)) ->
           let a = aux a in
           let b = aux b in
           begin match a.term_cell, b.term_cell with
