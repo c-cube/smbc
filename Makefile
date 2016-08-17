@@ -19,3 +19,8 @@ watch:
 		sleep 0.1; \
 		make all; \
 	done
+
+benchs:
+	frogtest run -c benchmarks/smbc.toml --save snapshots/tip-`git rev-parse HEAD`
+
+.PHONY: watch benchs clean build test
