@@ -1603,30 +1603,23 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
            once their conjunction reduces to [true] or [false].
 
            We first compute only [c], in case it is [False]. *)
-        let _, c' = compute_nf c in
+        let e_a, c' = compute_nf a in
         begin match c'.term_cell with
           | False ->
-            let e, c'' = compute_nf a in
-            assert (Term.equal c' c'');
-            e, Term.false_
+            e_a, Term.false_
           | _ ->
-            let _, d' = compute_nf d in
+            let e_b, d' = compute_nf b in
             begin match c'.term_cell, d'.term_cell with
               | _, False ->
-                let e, d'' = compute_nf b in
-                assert (Term.equal d' d'');
-                e, Term.false_
+                e_b, Term.false_
               | True, True ->
-                let e1, c'' = compute_nf a in
-                let e2, d'' = compute_nf b in
-                assert (Term.equal c' c'');
-                assert (Term.equal d' d'');
-                let e = Explanation.append e1 e2 in
-                e, Term.true_
+                let e_ab = Explanation.append e_a e_b in
+                e_ab, Term.true_
               | _ ->
                 let t' =
                   if c==c' && d==d' then old else Term.and_par a b c' d'
                 in
+                (* keep the explanations for when the value is true/false *)
                 Explanation.empty, t'
             end
         end
