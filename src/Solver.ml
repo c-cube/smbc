@@ -2449,11 +2449,11 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
 
   let rec pp_proof out p =
     let pp_step out = function
-      | M.Proof.Hypothesis -> CCFormat.string out "hypothesis"
       | M.Proof.Lemma () -> Format.fprintf out "(@[<1>lemma@ ()@])"
       | M.Proof.Resolution (p1, p2, _) ->
         Format.fprintf out "(@[<1>resolution@ %a@ %a@])"
           pp_proof p1 pp_proof p2
+      | _ -> CCFormat.string out "<other>"
     in
     let {M.Proof.conclusion; step } = M.Proof.expand p in
     let conclusion = clause_of_mclause conclusion in
