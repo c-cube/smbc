@@ -14,7 +14,7 @@ depends: [
   "base-bytes"
   "containers" { > "0.16" }
   "sequence" { >= "0.4" }
-  "msat" { >= "0.4" & <= "0.5" }
+  "msat" { >= "0.4" & < "0.5" }
   "tip-parser"
   "menhir"
 ]
