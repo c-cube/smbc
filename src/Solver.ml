@@ -776,7 +776,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           fpf out "(@[if %a@ %a@ %a@])" pp a pp b pp c
         | Match (t,m) ->
           let pp_bind out (id,(_tys,rhs)) =
-            fpf out "(@[%a %a@])" ID.pp id pp rhs
+            fpf out "(@[<1>%a@ %a@])" ID.pp id pp rhs
           in
           let print_map =
             CCFormat.seq ~start:"" ~stop:"" ~sep:" " pp_bind
@@ -2224,7 +2224,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
 
     let pp out m =
       let pp_pair out (c,t) =
-        Format.fprintf out "(@[%a %a@])"
+        Format.fprintf out "(@[<1>%a@ %a@])"
           ID.pp_name (Typed_cst.id c)
           (Term.pp_top ~ids:false) t
       in
