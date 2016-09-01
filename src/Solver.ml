@@ -42,6 +42,11 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
   let stat_num_clause_push = ref 0
   let stat_num_clause_tautology = ref 0
 
+  (* for objects that are expanded on demand only *)
+  type 'a lazily_expanded =
+    | Lazy_some of 'a
+    | Lazy_none
+
   (* main term cell *)
   type term = {
     mutable term_id: int; (* unique ID *)
@@ -100,7 +105,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     cst_parent: (cst * cst_parent_case_list) option;
     (* if const was created as a parameter to some cases of another constant
        (e.g., [b] might be created because [a = A1 b | A2 b | A3]) *)
-    mutable cst_cases: term list option;
+    mutable cst_cases: term list lazily_expanded;
     (* cover set (lazily evaluated) *)
     mutable cst_complete: bool;
     (* does [cst_cases] cover all possible cases, or only
@@ -310,7 +315,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           | None -> 0
         in
         { cst_depth; cst_parent=parent;
-          cst_cases=None;
+          cst_cases=Lazy_none;
           cst_complete=false;
           cst_cur_case=None;
           cst_watched=
@@ -897,8 +902,8 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       | Builtin (B_eq (a, b)) ->
         (* is [t] one of the cases for this constant? *)
         let is_case info t = match info.cst_cases with
-          | Some l -> List.memq t l
-          | None -> false
+          | Lazy_some l -> List.memq t l
+          | Lazy_none -> false
         in
         begin match Term.as_cst_undef a, Term.as_cst_undef b with
           | Some (c,_,info), _ when is_case info b ->
@@ -1158,7 +1163,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
 
   (* build the disjunction [l] of cases for [info]. No side effect. *)
   let expand_cases (cst:cst) (ty:Ty.t) (info:cst_info): term list =
-    assert (info.cst_cases = None);
+    assert (info.cst_cases = Lazy_none);
     (* make a sub-constant with given type *)
     let mk_sub_cst ~parent ty_arg =
       let basename = Ty.mangle ty_arg in
@@ -1725,16 +1730,16 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       assert (depth <= (Iterative_deepening.current_depth() :> int));
       (* check whether [c] is expanded *)
       begin match info.cst_cases with
-        | None ->
+        | Lazy_none ->
           (* [c] is blocking, not too deep, but not expanded *)
           let l = expand_cases c ty info in
           Log.debugf 2
             (fun k->k "(@[<1>expand_cases@ @[%a@]@ :into (@[%a@])@ :depth %d@])"
                 Typed_cst.pp c (Utils.pp_list Term.pp) l depth);
-          info.cst_cases <- Some l;
+          info.cst_cases <- Lazy_some l;
           incr stat_num_cst_expanded;
           Clause.push_new_l (clauses_of_cases c l depth)
-        | Some _ -> ()
+        | Lazy_some _ -> ()
       end;
       ()
 
@@ -1968,7 +1973,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
                  Typed_cst.pp c Term.pp nf
                  (match Typed_cst.as_undefined c with
                    | None -> assert false
-                   | Some (_,_,i) -> i.cst_cases <> None)
+                   | Some (_,_,i) -> i.cst_cases <> Lazy_none)
              in
              let pp_lit out l =
                let e, nf = Reduce.get_nf l in
