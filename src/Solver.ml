@@ -88,13 +88,26 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       (* blocked by non-refined constant *)
     | Dep_uty of ty_uninterpreted_slice
       (* blocked because this type is not expanded enough *)
+    | Dep_bool_expr of term
+      (* blocked by this boolean expression *)
 
   and builtin =
     | B_not of term
     | B_eq of term * term
-    | B_and of term * term * term * term (* parallel and *)
-    | B_or of term * term
-    | B_imply of term * term
+    | B_and of term * term * bool_info
+    | B_or of term * term * bool_info
+    | B_imply of term * term * bool_info
+    | B_equiv of term * term * bool_info
+
+  and bool_info = {
+    mutable bi_expanded: bool;
+    (* did we expand the literal into CNF yet? *)
+    mutable bi_decided: (explanation * bool) option;
+    (* current truth value in the model *)
+    bi_watched: term Poly_set.t lazy_t;
+    (* set of (bool) literals that depend on this expression
+       for evaluation *)
+  }
 
   (* a table [m] from values of type [switch_ty_arg]
      to terms of type [switch_ty_ret],
@@ -488,10 +501,6 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     | Uty_empty -> CCFormat.string out "empty"
     | Uty_nonempty -> CCFormat.string out "non_empty"
 
-  let pp_dep out = function
-    | Dep_cst c -> Typed_cst.pp out c
-    | Dep_uty uty -> pp_uty out uty
-
   module Backtrack = struct
     type _level = level
     type level = _level
@@ -508,6 +517,9 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       | S_set_uty of
           ty_uninterpreted_slice * (explanation * ty_uninterpreted_status) option
           (* uty1.uty_status <- status2 *)
+      | S_set_bi of
+          bool_info * (explanation * bool) option
+          (* bi1.status <- bool2 *)
 
     type stack = stack_cell CCVector.vector
 
@@ -522,6 +534,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           | S_set_nf (t, nf) -> t.term_nf <- nf;
           | S_set_cst_case (info, c) -> info.cst_cur_case <- c;
           | S_set_uty (uty, s) -> uty.uty_status <- s;
+          | S_set_bi (bi, s) -> bi.bi_decided <- s;
       done;
       ()
 
@@ -540,6 +553,9 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
 
     let push_uty_status (uty:ty_uninterpreted_slice) =
       CCVector.push st_ (S_set_uty (uty, uty.uty_status))
+
+    let push_bi (bi:bool_info) =
+      CCVector.push st_ (S_set_bi (bi, bi.bi_decided))
   end
 
   let new_switch_id_ =
@@ -574,11 +590,11 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
             in
             Hash.combine3 8 u.term_id hash_m
           | Builtin (B_not a) -> Hash.combine2 20 a.term_id
-          | Builtin (B_and (t1,t2,t3,t4)) ->
-            Hash.list sub_hash [t1;t2;t3;t4]
-          | Builtin (B_or (t1,t2)) -> Hash.combine3 22 t1.term_id t2.term_id
-          | Builtin (B_imply (t1,t2)) -> Hash.combine3 23 t1.term_id t2.term_id
-          | Builtin (B_eq (t1,t2)) -> Hash.combine3 24 t1.term_id t2.term_id
+          | Builtin (B_and (t1,t2,_)) -> Hash.combine3 21 t1.term_id t2.term_id
+          | Builtin (B_or (t1,t2,_)) -> Hash.combine3 22 t1.term_id t2.term_id
+          | Builtin (B_imply (t1,t2,_)) -> Hash.combine3 23 t1.term_id t2.term_id
+          | Builtin (B_equiv (t1,t2,_)) -> Hash.combine3 24 t1.term_id t2.term_id
+          | Builtin (B_eq (t1,t2)) -> Hash.combine3 25 t1.term_id t2.term_id
           | Mu sub -> Hash.combine sub_hash 30 sub
           | Switch (t, tbl) ->
             Hash.combine3 31 (sub_hash t) tbl.switch_id
@@ -611,13 +627,13 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           | Builtin b1, Builtin b2 ->
             begin match b1, b2 with
               | B_not a1, B_not a2 -> a1 == a2
-              | B_and (a1,b1,c1,d1), B_and (a2,b2,c2,d2) ->
-                a1 == a2 && b1 == b2 && c1 == c2 && d1 == d2
-              | B_or (a1,b1), B_or (a2,b2)
+              | B_and (a1,b1,_), B_and (a2,b2,_)
+              | B_or (a1,b1,_), B_or (a2,b2,_)
               | B_eq (a1,b1), B_eq (a2,b2)
-              | B_imply (a1,b1), B_imply (a2,b2) -> a1 == a2 && b1 == b2
+              | B_equiv (a1,b1,_), B_equiv (a2,b2,_)
+              | B_imply (a1,b1,_), B_imply (a2,b2,_) -> a1 == a2 && b1 == b2
               | B_not _, _ | B_and _, _ | B_eq _, _
-              | B_or _, _ | B_imply _, _ -> false
+              | B_or _, _ | B_imply _, _ | B_equiv _, _ -> false
             end
           | Mu t1, Mu t2 -> t1==t2
           | Quant (q1,ty1,bod1), Quant (q2,ty2,bod2) ->
@@ -658,6 +674,8 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       | Term_dep_sub of term
       | Term_dep_sub2 of term * term
       | Term_dep_uty of ty_uninterpreted_slice
+      | Term_dep_bool_expr of term
+      | Term_dep_self (* the term is its own blocker *)
 
     type delayed_ty =
       | DTy_direct of ty_h
@@ -665,14 +683,22 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
 
     let sorted_merge_ l1 l2 = CCList.sorted_merge_uniq ~cmp:compare l1 l2
 
-    let cmp_term_dep_ a b = match a, b with
+    let cmp_term_dep_ a b =
+      let to_int_ = function
+        | Dep_cst _ -> 0
+        | Dep_uty _ -> 1
+        | Dep_bool_expr _ -> 2
+      in
+      match a, b with
       | Dep_cst c1, Dep_cst c2 -> Typed_cst.compare c1 c2
       | Dep_uty u1, Dep_uty u2 ->
         let (<?>) = CCOrd.(<?>) in
         Ty.compare (Lazy.force u1.uty_self) (Lazy.force u2.uty_self)
         <?> (CCOrd.int_, u1.uty_offset, u2.uty_offset)
-      | Dep_cst _, Dep_uty _ -> 1
-      | Dep_uty _, Dep_cst _ -> -1
+      | Dep_bool_expr t1, Dep_bool_expr t2 -> term_cmp_ t1 t2
+      | Dep_cst _, _
+      | Dep_uty _, _
+      | Dep_bool_expr _, _ -> CCOrd.int_ (to_int_ a) (to_int_ b)
 
     (* build a term. If it's new, add it to the watchlist
        of every member of [watching] *)
@@ -700,6 +726,10 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
             CCList.sorted_merge_uniq
               ~cmp:cmp_term_dep_ a.term_deps b.term_deps
           | Term_dep_uty uty -> [Dep_uty uty]
+          | Term_dep_bool_expr t -> [Dep_bool_expr t]
+          | Term_dep_self ->
+            assert (Ty.is_prop t'.term_ty);
+            [Dep_bool_expr t']
         in
         t'.term_deps <- deps
       );
@@ -783,8 +813,9 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       (* normalize a bit *)
       let b = match b with
         | B_eq (a,b) when a.term_id > b.term_id -> B_eq (b,a)
-        | B_and (a,b,c,d) when a.term_id > b.term_id -> B_and (b,a,d,c)
-        | B_or (a,b) when a.term_id > b.term_id -> B_or (b,a)
+        | B_and (a,b,i) when a.term_id > b.term_id -> B_and (b,a,i)
+        | B_equiv (a,b,i) when a.term_id > b.term_id -> B_equiv (b,a,i)
+        | B_or (a,b,i) when a.term_id > b.term_id -> B_or (b,a,i)
         | _ -> b
       in
       let t = mk_term_ ~deps (Builtin b) ~ty:(DTy_direct Ty.prop) in
@@ -793,9 +824,8 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     let builtin b =
       let deps = match b with
         | B_not u -> Term_dep_sub u
-        | B_and (_,_,a,b)
-        | B_or (a,b)
-        | B_eq (a,b) | B_imply (a,b) -> Term_dep_sub2 (a,b)
+        | B_and _ | B_or _ | B_equiv _ | B_imply _ -> Term_dep_self
+        | B_eq (a,b) -> Term_dep_sub2 (a,b)
       in
       builtin_ ~deps b
 
@@ -820,14 +850,20 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     let forall = quant Forall
     let exists = quant Exists
 
-    let and_ a b = builtin_ ~deps:(Term_dep_sub2 (a,b)) (B_and (a,b,a,b))
-    let or_ a b = builtin_ ~deps:(Term_dep_sub2 (a,b)) (B_or (a,b))
-    let imply a b = builtin_ ~deps:(Term_dep_sub2 (a,b)) (B_imply (a,b))
-    let eq a b = builtin_ ~deps:(Term_dep_sub2 (a,b)) (B_eq (a,b))
-    let neq a b = not_ (eq a b)
+    let mk_bi () : bool_info = {
+      bi_expanded=false;
+      bi_decided=None;
+      bi_watched=lazy (Poly_set.create ~eq:term_equal_ 16);
+    }
 
-    let and_par a b c d =
-      builtin_ ~deps:(Term_dep_sub2 (c,d)) (B_and (a,b,c,d))
+    let and_ a b = builtin (B_and (a,b, mk_bi()))
+    let or_ a b = builtin (B_or (a,b, mk_bi()))
+    let imply a b = builtin (B_imply (a,b, mk_bi()))
+    let equiv a b = builtin (B_equiv (a,b, mk_bi()))
+    let eq a b =
+      assert (not (Ty.is_prop a.term_ty));
+      builtin (B_eq (a,b))
+    let neq a b = not_ (eq a b)
 
     let and_l = function
       | [] -> true_
@@ -850,19 +886,21 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         | B_not t ->
           let acc, t' = f acc t in
           acc, B_not t'
-        | B_and (a,b,c,d) ->
+        | B_and (a,b,_) ->
           let acc, a, b = fold_binary acc a b in
-          let acc, c, d = fold_binary acc c d in
-          acc, B_and (a,b,c,d)
-        | B_or (a,b) ->
+          acc, B_and (a, b, mk_bi())
+        | B_or (a,b,_) ->
           let acc, a, b = fold_binary acc a b in
-          acc, B_or (a, b)
+          acc, B_or (a, b, mk_bi())
+        | B_equiv (a,b,_) ->
+          let acc, a, b = fold_binary acc a b in
+          acc, B_equiv (a, b, mk_bi())
         | B_eq (a,b) ->
           let acc, a, b = fold_binary acc a b in
           acc, B_eq (a, b)
-        | B_imply (a,b) ->
+        | B_imply (a,b,_) ->
           let acc, a, b = fold_binary acc a b in
-          acc, B_imply (a, b)
+          acc, B_imply (a, b, mk_bi())
 
     let is_const t = match t.term_cell with
       | Const _ -> true
@@ -874,16 +912,17 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
 
     let builtin_to_seq b yield = match b with
       | B_not t -> yield t
-      | B_or (a,b)
-      | B_imply (a,b)
+      | B_and (a,b,_)
+      | B_or (a,b,_)
+      | B_imply (a,b,_)
+      | B_equiv (a,b,_)
       | B_eq (a,b) -> yield a; yield b
-      | B_and (a,b,c,d) -> yield a; yield b; yield c; yield d
 
     let ty t = t.term_ty
 
     let equal = term_equal_
     let hash = term_hash_
-    let compare a b = CCOrd.int_ a.term_id b.term_id
+    let compare = term_cmp_
 
     module As_key = struct
         type t = term
@@ -938,6 +977,16 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         | Const ({cst_kind=Cst_uninterpreted_dom_elt ty; _} as c) -> Some (c,ty)
         | _ -> None
 
+    let as_bi (t:term): bool_info option =
+      match t.term_cell with
+        | Builtin b ->
+          begin match b with
+            | B_and (_, _, bi)  | B_or (_, _, bi)
+            | B_imply (_, _, bi) | B_equiv (_, _, bi) -> Some bi
+            | B_eq _ | B_not _ -> None
+          end
+        | _ -> None
+
     let fpf = Format.fprintf
 
     let pp_top ~ids out t =
@@ -963,7 +1012,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           fpf out "(@[if %a@ %a@ %a@])" pp a pp b pp c
         | Match (t,m) ->
           let pp_bind out (id,(_tys,rhs)) =
-            fpf out "(@[<1>%a@ %a@])" ID.pp id pp rhs
+            fpf out "(@[<1>case@ %a@ %a@])" ID.pp id pp rhs
           in
           let print_map =
             CCFormat.seq ~start:"" ~stop:"" ~sep:" " pp_bind
@@ -980,12 +1029,14 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           fpf out "(@[switch %a@ (@[<hv>%a@])@])"
             pp t print_map (ID.Tbl.to_seq m.switch_tbl)
         | Builtin (B_not t) -> fpf out "(@[<hv1>not@ %a@])" pp t
-        | Builtin (B_and (_, _, a,b)) ->
+        | Builtin (B_and (a,b,_)) ->
           fpf out "(@[<hv1>and@ %a@ %a@])" pp a pp b
-        | Builtin (B_or (a,b)) ->
+        | Builtin (B_or (a,b,_)) ->
           fpf out "(@[<hv1>or@ %a@ %a@])" pp a pp b
-        | Builtin (B_imply (a,b)) ->
+        | Builtin (B_imply (a,b,_)) ->
           fpf out "(@[<hv1>=>@ %a@ %a@])" pp a pp b
+        | Builtin (B_equiv (a,b,_)) ->
+          fpf out "(@[<hv1>=@ %a@ %a@])" pp a pp b
         | Builtin (B_eq (a,b)) ->
           fpf out "(@[<hv1>=@ %a@ %a@])" pp a pp b
       in
@@ -1022,6 +1073,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
              |> Sequence.filter_map
                (function
                  | Dep_cst c -> Some (GE_dep, const c)
+                 | Dep_bool_expr t -> Some (GE_dep, t)
                  | Dep_uty _ -> None)
            and nf = match t.term_nf with
              | None -> Sequence.empty
@@ -1051,7 +1103,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         | Builtin b ->
           CCFormat.string out
             begin match b with
-              | B_not _ -> "not" | B_and _ -> "and"
+              | B_not _ -> "not" | B_and _ -> "and" | B_equiv _ -> "<=>"
               | B_or _ -> "or" | B_imply _ -> "=>" | B_eq _ -> "="
             end
       in
@@ -1090,6 +1142,11 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     if l.lit_sign then pp_lit_view out l.lit_view
     else Format.fprintf out "(@[@<1>¬@ %a@])" pp_lit_view l.lit_view
 
+  let pp_dep out = function
+    | Dep_cst c -> Typed_cst.pp out c
+    | Dep_uty uty -> pp_uty out uty
+    | Dep_bool_expr t -> Format.fprintf out "(@[bool_expr@ %a@])" Term.pp t
+
   module Explanation = struct
     type t = explanation
     let empty : t = E_empty
@@ -1119,7 +1176,6 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         (Utils.pp_list pp_lit) (to_list_uniq e)
   end
 
-  (* FIXME: make a specific data structure *)
   (** {2 Literals} *)
   module Lit = struct
     type t = lit
@@ -1187,6 +1243,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       id: int;
     }
     val make : Lit.t list -> t
+    val of_terms : term list -> t
     val lits : t -> Lit.t list
     val conflicts : t Queue.t
     val lemma_queue : t Queue.t
@@ -1221,6 +1278,10 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         } in
         incr n_;
         c
+
+    let of_terms l =
+      let l = List.map (fun t->Lit.atom t) l in
+      make l
 
     let equal_ c1 c2 = CCList.equal Lit.equal c1.lits c2.lits
     let hash_ c = Hash.list Lit.hash c.lits
@@ -1795,6 +1856,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         | None -> Explanation.empty, t
         | Some (new_t,e) -> e, new_t
 
+    (* FIXME: use Term.as_domain_elt instead *)
     let as_uninterpreted_dom_elt (t:term): ID.t option =
       match t.term_cell with
         | Const {cst_kind=Cst_uninterpreted_dom_elt _; cst_id; _} -> Some cst_id
@@ -1974,6 +2036,9 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       let e', t' = compute_nf t in
       Explanation.append e e', t'
 
+    (* TODO: some basic simplifications (`a & b --> b` if `a --> true` with
+       an empty explanation, for instance) *)
+
     (* compute the builtin, assuming its components are
        already reduced *)
     and compute_builtin ~(old:term) (bu:builtin): explanation * term = match bu with
@@ -1986,15 +2051,16 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
             let t' = if a==a' then old else Term.not_ a' in
             e_a, t'
         end
-      | B_or (a,b) ->
-        (* [a or b] becomes [not (not a and not b)] *)
-        let a' = Term.not_ a in
-        let b' = Term.not_ b in
-        compute_nf (Term.not_ (Term.and_par a' b' a' b'))
-      | B_imply (a,b) ->
-        (* [a => b] becomes [not [a and not b]] *)
-        let b' = Term.not_ b in
-        compute_nf (Term.not_ (Term.and_par a b' a b'))
+      | B_and (_,_,i)
+      | B_equiv  (_,_,i)
+      | B_imply (_,_,i)
+      | B_or (_,_,i) ->
+        let t = Term.builtin bu in
+        begin match i.bi_decided with
+          | None -> Explanation.empty, t
+          | Some (e, true) -> e, Term.true_
+          | Some (e, false) -> e, Term.false_
+        end
       | B_eq (a,b) when Ty.is_prop a.term_ty ->
         let e_a, a' = compute_nf a in
         let e_b, b' = compute_nf b in
@@ -2011,32 +2077,8 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
             in
             e_ab, t'
         end
-      | B_and (a,b,c,d) ->
-        (* evaluate [c] and [d], but only provide some explanation
-           once their conjunction reduces to [true] or [false].
-
-           We first compute only [c], in case it is [False]. *)
-        let e_a, c' = compute_nf a in
-        begin match c'.term_cell with
-          | False ->
-            e_a, Term.false_
-          | _ ->
-            let e_b, d' = compute_nf b in
-            begin match c'.term_cell, d'.term_cell with
-              | _, False ->
-                e_b, Term.false_
-              | True, True ->
-                let e_ab = Explanation.append e_a e_b in
-                e_ab, Term.true_
-              | _ ->
-                let t' =
-                  if c==c' && d==d' then old else Term.and_par a b c' d'
-                in
-                (* keep the explanations for when the value is true/false *)
-                Explanation.empty, t'
-            end
-        end
       | B_eq (a,b) ->
+        assert (not (Ty.is_prop a.term_ty));
         let e_a, a' = compute_nf a in
         let e_b, b' = compute_nf b in
         let e_ab = Explanation.append e_a e_b in
@@ -2136,6 +2178,9 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       Clause.push_new c;
       ()
 
+    (* set of literals whose boolean value is of interest *)
+    let watched_ : unit Lit.Tbl.t = Lit.Tbl.create 256
+
     (* add [t] to the list of literals that watch the constant [c] *)
     let watch_cst_ (t:t)(c:cst) : unit =
       assert (Ty.is_prop t.term_ty);
@@ -2189,14 +2234,74 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       end;
       ()
 
-    let watch_dep (t:t) (d:term_dep) : unit = match d with
+    (* add [t] to the list of literals that watch the boolean expression [bi] *)
+    let rec watch_bool_expr_ ~(b_expr:t) (t:t): unit =
+      assert (Ty.is_prop b_expr.term_ty);
+      assert (Ty.is_prop t.term_ty);
+      Log.debugf 2
+        (fun k->k "(@[<1>watch_bi@ b_expr: %a@ watching: %a@])"
+            Term.pp b_expr Term.pp t);
+      let bu, info = match b_expr.term_cell with
+        | Builtin bu ->
+          begin match bu with
+            | B_and (_,_,i) | B_or (_,_,i)
+            | B_imply (_,_,i) | B_equiv (_,_,i) -> bu, i
+            | B_not _ | B_eq _ -> assert false
+          end
+        | _ -> assert false
+      in
+      if not (Term.equal b_expr t)
+      then Poly_set.add (Lazy.force info.bi_watched) t;
+      (* check whether [b_expr] is expanded *)
+      if not info.bi_expanded then (
+        (* [b_expr] is blocking but not expanded *)
+        info.bi_expanded <- true;
+        let neg_ = Term.not_ in
+        let clauses, subs = match bu with
+          | B_and (a,b,_) ->
+            [ [neg_ b_expr; a];
+              [neg_ b_expr; b];
+              [neg_ a; neg_ b; b_expr]],
+            [a;b]
+          | B_or (a,b,_) ->
+            [ [neg_ a; b_expr];
+              [neg_ b; b_expr];
+              [a; b; neg_ b_expr]],
+            [a;b]
+          | B_imply (a,b,_) ->
+            [ [a; b_expr];
+              [neg_ b; b_expr];
+              [neg_ a; b; neg_ b_expr]],
+            [a;b]
+          | B_equiv (a,b,_) ->
+            [ [neg_ a; neg_ b; b_expr];
+              [a; b; b_expr];
+              [a; neg_ b; neg_ b_expr];
+              [neg_ a; b; neg_ b_expr];
+            ],
+            [a;b]
+          | B_not _
+          | B_eq _ -> assert false
+        in
+        let clauses = List.rev_map Clause.of_terms clauses in
+        Log.debugf 4
+          (fun k->k "(@[<hv1>CNF@ %a@ @[<hv2>:clauses@ %a@]@])"
+              Term.pp b_expr (Utils.pp_list Clause.pp) clauses);
+        Clause.push_new_l clauses;
+        (* the subterms themselves must be watched/expanded, too *)
+        List.iter watch subs;
+      );
+      ()
+
+    and watch_dep (t:t) (d:term_dep) : unit = match d with
       | Dep_cst c -> watch_cst_ t c
       | Dep_uty uty -> watch_uty t uty
+      | Dep_bool_expr u -> watch_bool_expr_ ~b_expr:u t
 
     (* ensure that [t] is on the watchlist of all the
        constants it depends on;
        also ensure those constants are expanded *)
-    let update_watches_of (t:t): unit =
+    and update_watches_of (t:t): unit =
       assert (Ty.is_prop t.term_ty);
       let e, new_t = Reduce.compute_nf t in
       (* if [new_t = true/false], propagate literal *)
@@ -2218,15 +2323,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       end;
       ()
 
-    let update_watches_of_term = update_watches_of
-
-    let watched_ : unit Lit.Tbl.t = Lit.Tbl.create 256
-
-      (* TODO: if [lit] is new, do on-the-fly CNF of its inner formula
-         (break not/and/or, maybe explore a bit the equalities eagerly?).
-      *)
-
-    let watch (lit:t) =
+    and watch (lit:t) =
       let lit, _ = Term.abs lit in
       if not (Lit.Tbl.mem watched_ lit) then (
         Log.debugf 3
@@ -2237,6 +2334,8 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       )
 
     let watch_term = watch
+
+    let update_watches_of_term = update_watches_of
 
     let is_watched (lit:t) : bool =
       let lit, _ = Term.abs lit in
@@ -2347,25 +2446,49 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           assert (s = status)
       end
 
+    (* assert another atom *)
+    let assert_b_expr ~b_expr ~sign (t:term): unit =
+      Log.debugf 2
+        (fun k->k "(@[<1>@{<green>assume_b_expr@}@ @[%a@]@ sign: %B@])"
+        Term.pp t sign);
+      begin match b_expr.bi_decided with
+        | None ->
+          Backtrack.push_bi b_expr;
+          let e = Explanation.return (Lit.atom ~sign t) in
+          b_expr.bi_decided <- Some (e, sign);
+          Poly_set.iter
+            Watched_lit.update_watches_of_term
+            (Lazy.force b_expr.bi_watched);
+        | Some (_, sign') ->
+          (* already assigned, check consistency *)
+          assert (sign=sign');
+      end
+
     (* handle a literal assumed by the SAT solver *)
     let assume_lit (lit:Lit.t) : unit =
       Log.debugf 2
         (fun k->k "(@[<1>@{<green>assume_lit@}@ @[%a@]@])" Lit.pp lit);
       (* check consistency first *)
       let e, lit' = Reduce.compute_nf_lit lit in
-      begin match Lit.view lit' with
-        | Lit_fresh _ -> ()
-        | Lit_atom {term_cell=True; _} -> ()
-        | Lit_atom {term_cell=False; _} ->
+      begin match Lit.view lit', Lit.sign lit with
+        | Lit_fresh _, _ -> ()
+        | Lit_atom {term_cell=True; _}, true
+        | Lit_atom {term_cell=False; _}, false -> ()
+        | Lit_atom {term_cell=True; _}, false -> ()
+        | Lit_atom {term_cell=False; _}, true ->
           (* conflict! *)
           let c = Lit.neg lit :: clause_guard_of_exp_ e |> Clause.make in
           Clause.push_conflict c
-        | Lit_atom _ -> ()
-        | Lit_assign(c, t) ->
-          if Lit.sign lit then assert_choice c t
-        | Lit_uty_empty uty ->
-          let status = if Lit.sign lit then Uty_empty else Uty_nonempty in
-          assert_uty uty status
+        | Lit_atom t, sign ->
+          begin match Term.as_bi t with
+            | Some bi ->
+              assert_b_expr ~b_expr:bi ~sign t
+            | None -> ()
+          end
+        | Lit_assign(c, t), true -> assert_choice c t
+        | Lit_assign _, false -> ()
+        | Lit_uty_empty uty, true -> assert_uty uty Uty_empty
+        | Lit_uty_empty uty, false -> assert_uty uty Uty_nonempty
       end
 
     (* propagation from the bool solver *)
@@ -2455,6 +2578,9 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
                  Format.fprintf out
                    "(@[%a@ :expanded %B@])"
                    pp_uty uty (uty.uty_pair<>Lazy_none)
+               | Dep_bool_expr u ->
+                 let _, nf = Reduce.get_nf u in
+                 Format.fprintf out "(@[%a@ nf:%a@@])" Term.pp u Term.pp nf
              in
              let pp_lit out l =
                let e, nf = Reduce.get_nf l in
@@ -2685,8 +2811,10 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     | U_incomplete
 
   module Model = struct
+    type domain = cst list
+
     type t = {
-      domains: cst list Ty.Tbl.t;
+      domains: domain Ty.Tbl.t;
       (* uninterpreted type -> its domain *)
       consts: term Typed_cst.Map.t;
       (* constant -> its value *)
@@ -2694,21 +2822,27 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
 
     let make ~consts ~domains = {consts; domains}
 
+    type entry =
+      | E_ty of Ty.t * domain
+      | E_const of Typed_cst.t * term
+
     let pp out (m:t) =
       let pp_cst_name out c = ID.pp_name out (Typed_cst.id c) in
-      let pp_dom out (ty,l) =
-        Format.fprintf out "(@[<1>type@ %a@ (@[<hv>%a@])@])"
-          Ty.pp ty (Utils.pp_list pp_cst_name) l
-      and pp_pair out (c,t) =
-        Format.fprintf out "(@[<1>val@ %a@ %a@])"
-          ID.pp_name (Typed_cst.id c)
-          (Term.pp_top ~ids:false) t
+      let pp_entry out = function
+        | E_ty (ty,l) ->
+          Format.fprintf out "(@[<1>type@ %a@ (@[<hv>%a@])@])"
+            Ty.pp ty (Utils.pp_list pp_cst_name) l
+        | E_const (c,t) ->
+          Format.fprintf out "(@[<1>val@ %a@ %a@])"
+            ID.pp_name (Typed_cst.id c)
+            (Term.pp_top ~ids:false) t
       in
-      Format.fprintf out "(@[<v>%a@,%a@])"
-        (Utils.pp_list pp_dom)
-        (Ty.Tbl.to_list m.domains)
-        (Utils.pp_list pp_pair)
-        (Typed_cst.Map.to_list m.consts)
+      let es =
+        CCList.append
+          (Ty.Tbl.to_list m.domains |> List.map (fun (ty,dom) -> E_ty (ty,dom)))
+          (Typed_cst.Map.to_list m.consts |> List.map (fun (c,t) -> E_const (c,t)))
+      in
+      Format.fprintf out "(@[<v>%a@])" (Utils.pp_list pp_entry) es
 
     exception Bad_model of t * term * term
 
@@ -2722,6 +2856,10 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
             in
             Some msg
           | _ -> None)
+
+    let check_bi_ bi b = match bi.bi_decided with
+      | None -> assert false
+      | Some (_, b') -> assert (b=b')
 
     (* eval term [t] under model [m] *)
     let eval_ (m:t) t =
@@ -2805,48 +2943,49 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
             | False -> Term.true_
             | _ -> Term.not_ f
           end
-        | Builtin (B_and (_,_,a,b)) ->
+        | Builtin (B_and (a,b,bi)) ->
           let a = aux a in
           let b = aux b in
           begin match a.term_cell, b.term_cell with
-            | True, True -> Term.true_
+            | True, True -> check_bi_ bi true; Term.true_
             | False, _
-            | _, False -> Term.false_
+            | _, False -> check_bi_ bi false; Term.false_
             | _ -> Term.and_ a b
           end
-        | Builtin (B_or (a,b)) ->
+        | Builtin (B_or (a,b,bi)) ->
           let a = aux a in
           let b = aux b in
           begin match a.term_cell, b.term_cell with
             | True, _
-            | _, True -> Term.true_
-            | False, False -> Term.false_
+            | _, True -> check_bi_ bi true; Term.true_
+            | False, False -> check_bi_ bi false; Term.false_
             | _ -> Term.or_ a b
           end
-        | Builtin (B_imply (a,b)) ->
+        | Builtin (B_imply (a,b,bi)) ->
           let a = aux a in
           let b = aux b in
           begin match a.term_cell, b.term_cell with
             | _, True
-            | False, _  -> Term.true_
-            | True, False -> Term.false_
+            | False, _  -> check_bi_ bi true; Term.true_
+            | True, False -> check_bi_ bi false; Term.false_
             | _ -> Term.imply a b
           end
-        | Builtin (B_eq (a,b)) when Ty.is_prop a.term_ty ->
+        | Builtin (B_equiv (a,b,bi)) ->
           let a = aux a in
           let b = aux b in
           begin match a.term_cell, b.term_cell with
             | True, True
-            | False, False -> Term.true_
+            | False, False -> check_bi_ bi true; Term.true_
             | True, False
-            | False, True -> Term.false_
-            | _ when Term.equal a b -> Term.true_
-            | _ -> Term.eq a b
+            | False, True -> check_bi_ bi false; Term.false_
+            | _ when Term.equal a b -> check_bi_ bi true; Term.true_
+            | _ -> Term.equiv a b
           end
         | Builtin (B_eq (a,b)) ->
           let a = aux a in
           let b = aux b in
           begin match Term.as_cstor_app a, Term.as_cstor_app b with
+            | _ when Term.equal a b -> Term.true_
             | Some (c1,_,l1), Some (c2,_,l2) ->
               if Typed_cst.equal c1 c2 then (
                 assert (List.length l1 = List.length l2);
@@ -2861,7 +3000,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
                   then Term.true_
                   else Term.false_
                 | _ ->
-                    Term.eq a b
+                  Term.eq a b
               end
 
           end
