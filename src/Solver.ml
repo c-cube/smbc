@@ -2471,7 +2471,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         (fun k->k "(@[<1>@{<green>assume_lit@}@ @[%a@]@])" Lit.pp lit);
       (* check consistency first *)
       let e, lit' = Reduce.compute_nf_lit lit in
-      begin match Lit.view lit', Lit.sign lit with
+      begin match Lit.view lit', Lit.sign lit' with
         | Lit_fresh _, _ -> ()
         | Lit_atom {term_cell=True; _}, true
         | Lit_atom {term_cell=False; _}, false ->
