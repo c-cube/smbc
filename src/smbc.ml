@@ -6,6 +6,7 @@ type config = {
   print_stat: bool;
   dot_term_graph: string option;
   pp_hashcons: bool;
+  pp_trail: bool;
   progress : bool;
   deepening_step: int option;
   check: bool;
@@ -45,7 +46,7 @@ let solve ~config (ast:Ast.statement list) : unit =
   in
   (* solve *)
   S.add_statement_l ast;
-  let res = S.solve ~on_exit ~check:config.check () in
+  let res = S.solve ~on_exit ~pp_trail:config.pp_trail ~check:config.check () in
   if config.print_stat then Format.printf "%a@." S.pp_stats ();
   match res with
     | S.Sat m ->
@@ -66,6 +67,7 @@ let pp_hashcons_ = ref false
 let max_depth_ = ref 60
 let depth_step_ = ref 0
 let check_ = ref false
+let pp_trail_ = ref false
 let timeout_ = ref ~-1
 let syntax_ = ref Ast.Auto
 
@@ -84,7 +86,6 @@ let set_syntax_ s =
 
 let set_debug_ d =
   Log.set_debug d;
-  Msat.Log.set_debug d;
   ()
 
 let options =
@@ -99,6 +100,7 @@ let options =
     "--input", Arg.String set_syntax_, " input format";
     "-i", Arg.String set_syntax_, " alias to --input";
     "--pp-hashcons", Arg.Set pp_hashcons_, " print hashconsing IDs";
+    "--pp-trail", Arg.Set pp_trail_, " print boolean trail on SAT";
     "--debug", Arg.Int set_debug_, " set debug level";
     "--stats", Arg.Set stats_, " print stats";
     "--backtrace", Arg.Unit (fun () -> Printexc.record_backtrace true), " enable backtrace";
@@ -138,6 +140,7 @@ let () =
     max_depth = !max_depth_;
     print_stat = !stats_;
     progress = !progress_;
+    pp_trail = !pp_trail_;
     pp_hashcons = !pp_hashcons_;
     deepening_step =
       (if !depth_step_ = 0 then None else Some !depth_step_);
