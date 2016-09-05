@@ -24,10 +24,7 @@ module Make(C:CONFIG)(Dummy : sig end) : sig
 
   type cst_info
 
-  (** Definition of an atomic type *)
-  type ty_def =
-    | Uninterpreted (* uninterpreted type TODO: cardinal, \And, \Or *)
-    | Data of cst lazy_t list (* set of constructors *)
+  type ty_def
 
   type ty_cell =
     | Prop
@@ -55,6 +52,8 @@ module Make(C:CONFIG)(Dummy : sig end) : sig
     include Intf.ORD with type t := t
     include Intf.HASH with type t := t
     include Intf.PRINT with type t := t
+
+    module Tbl : CCHashtbl.S with type key = ty_h
   end
 
   (** {2 Typed De Bruijn indices} *)
@@ -128,10 +127,16 @@ module Make(C:CONFIG)(Dummy : sig end) : sig
 
   (** {2 Main} *)
 
-  type model = term Typed_cst.Map.t
-  (** Map from constants to their value *)
+  module Model : sig
+    type t = private {
+      domains: Typed_cst.t list Ty.Tbl.t;
+      (* uninterpreted type -> its domain *)
+      consts: term Typed_cst.Map.t;
+      (* constant -> its value *)
+    }
 
-  val pp_model : model CCFormat.printer
+    val pp : t CCFormat.printer
+  end
 
   type unknown =
     | U_timeout
@@ -139,7 +144,7 @@ module Make(C:CONFIG)(Dummy : sig end) : sig
     | U_incomplete
 
   type res =
-    | Sat of model
+    | Sat of Model.t
     | Unsat (* TODO: proof *)
     | Unknown of unknown
 

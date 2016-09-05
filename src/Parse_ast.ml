@@ -30,6 +30,8 @@ type term =
   | And of term list
   | Or of term list
   | Not of term
+  | Forall of typed_var * term
+  | Exists of typed_var * term
 
 and match_branch =
   | Match_case of string * var list * term
@@ -71,6 +73,8 @@ let imply a b = Imply(a,b)
 let and_ l = And l
 let or_ l = Or l
 let not_ t = Not t
+let forall x t = Forall (x,t)
+let exists x t = Exists (x,t)
 
 let _mk ?loc stmt = { loc; stmt }
 
@@ -112,6 +116,8 @@ let rec pp_term out (t:term) = match t with
   | Let (v,t,u) -> fpf out "(@[<hv1>let %s@ %a@ %a@])" v pp_term t pp_term u
   | If (a,b,c) -> fpf out "(@[<hv1>if %a@ %a@ %a@])" pp_term a pp_term b pp_term c
   | Fun (v,body) -> fpf out "(@[<1>fun@ (%a)@ %a@])" pp_typed_var v pp_term body
+  | Forall (v,body) -> fpf out "(@[<1>forall@ (%a)@ %a@])" pp_typed_var v pp_term body
+  | Exists (v,body) -> fpf out "(@[<1>exists@ (%a)@ %a@])" pp_typed_var v pp_term body
   | Mu (v,body) -> fpf out "(@[<1>fun@ (%a)@ %a@])" pp_typed_var v pp_term body
   | Eq (a,b) -> fpf out "(@[=@ %a@ %a@])" pp_term a pp_term b
   | Imply (a,b) -> fpf out "(@[=>@ %a@ %a@])" pp_term a pp_term b

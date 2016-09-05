@@ -84,6 +84,8 @@ and term_cell =
   | Match of term * (var list * term) ID.Map.t
   | Let of var * term * term
   | Fun of var * term
+  | Forall of var * term
+  | Exists of var * term
   | Mu of var * term
   | Not of term
   | Binop of binop * term * term
@@ -114,6 +116,10 @@ val match_ : term -> (var list * term) ID.Map.t -> term
 val let_ : var -> term -> term -> term
 val fun_ : var -> term -> term
 val fun_l : var list -> term -> term
+val forall : var -> term -> term
+val forall_l : var list -> term -> term
+val exists : var -> term -> term
+val exists_l : var list -> term -> term
 val mu : var -> term -> term
 val eq : term -> term -> term
 val not_ : term -> term

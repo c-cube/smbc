@@ -33,3 +33,5 @@ let seq f seq =
   let h = ref 0x43 in
   seq (fun x -> h := combine f !h x);
   !h
+
+let poly x = Hashtbl.hash x

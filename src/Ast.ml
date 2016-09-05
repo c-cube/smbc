@@ -136,6 +136,8 @@ and term_cell =
   | Match of term * (var list * term) ID.Map.t
   | Let of var * term * term
   | Fun of var * term
+  | Forall of var * term
+  | Exists of var * term
   | Mu of var * term
   | Not of term
   | Binop of binop * term * term
@@ -179,6 +181,10 @@ let rec term_to_sexp t = match t.term with
     S.of_list [S.atom "let"; var_sexp_ v; term_to_sexp t; term_to_sexp u]
   | Fun (v,t) ->
     S.of_list [S.atom "fun"; typed_var_to_sexp v; term_to_sexp t]
+  | Forall (v,t) ->
+    S.of_list [S.atom "forall"; typed_var_to_sexp v; term_to_sexp t]
+  | Exists (v,t) ->
+    S.of_list [S.atom "exists"; typed_var_to_sexp v; term_to_sexp t]
   | Mu (v,t) ->
     S.of_list [S.atom "mu"; typed_var_to_sexp v; term_to_sexp t]
   | Not t -> S.of_list [S.atom "not"; term_to_sexp t]
@@ -281,6 +287,17 @@ let fun_ v t =
   let ty = Ty.arrow (Var.ty v) t.ty in
   mk_ (Fun (v,t)) ty
 
+let quant_ q v t =
+  if not (Ty.equal t.ty Ty.prop)
+  then Ty.ill_typed
+      "quantifier: bounded term : %a@ should have type prop"
+      Ty.pp t.ty;
+  let ty = Ty.prop in
+  mk_ (q v t) ty
+
+let forall = quant_ (fun v t -> Forall (v,t))
+let exists = quant_ (fun v t -> Exists (v,t))
+
 let mu v t =
   if not (Ty.equal (Var.ty v) t.ty)
   then Ty.ill_typed "mu-term: var has type %a,@ body %a"
@@ -289,6 +306,8 @@ let mu v t =
   mk_ (Fun (v,t)) ty
 
 let fun_l = List.fold_right fun_
+let forall_l = List.fold_right forall
+let exists_l = List.fold_right exists
 
 let eq a b =
   if not (Ty.equal a.ty b.ty)
@@ -344,10 +363,15 @@ module StrTbl = CCHashtbl.Make(struct
 
 module Ctx = struct
   type kind =
-    | K_ty
+    | K_ty of ty_kind
     | K_fun of Ty.t
     | K_cstor of Ty.t
     | K_var of var (* local *)
+
+  and ty_kind =
+    | K_data (* data type *)
+    | K_uninterpreted (* uninterpreted type *)
+    | K_other
 
   type t = {
     names: ID.t StrTbl.t;
@@ -407,7 +431,7 @@ module Ctx = struct
     | _ -> errorf "expected %a to be a constant type" Ty.pp ty
 
   let pp_kind out = function
-    | K_ty -> Format.fprintf out "type"
+    | K_ty _ -> Format.fprintf out "type"
     | K_cstor ty ->
       Format.fprintf out "(@[cstor : %a@])" Ty.pp ty
     | K_fun ty ->
@@ -433,12 +457,16 @@ let rec conv_ty ctx (t:A.ty) =
     Ty.ill_typed "at %a:@ %s" A.Loc.pp_opt (Ctx.loc ctx) msg
 
 and conv_ty_aux ctx t = match t with
-  | A.Ty_bool -> Ty.prop
-  | A.Ty_const s -> let id = find_id_ ctx s in Ty.const id
+  | A.Ty_bool -> Ty.prop, Ctx.K_ty Ctx.K_other
+  | A.Ty_const s ->
+    let id = find_id_ ctx s in
+    Ty.const id, Ctx.find_kind ctx id
   | A.Ty_arrow (args, ret) ->
-    let args = List.map (conv_ty ctx) args in
-    let ret = conv_ty ctx ret in
-    Ty.arrow_l args ret
+    let args = List.map (conv_ty_fst ctx) args in
+    let ret, _ = conv_ty ctx ret in
+    Ty.arrow_l args ret, Ctx.K_ty Ctx.K_other
+
+and conv_ty_fst ctx t = fst (conv_ty ctx t)
 
 let rec conv_term ctx (t:A.term) : term =
   try conv_term_aux ctx t
@@ -454,7 +482,7 @@ and conv_term_aux ctx t = match t with
       | Ctx.K_var v -> var v
       | Ctx.K_fun ty
       | Ctx.K_cstor ty -> const id ty
-      | Ctx.K_ty ->
+      | Ctx.K_ty _ ->
         errorf_ctx ctx "expected term, not type; got `%a`" ID.pp id
     end
   | A.If (a,b,c) ->
@@ -463,11 +491,33 @@ and conv_term_aux ctx t = match t with
     let c = conv_term ctx c in
     if_ a b c
   | A.Fun ((v,ty), body) ->
-    let ty = conv_ty ctx ty in
+    let ty, _ = conv_ty ctx ty in
     Ctx.with_var ctx v ty
       (fun var ->
          let body = conv_term ctx body in
          fun_ var body)
+  | A.Forall ((v,ty), body) ->
+    let ty, ty_k = conv_ty ctx ty in
+    if ty_k <> Ctx.K_ty Ctx.K_uninterpreted
+    then Ty.ill_typed
+        "unexpected quantification over @[%a@];@ only quantification \
+         over uninterpreted types is supported"
+        Ty.pp ty;
+    Ctx.with_var ctx v ty
+      (fun var ->
+         let body = conv_term ctx body in
+         forall var body)
+  | A.Exists ((v,ty), body) ->
+    let ty, ty_k = conv_ty ctx ty in
+    if ty_k <> Ctx.K_ty Ctx.K_uninterpreted
+    then Ty.ill_typed
+        "unexpected quantification over @[%a@];@ only quantification \
+         over uninterpreted types is supported"
+        Ty.pp ty;
+    Ctx.with_var ctx v ty
+      (fun var ->
+         let body = conv_term ctx body in
+         exists var body)
   | A.Let (v,t,u) ->
     let t = conv_term ctx t in
     Ctx.with_var ctx v t.ty
@@ -475,7 +525,7 @@ and conv_term_aux ctx t = match t with
          let u = conv_term ctx u in
          let_ var t u)
   | A.Mu ((x,ty), body) ->
-    let ty = conv_ty ctx ty in
+    let ty, _ = conv_ty ctx ty in
     Ctx.with_var ctx x ty
       (fun var ->
          let body = conv_term ctx body in
@@ -599,17 +649,17 @@ and conv_statement_aux ctx syn (t:A.statement) : statement list = match A.view t
         parse_file_exn ctx syn ~file:s'
     end
   | A.Stmt_ty_decl s ->
-    let id = Ctx.add_id ctx s Ctx.K_ty in
+    let id = Ctx.add_id ctx s (Ctx.K_ty Ctx.K_uninterpreted) in
     [TyDecl id]
   | A.Stmt_decl (s, ty) ->
-    let ty = conv_ty ctx ty in
+    let ty, _ = conv_ty ctx ty in
     let id = Ctx.add_id ctx s (Ctx.K_fun ty) in
     [Decl (id,ty)]
   | A.Stmt_data l ->
     (* first, read and declare each datatype (it can occur in the other
        datatypes' construtors) *)
     let pre_parse (data_name,cases) =
-      let data_id = Ctx.add_id ctx data_name Ctx.K_ty in
+      let data_id = Ctx.add_id ctx data_name (Ctx.K_ty Ctx.K_data) in
       data_id, cases
     in
     let l = List.map pre_parse l in
@@ -619,7 +669,7 @@ and conv_statement_aux ctx syn (t:A.statement) : statement list = match A.view t
         (fun (data_id, cstors) ->
            let data_ty = Ty.const data_id in
            let parse_case (c, ty_args) =
-             let ty_args = List.map (conv_ty ctx) ty_args in
+             let ty_args = List.map (conv_ty_fst ctx) ty_args in
              let ty_c = Ty.arrow_l ty_args data_ty in
              let id = Ctx.add_id ctx c (Ctx.K_cstor ty_c) in
              id, ty_c
@@ -634,7 +684,7 @@ and conv_statement_aux ctx syn (t:A.statement) : statement list = match A.view t
   | A.Stmt_def defs ->
     (* parse id,ty and declare them before parsing the function bodies *)
     let preparse (name, ty, rhs) =
-      let ty = conv_ty ctx ty in
+      let ty, _ = conv_ty ctx ty in
       let id = Ctx.add_id ctx name (Ctx.K_fun ty) in
       id, ty, rhs
     in
@@ -655,7 +705,7 @@ and conv_statement_aux ctx syn (t:A.statement) : statement list = match A.view t
     let vars =
       List.map
         (fun (s,ty) ->
-           let ty = conv_ty ctx ty in
+           let ty, _ = conv_ty ctx ty in
            s, ty)
         vars
     in

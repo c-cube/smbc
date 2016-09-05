@@ -33,6 +33,8 @@ rule token = parse
   | "if" { IF }
   | "match" { MATCH }
   | "fun" { FUN }
+  | "forall" { FORALL }
+  | "exists" { EXISTS }
   | "mu" { MU }
   | "and" { AND }
   | "or" { OR }
@@ -43,6 +45,7 @@ rule token = parse
   | "assert" { ASSERT }
   | "goal" { GOAL }
   | "decl" { DECL }
+  | "decl-ty" { DECL_TY }
   | "define" { DEFINE }
   | "include" { INCLUDE }
   | ident { IDENT(Lexing.lexeme lexbuf) }

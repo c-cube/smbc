@@ -29,11 +29,14 @@
 %token NOT
 %token IMPLY
 %token EQ
+%token FORALL
+%token EXISTS
 
 %token DATA
 %token ASSERT
 %token GOAL
 %token DECL
+%token DECL_TY
 %token DEFINE
 %token INCLUDE
 
@@ -77,6 +80,11 @@ stmt:
     {
       let loc = Loc.mk_pos $startpos $endpos in
       A.decl ~loc s ty
+    }
+  | LEFT_PAREN DECL_TY s=IDENT RIGHT_PAREN
+    {
+      let loc = Loc.mk_pos $startpos $endpos in
+      A.ty_decl ~loc s
     }
   | LEFT_PAREN
       GOAL
@@ -145,6 +153,8 @@ term:
   | LEFT_PAREN f=term args=term+ RIGHT_PAREN { A.app f args }
   | LEFT_PAREN IF a=term b=term c=term RIGHT_PAREN { A.if_ a b c }
   | LEFT_PAREN FUN v=typed_var body=term RIGHT_PAREN { A.fun_ v body }
+  | LEFT_PAREN FORALL v=typed_var body=term RIGHT_PAREN { A.forall v body }
+  | LEFT_PAREN EXISTS v=typed_var body=term RIGHT_PAREN { A.exists v body }
   | LEFT_PAREN MATCH lhs=term l=branch+ RIGHT_PAREN { A.match_ lhs l }
   | LEFT_PAREN AND l=term+ RIGHT_PAREN { A.and_ l }
   | LEFT_PAREN OR l=term+ RIGHT_PAREN { A.or_ l }
