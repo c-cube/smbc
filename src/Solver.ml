@@ -3012,18 +3012,28 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
 
   let add_statement_l = Conv.add_statement_l
 
-  let rec pp_proof out p =
+  let pp_proof out p =
+    let pp_step_res out p = 
+      let {M.Proof.conclusion; _ } = M.Proof.expand p in
+      let conclusion = clause_of_mclause conclusion in
+      Clause.pp out conclusion
+    in
     let pp_step out = function
       | M.Proof.Lemma () -> Format.fprintf out "(@[<1>lemma@ ()@])"
       | M.Proof.Resolution (p1, p2, _) ->
         Format.fprintf out "(@[<1>resolution@ %a@ %a@])"
-          pp_proof p1 pp_proof p2
+          pp_step_res p1 pp_step_res p2
       | _ -> CCFormat.string out "<other>"
     in
-    let {M.Proof.conclusion; step } = M.Proof.expand p in
-    let conclusion = clause_of_mclause conclusion in
-    Format.fprintf out "(@[<hv1>step@ %a@ @[<1>from:@ %a@]@])"
-      Clause.pp conclusion pp_step step
+    Format.fprintf out "(@[<v>";
+    M.Proof.fold
+      (fun () {M.Proof.conclusion; step } ->
+         let conclusion = clause_of_mclause conclusion in
+         Format.fprintf out "(@[<hv1>step@ %a@ @[<1>from:@ %a@]@])@,"
+           Clause.pp conclusion pp_step step)
+      () p;
+    Format.fprintf out "@])";
+    ()
 
   type proof_status =
     | PS_depth_limited of Lit.t
