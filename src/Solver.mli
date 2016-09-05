@@ -24,13 +24,6 @@ module Make(C:CONFIG)(Dummy : sig end) : sig
 
   type cst_info
 
-  (** The various kinds of constants *)
-  type cst_kind =
-    | Cst_bool
-    | Cst_undef of ty_h * cst_info
-    | Cst_cstor of ty_h
-    | Cst_defined of ty_h * term lazy_t
-
   (** Definition of an atomic type *)
   type ty_def =
     | Uninterpreted (* uninterpreted type TODO: cardinal, \And, \Or *)
@@ -78,10 +71,7 @@ module Make(C:CONFIG)(Dummy : sig end) : sig
     type t = cst
 
     val id : t -> ID.t
-    val kind : t -> cst_kind
     val ty : t -> Ty.t
-
-    val ty_of_kind : cst_kind -> Ty.t
 
     include Intf.EQ with type t := t
     include Intf.ORD with type t := t
@@ -98,7 +88,6 @@ module Make(C:CONFIG)(Dummy : sig end) : sig
 
     val db : DB.t -> t
     val const : cst -> t
-    val const_with_env : term db_env -> cst -> t
     val app : t -> t list -> t
     val fun_ : Ty.t -> t -> t
     val mu : t -> t

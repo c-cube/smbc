@@ -59,7 +59,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     | True
     | False
     | DB of db (* de bruijn indice *)
-    | Const of cst * term db_env (* explicit closures *)
+    | Const of cst
     | App of term * term list
     | Fun of ty_h * term
     | Mu of term
@@ -116,11 +116,6 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
        then [lit] will watch [c1,...,ck].
 
        Watch list only grow, they never shrink. *)
-    cst_db_ctx: ty_h db_env;
-    (* De Bruijn variables (their type) available in context. *)
-    cst_can_use: term list;
-    (* other terms that can be used to refine this constant or its own
-       sub-constants. This is useful for controlling recursion. *)
   }
 
   and cst_parent_case_list = term lazy_t list ref
@@ -294,11 +289,6 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
 
     let ty t = ty_of_kind t.cst_kind
 
-    let size_ctx c = match c.cst_kind with
-      | Cst_undef (_, info) ->
-        DB_env.size info.cst_db_ctx
-      | Cst_cstor _ | Cst_defined _ | Cst_bool -> 0
-
     let make cst_id cst_kind = {cst_id; cst_kind}
     let make_bool id = make id Cst_bool
     let make_cstor id ty =
@@ -307,7 +297,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       make id (Cst_cstor ty)
     let make_defined id ty t = make id (Cst_defined (ty, t))
 
-    let make_undef ?(can_use=[]) ?(env=DB_env.empty) ?parent id ty =
+    let make_undef ?parent id ty =
       let info =
         let cst_depth = match parent with
           | Some ({cst_kind=Cst_undef (ty, i); _}, _) ->
@@ -325,8 +315,6 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           cst_cur_case=None;
           cst_watched=
             Poly_set.create ~eq:term_equal_ 16;
-          cst_can_use=can_use;
-          cst_db_ctx=env;
         }
       in
       make id (Cst_undef (ty, info))
@@ -408,9 +396,8 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           | True -> 1
           | False -> 2
           | DB d -> Hash.combine DB.hash 3 d
-          | Const (c,e) ->
-            Hash.combine3 4 (Typed_cst.hash c)
-              (DB_env.hash sub_hash e)
+          | Const c ->
+            Hash.combine2 4 (Typed_cst.hash c)
           | App (f,l) ->
             Hash.combine3 5 f.term_id (Hash.list sub_hash l)
           | Fun (ty, f) -> Hash.combine3 6 (Ty.hash ty) f.term_id
@@ -436,8 +423,8 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           | True, True
           | False, False -> true
           | DB x, DB y -> DB.equal x y
-          | Const (c1,e1), Const (c2,e2) ->
-            Typed_cst.equal c1 c2 && DB_env.equal term_equal_ e1 e2
+          | Const (c1), Const (c2) ->
+            Typed_cst.equal c1 c2
           | App (f1, l1), App (f2, l2) ->
             f1 == f2 && CCList.equal (==) l1 l2
           | Fun (ty1,f1), Fun (ty2,f2) -> Ty.equal ty1 ty2 && f1 == f2
@@ -536,27 +523,12 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     let db d =
       mk_term_ ~deps:Dep_none (DB d) ~ty:(DTy_direct (DB.ty d))
 
-    (* initial term environment, built from De Bruijn indices *)
-    let env_of_ty_env (e:ty_h DB_env.t): term DB_env.t =
-      DB_env.mapi
-        (fun i o -> match o with
-           | None -> None
-           | Some ty -> Some (db (DB.make i ty)))
-        e
-
-    let const_with_env env c =
+    let const c =
       let deps = match c.cst_kind with
         | Cst_undef _ -> Dep_cst c (* depends on evaluation! *)
         | Cst_bool | Cst_defined _ | Cst_cstor _ -> Dep_none
       in
-      mk_term_ ~deps (Const (c,env)) ~ty:(DTy_direct (Typed_cst.ty c))
-
-    let const c =
-      let env = match Typed_cst.as_undefined c with
-        | None -> DB_env.empty
-        | Some (_,_,info) -> env_of_ty_env info.cst_db_ctx
-      in
-      const_with_env env c
+      mk_term_ ~deps (Const c) ~ty:(DTy_direct (Typed_cst.ty c))
 
     (* type of an application *)
     let rec app_ty_ ty l : Ty.t = match Ty.view ty, l with
@@ -729,21 +701,21 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
 
     (* return [Some] iff the term is an undefined constant *)
     let as_cst_undef (t:term):
-      (cst * Ty.t * cst_info * term DB_env.t) option
+      (cst * Ty.t * cst_info) option
       =
       match t.term_cell with
-        | Const ({cst_kind=Cst_undef (ty,info); _} as c, e) ->
-          Some (c,ty,info,e)
+        | Const ({cst_kind=Cst_undef (ty,info); _} as c) ->
+          Some (c,ty,info)
         | _ -> None
 
     (* return [Some (cstor,ty,args)] if the term is a constructor
        applied to some arguments *)
     let as_cstor_app (t:term): (cst * Ty.t * term list) option =
       match t.term_cell with
-        | Const ({cst_kind=Cst_cstor ty; _} as c, _) -> Some (c,ty,[])
+        | Const ({cst_kind=Cst_cstor ty; _} as c) -> Some (c,ty,[])
         | App (f, l) ->
           begin match f.term_cell with
-            | Const ({cst_kind=Cst_cstor ty; _} as c, _) -> Some (c,ty,l)
+            | Const ({cst_kind=Cst_cstor ty; _} as c) -> Some (c,ty,l)
             | _ -> None
           end
         | _ -> None
@@ -760,13 +732,8 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         | True -> CCFormat.string out "true"
         | False -> CCFormat.string out "false"
         | DB d -> DB.pp out d
-        | Const (c,e) ->
-          let pp_cst out c =
-            if ids then Typed_cst.pp out c else ID.pp_name out c.cst_id
-          in
-          if DB_env.is_empty e
-          then pp_cst out c
-          else Format.fprintf out "@[%a[%a]@]" pp_cst c (DB_env.pp pp) e
+        | Const c ->
+          if ids then Typed_cst.pp out c else ID.pp_name out c.cst_id
         | App (f,l) ->
           fpf out "(@[<1>%a@ %a@])" pp f (Utils.pp_list pp) l
         | Fun (ty,f) ->
@@ -834,14 +801,11 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         | True -> CCFormat.string out "true"
         | False -> CCFormat.string out "false"
         | DB d -> DB.pp out d
-        | Const (c,e) ->
-          if DB_env.is_empty e
-          then Typed_cst.pp out c
-          else
-            Format.fprintf out "@[%a[%a]@]" Typed_cst.pp c (DB_env.pp pp) e
+        | Const c ->
+          Typed_cst.pp out c
         | App (f,_) ->
           begin match f.term_cell with
-            | Const (c,_) -> Typed_cst.pp out c (* no boxing *)
+            | Const c -> Typed_cst.pp out c (* no boxing *)
             | _ -> CCFormat.string out "@"
           end
         | If _ -> CCFormat.string out "if"
@@ -937,9 +901,9 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           | None -> false
         in
         begin match Term.as_cst_undef a, Term.as_cst_undef b with
-          | Some (c,_,info,_), _ when is_case info b ->
+          | Some (c,_,info), _ when is_case info b ->
             V_cst_choice (c,b)
-          | _, Some (c,_,info,_) when is_case info a ->
+          | _, Some (c,_,info) when is_case info a ->
             V_cst_choice (c,a)
           | _ -> V_assert (t, true)
         end
@@ -1187,51 +1151,44 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
   (* make a fresh constant, with a unique name *)
   let new_cst_ =
     let n = ref 0 in
-    fun ?can_use ?env ~parent name ty ->
+    fun ~parent name ty ->
       let id = ID.makef "?%s_%d" name !n in
       incr n;
-      Typed_cst.make_undef ?can_use ?env ~parent id ty
+      Typed_cst.make_undef ~parent id ty
 
   (* build the disjunction [l] of cases for [info]. No side effect. *)
   let expand_cases (cst:cst) (ty:Ty.t) (info:cst_info): term list =
     assert (info.cst_cases = None);
     (* make a sub-constant with given type *)
-    let mk_sub_cst ~can_use ~env ~parent ty_arg =
+    let mk_sub_cst ~parent ty_arg =
       let basename = Ty.mangle ty_arg in
-      new_cst_ basename ~can_use ~env ty_arg ~parent
+      new_cst_ basename ty_arg ~parent
     in
     (* table of already built constants, by type *)
     let memo : (cst * cst_parent_case_list) list Ty.Tbl.t = Ty.Tbl.create 16 in
     (* get or create a constant that has this type *)
     let get_or_create_cst
-        ~can_use ~env ~(parent:cst) ~(used:cst list ref) ty_arg
+        ~(parent:cst) ~(used:cst list ref) ty_arg
         : cst * cst_parent_case_list =
-      if DB_env.is_empty env
-      then (
-        let usable =
-          Ty.Tbl.get_or ~or_:[] memo ty_arg
-          |> List.filter
-            (fun (c',_) -> not (List.exists (Typed_cst.equal c') !used))
-        in
-        match usable with
-          | [] ->
-            (* make a new constant and remember it *)
-            let plist = ref [] in
-            let cst = mk_sub_cst ~can_use ~env ~parent:(parent,plist) ty_arg in
-            Ty.Tbl.add_list memo ty_arg (cst,plist);
-            used := cst :: !used; (* cannot use it in the same case *)
-            cst, plist
-          | (cst,plist) :: _ ->
-            (* [cst] has the proper type, and is not used yet *)
-            used := cst :: !used;
-            cst, plist
-      ) else (
-        (* no caching when there is an environment *)
-        let plist = ref [] in
-        mk_sub_cst ~can_use ~env ~parent:(cst,plist) ty_arg, plist
-      )
+      let usable =
+        Ty.Tbl.get_or ~or_:[] memo ty_arg
+        |> List.filter
+          (fun (c',_) -> not (List.exists (Typed_cst.equal c') !used))
+      in
+      match usable with
+        | [] ->
+          (* make a new constant and remember it *)
+          let plist = ref [] in
+          let cst = mk_sub_cst ~parent:(parent,plist) ty_arg in
+          Ty.Tbl.add_list memo ty_arg (cst,plist);
+          used := cst :: !used; (* cannot use it in the same case *)
+          cst, plist
+        | (cst,plist) :: _ ->
+          (* [cst] has the proper type, and is not used yet *)
+          used := cst :: !used;
+          cst, plist
     in
-    (* expand constant depending on its *)
+    (* expand constant depending on its type *)
     let by_ty = match Ty.view ty with
       | Atomic (_, Data cstors) ->
         (* datatype: refine by picking the head constructor *)
@@ -1247,11 +1204,8 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
                let args =
                  List.map
                    (fun ty_arg ->
-                      let c, plist = get_or_create_cst
-                        ty_arg
-                          ~can_use:info.cst_can_use
-                          ~env:info.cst_db_ctx
-                          ~parent:cst ~used
+                      let c, plist =
+                        get_or_create_cst ty_arg ~parent:cst ~used
                       in
                       plist := case :: !plist;
                       Term.const c
@@ -1265,67 +1219,59 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           cstors
       | Atomic (_, Uninterpreted) ->
         assert false (* TODO, but how? *)
-      | Arrow _ ->
-        let ty_args, ty_ret = Ty.unfold ty in
-        assert (ty_args<>[]);
-        (* just create one case, which is [fun x y z. ?body[x,y,z]] *)
-        let env = DB_env.push_l ty_args info.cst_db_ctx in
-        (* TODO: add recursion? *)
-        let can_use = info.cst_can_use in
-        let rec fun_ = lazy (
-          let plist = ref [fun_] in
-          let parent = cst, plist in
-          let c = mk_sub_cst ty_ret ~can_use ~env ~parent in
-          Term.fun_l ty_args (Term.const c)
-        ) in
-        let fun_ = Lazy.force fun_ in
-        [fun_]
+      | Arrow (ty_arg, ty_ret) ->
+        (* synthesize a function [fun x:ty_arg. body]
+           where [body] will destruct [x] depending on its type *)
+        let the_param = Term.db (DB.make 0 ty_arg) in
+        let rec body = lazy (
+          (* only one parent in any case *)
+          let parent = cst, ref [fun_] in
+          match Ty.view ty_arg with
+          | Prop ->
+            (* make a test on [the_param] *)
+            let then_ = mk_sub_cst ty_ret ~parent |> Term.const in
+            let else_ = mk_sub_cst ty_ret ~parent |> Term.const in
+            Term.if_ the_param then_ else_
+          | Atomic (_, Data cstors) ->
+            (* match without recursion on some parameter *)
+            let m =
+              cstors
+              |> List.map
+                (fun (lazy cstor) ->
+                   let ty_cstor_args, _ =
+                     Typed_cst.ty cstor |> Ty.unfold
+                   in
+                   let n_ty_args = List.length ty_cstor_args in
+                   (* build a function over the cstor arguments *)
+                   let ty_sub_f = Ty.arrow_l ty_cstor_args ty_ret in
+                   let sub_f = mk_sub_cst ty_sub_f ~parent in
+                   (* apply [sub_f] to the cstor's arguments *)
+                   let sub_params =
+                     List.mapi
+                       (fun i ty_arg ->
+                          let db_arg = DB.make (n_ty_args-i-1) ty_arg in
+                          Term.db db_arg)
+                       ty_cstor_args
+                   in
+                   let rhs = Term.app_cst sub_f sub_params in
+                   cstor.cst_id, (ty_cstor_args, rhs)
+                )
+              |> ID.Map.of_list
+            in
+            Term.match_ the_param m
+          | Atomic (_, Uninterpreted)
+          | Arrow _ ->
+            assert false (* TODO: support HO? *)
+        )
+        and fun_ =
+          lazy (Term.fun_ ty_arg (Lazy.force body))
+        in
+        [Lazy.force fun_]
       | Prop ->
         (* simple try true/false *)
         [Term.true_; Term.false_]
-
-    (* terms built from variables available in the context *)
-    and by_ctx =
-      let env = info.cst_db_ctx in
-      env
-      |> DB_env.to_list
-      |> List.mapi
-        (fun i o -> match o with
-           | None -> None
-           | Some ty_o ->
-             let ty_args, ty_ret = Ty.unfold ty_o in
-             if Ty.equal ty_ret ty
-             then (
-               let hd = Term.db (DB.make i ty_o) in
-               let rec case = lazy (
-                 let used = ref [] in
-                 let args =
-                   List.map
-                     (fun ty_arg ->
-                        let c, plist =
-                          get_or_create_cst ty_arg
-                            ~env:info.cst_db_ctx
-                            ~can_use:info.cst_can_use ~parent:cst ~used
-                        in
-                        plist := case :: !plist;
-                        Term.const c)
-                     ty_args
-                 in
-                 Term.app hd args
-               ) in
-               Some (Lazy.force case)
-             )
-             else None
-        )
-      |> CCList.filter_map (fun o->o)
-
-    (* terms available for refinement, if they have the proper type *)
-    and by_usable_terms =
-      List.filter
-        (fun t -> Ty.equal t.term_ty ty)
-        info.cst_can_use
     in
-    by_usable_terms @ by_ctx @ by_ty
+    by_ty
 
   (** {2 Reduction to Normal Form} *)
 
@@ -1347,16 +1293,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
               | None -> t
               | Some t' -> t'
             end
-          | Const (_,clos) when DB_env.is_empty clos -> t
-          | Const (c,clos) ->
-            (* [env'] should be a complete closure over
-                all variables in [c] *)
-            assert (DB_env.size clos = Typed_cst.size_ctx c);
-            (* evaluate [env'] in the current environment *)
-            let new_env =
-              DB_env.map (fun o -> CCOpt.map (aux env) o) clos
-            in
-            Term.const_with_env new_env c
+          | Const _ -> t
           | True
           | False -> t
           | Fun (ty, body) ->
@@ -1452,16 +1389,14 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         | DB _ -> Explanation.empty, t
         | True | False ->
           Explanation.empty, t (* always trivial *)
-        | Const (c,clos) ->
+        | Const c ->
           begin match c.cst_kind with
             | Cst_defined (_, rhs) ->
               (* expand defined constants *)
               compute_nf (Lazy.force rhs)
             | Cst_undef (_, {cst_cur_case=Some (e,new_t); _}) ->
-              (* c := new_t, we can reduce; but first,
-                 evaluate [new_t] using env *)
-              let new_t = eval_db clos new_t in
-              compute_nf_add e new_t
+              (* c := new_t, we can reduce *)
+              e, new_t
             | Cst_undef _
             | Cst_cstor _ | Cst_bool -> Explanation.empty, t
           end
@@ -1517,7 +1452,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           let e = Explanation.append e_u e_branch in
           set_nf_ t t' e;
           e, t'
-        | App ({term_cell=Const ({cst_kind=Cst_cstor _; _}, _); _}, _) ->
+        | App ({term_cell=Const {cst_kind=Cst_cstor _; _}; _}, _) ->
           Explanation.empty, t (* do not reduce under cstors *)
         | App (f, l) ->
           let e_f, f' = compute_nf f in
@@ -1532,8 +1467,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
 
     (* apply [f] to [l], until no beta-redex is found *)
     and compute_nf_app env e f l = match f.term_cell, l with
-      | Const ({cst_kind=Cst_defined (_, lazy def_f); _}, local_env), l ->
-        assert (DB_env.is_empty local_env);
+      | Const {cst_kind=Cst_defined (_, lazy def_f); _}, l ->
         (* reduce [f l] into [def_f l] when [f := def_f] *)
         compute_nf_app env e def_f l
       | Fun (_ty, body), arg :: other_args ->
@@ -1729,7 +1663,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
                Term.to_seq rhs
                |> Sequence.exists
                  (fun sub -> match sub.term_cell with
-                    | Const ({cst_kind=Cst_undef (_,info); _}, _) ->
+                    | Const {cst_kind=Cst_undef (_,info); _} ->
                       (* is [sub] a constant deeper than [d]? *)
                       info.cst_depth > depth
                     | _ -> false)
@@ -1737,9 +1671,23 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
              lit, needs_guard)
           l
       in
+      (* if all cases go over the depth limit, then we must revert the
+         choice of [parent] *)
+      let all_need_guard = List.for_all snd lits in
+      let cs_possible_depth = match lit_guard, guard_parent, all_need_guard with
+        | _, [], true -> assert false (* depth 0 ?! *)
+        | Some guard, _::_, true ->
+          (* each [parent=parent_case] that leads to [c] is incompatible
+             with [guard] because it would use too deep constants *)
+          List.map
+            (fun parent ->
+               [Lit.neg guard; Lit.neg parent] |> Clause.make)
+            guard_parent
+        | _ -> []
+      in
       (* at least one case. We only enforce that if the
          parent constant has the proper case *)
-      let c_choose : Clause.t list =
+      let cs_choose : Clause.t list =
         List.map fst lits
         |> product_imply guard_parent
         |> List.map Clause.make
@@ -1760,7 +1708,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
                | _ -> [])
           lits
       in
-      c_choose @ cs_limit @ cs_once
+      cs_possible_depth @ cs_limit @ cs_choose @ cs_once
 
     (* add [t] to the list of literals that watch the constant [c] *)
     let watch_cst_ (c:cst) (t:t): unit =
@@ -1781,8 +1729,8 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           (* [c] is blocking, not too deep, but not expanded *)
           let l = expand_cases c ty info in
           Log.debugf 2
-            (fun k->k "(@[<1>expand_cases@ @[%a@]@ :into (@[%a@])@])"
-                Typed_cst.pp c (Utils.pp_list Term.pp) l);
+            (fun k->k "(@[<1>expand_cases@ @[%a@]@ :into (@[%a@])@ :depth %d@])"
+                Typed_cst.pp c (Utils.pp_list Term.pp) l depth);
           info.cst_cases <- Some l;
           incr stat_num_cst_expanded;
           Clause.push_new_l (clauses_of_cases c l depth)
@@ -2256,11 +2204,11 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         | True
         | False
         | DB _ -> t
-        | Const ({cst_kind=Cst_defined(_,lazy t'); _},_) -> aux t'
-        | Const ({cst_kind=Cst_undef(_,_); _} as c, clos) ->
+        | Const {cst_kind=Cst_defined(_,lazy t'); _} -> aux t'
+        | Const ({cst_kind=Cst_undef(_,_); _} as c) ->
           begin match Typed_cst.Map.get c m with
             | None -> t
-            | Some t' -> aux (Reduce.eval_db clos t')
+            | Some t' -> aux t'
           end
         | Const _ -> t
         | App (f,l) ->
@@ -2348,8 +2296,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
             | _ -> Term.eq a b
           end
       and aux_app env f l = match f.term_cell, l with
-        | Const ({cst_kind=Cst_defined(_, lazy def_f); _}, clos), _ ->
-          assert (DB_env.is_empty clos);
+        | Const {cst_kind=Cst_defined(_, lazy def_f); _}, _ ->
           aux_app env def_f l
         | Fun (_, body), arg :: tail ->
           let env = DB_env.push arg env in
