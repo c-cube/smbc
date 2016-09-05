@@ -2250,6 +2250,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           end
         | _ -> assert false
       in
+      (* add [t] to the watchlist *)
       if not (Term.equal b_expr t)
       then Poly_set.add (Lazy.force info.bi_watched) t;
       (* check whether [b_expr] is expanded *)
@@ -2473,12 +2474,15 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       begin match Lit.view lit', Lit.sign lit with
         | Lit_fresh _, _ -> ()
         | Lit_atom {term_cell=True; _}, true
-        | Lit_atom {term_cell=False; _}, false -> ()
-        | Lit_atom {term_cell=True; _}, false -> ()
+        | Lit_atom {term_cell=False; _}, false ->
+          (* propagate *)
+          let c = lit :: clause_guard_of_exp_ e |> Clause.make in
+          Clause.push_new c
+        | Lit_atom {term_cell=True; _}, false
         | Lit_atom {term_cell=False; _}, true ->
-          (* conflict! *)
+          (* propagate *)
           let c = Lit.neg lit :: clause_guard_of_exp_ e |> Clause.make in
-          Clause.push_conflict c
+          Clause.push_new c
         | Lit_atom t, sign ->
           begin match Term.as_bi t with
             | Some bi ->
@@ -2705,7 +2709,10 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           | Ast.And -> Term.and_ a b
           | Ast.Or -> Term.or_ a b
           | Ast.Imply -> Term.imply a b
-          | Ast.Eq -> Term.eq a b
+          | Ast.Eq ->
+            if Ty.is_prop a.term_ty
+            then Term.equiv a b
+            else Term.eq a b
         end
 
     let add_statement st =
@@ -2857,9 +2864,10 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
             Some msg
           | _ -> None)
 
-    let check_bi_ bi b = match bi.bi_decided with
+    (* helper to return a boolean, checking consistency with [bi] *)
+    let ret_bi_ bi b = match bi.bi_decided with
       | None -> assert false
-      | Some (_, b') -> assert (b=b')
+      | Some (_, b') -> assert (b=b'); if b then Term.true_ else Term.false_
 
     (* eval term [t] under model [m] *)
     let eval_ (m:t) t =
@@ -2947,9 +2955,9 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           let a = aux a in
           let b = aux b in
           begin match a.term_cell, b.term_cell with
-            | True, True -> check_bi_ bi true; Term.true_
+            | True, True -> ret_bi_ bi true
             | False, _
-            | _, False -> check_bi_ bi false; Term.false_
+            | _, False -> ret_bi_ bi false
             | _ -> Term.and_ a b
           end
         | Builtin (B_or (a,b,bi)) ->
@@ -2957,8 +2965,8 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           let b = aux b in
           begin match a.term_cell, b.term_cell with
             | True, _
-            | _, True -> check_bi_ bi true; Term.true_
-            | False, False -> check_bi_ bi false; Term.false_
+            | _, True -> ret_bi_ bi true
+            | False, False -> ret_bi_ bi false
             | _ -> Term.or_ a b
           end
         | Builtin (B_imply (a,b,bi)) ->
@@ -2966,8 +2974,8 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           let b = aux b in
           begin match a.term_cell, b.term_cell with
             | _, True
-            | False, _  -> check_bi_ bi true; Term.true_
-            | True, False -> check_bi_ bi false; Term.false_
+            | False, _  -> ret_bi_ bi true
+            | True, False -> ret_bi_ bi false
             | _ -> Term.imply a b
           end
         | Builtin (B_equiv (a,b,bi)) ->
@@ -2975,10 +2983,10 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           let b = aux b in
           begin match a.term_cell, b.term_cell with
             | True, True
-            | False, False -> check_bi_ bi true; Term.true_
+            | False, False -> ret_bi_ bi true
             | True, False
-            | False, True -> check_bi_ bi false; Term.false_
-            | _ when Term.equal a b -> check_bi_ bi true; Term.true_
+            | False, True -> ret_bi_ bi false
+            | _ when Term.equal a b -> ret_bi_ bi true
             | _ -> Term.equiv a b
           end
         | Builtin (B_eq (a,b)) ->
