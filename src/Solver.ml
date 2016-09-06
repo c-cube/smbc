@@ -104,6 +104,9 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     (* did we expand the literal into CNF yet? *)
     mutable bi_decided: (explanation * bool) option;
     (* current truth value in the model *)
+    bi_watched: term Poly_set.t lazy_t;
+    (* set of (bool) literals that depend on this expression
+       for evaluation *)
   }
 
   (* a table [m] from values of type [switch_ty_arg]
@@ -172,6 +175,15 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
        a subset? Affects completeness *)
     mutable cst_cur_case: (explanation * term) option;
     (* current choice of normal form *)
+    cst_watched: term Poly_set.t;
+    (* set of literals (rather, boolean terms) that depend on this constant
+       for evaluation.
+
+       A literal [lit] can watch several typed constants. If
+       [lit.nf = t], and [t]'s evaluation is blocked by [c1,...,ck],
+       then [lit] will watch [c1,...,ck].
+
+       Watch list only grow, they never shrink. *)
   }
 
   (* this is a disjunction of sufficient conditions for the existence of
@@ -224,6 +236,9 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
        Expanded on demand. *)
     mutable uty_status: (explanation * ty_uninterpreted_status) option;
     (* current status in the model *)
+    uty_watched: term Poly_set.t;
+    (* set of terms whose evaluation is blocked by this uty.
+       See {!info.cst_watched} for more details *)
   }
 
   let pp_quant out = function
@@ -406,6 +421,8 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           cst_cases=Lazy_none;
           cst_complete=false;
           cst_cur_case=None;
+          cst_watched=
+            Poly_set.create ~eq:term_equal_ 16;
         }
       in
       make id (Cst_undef (ty, info, slice))
@@ -657,7 +674,6 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       | Term_dep_sub of term
       | Term_dep_sub2 of term * term
       | Term_dep_uty of ty_uninterpreted_slice
-      | Term_dep_bool_expr of term
       | Term_dep_self (* the term is its own blocker *)
 
     type delayed_ty =
@@ -709,7 +725,6 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
             CCList.sorted_merge_uniq
               ~cmp:cmp_term_dep_ a.term_deps b.term_deps
           | Term_dep_uty uty -> [Dep_uty uty]
-          | Term_dep_bool_expr t -> [Dep_bool_expr t]
           | Term_dep_self ->
             assert (Ty.is_prop t'.term_ty);
             [Dep_bool_expr t']
@@ -836,6 +851,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     let mk_bi () : bool_info = {
       bi_expanded=false;
       bi_decided=None;
+      bi_watched=lazy (Poly_set.create ~eq:term_equal_ 16);
     }
 
     let and_ a b = builtin (B_and (a,b, mk_bi()))
@@ -1514,6 +1530,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
             uty_pair=Lazy_none;
             uty_offset=n+1;
             uty_status=None;
+            uty_watched=Poly_set.create 16 ~eq:term_equal_;
           } in
           Log.debugf 5
             (fun k->k "expand slice %a@ into (@[%a,@ %a@])"
@@ -2167,9 +2184,6 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       let e', t' = compute_nf t in
       Explanation.append e e', t'
 
-    (* TODO: some basic simplifications (`a & b --> b` if `a --> true` with
-       an empty explanation, for instance) *)
-
     (* compute the builtin, assuming its components are
        already reduced *)
     and compute_builtin ~(old:term) (bu:builtin): explanation * term = match bu with
@@ -2282,55 +2296,46 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       and propagate it into the SAT solver. *)
 
   module Watched_lit : sig
-    type t = private {
-      original: term;
-      simplified: term; (* after simplification, the initial blocked term *)
-    }
+    type t = private term
 
     val to_lit : t -> Lit.t
     val pp : t CCFormat.printer
-    val original : t -> term
-    val simplified : t -> term
-    val of_term : term -> t
     val watch : t -> unit
     val watch_term : term -> unit
+    val update_watches_of : t -> unit
+    val update_watches_of_term : term -> unit
     val is_watched : t -> bool
-    val expand_deps : t -> unit
-    val expand_deps_of_term : term -> unit
     val size : unit -> int
     val to_seq : t Sequence.t
     val to_seq_term : term Sequence.t
   end = struct
-    type t = {
-      original: term;
-      simplified: term; (* after simplification, the initial blocked term *)
-    }
-    (* actually, the watched lit is [Lit.atom t.original], but we link
+    type t = term
+    (* actually, the watched lit is [Lit.atom t], but we link
        [t] directly because this way we have direct access to its
-       normal form.
+       normal form *)
 
-       Invariants:
-       [t.simplified = Reduce.simplify t.original]
-       [t.original = fst (Term.abs t.original)]
-    *)
+    let to_lit = Lit.atom ~sign:true
+    let pp = Term.pp
 
-    let original t = t.original
-    let simplified t = t.simplified
-    let to_lit t = Lit.atom ~sign:true t.original
-    let pp out t =
-      Format.fprintf out "(@[<hv>original: %a@ simplified: %a@])"
-        Term.pp t.original Term.pp t.simplified
+    let propagate_lit_ (l:t) (e:explanation): unit =
+      let c = to_lit l :: clause_guard_of_exp_ e |> Clause.make in
+      Log.debugf 4
+        (fun k->k
+            "(@[<hv1>@{<green>propagate_lit@}@ %a@ nf: %a@ clause: %a@])"
+            pp l pp (snd (Reduce.compute_nf l)) Clause.pp c);
+      Clause.push_new c;
+      ()
 
     (* set of literals whose boolean value is of interest *)
-    let watched_ : t Term.Tbl.t = Term.Tbl.create 256
+    let watched_ : unit Term.Tbl.t = Term.Tbl.create 256
 
-    let is_watched (t:t) : bool = Term.Tbl.mem watched_ t.original
+    let is_watched (t:t) : bool = Term.Tbl.mem watched_ t
 
     (* build watched lit, enforcing invariants *)
     let of_term (t:term): t =
-      let original, _ = Term.abs t in
-      let simplified = Reduce.simplify original in
-      {original; simplified}
+      assert (Ty.is_prop t.term_ty);
+      let t, _ = Term.abs t in
+      t
 
     (* expand the given term dependency so that, later, it will be
        assigned a value by the SAT solver *)
@@ -2427,32 +2432,82 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           );
       end
 
+    and watch_dep (t:t) (d:term_dep) : unit =
+      expand_dep d;
+      begin match d with
+        | Dep_cst c ->
+          let _ty, info = match c.cst_kind with
+            | Cst_undef (ty,i,_) -> ty,i
+            | Cst_defined _ | Cst_cstor _ | Cst_uninterpreted_dom_elt _ ->
+              assert false
+          in
+          Poly_set.add info.cst_watched t;
+        | Dep_uty uty ->
+          Poly_set.add uty.uty_watched t;
+        | Dep_bool_expr b_expr ->
+          let info = match b_expr.term_cell with
+            | Builtin bu ->
+              begin match bu with
+                | B_and (_,_,i) | B_or (_,_,i)
+                | B_imply (_,_,i) | B_equiv (_,_,i) -> i
+                | B_not _ | B_eq _ -> assert false
+              end
+            | _ -> assert false
+          in
+          (* add [t] to the watchlist *)
+          if not (Term.equal b_expr t)
+          then Poly_set.add (Lazy.force info.bi_watched) t;
+      end
+
     (* [t] being a watched literal, its evaluation can be blocked by some
        dependencies (constants, boolean connectives, etc.).
        We need to expand those blocking dependencies so that the SAT solver
        can eventually pick a value for them and so  that evaluation can
-       proceed forward *)
-    and expand_deps (t:t): unit =
-      Log.debugf 5
-        (fun k->k "(@[<1>expand_deps@ %a@ deps: (@[%a@])@])"
-            pp t (Utils.pp_list pp_dep) t.simplified.term_deps);
-      List.iter expand_dep t.simplified.term_deps
+       proceed forward.
+
+       We also need to register [t] to the watchlist of those dependencies
+       so that [t] is recomputed when those dependencies are assigned. *)
+    and update_watches_of (t:t): unit =
+      assert (Ty.is_prop t.term_ty);
+      (* first, ensure that [t] is properly watched even upon backtracking *)
+      let t' = Reduce.simplify t in
+      List.iter (watch_dep t) t'.term_deps;
+      (* then, update the current normal form, which might have other deps *)
+      let e, new_t = Reduce.compute_nf t in
+      (* if [new_t = true/false], propagate literal *)
+      begin match new_t.term_cell with
+        | True -> propagate_lit_ t e
+        | False -> propagate_lit_ (Term.not_ t) e
+        | _ ->
+          (* partially evaluated literal: add [t] (not its
+             temporary normal form) to the watch list of every
+             blocking constant *)
+          Log.debugf 4
+            (fun k->k
+                "(@[<1>update_watches@ %a@ @[<1>:normal_form@ %a@]@ \
+                 :deps (@[%a@])@ :exp @[<hv>%a@]@])"
+                Term.pp t Term.pp new_t
+                (Utils.pp_list pp_dep) new_t.term_deps
+                Explanation.pp e);
+          List.iter (watch_dep t) new_t.term_deps;
+      end;
+      ()
 
     and watch (lit:t) =
       if not (is_watched lit) then (
         Log.debugf 3
           (fun k->k "(@[<1>@{<green>watch_lit@}@ %a@])" pp lit);
-        Term.Tbl.add watched_ lit.original lit;
+        Term.Tbl.add watched_ lit ();
         (* also ensure its dependencies are going to be refined *)
-        expand_deps lit;
+        update_watches_of lit;
       )
 
     and watch_term t = watch (of_term t)
 
-    let expand_deps_of_term t = expand_deps (of_term t)
+    let update_watches_of_term t = update_watches_of (of_term t)
 
-    let to_seq = Term.Tbl.values watched_
-    let to_seq_term = to_seq |> Sequence.map original
+    let to_seq = Term.Tbl.keys watched_
+    let to_seq_term = to_seq
 
     let size () = Term.Tbl.length watched_
   end
@@ -2520,36 +2575,6 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         raise (Conflict c)
       )
 
-    (* propagate that the current lit reduces to true/false
-       with the given explanation *)
-    let propagate_lit_ (l:lit) (e:explanation): unit =
-      let c = l :: clause_guard_of_exp_ e |> Clause.make in
-      Log.debugf 4
-        (fun k->k
-            "(@[<hv1>@{<green>propagate_lit@}@ %a@ clause: %a@])"
-            Lit.pp l Clause.pp c);
-      Clause.push_new c;
-      ()
-
-    (* traverse the set of watched lits that are blocked by the given
-       dependency, re-compute them, and propagate them back to the SAT solver
-       if they reduce to true/false *)
-    let propagate_watched_lits (d:term_dep): unit =
-      Watched_lit.to_seq
-      |> Sequence.iter
-        (fun t ->
-           let e, new_t = Reduce.compute_nf (Watched_lit.original t) in
-           (* if [new_t = true/false], propagate literal *)
-           begin match new_t.term_cell with
-             | True -> propagate_lit_ (Watched_lit.to_lit t) e
-             | False -> propagate_lit_ (Watched_lit.to_lit t |> Lit.neg) e
-             | _ ->
-               (* still partially evaluated, just expand what blocks the
-                  evaluation of [new_t] *)
-               assert (not(Term.is_blocked_by new_t ~dep:d));
-               Watched_lit.expand_deps_of_term new_t;
-           end)
-
     (* assert [c := new_t], or conflict *)
     let assert_choice (c:cst)(new_t:term) : unit =
       let _, _, info, _ = Typed_cst.as_undefined_exn c in
@@ -2558,6 +2583,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           let e = Explanation.return (Lit.cst_choice c new_t) in
           Backtrack.push_set_cst_case_ info;
           info.cst_cur_case <- Some (e, new_t);
+          Poly_set.iter Watched_lit.update_watches_of_term info.cst_watched
         | Some (_,new_t') ->
           Log.debugf 1
             (fun k->k "(@[<hv1>assert_choice %a@ :to %a@ :cur %a@])"
@@ -2577,6 +2603,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           let e = Explanation.return (Lit.uty_choice_status uty status) in
           Backtrack.push_uty_status uty;
           uty.uty_status <- Some (e, status);
+          Poly_set.iter Watched_lit.update_watches_of_term uty.uty_watched
         | Some (_, ((Uty_empty | Uty_nonempty) as s)) ->
           Log.debugf 1
             (fun k->k "(@[<hv1>assert_uty %a@ :to %a@ :cur %a@])"
@@ -2594,6 +2621,9 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           Backtrack.push_bi b_expr;
           let e = Explanation.return (Lit.atom ~sign t) in
           b_expr.bi_decided <- Some (e, sign);
+          Poly_set.iter
+            Watched_lit.update_watches_of_term
+            (Lazy.force b_expr.bi_watched);
         | Some (_, sign') ->
           (* already assigned, check consistency *)
           assert (sign=sign');
@@ -2612,22 +2642,13 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         | Lit_atom t, sign ->
           begin match Term.as_bi t with
             | Some bi ->
-              assert_b_expr ~b_expr:bi ~sign t;
-              (* update literals that were blocked *)
-              propagate_watched_lits (Dep_bool_expr t);
+              assert_b_expr ~b_expr:bi ~sign t
             | None -> ()
           end
-        | Lit_assign(c, t), true ->
-          assert_choice c t;
-          (* update literals that were blocked *)
-          propagate_watched_lits (Dep_cst c);
+        | Lit_assign(c, t), true -> assert_choice c t
         | Lit_assign _, false -> ()
-        | Lit_uty_empty uty, true ->
-          assert_uty uty Uty_empty;
-          propagate_watched_lits (Dep_uty uty);
-        | Lit_uty_empty uty, false ->
-          assert_uty uty Uty_nonempty;
-          propagate_watched_lits (Dep_uty uty);
+        | Lit_uty_empty uty, true -> assert_uty uty Uty_empty
+        | Lit_uty_empty uty, false -> assert_uty uty Uty_nonempty
       end
 
     (* propagation from the bool solver *)
@@ -2882,6 +2903,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
               uty_offset=0; (* root *)
               uty_pair=Lazy_none;
               uty_status=None;
+              uty_watched=Poly_set.create 16 ~eq:term_equal_;
             } in
             Ty.atomic id (Uninterpreted ty0)
           ) in
