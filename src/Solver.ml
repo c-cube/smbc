@@ -226,11 +226,6 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     (* current status in the model *)
   }
 
-  type watched_lit = {
-    wl_original: term;
-    mutable wl_nf: term; (* current normal form of [wf_original] *)
-  }
-
   let pp_quant out = function
     | Forall -> CCFormat.string out "forall"
     | Exists -> CCFormat.string out "exists"
@@ -508,9 +503,6 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       | S_set_bi of
           bool_info * (explanation * bool) option
           (* bi1.status <- bool2 *)
-      | S_set_wl_nf of
-          watched_lit * term
-          (* w1.wl_nf <- t2 *)
 
     type stack = stack_cell CCVector.vector
 
@@ -526,7 +518,6 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           | S_set_cst_case (info, c) -> info.cst_cur_case <- c;
           | S_set_uty (uty, s) -> uty.uty_status <- s;
           | S_set_bi (bi, s) -> bi.bi_decided <- s;
-          | S_set_wl_nf (wl, t) -> wl.wl_nf <- t;
       done;
       ()
 
@@ -548,9 +539,6 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
 
     let push_bi (bi:bool_info) =
       CCVector.push st_ (S_set_bi (bi, bi.bi_decided))
-
-    let push_wl (wl:watched_lit) =
-      CCVector.push st_ (S_set_wl_nf (wl, wl.wl_nf))
   end
 
   let new_switch_id_ =
@@ -669,6 +657,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       | Term_dep_sub of term
       | Term_dep_sub2 of term * term
       | Term_dep_uty of ty_uninterpreted_slice
+      | Term_dep_bool_expr of term
       | Term_dep_self (* the term is its own blocker *)
 
     type delayed_ty =
@@ -720,6 +709,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
             CCList.sorted_merge_uniq
               ~cmp:cmp_term_dep_ a.term_deps b.term_deps
           | Term_dep_uty uty -> [Dep_uty uty]
+          | Term_dep_bool_expr t -> [Dep_bool_expr t]
           | Term_dep_self ->
             assert (Ty.is_prop t'.term_ty);
             [Dep_bool_expr t']
@@ -2292,12 +2282,15 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       and propagate it into the SAT solver. *)
 
   module Watched_lit : sig
-    type t = watched_lit
+    type t = private {
+      original: term;
+      simplified: term; (* after simplification, the initial blocked term *)
+    }
 
     val to_lit : t -> Lit.t
     val pp : t CCFormat.printer
     val original : t -> term
-    val nf : t -> term
+    val simplified : t -> term
     val of_term : term -> t
     val watch : t -> unit
     val watch_term : term -> unit
@@ -2308,29 +2301,36 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     val to_seq : t Sequence.t
     val to_seq_term : term Sequence.t
   end = struct
-    type t = watched_lit
-    (* Invariants:
-       [t.wl_nf = Reduce.simplify t.wl_original] at start
-       [t.wl_original = fst (Term.abs t.wl_original)]
+    type t = {
+      original: term;
+      simplified: term; (* after simplification, the initial blocked term *)
+    }
+    (* actually, the watched lit is [Lit.atom t.original], but we link
+       [t] directly because this way we have direct access to its
+       normal form.
+
+       Invariants:
+       [t.simplified = Reduce.simplify t.original]
+       [t.original = fst (Term.abs t.original)]
     *)
 
-    let original t = t.wl_original
-    let nf t = t.wl_nf
-    let to_lit t = Lit.atom ~sign:true t.wl_original
+    let original t = t.original
+    let simplified t = t.simplified
+    let to_lit t = Lit.atom ~sign:true t.original
     let pp out t =
-      Format.fprintf out "(@[<hv>original: %a@ nf: %a@])"
-        Term.pp t.wl_original Term.pp t.wl_nf
+      Format.fprintf out "(@[<hv>original: %a@ simplified: %a@])"
+        Term.pp t.original Term.pp t.simplified
 
     (* set of literals whose boolean value is of interest *)
     let watched_ : t Term.Tbl.t = Term.Tbl.create 256
 
-    let is_watched (t:t) : bool = Term.Tbl.mem watched_ t.wl_original
+    let is_watched (t:t) : bool = Term.Tbl.mem watched_ t.original
 
     (* build watched lit, enforcing invariants *)
     let of_term (t:term): t =
-      let wl_original, _ = Term.abs t in
-      let simplified = Reduce.simplify wl_original in
-      {wl_original; wl_nf=simplified}
+      let original, _ = Term.abs t in
+      let simplified = Reduce.simplify original in
+      {original; simplified}
 
     (* expand the given term dependency so that, later, it will be
        assigned a value by the SAT solver *)
@@ -2435,20 +2435,15 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     and expand_deps (t:t): unit =
       Log.debugf 5
         (fun k->k "(@[<1>expand_deps@ %a@ deps: (@[%a@])@])"
-            pp t (Utils.pp_list pp_dep) t.wl_nf.term_deps);
-      List.iter expand_dep t.wl_nf.term_deps
+            pp t (Utils.pp_list pp_dep) t.simplified.term_deps);
+      List.iter expand_dep t.simplified.term_deps
 
     and watch (lit:t) =
       if not (is_watched lit) then (
         Log.debugf 3
           (fun k->k "(@[<1>@{<green>watch_lit@}@ %a@])" pp lit);
-        Term.Tbl.add watched_ lit.wl_original lit;
-        (* also ensure its dependencies are going to be refined. For
-           that we need to evaluate it *)
-        expand_deps lit;
-        let _, nf = Reduce.compute_nf lit.wl_original in
-        Backtrack.push_wl lit;
-        lit.wl_nf <- nf;
+        Term.Tbl.add watched_ lit.original lit;
+        (* also ensure its dependencies are going to be refined *)
         expand_deps lit;
       )
 
@@ -2541,27 +2536,18 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
        if they reduce to true/false *)
     let propagate_watched_lits (d:term_dep): unit =
       Watched_lit.to_seq
-      |> Sequence.filter
-        (fun wl ->
-           let nf = Watched_lit.nf wl in
-           Term.is_blocked_by nf ~dep:d)
       |> Sequence.iter
-        (fun wl ->
-           let e, new_t = Reduce.compute_nf (Watched_lit.original wl) in
+        (fun t ->
+           let e, new_t = Reduce.compute_nf (Watched_lit.original t) in
            (* if [new_t = true/false], propagate literal *)
            begin match new_t.term_cell with
-             | True -> propagate_lit_ (Watched_lit.to_lit wl) e
-             | False -> propagate_lit_ (Watched_lit.to_lit wl |> Lit.neg) e
+             | True -> propagate_lit_ (Watched_lit.to_lit t) e
+             | False -> propagate_lit_ (Watched_lit.to_lit t |> Lit.neg) e
              | _ ->
-               let nf = Watched_lit.nf wl in
-               if new_t != nf then (
-                 (* still partially evaluated, just expand what blocks the
-                    evaluation of [new_t] *)
-                 assert (not(Term.is_blocked_by new_t ~dep:d));
-                 Backtrack.push_wl wl;
-                 wl.wl_nf <- new_t;
-                 Watched_lit.expand_deps_of_term new_t;
-               )
+               (* still partially evaluated, just expand what blocks the
+                  evaluation of [new_t] *)
+               assert (not(Term.is_blocked_by new_t ~dep:d));
+               Watched_lit.expand_deps_of_term new_t;
            end)
 
     (* assert [c := new_t], or conflict *)
@@ -3012,15 +2998,9 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           | _ -> None)
 
     (* helper to return a boolean, checking consistency with [bi] *)
-    let ret_bi_ t bi b = match bi.bi_decided with
+    let ret_bi_ bi b = match bi.bi_decided with
       | None -> if b then Term.true_ else Term.false_
-      | Some (_, b') ->
-        if b!=b' then (
-          Format.printf "error: @[%a@]@ bi_decided=%B, expect %B@."
-            Term.pp t b' b;
-          assert false
-        );
-        if b then Term.true_ else Term.false_
+      | Some (_, b') -> assert (b=b'); if b then Term.true_ else Term.false_
 
     (* eval term [t] under model [m] *)
     let eval_ (m:t) t =
@@ -3108,9 +3088,9 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           let a = aux a in
           let b = aux b in
           begin match a.term_cell, b.term_cell with
-            | True, True -> ret_bi_ t bi true
+            | True, True -> ret_bi_ bi true
             | False, _
-            | _, False -> ret_bi_ t bi false
+            | _, False -> ret_bi_ bi false
             | _ -> Term.and_ a b
           end
         | Builtin (B_or (a,b,bi)) ->
@@ -3118,8 +3098,8 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           let b = aux b in
           begin match a.term_cell, b.term_cell with
             | True, _
-            | _, True -> ret_bi_ t bi true
-            | False, False -> ret_bi_ t bi false
+            | _, True -> ret_bi_ bi true
+            | False, False -> ret_bi_ bi false
             | _ -> Term.or_ a b
           end
         | Builtin (B_imply (a,b,bi)) ->
@@ -3127,8 +3107,8 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           let b = aux b in
           begin match a.term_cell, b.term_cell with
             | _, True
-            | False, _  -> ret_bi_ t bi true
-            | True, False -> ret_bi_ t bi false
+            | False, _  -> ret_bi_ bi true
+            | True, False -> ret_bi_ bi false
             | _ -> Term.imply a b
           end
         | Builtin (B_equiv (a,b,bi)) ->
@@ -3136,10 +3116,10 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           let b = aux b in
           begin match a.term_cell, b.term_cell with
             | True, True
-            | False, False -> ret_bi_ t bi true
+            | False, False -> ret_bi_ bi true
             | True, False
-            | False, True -> ret_bi_ t bi false
-            | _ when Term.equal a b -> ret_bi_ t bi true
+            | False, True -> ret_bi_ bi false
+            | _ when Term.equal a b -> ret_bi_ bi true
             | _ -> Term.equiv a b
           end
         | Builtin (B_eq (a,b)) ->
