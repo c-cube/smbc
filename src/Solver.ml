@@ -3222,7 +3222,31 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     with Exit ->
       !s
 
-  let solve ?(on_exit=[]) ?(check=true) () =
+  (* trail: list of [(literal, level)] *)
+  let get_trail ~domains (): (Lit.t * int) list =
+    (* deref recursively some parts of the literal *)
+    let expand_lit l =
+      Lit.map l
+        ~f:(fun view -> match view with
+          | Lit_assign (c,t) -> Lit_assign (c, deref_deep domains t)
+          | Lit_atom _
+          | Lit_fresh _
+          | Lit_uty_empty _ -> view)
+    in
+    M.St.iter_elt
+    |> Sequence.map
+      (function
+        | M.St.E_lit _ -> assert false
+        | M.St.E_var v ->
+          let lev = v.M.St.v_level in
+          let a = v.M.St.pa in
+          let lit = a.M.St.lit |> expand_lit in
+          let lit = if a.M.St.is_true then lit else Lit.neg lit in
+          lit, lev)
+    |> Sequence.to_list
+    |> List.sort (CCFun.compose_binop snd CCOrd.int_) (* sort by level *)
+
+  let solve ?(on_exit=[]) ?(pp_trail=false) ?(check=true) () =
     let module ID = Iterative_deepening in
     (* iterated deepening *)
     let rec iter state = match state with
@@ -3237,6 +3261,14 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
             Log.debugf 1
               (fun k->k "@{<Yellow>** found SAT@} at depth %a"
                   ID.pp cur_depth);
+            if pp_trail then (
+              let pp_lit out (lit,lev) =
+                Format.fprintf out "(@[<1>%a@ level: %d@])" Lit.pp lit lev
+              in
+              Format.printf "(@[<2>trail@ @[<hv>%a@]@])@."
+                (Utils.pp_list pp_lit)
+                (get_trail ~domains:m.Model.domains ());
+            );
             do_on_exit ~on_exit;
             if check then (
               Log.debugf 1 (fun k->k "checking model…");

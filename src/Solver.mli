@@ -155,10 +155,12 @@ module Make(C:CONFIG)(Dummy : sig end) : sig
 
   val solve :
     ?on_exit:(unit -> unit) list ->
+    ?pp_trail:bool ->
     ?check:bool ->
     unit ->
     res
   (** [solve ()] checks the satisfiability of the statement added so far
       @param check if true, the model is checked before returning
+      @param pp_trail if true, the boolean trail is printed upon SAT
       @param on_exit functions to be run before this returns *)
 end
