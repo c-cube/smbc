@@ -1187,7 +1187,20 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
 
     let abs t: t = {t with lit_sign=true}
 
-    let make ~sign v = {lit_sign=sign; lit_view=v}
+    (* build literal, normalizing on the fly *)
+    let make ~sign v = match v with
+      | Lit_atom t ->
+        let t, sign' = Term.abs t in
+        let sign = if not sign' then not sign else sign in
+        {lit_sign=sign; lit_view=Lit_atom t}
+      | _ ->
+        {lit_sign=sign; lit_view=v}
+
+    (* map [f] on the view *)
+    let map ~f lit =
+      let v = f lit.lit_view in
+      (* re-normalize *)
+      make ~sign:lit.lit_sign v
 
     (* assume the ID is fresh *)
     let fresh_with id = make ~sign:true (Lit_fresh id)
@@ -1202,10 +1215,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
 
     let dummy = fresh()
 
-    let atom ?(sign=true) (t:term) : t =
-      let t, sign' = Term.abs t in
-      let sign = if not sign' then not sign else sign in
-      make ~sign (Lit_atom t)
+    let atom ?(sign=true) (t:term) : t = make ~sign (Lit_atom t)
 
     let eq a b = atom ~sign:true (Term.eq a b)
     let neq a b = atom ~sign:false (Term.eq a b)
@@ -3160,7 +3170,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
   let add_statement_l = Conv.add_statement_l
 
   let pp_proof out p =
-    let pp_step_res out p = 
+    let pp_step_res out p =
       let {M.Proof.conclusion; _ } = M.Proof.expand p in
       let conclusion = clause_of_mclause conclusion in
       Clause.pp out conclusion
