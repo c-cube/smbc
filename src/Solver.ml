@@ -59,6 +59,8 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     mutable term_deps: term_dep list;
     (* set of undefined constants
        that can make evaluation go further *)
+    mutable term_bool_info: bool_info option;
+    (* if the term is boolean, some additional information on it *)
   }
 
   (* term shallow structure *)
@@ -95,20 +97,29 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
   and builtin =
     | B_not of term
     | B_eq of term * term
-    | B_and of term * term * bool_info
-    | B_or of term * term * bool_info
-    | B_imply of term * term * bool_info
-    | B_equiv of term * term * bool_info
+    | B_and of term * term
+    | B_or of term * term
+    | B_imply of term * term
+    | B_equiv of term * term
 
   and bool_info = {
     mutable bi_expanded: bool;
-    (* did we expand the literal into CNF yet? *)
+    (* did we expand the literal into CNF yet, if needed? *)
     mutable bi_decided: (explanation * bool) option;
     (* current truth value in the model *)
+    mutable bi_graph: bool_info_graph_edge list;
+    (* list of other boolean terms that are linked to this one *)
     bi_watched: term Poly_set.t lazy_t;
     (* set of (bool) literals that depend on this expression
        for evaluation *)
   }
+
+(* edge of the boolean graph: destination + kind of edge *)
+  and bool_info_graph_edge = term * bool_info_graph_edge_kind
+
+  and bool_info_graph_edge_kind =
+    | BIG_conditional (* linked by CNF *)
+    | BIG_equiv of explanation (* equivalent to this other terms under assumptions *)
 
   (* a table [m] from values of type [switch_ty_arg]
      to terms of type [switch_ty_ret],
@@ -591,10 +602,10 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
             in
             Hash.combine3 8 u.term_id hash_m
           | Builtin (B_not a) -> Hash.combine2 20 a.term_id
-          | Builtin (B_and (t1,t2,_)) -> Hash.combine3 21 t1.term_id t2.term_id
-          | Builtin (B_or (t1,t2,_)) -> Hash.combine3 22 t1.term_id t2.term_id
-          | Builtin (B_imply (t1,t2,_)) -> Hash.combine3 23 t1.term_id t2.term_id
-          | Builtin (B_equiv (t1,t2,_)) -> Hash.combine3 24 t1.term_id t2.term_id
+          | Builtin (B_and (t1,t2)) -> Hash.combine3 21 t1.term_id t2.term_id
+          | Builtin (B_or (t1,t2)) -> Hash.combine3 22 t1.term_id t2.term_id
+          | Builtin (B_imply (t1,t2)) -> Hash.combine3 23 t1.term_id t2.term_id
+          | Builtin (B_equiv (t1,t2)) -> Hash.combine3 24 t1.term_id t2.term_id
           | Builtin (B_eq (t1,t2)) -> Hash.combine3 25 t1.term_id t2.term_id
           | Mu sub -> Hash.combine sub_hash 30 sub
           | Switch (t, tbl) ->
@@ -628,11 +639,11 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           | Builtin b1, Builtin b2 ->
             begin match b1, b2 with
               | B_not a1, B_not a2 -> a1 == a2
-              | B_and (a1,b1,_), B_and (a2,b2,_)
-              | B_or (a1,b1,_), B_or (a2,b2,_)
+              | B_and (a1,b1), B_and (a2,b2)
+              | B_or (a1,b1), B_or (a2,b2)
               | B_eq (a1,b1), B_eq (a2,b2)
-              | B_equiv (a1,b1,_), B_equiv (a2,b2,_)
-              | B_imply (a1,b1,_), B_imply (a2,b2,_) -> a1 == a2 && b1 == b2
+              | B_equiv (a1,b1), B_equiv (a2,b2)
+              | B_imply (a1,b1), B_imply (a2,b2) -> a1 == a2 && b1 == b2
               | B_not _, _ | B_and _, _ | B_eq _, _
               | B_or _, _ | B_imply _, _ | B_equiv _, _ -> false
             end
@@ -663,6 +674,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         term_cell=if b then True else False;
         term_nf=None;
         term_deps=[];
+        term_bool_info=None; (* not needed here *)
       } in
       H.hashcons t
 
@@ -700,6 +712,14 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       | Dep_uty _, _
       | Dep_bool_expr _, _ -> CCOrd.int_ (to_int_ a) (to_int_ b)
 
+    (* make fresh bool info *)
+    let mk_bi () : bool_info = {
+      bi_expanded=false;
+      bi_decided=None;
+      bi_graph=[];
+      bi_watched=lazy (Poly_set.create ~eq:term_equal_ 16);
+    }
+
     (* build a term. If it's new, add it to the watchlist
        of every member of [watching] *)
     let mk_term_ ~(deps:deps) cell ~(ty:delayed_ty) : term =
@@ -709,6 +729,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         term_cell=cell;
         term_nf=None;
         term_deps=[];
+        term_bool_info=None;
       } in
       let t' = H.hashcons t in
       if t==t' then (
@@ -717,6 +738,10 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           | DTy_direct ty -> ty
           | DTy_lazy f -> f ()
         end;
+        (* might initialize bool info *)
+        if Ty.is_prop t.term_ty then (
+          t.term_bool_info <- Some (mk_bi());
+        );
         (* compute evaluation dependencies *)
         let deps = match deps with
           | Term_dep_none -> []
@@ -812,9 +837,9 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       (* normalize a bit *)
       let b = match b with
         | B_eq (a,b) when a.term_id > b.term_id -> B_eq (b,a)
-        | B_and (a,b,i) when a.term_id > b.term_id -> B_and (b,a,i)
-        | B_equiv (a,b,i) when a.term_id > b.term_id -> B_equiv (b,a,i)
-        | B_or (a,b,i) when a.term_id > b.term_id -> B_or (b,a,i)
+        | B_and (a,b) when a.term_id > b.term_id -> B_and (b,a)
+        | B_equiv (a,b) when a.term_id > b.term_id -> B_equiv (b,a)
+        | B_or (a,b) when a.term_id > b.term_id -> B_or (b,a)
         | _ -> b
       in
       let t = mk_term_ ~deps (Builtin b) ~ty:(DTy_direct Ty.prop) in
@@ -840,6 +865,8 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       | Builtin (B_not t) -> t, false
       | _ -> t, true
 
+    let abs_fst (t:t): t = fst (abs t)
+
     let quant q uty body =
       assert (Ty.is_prop body.term_ty);
       (* evaluation is blocked by the uninterpreted type *)
@@ -849,16 +876,10 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     let forall = quant Forall
     let exists = quant Exists
 
-    let mk_bi () : bool_info = {
-      bi_expanded=false;
-      bi_decided=None;
-      bi_watched=lazy (Poly_set.create ~eq:term_equal_ 16);
-    }
-
-    let and_ a b = builtin (B_and (a,b, mk_bi()))
-    let or_ a b = builtin (B_or (a,b, mk_bi()))
-    let imply a b = builtin (B_imply (a,b, mk_bi()))
-    let equiv a b = builtin (B_equiv (a,b, mk_bi()))
+    let and_ a b = builtin (B_and (a,b))
+    let or_ a b = builtin (B_or (a,b))
+    let imply a b = builtin (B_imply (a,b))
+    let equiv a b = builtin (B_equiv (a,b))
     let eq a b =
       assert (not (Ty.is_prop a.term_ty));
       builtin (B_eq (a,b))
@@ -885,21 +906,21 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         | B_not t ->
           let acc, t' = f acc t in
           acc, B_not t'
-        | B_and (a,b,_) ->
+        | B_and (a,b) ->
           let acc, a, b = fold_binary acc a b in
-          acc, B_and (a, b, mk_bi())
-        | B_or (a,b,_) ->
+          acc, B_and (a, b)
+        | B_or (a,b) ->
           let acc, a, b = fold_binary acc a b in
-          acc, B_or (a, b, mk_bi())
-        | B_equiv (a,b,_) ->
+          acc, B_or (a, b)
+        | B_equiv (a,b) ->
           let acc, a, b = fold_binary acc a b in
-          acc, B_equiv (a, b, mk_bi())
+          acc, B_equiv (a, b)
         | B_eq (a,b) ->
           let acc, a, b = fold_binary acc a b in
           acc, B_eq (a, b)
-        | B_imply (a,b,_) ->
+        | B_imply (a,b) ->
           let acc, a, b = fold_binary acc a b in
-          acc, B_imply (a, b, mk_bi())
+          acc, B_imply (a, b)
 
     let is_const t = match t.term_cell with
       | Const _ -> true
@@ -911,10 +932,10 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
 
     let builtin_to_seq b yield = match b with
       | B_not t -> yield t
-      | B_and (a,b,_)
-      | B_or (a,b,_)
-      | B_imply (a,b,_)
-      | B_equiv (a,b,_)
+      | B_and (a,b)
+      | B_or (a,b)
+      | B_imply (a,b)
+      | B_equiv (a,b)
       | B_eq (a,b) -> yield a; yield b
 
     let ty t = t.term_ty
@@ -981,15 +1002,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         | Const ({cst_kind=Cst_uninterpreted_dom_elt ty; _} as c) -> Some (c,ty)
         | _ -> None
 
-    let as_bi (t:term): bool_info option =
-      match t.term_cell with
-        | Builtin b ->
-          begin match b with
-            | B_and (_, _, bi)  | B_or (_, _, bi)
-            | B_imply (_, _, bi) | B_equiv (_, _, bi) -> Some bi
-            | B_eq _ | B_not _ -> None
-          end
-        | _ -> None
+    let as_bi (t:term): bool_info option = t.term_bool_info
 
     let fpf = Format.fprintf
 
@@ -1033,13 +1046,13 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           fpf out "(@[switch %a@ (@[<hv>%a@])@])"
             pp t print_map (ID.Tbl.to_seq m.switch_tbl)
         | Builtin (B_not t) -> fpf out "(@[<hv1>not@ %a@])" pp t
-        | Builtin (B_and (a,b,_)) ->
+        | Builtin (B_and (a,b)) ->
           fpf out "(@[<hv1>and@ %a@ %a@])" pp a pp b
-        | Builtin (B_or (a,b,_)) ->
+        | Builtin (B_or (a,b)) ->
           fpf out "(@[<hv1>or@ %a@ %a@])" pp a pp b
-        | Builtin (B_imply (a,b,_)) ->
+        | Builtin (B_imply (a,b)) ->
           fpf out "(@[<hv1>=>@ %a@ %a@])" pp a pp b
-        | Builtin (B_equiv (a,b,_)) ->
+        | Builtin (B_equiv (a,b)) ->
           fpf out "(@[<hv1>=@ %a@ %a@])" pp a pp b
         | Builtin (B_eq (a,b)) ->
           fpf out "(@[<hv1>=@ %a@ %a@])" pp a pp b
@@ -1170,10 +1183,26 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       | E_leaf x -> yield x
       | E_append (a,b) -> to_seq a yield; to_seq b yield
 
+    let to_list e =
+      let rec aux acc = function
+        | E_empty -> acc
+        | E_leaf x -> x::acc
+        | E_append (a,b) -> aux (aux acc a) b
+      in
+      aux [] e
+
     let to_list_uniq e =
       to_seq e
       |> Sequence.to_rev_list
       |> CCList.sort_uniq ~cmp:cmp_lit
+
+    let equal a b =
+      let la = to_list a in
+      let lb = to_list b in
+      (* double inclusion *)
+      let mem l x = List.exists (fun y -> cmp_lit x y=0) l in
+      List.for_all (mem lb) la
+      && List.for_all (mem la) lb
 
     let pp out e =
       Format.fprintf out "(@[%a@])"
@@ -1920,14 +1949,14 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
             | B_not {term_cell=True; _} -> Term.false_
             | B_not {term_cell=False; _} -> Term.true_
             | B_eq (a,b) when Term.equal a b -> Term.true_
-            | B_and (a, {term_cell=True; _}, _)
-            | B_and ({term_cell=True; _}, a, _) -> a
-            | B_and (_, {term_cell=False; _}, _)
-            | B_and ({term_cell=False; _}, _, _) -> Term.false_
-            | B_or (a, {term_cell=False; _}, _)
-            | B_or ({term_cell=False; _}, a, _) -> a
-            | B_or (_, {term_cell=True; _}, _)
-            | B_or ({term_cell=True; _}, _, _) -> Term.true_
+            | B_and (a, {term_cell=True; _})
+            | B_and ({term_cell=True; _}, a) -> a
+            | B_and (_, {term_cell=False; _})
+            | B_and ({term_cell=False; _}, _) -> Term.false_
+            | B_or (a, {term_cell=False; _})
+            | B_or ({term_cell=False; _}, a) -> a
+            | B_or (_, {term_cell=True; _})
+            | B_or ({term_cell=True; _}, _) -> Term.true_
             | _ -> Term.builtin b'
           end
         | If (a,b,c) ->
@@ -2075,7 +2104,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           (* try boolean reductions, after trivial simplifications *)
           let e, t' =
             let t' = simplify t in
-            if t==t' then compute_builtin ~old:t b else compute_nf t'
+            if t==t' then compute_builtin ~term:t b else compute_nf t'
           in
           set_nf_ t t' e;
           e, t'
@@ -2187,22 +2216,28 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
 
     (* compute the builtin, assuming its components are
        already reduced *)
-    and compute_builtin ~(old:term) (bu:builtin): explanation * term = match bu with
+    and compute_builtin ~term:(t:term) (bu:builtin)
+      : explanation * term
+      = match bu with
       | B_not a ->
         let e_a, a' = compute_nf a in
         begin match a'.term_cell with
           | True -> e_a, Term.false_
           | False -> e_a, Term.true_
           | _ ->
-            let t' = if a==a' then old else Term.not_ a' in
+            let t' = if a==a' then t else Term.not_ a' in
             e_a, t'
         end
-      | B_and (_,_,i)
-      | B_equiv  (_,_,i)
-      | B_imply (_,_,i)
-      | B_or (_,_,i) ->
+      | B_and (_,_)
+      | B_equiv  (_,_)
+      | B_imply (_,_)
+      | B_or (_,_) ->
+        let i = match t.term_bool_info with
+          | None -> assert false
+          | Some i -> i
+        in
         begin match i.bi_decided with
-          | None -> Explanation.empty, old
+          | None -> Explanation.empty, t
           | Some (e, true) -> e, Term.true_
           | Some (e, false) -> e, Term.false_
         end
@@ -2218,7 +2253,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           | _ when Term.equal a' b' -> e_ab, Term.true_
           | _ ->
             let t' =
-              if a==a' && b==b' then old else Term.eq a' b'
+              if a==a' && b==b' then t else Term.eq a' b'
             in
             e_ab, t'
         end
@@ -2228,7 +2263,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         let e_b, b' = compute_nf b in
         let e_ab = Explanation.append e_a e_b in
         let default() =
-          if a==a' && b==b' then old else Term.eq a' b'
+          if a==a' && b==b' then t else Term.eq a' b'
         in
         if Term.equal a' b'
         then e_ab, Term.true_ (* syntactic *)
@@ -2283,10 +2318,35 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
          [e1 & e2 & ... & en => …], that is, the clause
          [not e1 | not e2 | ... | not en] *)
   let clause_guard_of_exp_ (e:explanation): Lit.t list =
-    Explanation.to_seq e
-    |> Sequence.map Lit.neg (* this is a guard! *)
-    |> Sequence.to_rev_list
+    Explanation.to_list e
+    |> List.map Lit.neg (* this is a guard! *)
     |> CCList.sort_uniq ~cmp:Lit.compare
+
+  (* a graph representing the propositional structure of the problem,
+       a link [t -> t'] means that [t <=> t'] under some assumptions *)
+  module Term_graph : sig
+    val add : term -> term -> bool_info_graph_edge_kind -> unit
+    val mem : term -> term -> bool_info_graph_edge_kind -> bool
+  end = struct
+    let mem a b k = match a.term_bool_info with
+      | None -> false
+      | Some bi ->
+        List.exists
+          (fun (b',k') ->
+             Term.equal b b'
+             &&
+             match k, k' with
+               | BIG_conditional, BIG_conditional -> true
+               | BIG_equiv e1, BIG_equiv e2 -> Explanation.equal e1 e2
+               | BIG_conditional, _
+               | BIG_equiv _, _ -> false)
+          bi.bi_graph
+
+    let add a b k = match a.term_bool_info with
+      | None -> assert false
+      | Some bi ->
+        bi.bi_graph <- (b,k) :: bi.bi_graph
+  end
 
   (** {2 A literal communicated to the SAT solver}
 
@@ -2395,13 +2455,8 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           end
         | Dep_bool_expr b_expr ->
           assert (Ty.is_prop b_expr.term_ty);
-          let bu, info = match b_expr.term_cell with
-            | Builtin bu ->
-              begin match bu with
-                | B_and (_,_,i) | B_or (_,_,i)
-                | B_imply (_,_,i) | B_equiv (_,_,i) -> bu, i
-                | B_not _ | B_eq _ -> assert false
-              end
+          let bu, info = match b_expr.term_cell, b_expr.term_bool_info with
+            | Builtin bu, Some i -> bu, i
             | _ -> assert false
           in
           (* check whether [b_expr] is expanded *)
@@ -2409,22 +2464,22 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
             info.bi_expanded <- true;
             let neg_ = Term.not_ in
             let clauses, subs = match bu with
-              | B_and (a,b,_) ->
+              | B_and (a,b) ->
                 [ [neg_ b_expr; a];
                   [neg_ b_expr; b];
                   [neg_ a; neg_ b; b_expr]],
                 [a;b]
-              | B_or (a,b,_) ->
+              | B_or (a,b) ->
                 [ [neg_ a; b_expr];
                   [neg_ b; b_expr];
                   [a; b; neg_ b_expr]],
                 [a;b]
-              | B_imply (a,b,_) ->
+              | B_imply (a,b) ->
                 [ [a; b_expr];
                   [neg_ b; b_expr];
                   [neg_ a; b; neg_ b_expr]],
                 [a;b]
-              | B_equiv (a,b,_) ->
+              | B_equiv (a,b) ->
                 [ [neg_ a; neg_ b; b_expr];
                   [a; b; b_expr];
                   [a; neg_ b; neg_ b_expr];
@@ -2439,6 +2494,10 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
               (fun k->k "(@[<hv1>expand_CNF@ %a@ @[<hv2>:clauses@ %a@]@])"
                   Term.pp b_expr (Utils.pp_list Clause.pp) clauses);
             Clause.push_new_l clauses;
+            List.iter
+              (fun sub ->
+                 Term_graph.add b_expr sub BIG_conditional)
+              subs;
             (* the subterms themselves must be watched/expanded, too *)
             List.iter watch_term subs;
           );
@@ -2457,14 +2516,9 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         | Dep_uty uty ->
           Poly_set.add uty.uty_watched t;
         | Dep_bool_expr b_expr ->
-          let info = match b_expr.term_cell with
-            | Builtin bu ->
-              begin match bu with
-                | B_and (_,_,i) | B_or (_,_,i)
-                | B_imply (_,_,i) | B_equiv (_,_,i) -> i
-                | B_not _ | B_eq _ -> assert false
-              end
-            | _ -> assert false
+          let info = match b_expr.term_bool_info with
+            | Some i -> i
+            | None -> assert false
           in
           (* add [t] to the watchlist *)
           if not (Term.equal b_expr t)
@@ -2505,18 +2559,22 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           (* also propagate at the SAT level that [t <=> new_t], if
              [simplify t] is not a boolean connective but [new_t] is. *)
           begin match
-              (fst (Term.abs t')).term_cell,
-              (fst (Term.abs new_t)).term_cell
+              (Term.abs_fst t').term_cell,
+              (Term.abs_fst new_t).term_cell
             with
               | Builtin (B_and _ | B_or _ | B_equiv _ | B_imply _), _ -> ()
               | _, Builtin (B_and _ | B_or _ | B_equiv _ | B_imply _) ->
-                Log.debugf 3
-                  (fun k->k
-                      "(@[<1>add_intermediate_lemma@ %a@ with: %a@ exp: (@[%a@])@])"
-                      Term.pp t Term.pp new_t Explanation.pp e);
-                let cs = clauses_equiv t new_t e in
-                Clause.push_new_l cs;
-                incr stat_num_equiv_lemmas;
+                if not (Term_graph.mem t new_t (BIG_equiv e))
+                then (
+                  Log.debugf 3
+                    (fun k->k
+                        "(@[<1>add_intermediate_lemma@ %a@ with: %a@ exp: (@[%a@])@])"
+                        Term.pp t Term.pp new_t Explanation.pp e);
+                  Term_graph.add t new_t (BIG_equiv e);
+                  let cs = clauses_equiv t new_t e in
+                  Clause.push_new_l cs;
+                  incr stat_num_equiv_lemmas;
+                );
               | _ -> ()
           end;
       end;
@@ -3128,73 +3186,76 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         | Mu f ->
           let env = DB_env.singleton f in
           aux (Reduce.eval_db env f)
-        | Builtin (B_not f) ->
-          let f = aux f in
-          begin match f.term_cell with
-            | True -> Term.false_
-            | False -> Term.true_
-            | _ -> Term.not_ f
-          end
-        | Builtin (B_and (a,b,bi)) ->
-          let a = aux a in
-          let b = aux b in
-          begin match a.term_cell, b.term_cell with
-            | True, True -> ret_bi_ bi true
-            | False, _
-            | _, False -> ret_bi_ bi false
-            | _ -> Term.and_ a b
-          end
-        | Builtin (B_or (a,b,bi)) ->
-          let a = aux a in
-          let b = aux b in
-          begin match a.term_cell, b.term_cell with
-            | True, _
-            | _, True -> ret_bi_ bi true
-            | False, False -> ret_bi_ bi false
-            | _ -> Term.or_ a b
-          end
-        | Builtin (B_imply (a,b,bi)) ->
-          let a = aux a in
-          let b = aux b in
-          begin match a.term_cell, b.term_cell with
-            | _, True
-            | False, _  -> ret_bi_ bi true
-            | True, False -> ret_bi_ bi false
-            | _ -> Term.imply a b
-          end
-        | Builtin (B_equiv (a,b,bi)) ->
-          let a = aux a in
-          let b = aux b in
-          begin match a.term_cell, b.term_cell with
-            | True, True
-            | False, False -> ret_bi_ bi true
-            | True, False
-            | False, True -> ret_bi_ bi false
-            | _ when Term.equal a b -> ret_bi_ bi true
-            | _ -> Term.equiv a b
-          end
-        | Builtin (B_eq (a,b)) ->
-          let a = aux a in
-          let b = aux b in
-          begin match Term.as_cstor_app a, Term.as_cstor_app b with
-            | _ when Term.equal a b -> Term.true_
-            | Some (c1,_,l1), Some (c2,_,l2) ->
-              if Typed_cst.equal c1 c2 then (
-                assert (List.length l1 = List.length l2);
-                aux (Term.and_l (List.map2 Term.eq l1 l2))
-              ) else Term.false_
-            | _ ->
-              begin match Term.as_domain_elt a, Term.as_domain_elt b with
-                | Some (c1,ty1), Some (c2,ty2) ->
-                  (* domain elements: they are all distinct *)
-                  assert (Ty.equal ty1 ty2);
-                  if Typed_cst.equal c1 c2
-                  then Term.true_
-                  else Term.false_
-                | _ ->
-                  Term.eq a b
+        | Builtin b ->
+          begin match b, t.term_bool_info with
+            | B_not f, _ ->
+              let f = aux f in
+              begin match f.term_cell with
+                | True -> Term.false_
+                | False -> Term.true_
+                | _ -> Term.not_ f
               end
-
+            | B_and (a,b), Some bi ->
+              let a = aux a in
+              let b = aux b in
+              begin match a.term_cell, b.term_cell with
+                | True, True -> ret_bi_ bi true
+                | False, _
+                | _, False -> ret_bi_ bi false
+                | _ -> Term.and_ a b
+              end
+            | B_or (a,b), Some bi ->
+              let a = aux a in
+              let b = aux b in
+              begin match a.term_cell, b.term_cell with
+                | True, _
+                | _, True -> ret_bi_ bi true
+                | False, False -> ret_bi_ bi false
+                | _ -> Term.or_ a b
+              end
+            | B_imply (a,b), Some bi ->
+              let a = aux a in
+              let b = aux b in
+              begin match a.term_cell, b.term_cell with
+                | _, True
+                | False, _  -> ret_bi_ bi true
+                | True, False -> ret_bi_ bi false
+                | _ -> Term.imply a b
+              end
+            | B_equiv (a,b), Some bi ->
+              let a = aux a in
+              let b = aux b in
+              begin match a.term_cell, b.term_cell with
+                | True, True
+                | False, False -> ret_bi_ bi true
+                | True, False
+                | False, True -> ret_bi_ bi false
+                | _ when Term.equal a b -> ret_bi_ bi true
+                | _ -> Term.equiv a b
+              end
+            | (B_equiv _ | B_or _ | B_and _ | B_imply _), None -> assert false
+            | B_eq (a,b), _ ->
+              let a = aux a in
+              let b = aux b in
+              begin match Term.as_cstor_app a, Term.as_cstor_app b with
+                | _ when Term.equal a b -> Term.true_
+                | Some (c1,_,l1), Some (c2,_,l2) ->
+                  if Typed_cst.equal c1 c2 then (
+                    assert (List.length l1 = List.length l2);
+                    aux (Term.and_l (List.map2 Term.eq l1 l2))
+                  ) else Term.false_
+                | _ ->
+                  begin match Term.as_domain_elt a, Term.as_domain_elt b with
+                    | Some (c1,ty1), Some (c2,ty2) ->
+                      (* domain elements: they are all distinct *)
+                      assert (Ty.equal ty1 ty2);
+                      if Typed_cst.equal c1 c2
+                      then Term.true_
+                      else Term.false_
+                    | _ ->
+                      Term.eq a b
+                  end
+              end
           end
       and aux_app env f l = match f.term_cell, l with
         | Const {cst_kind=Cst_defined(_, lazy def_f); _}, _ ->
