@@ -41,6 +41,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
   let stat_num_cst_expanded = ref 0
   let stat_num_uty_expanded = ref 0
   let stat_num_clause_push = ref 0
+  let stat_num_propagations = ref 0
   let stat_num_clause_tautology = ref 0
   let stat_num_equiv_lemmas = ref 0
 
@@ -109,12 +110,23 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     (* current truth value in the model *)
     mutable bi_graph: bool_info_graph_edge list;
     (* list of other boolean terms that are linked to this one *)
-    bi_watched: term Poly_set.t lazy_t;
+    mutable bi_watched_status: watched_status;
+    (* whether this term is in the watchlist
+       (i.e. its truth value should be communicated to the SAT solver) *)
+    mutable bi_forwarded: bool;
+    (* if true, then, in the current branch, this literal's truth value
+       will be computed by the SAT solver, for it is equivalent to
+       a boolean connective. *)
+    bi_watching: term Poly_set.t lazy_t;
     (* set of (bool) literals that depend on this expression
        for evaluation *)
   }
 
-(* edge of the boolean graph: destination + kind of edge *)
+  and watched_status =
+    | WS_not_watched
+    | WS_watched of term option (* next in the list *)
+
+    (* edge of the boolean graph: destination + kind of edge *)
   and bool_info_graph_edge = term * bool_info_graph_edge_kind
 
   and bool_info_graph_edge_kind =
@@ -513,7 +525,19 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     | Uty_empty -> CCFormat.string out "empty"
     | Uty_nonempty -> CCFormat.string out "non_empty"
 
-  module Backtrack = struct
+  module Backtrack : sig
+    type level
+    val dummy_level : level
+    val backtrack : level -> unit
+    val cur_level: unit -> level
+    val push_level: unit -> unit
+
+    val push_set_nf_ : term -> unit
+    val push_set_cst_case_: cst_info -> unit
+    val push_uty_status: ty_uninterpreted_slice -> unit
+    val push_bi_status: bool_info -> unit
+    val push_bi_forwarded: bool_info -> unit
+  end = struct
     type _level = level
     type level = _level
 
@@ -529,8 +553,11 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       | S_set_uty of
           ty_uninterpreted_slice * (explanation * ty_uninterpreted_status) option
           (* uty1.uty_status <- status2 *)
-      | S_set_bi of
+      | S_set_bi_status of
           bool_info * (explanation * bool) option
+          (* bi1.status <- bool2 *)
+      | S_set_bi_forwarded of
+          bool_info * bool
           (* bi1.status <- bool2 *)
 
     type stack = stack_cell CCVector.vector
@@ -546,7 +573,8 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           | S_set_nf (t, nf) -> t.term_nf <- nf;
           | S_set_cst_case (info, c) -> info.cst_cur_case <- c;
           | S_set_uty (uty, s) -> uty.uty_status <- s;
-          | S_set_bi (bi, s) -> bi.bi_decided <- s;
+          | S_set_bi_status (bi, s) -> bi.bi_decided <- s;
+          | S_set_bi_forwarded (bi, s) -> bi.bi_forwarded <- s;
       done;
       ()
 
@@ -566,8 +594,11 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     let push_uty_status (uty:ty_uninterpreted_slice) =
       CCVector.push st_ (S_set_uty (uty, uty.uty_status))
 
-    let push_bi (bi:bool_info) =
-      CCVector.push st_ (S_set_bi (bi, bi.bi_decided))
+    let push_bi_status (bi:bool_info) =
+      CCVector.push st_ (S_set_bi_status (bi, bi.bi_decided))
+
+    let push_bi_forwarded (bi:bool_info) =
+      CCVector.push st_ (S_set_bi_forwarded (bi, bi.bi_forwarded))
   end
 
   let new_switch_id_ =
@@ -717,7 +748,9 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       bi_expanded=false;
       bi_decided=None;
       bi_graph=[];
-      bi_watched=lazy (Poly_set.create ~eq:term_equal_ 16);
+      bi_watching=lazy (Poly_set.create ~eq:term_equal_ 16);
+      bi_watched_status=WS_not_watched;
+      bi_forwarded=false;
     }
 
     (* build a term. If it's new, add it to the watchlist
@@ -2314,19 +2347,32 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     type t = term
     (* actually, the watched lit is [Lit.atom t], but we link
        [t] directly because this way we have direct access to its
-       normal form *)
+       normal form.
+
+       Invariant:
+       [t.term_bool_info = Some bi]
+       [bi.bi_watched_status = WS_watched something]
+    *)
 
     let to_lit = Lit.atom ~sign:true
     let pp = Term.pp
 
     (* clause for [e => l] *)
     let propagate_lit_ (l:t) (e:explanation): unit =
-      let c = to_lit l :: clause_guard_of_exp_ e |> Clause.make in
-      Log.debugf 4
-        (fun k->k
-            "(@[<hv1>@{<green>propagate_lit@}@ %a@ nf: %a@ clause: %a@])"
-            pp l pp (snd (Reduce.compute_nf l)) Clause.pp c);
-      Clause.push_new c;
+      let bi = match (Term.abs_fst l).term_bool_info with
+        | None -> assert false | Some i -> i
+      in
+      (* only propagate for non-forwarded lits *)
+      if not bi.bi_forwarded then (
+        let c = to_lit l :: clause_guard_of_exp_ e |> Clause.make in
+        Log.debugf 4
+          (fun k->k
+              "(@[<hv1>@{<green>propagate_lit@}@ %a@ nf: %a@ \
+               clause: %a@ forwarded: %B@])"
+              pp l pp (snd (Reduce.compute_nf l)) Clause.pp c bi.bi_forwarded);
+        incr stat_num_propagations;
+        Clause.push_new c;
+      );
       ()
 
     (* clauses that express [e => (a <=> b)] *)
@@ -2339,10 +2385,12 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       let c2 = a :: Lit.neg b :: guard |> Clause.make in
       [ c1; c2 ]
 
-    (* set of literals whose boolean value is of interest *)
-    let watched_ : unit Term.Tbl.t = Term.Tbl.create 256
+    (* entry point to the list of watched terms *)
+    let first_watched_ : term option ref = ref None
 
-    let is_watched (t:t) : bool = Term.Tbl.mem watched_ t
+    let is_watched (t:t) : bool = match t.term_bool_info with
+      | Some {bi_watched_status=WS_watched _; _} -> true
+      | _ -> false
 
     (* build watched lit, enforcing invariants *)
     let of_term (t:term): t =
@@ -2469,7 +2517,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           in
           (* add [t] to the watchlist *)
           if not (Term.equal b_expr t)
-          then Poly_set.add (Lazy.force info.bi_watched) t;
+          then Poly_set.add (Lazy.force info.bi_watching) t;
       end
 
     (* [t] being a watched literal, its evaluation can be blocked by some
@@ -2489,7 +2537,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       let e, new_t = Reduce.compute_nf t in
       (* if [new_t = true/false], propagate literal *)
       begin match new_t.term_cell with
-        | True -> propagate_lit_ t e
+        | True -> propagate_lit_ t e (*TODO: only if not currently delegating to CNF *)
         | False -> propagate_lit_ (Term.not_ t) e
         | _ ->
           (* partially evaluated literal: add [t] (not its
@@ -2521,29 +2569,52 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
                   let cs = clauses_equiv t new_t e in
                   Clause.push_new_l cs;
                   incr stat_num_equiv_lemmas;
+                  (* also, notice that now the term is forwarded, no need to
+                     propagate its values *)
+                  let bi = match t.term_bool_info with
+                    | None -> assert false
+                    | Some i -> i
+                  in
+                  Backtrack.push_bi_forwarded bi;
+                  bi.bi_forwarded <- true;
                 );
               | _ -> ()
           end;
       end;
       ()
 
-    and watch (lit:t) =
-      if not (is_watched lit) then (
+    and watch (t:t) = match t.term_cell, t.term_bool_info with
+      | True, _
+      | False, _ -> ()
+      | _, None -> assert false
+      | _, Some ({bi_watched_status=WS_not_watched; _} as bi) ->
         Log.debugf 3
-          (fun k->k "(@[<1>@{<green>watch_lit@}@ %a@])" pp lit);
-        Term.Tbl.add watched_ lit ();
+          (fun k->k "(@[<1>@{<green>watch_lit@}@ %a@])" pp t);
+        (* add to the linked list *)
+        bi.bi_watched_status <- WS_watched !first_watched_;
+        first_watched_ := Some t;
         (* also ensure its dependencies are going to be refined *)
-        update_watches_of lit;
-      )
+        update_watches_of t;
+      | _, Some _ -> () (* already watched *)
 
     and watch_term t = watch (of_term t)
 
     let update_watches_of_term t = update_watches_of (of_term t)
 
-    let to_seq = Term.Tbl.keys watched_
+    let to_seq yield =
+      let rec aux : t option -> unit = function
+        | None -> ()
+        | Some t ->
+          yield t;
+          match t.term_bool_info with
+            | Some {bi_watched_status=WS_watched next; _} -> aux next
+            | _ -> assert false
+      in
+      aux !first_watched_
+
     let to_seq_term = to_seq
 
-    let size () = Term.Tbl.length watched_
+    let size () = Sequence.length to_seq
   end
 
   (** {2 Sat Solver} *)
@@ -2560,12 +2631,14 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
 
   let print_progress () : unit =
     Printf.printf
-      "\r[%.2f] depth %d | expanded %d | clauses %d | lemmas %d | lits %d%!"
+      "\r[%.2f] depth %d | expanded %d | clauses %d | \
+       lemmas %d | propagated %d | watched_lits %d%!"
       (get_time())
       (Iterative_deepening.current_depth() :> int)
       !stat_num_cst_expanded
       !stat_num_clause_push
       !stat_num_clause_tautology
+      !stat_num_propagations
       (Watched_lit.size())
 
   (* TODO: find the proper code for "kill line" *)
@@ -2652,12 +2725,12 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         Term.pp t sign);
       begin match b_expr.bi_decided with
         | None ->
-          Backtrack.push_bi b_expr;
+          Backtrack.push_bi_status b_expr;
           let e = Explanation.return (Lit.atom ~sign t) in
           b_expr.bi_decided <- Some (e, sign);
           Poly_set.iter
             Watched_lit.update_watches_of_term
-            (Lazy.force b_expr.bi_watched);
+            (Lazy.force b_expr.bi_watching);
         | Some (_, sign') ->
           (* already assigned, check consistency *)
           assert (sign=sign');
@@ -3335,13 +3408,15 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
        :num_clause_push %d@ \
        :num_clause_tautology %d@ \
        :num_equiv_lemmas %d@ \
-       :num_lits %d\
+       :num_propagations %d@ \
+       :num_watched_lits %d\
        @])"
       !stat_num_cst_expanded
       !stat_num_uty_expanded
       !stat_num_clause_push
       !stat_num_clause_tautology
       !stat_num_equiv_lemmas
+      !stat_num_propagations
       (Watched_lit.size())
 
   let do_on_exit ~on_exit =
