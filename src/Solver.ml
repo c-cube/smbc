@@ -6,9 +6,10 @@ let get_time : unit -> float =
   fun () ->
     Unix.gettimeofday() -. start
 
-module FI = Msat.Formula_intf
-module TI = Msat.Theory_intf
-module SI = Msat.Solver_intf
+module M = Minisat
+module M_lit = M.Lit
+
+type minisat_clause = M_lit.t list
 
 (** {1 Solver} *)
 
@@ -44,6 +45,21 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
   let stat_num_propagations = ref 0
   let stat_num_clause_tautology = ref 0
   let stat_num_equiv_lemmas = ref 0
+  let stat_num_calls_minisat = ref 0
+
+  (** {2 Timestamps: number of calls to Minisat} *)
+  module Timestamp : sig
+    type t = private int
+    val cur : unit -> t
+    val incr : unit -> unit
+  end = struct
+    type t = int
+    let n_ = ref 0
+    let cur() = !n_
+    let incr () =
+      Log.debugf 2 (fun k->k "(@[incr_timestamp@ old: %d@])" !n_);
+      incr n_
+  end
 
   (* for objects that are expanded on demand only *)
   type 'a lazily_expanded =
@@ -55,8 +71,8 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     mutable term_id: int; (* unique ID *)
     mutable term_ty: ty_h;
     term_cell: term_cell;
-    mutable term_nf: (term * explanation) option;
-      (* normal form + explanation of why *)
+    mutable term_nf: (term * explanation * Timestamp.t) option;
+      (* normal form + explanation of why + timestamp *)
     mutable term_deps: term_dep list;
     (* set of undefined constants
        that can make evaluation go further *)
@@ -106,20 +122,14 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
   and bool_info = {
     mutable bi_expanded: bool;
     (* did we expand the literal into CNF yet, if needed? *)
-    mutable bi_decided: (explanation * bool) option;
-    (* current truth value in the model *)
     mutable bi_graph: bool_info_graph_edge list;
     (* list of other boolean terms that are linked to this one *)
     mutable bi_watched_status: watched_status;
     (* whether this term is in the watchlist
        (i.e. its truth value should be communicated to the SAT solver) *)
-    mutable bi_forwarded: bool;
-    (* if true, then, in the current branch, this literal's truth value
-       will be computed by the SAT solver, for it is equivalent to
-       a boolean connective. *)
-    bi_watching: term Poly_set.t lazy_t;
-    (* set of (bool) literals that depend on this expression
-       for evaluation *)
+    mutable bi_lit: lit lazily_expanded;
+    (* as a boolean literal.
+       Invariant: Lazy_none iff bi_expanded=false *)
   }
 
   and watched_status =
@@ -162,17 +172,24 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     | E_leaf of lit
     | E_append of explanation * explanation
 
-  (* boolean literal *)
+  (* boolean atom (without a sign) *)
+  and atom = {
+    mutable atom_id: int; (* unique ID *)
+    atom_view: atom_view;
+  }
+
+  and atom_view =
+    | Atom_fresh of ID.t (* fresh literals *)
+    | Atom_assert of term
+    | Atom_assign of cst * term
+    | Atom_uty_empty of ty_uninterpreted_slice
+
+  (* boolean literal: atom + sign. Belongs in a boolean clause. *)
   and lit = {
-    lit_view: lit_view;
+    lit_atom: atom;
     lit_sign: bool;
   }
 
-  and lit_view =
-    | Lit_fresh of ID.t (* fresh literals *)
-    | Lit_atom of term
-    | Lit_assign of cst * term
-    | Lit_uty_empty of ty_uninterpreted_slice
 
   and cst = {
     cst_id: ID.t;
@@ -194,24 +211,16 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     (* disjunction of possible conditions for cst to exist/be relevant *)
     mutable cst_cases: term list lazily_expanded;
     (* cover set (lazily evaluated) *)
+    mutable cst_cases_lits: lit list lazily_expanded;
+    (* literals obtained from [cst_cases].
+       invariant: [c.cst_cases_lits = List.map (Lit.cst_choice c) c.cst_cases] *)
     mutable cst_complete: bool;
     (* does [cst_cases] cover all possible cases, or only
        a subset? Affects completeness *)
-    mutable cst_cur_case: (explanation * term) option;
-    (* current choice of normal form *)
-    cst_watched: term Poly_set.t;
-    (* set of literals (rather, boolean terms) that depend on this constant
-       for evaluation.
-
-       A literal [lit] can watch several typed constants. If
-       [lit.nf = t], and [t]'s evaluation is blocked by [c1,...,ck],
-       then [lit] will watch [c1,...,ck].
-
-       Watch list only grow, they never shrink. *)
   }
 
   (* this is a disjunction of sufficient conditions for the existence of
-     some meta (cst). Each condition is a literal *)
+     some meta (cst). Each condition is a literal. *)
   and cst_exist_conds = lit lazy_t list ref
 
   and 'a db_env = {
@@ -258,11 +267,9 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     (* the domain constant, must be Cst_uninterpreted_dom_elt,
        and the next slice.
        Expanded on demand. *)
-    mutable uty_status: (explanation * ty_uninterpreted_status) option;
-    (* current status in the model *)
-    uty_watched: term Poly_set.t;
-    (* set of terms whose evaluation is blocked by this uty.
-       See {!info.cst_watched} for more details *)
+    mutable uty_lit_empty: lit lazily_expanded;
+    (* boolean literal corresponding to this slice being empty.
+       Invariant: Lazy_none iif uty_pair = Lazy_none*)
   }
 
   let pp_quant out = function
@@ -443,10 +450,8 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           cst_parent=parent;
           cst_exist_conds=CCOpt.get_lazy (fun ()->ref []) exist_if;
           cst_cases=Lazy_none;
+          cst_cases_lits=Lazy_none;
           cst_complete=false;
-          cst_cur_case=None;
-          cst_watched=
-            Poly_set.create ~eq:term_equal_ 16;
         }
       in
       make id (Cst_undef (ty, info, slice))
@@ -483,37 +488,6 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
   let hash_uty uty =
     Hash.combine3 104 (Ty.hash (Lazy.force uty.uty_self)) uty.uty_offset
 
-  let cmp_lit a b =
-    let c = CCOrd.bool_ a.lit_sign b.lit_sign in
-    if c<>0 then c
-    else
-      let int_of_cell_ = function
-        | Lit_fresh _ -> 0
-        | Lit_atom _ -> 1
-        | Lit_assign _ -> 2
-        | Lit_uty_empty _ -> 3
-      in
-      match a.lit_view, b.lit_view with
-        | Lit_fresh i1, Lit_fresh i2 -> ID.compare i1 i2
-        | Lit_atom t1, Lit_atom t2 -> term_cmp_ t1 t2
-        | Lit_assign (c1,t1), Lit_assign (c2,t2) ->
-          CCOrd.(Typed_cst.compare c1 c2 <?> (term_cmp_, t1, t2))
-        | Lit_uty_empty u1, Lit_uty_empty u2 -> cmp_uty u1 u2
-        | Lit_fresh _, _
-        | Lit_atom _, _
-        | Lit_assign _, _
-        | Lit_uty_empty _, _ ->
-          CCOrd.int_ (int_of_cell_ a.lit_view) (int_of_cell_ b.lit_view)
-
-  let hash_lit a =
-    let sign = a.lit_sign in
-    match a.lit_view with
-      | Lit_fresh i -> Hash.combine3 1 (Hash.bool sign) (ID.hash i)
-      | Lit_atom t -> Hash.combine3 2 (Hash.bool sign) (term_hash_ t)
-      | Lit_assign (c,t) ->
-        Hash.combine4 3 (Hash.bool sign) (Typed_cst.hash c) (term_hash_ t)
-      | Lit_uty_empty uty -> Hash.combine3 4 (Hash.bool sign) (hash_uty uty)
-
   let pp_uty out uty =
     let n = uty.uty_offset in
     let lazy ty = uty.uty_self in
@@ -524,82 +498,6 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
   let pp_uty_status out = function
     | Uty_empty -> CCFormat.string out "empty"
     | Uty_nonempty -> CCFormat.string out "non_empty"
-
-  module Backtrack : sig
-    type level
-    val dummy_level : level
-    val backtrack : level -> unit
-    val cur_level: unit -> level
-    val push_level: unit -> unit
-
-    val push_set_nf_ : term -> unit
-    val push_set_cst_case_: cst_info -> unit
-    val push_uty_status: ty_uninterpreted_slice -> unit
-    val push_bi_status: bool_info -> unit
-    val push_bi_forwarded: bool_info -> unit
-  end = struct
-    type _level = level
-    type level = _level
-
-    let dummy_level = -1
-
-    type stack_cell =
-      | S_set_nf of
-          term * (term * explanation) option
-          (* t1.nf <- t2 *)
-      | S_set_cst_case of
-          cst_info * (explanation * term) option
-          (* c1.cst_case <- t2 *)
-      | S_set_uty of
-          ty_uninterpreted_slice * (explanation * ty_uninterpreted_status) option
-          (* uty1.uty_status <- status2 *)
-      | S_set_bi_status of
-          bool_info * (explanation * bool) option
-          (* bi1.status <- bool2 *)
-      | S_set_bi_forwarded of
-          bool_info * bool
-          (* bi1.status <- bool2 *)
-
-    type stack = stack_cell CCVector.vector
-
-    (* the global stack *)
-    let st_ : stack = CCVector.create()
-
-    let backtrack (l:level): unit =
-      Log.debugf 2
-        (fun k->k "@{<Yellow>** now at level %d (backtrack)@}" l);
-      while CCVector.length st_ > l do
-        match CCVector.pop_exn st_ with
-          | S_set_nf (t, nf) -> t.term_nf <- nf;
-          | S_set_cst_case (info, c) -> info.cst_cur_case <- c;
-          | S_set_uty (uty, s) -> uty.uty_status <- s;
-          | S_set_bi_status (bi, s) -> bi.bi_decided <- s;
-          | S_set_bi_forwarded (bi, s) -> bi.bi_forwarded <- s;
-      done;
-      ()
-
-    let cur_level () = CCVector.length st_
-
-    let push_level () : unit =
-      let l = cur_level() in
-      Log.debugf 2 (fun k->k "@{<Yellow>** now at level %d (push)@}" l);
-      ()
-
-    let push_set_nf_ (t:term) =
-      CCVector.push st_ (S_set_nf (t, t.term_nf))
-
-    let push_set_cst_case_ (i:cst_info) =
-      CCVector.push st_ (S_set_cst_case (i, i.cst_cur_case))
-
-    let push_uty_status (uty:ty_uninterpreted_slice) =
-      CCVector.push st_ (S_set_uty (uty, uty.uty_status))
-
-    let push_bi_status (bi:bool_info) =
-      CCVector.push st_ (S_set_bi_status (bi, bi.bi_decided))
-
-    let push_bi_forwarded (bi:bool_info) =
-      CCVector.push st_ (S_set_bi_forwarded (bi, bi.bi_forwarded))
-  end
 
   let new_switch_id_ =
     let n = ref 0 in
@@ -642,7 +540,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           | Switch (t, tbl) ->
             Hash.combine3 31 (sub_hash t) tbl.switch_id
           | Quant (q,ty,bod) ->
-            Hash.combine4 31 (Hash.poly q) (hash_uty ty) (sub_hash bod)
+            Hash.combine4 32 (Hash.poly q) (hash_uty ty) (sub_hash bod)
 
         (* equality that relies on physical equality of subterms *)
         let equal t1 t2 : bool = match t1.term_cell, t2.term_cell with
@@ -724,6 +622,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       | DTy_direct of ty_h
       | DTy_lazy of (unit -> ty_h)
 
+    (* TODO: remove this? *)
     let sorted_merge_ l1 l2 = CCList.sorted_merge_uniq ~cmp:compare l1 l2
 
     let cmp_term_dep_ a b =
@@ -746,11 +645,9 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     (* make fresh bool info *)
     let mk_bi () : bool_info = {
       bi_expanded=false;
-      bi_decided=None;
       bi_graph=[];
-      bi_watching=lazy (Poly_set.create ~eq:term_equal_ 16);
       bi_watched_status=WS_not_watched;
-      bi_forwarded=false;
+      bi_lit=Lazy_none;
     }
 
     (* build a term. If it's new, add it to the watchlist
@@ -997,6 +894,11 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       in
       aux t
 
+    let is_neg_ t = match t.term_cell with
+      | Builtin (B_not _)
+      | False -> true 
+      | _ -> false
+
     let is_blocked_by (t:t) ~(dep:term_dep): bool =
       List.exists
         (fun d' -> cmp_term_dep_ d' dep = 0)
@@ -1087,16 +989,167 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     let pp = pp_top ~ids:true
   end
 
-  let pp_lit out l =
-    let pp_lit_view out = function
-      | Lit_fresh i -> Format.fprintf out "#%a" ID.pp i
-      | Lit_atom t -> Term.pp out t
-      | Lit_assign (c,t) ->
+  module Atom : sig
+    type t = atom
+    val make : atom_view -> t
+    val mlit : t -> M_lit.t
+
+    val view : t -> atom_view
+    val id : t -> int
+    val equal : t -> t -> bool
+    val hash : t -> int
+    val compare : t -> t -> int
+    val pp : t CCFormat.printer
+  end = struct
+    type t = atom
+
+    module H = Hashcons.Make(struct
+        type t = atom
+
+        let equal a b = match a.atom_view, b.atom_view with
+          | Atom_fresh i1, Atom_fresh i2 -> ID.equal i1 i2
+          | Atom_assign (c1,t1), Atom_assign (c2,t2) ->
+            Typed_cst.equal c1 c2 && t1 == t2
+          | Atom_uty_empty u1, Atom_uty_empty u2 -> cmp_uty u1 u2=0
+          | Atom_assert t1, Atom_assert t2 -> t1==t2
+          | Atom_fresh _, _
+          | Atom_assign _, _
+          | Atom_uty_empty _, _
+          | Atom_assert _, _ -> false
+
+        let hash a = match a.atom_view with
+          | Atom_fresh i -> Hash.combine2 331 (ID.hash i)
+          | Atom_assign (c,t) ->
+            Hash.combine3 332 (Typed_cst.hash c) (term_hash_ t)
+          | Atom_uty_empty uty -> Hash.combine2 333 (hash_uty uty)
+          | Atom_assert t -> Hash.combine2 334 (term_hash_ t)
+
+        let set_id a i = a.atom_id <- (i+1) (* avoid 0 *)
+      end)
+
+    let make v =
+      assert (match v with
+        | Atom_assert t -> not (Term.is_neg_ t)
+        | _ -> true);
+      H.hashcons {atom_id= -1; atom_view=v; }
+
+    let mlit a = M_lit.make a.atom_id
+
+    let id a = a.atom_id
+    let view a = a.atom_view
+    let equal a b = a.atom_id = b.atom_id
+    let compare a b = CCOrd.int_ a.atom_id b.atom_id
+    let hash a = a.atom_id
+
+    let pp out a = match a.atom_view with
+      | Atom_fresh i -> Format.fprintf out "#%a" ID.pp i
+      | Atom_assert t -> Term.pp out t
+      | Atom_assign (c,t) ->
         Format.fprintf out "(@[:= %a@ %a@])" Typed_cst.pp c Term.pp t
-      | Lit_uty_empty u -> Format.fprintf out "(empty %a)" pp_uty u
-    in
-    if l.lit_sign then pp_lit_view out l.lit_view
-    else Format.fprintf out "(@[@<1>¬@ %a@])" pp_lit_view l.lit_view
+      | Atom_uty_empty u -> Format.fprintf out "(empty %a)" pp_uty u
+  end
+
+  (** {2 Literals} *)
+  module Lit : sig
+    type t = lit
+    val neg : t -> t
+    val abs : t -> t
+    val sign : t -> bool
+    val atom : t -> atom
+    val atom_view : t -> atom_view
+    val map : f:(atom_view -> atom_view) -> t -> t
+    val as_atom : t -> Atom.t * bool
+    val as_assert : t -> (term * bool) option
+    val mlit : t -> M_lit.t
+    val fresh_with : ID.t -> t
+    val fresh : unit -> t
+    val dummy : t
+    val assert_ : ?sign:bool -> term -> t
+    val eq : term -> term -> t
+    val neq : term -> term -> t
+    val cst_choice : cst -> term -> t
+    val uty_choice_empty : ty_uninterpreted_slice -> t
+    val uty_choice_nonempty : ty_uninterpreted_slice -> t
+    val uty_choice_status : ty_uninterpreted_slice -> ty_uninterpreted_status -> t
+    val hash : t -> int
+    val compare : t -> t -> int
+    val equal : t -> t -> bool
+    val print : t CCFormat.printer
+    val pp : t CCFormat.printer
+  end = struct
+    type t = lit
+
+    let neg l = {l with lit_sign=not l.lit_sign}
+
+    let sign t = t.lit_sign
+    let atom t = t.lit_atom
+    let atom_view t = Atom.view t.lit_atom
+
+    let abs t: t = {t with lit_sign=true}
+
+    (* build literal, normalizing on the fly *)
+    let make ~sign (v:atom_view): t = match v with
+      | Atom_assert t ->
+        let t, sign' = Term.abs t in
+        let sign = if not sign' then not sign else sign in
+        let lit_atom = Atom.make (Atom_assert t) in
+        {lit_sign=sign; lit_atom;}
+      | _ ->
+        let lit_atom = Atom.make v in
+        {lit_sign=sign; lit_atom}
+
+    (* map [f] on the view *)
+    let map ~f lit =
+      let v = f lit.lit_atom.atom_view in
+      (* re-normalize *)
+      make ~sign:lit.lit_sign v
+
+    (* assume the ID is fresh *)
+    let fresh_with id = make ~sign:true (Atom_fresh id)
+
+    (* fresh boolean literal *)
+    let fresh: unit -> t =
+      let n = ref 0 in
+      fun () ->
+        let id = ID.makef "#fresh_%d" !n in
+        incr n;
+        make ~sign:true (Atom_fresh id)
+
+    let dummy = fresh()
+
+    let assert_ ?(sign=true) (t:term) : t = make ~sign (Atom_assert t)
+
+    let eq a b = assert_ ~sign:true (Term.eq a b)
+    let neq a b = assert_ ~sign:false (Term.eq a b)
+    let cst_choice c t = make ~sign:true (Atom_assign (c, t))
+    let uty_choice_empty uty = make ~sign:true (Atom_uty_empty uty)
+    let uty_choice_nonempty uty : t = make ~sign:false (Atom_uty_empty uty)
+    let uty_choice_status uty s : t = match s with
+      | Uty_empty -> uty_choice_empty uty
+      | Uty_nonempty -> uty_choice_nonempty uty
+
+    let as_atom (lit:t) = lit.lit_atom, lit.lit_sign
+
+    let as_assert (lit:t) : (term * bool) option = match lit.lit_atom.atom_view with
+      | Atom_assert t -> Some (t, lit.lit_sign)
+      | _ -> None
+
+    let hash l = Hash.combine2 (Hash.bool l.lit_sign) (Atom.hash l.lit_atom)
+    let compare a b =
+      CCOrd.(bool_ a.lit_sign b.lit_sign <?> (Atom.compare, a.lit_atom, b.lit_atom))
+    let equal a b = compare a b = 0
+
+    let mlit (l:t): M_lit.t =
+      let ml = Atom.mlit l.lit_atom in
+      if l.lit_sign then ml else M_lit.neg ml
+
+    let pp_lit out l =
+      if l.lit_sign then Atom.pp out l.lit_atom
+      else Format.fprintf out "(@[@<1>¬@ %a@])" Atom.pp l.lit_atom
+
+    let pp = pp_lit
+    let print = pp
+  end
 
   let pp_dep out = function
     | Dep_cst c -> Typed_cst.pp out c
@@ -1133,109 +1186,19 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     let to_list_uniq e =
       to_seq e
       |> Sequence.to_rev_list
-      |> CCList.sort_uniq ~cmp:cmp_lit
+      |> CCList.sort_uniq ~cmp:Lit.compare
 
     let equal a b =
       let la = to_list a in
       let lb = to_list b in
       (* double inclusion *)
-      let mem l x = List.exists (fun y -> cmp_lit x y=0) l in
+      let mem l x = List.exists (fun y -> Lit.equal x y) l in
       List.for_all (mem lb) la
       && List.for_all (mem la) lb
 
     let pp out e =
       Format.fprintf out "(@[%a@])"
-        (Utils.pp_list pp_lit) (to_list_uniq e)
-  end
-
-  (** {2 Literals} *)
-  module Lit : sig
-    type t = lit
-    val neg : t -> t
-    val abs : t -> t
-    val sign : t -> bool
-    val view : t -> lit_view
-    val map : f:(lit_view -> lit_view) -> t -> t
-    val as_atom : t -> (term * bool) option
-    val norm : t -> t * FI.negated
-    val fresh_with : ID.t -> t
-    val fresh : unit -> t
-    val dummy : t
-    val atom : ?sign:bool -> term -> t
-    val eq : term -> term -> t
-    val neq : term -> term -> t
-    val cst_choice : cst -> term -> t
-    val uty_choice_empty : ty_uninterpreted_slice -> t
-    val uty_choice_nonempty : ty_uninterpreted_slice -> t
-    val uty_choice_status : ty_uninterpreted_slice -> ty_uninterpreted_status -> t
-    val hash : t -> int
-    val compare : t -> t -> int
-    val equal : t -> t -> bool
-    val print : t CCFormat.printer
-    val pp : t CCFormat.printer
-  end = struct
-    type t = lit
-
-    let neg l = {l with lit_sign=not l.lit_sign}
-
-    let sign t = t.lit_sign
-    let view (t:t): lit_view = t.lit_view
-
-    let abs t: t = {t with lit_sign=true}
-
-    (* build literal, normalizing on the fly *)
-    let make ~sign v = match v with
-      | Lit_atom t ->
-        let t, sign' = Term.abs t in
-        let sign = if not sign' then not sign else sign in
-        {lit_sign=sign; lit_view=Lit_atom t}
-      | _ ->
-        {lit_sign=sign; lit_view=v}
-
-    (* map [f] on the view *)
-    let map ~f lit =
-      let v = f lit.lit_view in
-      (* re-normalize *)
-      make ~sign:lit.lit_sign v
-
-    (* assume the ID is fresh *)
-    let fresh_with id = make ~sign:true (Lit_fresh id)
-
-    (* fresh boolean literal *)
-    let fresh: unit -> t =
-      let n = ref 0 in
-      fun () ->
-        let id = ID.makef "#fresh_%d" !n in
-        incr n;
-        make ~sign:true (Lit_fresh id)
-
-    let dummy = fresh()
-
-    let atom ?(sign=true) (t:term) : t = make ~sign (Lit_atom t)
-
-    let eq a b = atom ~sign:true (Term.eq a b)
-    let neq a b = atom ~sign:false (Term.eq a b)
-    let cst_choice c t = make ~sign:true (Lit_assign (c, t))
-    let uty_choice_empty uty = make ~sign:true (Lit_uty_empty uty)
-    let uty_choice_nonempty uty : t = make ~sign:false (Lit_uty_empty uty)
-    let uty_choice_status uty s : t = match s with
-      | Uty_empty -> uty_choice_empty uty
-      | Uty_nonempty -> uty_choice_nonempty uty
-
-    let as_atom (lit:t) : (term * bool) option = match lit.lit_view with
-      | Lit_atom t -> Some (t, lit.lit_sign)
-      | _ -> None
-
-    let hash = hash_lit
-    let compare = cmp_lit
-    let equal a b = compare a b = 0
-    let pp = pp_lit
-    let print = pp
-
-    (** {6 Normalization} *)
-
-    let norm l =
-      if l.lit_sign then l, FI.Same_sign else neg l, FI.Negated
+        (Utils.pp_list Lit.pp) (to_list_uniq e)
   end
 
   (** {2 Clauses} *)
@@ -1248,14 +1211,15 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     val make : Lit.t list -> t
     val of_terms : term list -> t
     val lits : t -> Lit.t list
-    val conflicts : t Queue.t
-    val lemma_queue : t Queue.t
-    val push_new : t -> unit
-    val push_new_l : t list -> unit
-    val push_conflict : t -> unit
+    val to_minisat : t -> minisat_clause
+
+    val equal : t -> t -> bool
+    val hash : t -> int
     val iter : (Lit.t -> unit) -> t -> unit
     val to_seq : t -> Lit.t Sequence.t
     val pp : t CCFormat.printer
+
+    module Tbl : CCHashtbl.S with type key = t
   end = struct
     type t = {
       lits: Lit.t list;
@@ -1283,48 +1247,24 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         c
 
     let of_terms l =
-      let l = List.map (fun t->Lit.atom t) l in
+      let l = List.map (fun t->Lit.assert_ t) l in
       make l
 
-    let equal_ c1 c2 = CCList.equal Lit.equal c1.lits c2.lits
-    let hash_ c = Hash.list Lit.hash c.lits
+    let to_minisat (c:t): minisat_clause =
+      List.map Lit.mlit c.lits
+
+    let equal c1 c2 = CCList.equal Lit.equal c1.lits c2.lits
+    let hash c = Hash.list Lit.hash c.lits
+
+    let iter f c = List.iter f c.lits
+    let to_seq c = Sequence.of_list c.lits
 
     module Tbl = CCHashtbl.Make(struct
         type t_ = t
         type t = t_
-        let equal = equal_
-        let hash = hash_
+        let equal = equal
+        let hash = hash
       end)
-
-    (* all lemmas generated so far, to avoid duplicates *)
-    let all_lemmas_ : unit Tbl.t = Tbl.create 1024
-
-    let conflicts : t Queue.t = Queue.create ()
-
-    let push_conflict c = Queue.push c conflicts
-
-    (* list of clauses that have been newly generated, waiting
-       to be propagated to Msat.
-       invariant: those clauses must be tautologies *)
-    let lemma_queue : t Queue.t = Queue.create()
-
-    let push_new (c:t): unit =
-      begin match c.lits with
-        | [a;b] when Lit.equal (Lit.neg a) b -> () (* trivial *)
-        | _ when Tbl.mem all_lemmas_ c -> () (* already asserted *)
-        | _ ->
-          Log.debugf 3
-            (fun k->k "(@[<1>@{<green>new_tautology@}@ @[%a@]@])" pp c);
-          incr stat_num_clause_tautology;
-          Tbl.add all_lemmas_ c ();
-          Queue.push c lemma_queue
-      end;
-      ()
-
-    let push_new_l = List.iter push_new
-
-    let iter f c = List.iter f c.lits
-    let to_seq c = Sequence.of_list c.lits
   end
 
   (** {2 Iterative Deepening} *)
@@ -1430,7 +1370,13 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
 
   let declare_defined_cst _ = ()
 
-  module Expand = struct
+  module Expand : sig
+    val expand_uninterpreted_slice :
+      ty_uninterpreted_slice ->
+      cst * ty_uninterpreted_slice * Clause.t list
+  
+    val expand_cases : cst -> Ty.t -> cst_info -> term list * Clause.t list
+  end = struct
     (* make a fresh constant, with a unique name *)
     let new_cst_ =
       let n = ref 0 in
@@ -1438,11 +1384,6 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         let id = ID.makef "?%s_%d" name !n in
         incr n;
         Typed_cst.make_undef ?slice ?exist_if ~parent id ty
-
-    (* [imply_opt g cs] returns [F => cs] if [g=Some F], or [cs] otherwise *)
-    let imply_opt g (c:Lit.t list): Lit.t list = match g with
-      | None -> c
-      | Some g -> Lit.neg g :: c
 
     (* [imply_product l cs] builds the list of
        [F => cs] for each [F] in [l], or returns [cs] if [l] is empty *)
@@ -1497,15 +1438,15 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
             uty_self=uty.uty_self;
             uty_parent=Some uty;
             uty_pair=Lazy_none;
+            uty_lit_empty=Lazy_none;
             uty_offset=n+1;
-            uty_status=None;
-            uty_watched=Poly_set.create 16 ~eq:term_equal_;
           } in
           Log.debugf 5
             (fun k->k "expand slice %a@ into (@[%a,@ %a@])"
                 pp_uty uty Typed_cst.pp c_head pp_uty uty_tail);
           (* memoize *)
           uty.uty_pair <- Lazy_some (c_head, uty_tail);
+          uty.uty_lit_empty <- Lazy_some (Lit.uty_choice_empty uty);
           (* emit clauses *)
           let clauses = clauses_of_uty uty in
           c_head, uty_tail, clauses
@@ -1755,15 +1696,118 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       by_ty, List.rev_append other_clauses case_clauses
   end
 
+  (** {2 The minisat instance} *)
+  module Sat : sig
+    type value = Minisat.value =
+      | V_undef
+      | V_true
+      | V_false
+
+    val value : Lit.t -> value
+
+    val value_cst : cst -> cst_info -> (Explanation.t * term) option
+    (** Evaluate the given meta-variable in the model *)
+
+    val value_uty :
+      ty_uninterpreted_slice ->
+      (Explanation.t * ty_uninterpreted_status) option
+    (** Status of this slice in the model *)
+
+    val value_bi : bool_info -> (Explanation.t * bool) option
+    (** Evaluate the boolean literal in the current model *)
+
+    val push_new : Clause.t -> unit
+    (** Push a clause into a queue before it is fed to the SAT solver *)
+
+    val push_new_l : Clause.t list -> unit
+    (** Push clauses into a queue before it is fed to the SAT solver *)
+
+    val flush : unit -> unit
+    (** Actually try to send clauses to the SAT solver.
+        @raise Minisat.Unsat if it results in a conflict *)
+  end = struct
+    type value = Minisat.value =
+      | V_undef
+      | V_true
+      | V_false
+
+    (* unique instance of minisat *)
+    let solver_ = M.create()
+
+    let value l = M.value solver_ (Lit.mlit l)
+
+    let value_cst c info = match info.cst_cases_lits with
+      | Lazy_none -> assert (info.cst_cases=Lazy_none); None
+      | Lazy_some lits ->
+        CCList.find_map
+          (fun lit -> match value lit, Lit.atom_view lit with
+             | V_true, Atom_assign (c', case) ->
+               (* this literal is true! it corresponds to the value *)
+               assert (Typed_cst.equal c c');
+               Some (Explanation.return lit, case)
+             | V_true, _ -> assert false
+             | V_false, _
+             | V_undef, _ -> None)
+          lits
+
+    let value_uty uty = match uty.uty_lit_empty with
+      | Lazy_none -> None
+      | Lazy_some lit ->
+        begin match value lit with
+          | V_undef -> None
+          | V_true -> Some (Explanation.return lit, Uty_empty)
+          | V_false -> Some (Explanation.return (Lit.neg lit), Uty_nonempty)
+        end
+
+    let value_bi (i:bool_info) = match i.bi_lit with
+      | Lazy_none -> None
+      | Lazy_some lit ->
+        begin match value lit with
+          | V_undef -> None
+          | V_true -> Some (Explanation.return lit, true)
+          | V_false -> Some (Explanation.return (Lit.neg lit), false)
+        end
+
+    (* all lemmas generated so far, to avoid duplicates *)
+    let all_lemmas_ : unit Clause.Tbl.t = Clause.Tbl.create 1024
+
+    (* list of clauses that have been newly generated, waiting
+       to be propagated to Msat.
+       invariant: those clauses must be tautologies *)
+    let lemma_queue : Clause.t Queue.t = Queue.create()
+
+    let push_new (c:Clause.t): unit =
+      begin match c.Clause.lits with
+        | [a;b] when Lit.equal (Lit.neg a) b -> () (* trivial *)
+        | _ when Clause.Tbl.mem all_lemmas_ c -> () (* already asserted *)
+        | _ ->
+          Log.debugf 3
+            (fun k->k "(@[<1>@{<green>new_tautology@}@ @[%a@]@])" Clause.pp c);
+          incr stat_num_clause_tautology;
+          Clause.Tbl.add all_lemmas_ c ();
+          Queue.push c lemma_queue
+      end;
+      ()
+
+    let push_new_l = List.iter push_new
+
+    let flush () =
+      while not (Queue.is_empty lemma_queue) do
+        let c = Queue.pop lemma_queue in
+        M.add_clause_l solver_ (Clause.to_minisat c);
+      done
+
+    (* TODO: also a solve method? *)
+  end
+
   (** {2 Reduction to Normal Form} *)
 
   module Reduce : sig
     type eval_env = term DB_env.t
     val eval_db : eval_env -> term -> term
-    val get_nf : term -> explanation * term
+    val get_nf : term -> explanation * term * Timestamp.t
     val simplify : term -> term
     val compute_nf : term -> explanation * term
-    val compute_nf_lit : lit -> explanation * lit
   end = struct
     (* environment for evaluation: not-yet-evaluated terms *)
     type eval_env = term DB_env.t
@@ -1850,18 +1894,17 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     let set_nf_ t new_t (e:explanation) : unit =
       if Term.equal t new_t then ()
       else (
-        Backtrack.push_set_nf_ t;
-        t.term_nf <- Some (new_t, e);
+        t.term_nf <- Some (new_t, e, Timestamp.cur());
         Log.debugf 5
           (fun k->k
               "(@[<hv1>set_nf@ @[%a@]@ @[%a@]@ :explanation @[<hv>%a@]@])"
               Term.pp t Term.pp new_t Explanation.pp e);
       )
 
-    let get_nf t : explanation * term =
+    let get_nf t : explanation * term * Timestamp.t =
       match t.term_nf with
-        | None -> Explanation.empty, t
-        | Some (new_t,e) -> e, new_t
+        | None -> Explanation.empty, t, Timestamp.cur()
+        | Some (new_t,e,time) -> e, new_t, time
 
     (* simplify: evaluate without following current values of constants, boolean
        expressions, etc. That is, compute the unconditional normal form
@@ -1982,14 +2025,16 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
        subterm(s) has been reduced *)
     let rec compute_nf (t:term) : explanation * term =
       (* follow the "normal form" pointer *)
+      let now = Timestamp.cur() in
       match t.term_nf with
-        | Some (t', e) ->
-          let exp, nf = compute_nf_add e t' in
-          (* path compression here *)
-          if not (Term.equal t' nf)
-          then set_nf_ t nf exp;
-          exp, nf
-        | None -> compute_nf_noncached t
+        | Some (t', e, time) when time=now->
+          (* already computed, just return *)
+          e, t'
+        | None 
+        | Some _ ->
+          let e, nf = compute_nf_noncached t in
+          set_nf_ t nf e;
+          e, nf
 
     and compute_nf_noncached t =
       assert (t.term_nf = None);
@@ -2002,10 +2047,14 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
             | Cst_defined (_, rhs) ->
               (* expand defined constants *)
               compute_nf (Lazy.force rhs)
-            | Cst_undef (_, {cst_cur_case=Some (e,new_t); _}, _) ->
-              (* c := new_t, we can reduce *)
-              compute_nf_add e new_t
-            | Cst_undef _ | Cst_uninterpreted_dom_elt _ | Cst_cstor _ ->
+            | Cst_undef (_, info, _) ->
+              begin match Sat.value_cst c info with
+                | None -> Explanation.empty, t (* no value in model *)
+                | Some (e, new_t) ->
+                  (* c := new_t, we can reduce *)
+                  compute_nf_add e new_t
+              end
+            | Cst_uninterpreted_dom_elt _ | Cst_cstor _ ->
               Explanation.empty, t
           end
         | Fun _ -> Explanation.empty, t (* no eval under lambda *)
@@ -2014,7 +2063,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           let env = DB_env.singleton t in
           Explanation.empty, eval_db env body
         | Quant (q,uty,body) ->
-          begin match uty.uty_status with
+          begin match Sat.value_uty uty with
             | None -> Explanation.empty, t
             | Some (e, status) ->
               let c_head, uty_tail = match uty.uty_pair with
@@ -2177,7 +2226,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           | None -> assert false
           | Some i -> i
         in
-        begin match i.bi_decided with
+        begin match Sat.value_bi i with
           | None -> Explanation.empty, t
           | Some (e, true) -> e, Term.true_
           | Some (e, false) -> e, Term.false_
@@ -2244,15 +2293,6 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
               | _ -> e_ab, default()
             end
         end
-
-    let compute_nf_lit (lit:lit): explanation * lit =
-      match Lit.view lit with
-        | Lit_fresh _
-        | Lit_assign (_,_)
-        | Lit_uty_empty _ -> Explanation.empty, lit
-        | Lit_atom t ->
-          let e, t' = compute_nf t in
-          e, Lit.atom ~sign:(Lit.sign lit) t'
   end
 
   (* from explanation [e1, e2, ..., en] build the guard
@@ -2263,31 +2303,45 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     |> List.map Lit.neg (* this is a guard! *)
     |> CCList.sort_uniq ~cmp:Lit.compare
 
-  (* a graph representing the propositional structure of the problem,
-       a link [t -> t'] means that [t <=> t'] under some assumptions *)
+  (** {2 Global Constraint Graph}
+
+      A graph representing the propositional structure of the problem,
+      a link [t -> t'] means either:
+
+      - [t <=> t'] under some assumptions,
+      - [t <=> t' OP u] where OP is a boolean connective 
+  *)
   module Term_graph : sig
     val add : term -> term -> bool_info_graph_edge_kind -> unit
     val mem : term -> term -> bool_info_graph_edge_kind -> bool
     val pp_dot : term Sequence.t CCFormat.printer
   end = struct
-    let mem a b k = match a.term_bool_info with
-      | None -> false
-      | Some bi ->
-        List.exists
-          (fun (b',k') ->
-             Term.equal b b'
-             &&
-             match k, k' with
-               | BIG_conditional, BIG_conditional -> true
-               | BIG_equiv e1, BIG_equiv e2 -> Explanation.equal e1 e2
-               | BIG_conditional, _
-               | BIG_equiv _, _ -> false)
-          bi.bi_graph
+    let mem a b k =
+      assert (Term.equal (Term.abs_fst a) a);
+      assert (Term.equal (Term.abs_fst b) b);
+      begin match a.term_bool_info with
+        | None -> false
+        | Some bi ->
+          List.exists
+            (fun (b',k') ->
+               Term.equal b b'
+               &&
+               match k, k' with
+                 | BIG_conditional, BIG_conditional -> true
+                 | BIG_equiv e1, BIG_equiv e2 -> Explanation.equal e1 e2
+                 | BIG_conditional, _
+                 | BIG_equiv _, _ -> false)
+            bi.bi_graph
+      end
 
-    let add a b k = match a.term_bool_info with
-      | None -> assert false
-      | Some bi ->
-        bi.bi_graph <- (b,k) :: bi.bi_graph
+    let add a b k =
+      assert (Term.equal (Term.abs_fst a) a);
+      assert (Term.equal (Term.abs_fst b) b);
+      begin match a.term_bool_info with
+        | None -> assert false
+        | Some bi ->
+          bi.bi_graph <- (b,k) :: bi.bi_graph
+      end
 
     let as_graph : (term, term * bool_info_graph_edge_kind * term) CCGraph.t =
       CCGraph.make_labelled_tuple
@@ -2325,11 +2379,12 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
   (** {2 A literal communicated to the SAT solver}
 
       A watched literal is a particular boolean term
-      (literal of the shape [Lit_atom t], conceptually) whose truth value
+      (literal of the shape [Atom_assert t], conceptually) whose truth value
       is of interest to the SAT solver. The SAT solver might decide
       its value, or smbc might compute the literal's value through evaluation
       and propagate it into the SAT solver. *)
 
+  (* FIXME: should become useless, Top_goals is enough
   module Watched_lit : sig
     type t = private term
 
@@ -2616,34 +2671,106 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
 
     let size () = Sequence.length to_seq
   end
-
-  (** {2 Sat Solver} *)
-
-  (* formulas for msat *)
-  module M_expr
-    : Msat.Formula_intf.S
-      with type t = Lit.t
-       and type proof = unit
-  = struct
-    include Lit
-    type proof = unit (* TODO later *)
-  end
+  *)
 
   let print_progress () : unit =
     Printf.printf
       "\r[%.2f] depth %d | expanded %d | clauses %d | \
-       lemmas %d | propagated %d | watched_lits %d%!"
+       lemmas %d | propagated %d%!"
       (get_time())
       (Iterative_deepening.current_depth() :> int)
       !stat_num_cst_expanded
       !stat_num_clause_push
       !stat_num_clause_tautology
       !stat_num_propagations
-      (Watched_lit.size())
 
   (* TODO: find the proper code for "kill line" *)
   let flush_progress (): unit =
     Printf.printf "\r%-80d\r%!" 0
+
+  (** {2 Toplevel Goals}
+
+      List of toplevel goals to satisfy. The solver will stop when all of
+      them evaluate to true, or when Unsat is reached, or when time runs out.
+  *)
+  module Top_goals: sig
+    val push : term -> unit
+    val to_seq : term Sequence.t
+    val check: unit -> unit
+  end = struct
+    (* list of terms to fully evaluate *)
+    let toplevel_goals_ : term list ref = ref []
+
+    (* add [t] to the set of terms that must be evaluated *)
+    let push = CCList.Ref.push toplevel_goals_
+
+    let to_seq k = List.iter k !toplevel_goals_
+
+    (* check that this term fully evaluates to [true] in the current model *)
+    let is_true_ (t:term): bool =
+      let _, t' = Reduce.compute_nf t in
+      match t'.term_cell with
+        | True -> true
+        | _ -> false
+
+(* FIXME: this is now the main loop.
+   
+   It should return something like
+   All_true | Some_expanded?
+
+   TODO:
+   for each top goal, apply the following recursive function:
+
+   - take a boolean term [t] of interest
+   - evaluate it in the current model
+     + if it reduces to true/false under E, propagate to minisat
+       (and add to the graph?)
+     + if it reduces to (not)(a & b),
+       1/ add to the graph
+       2/ add to Sat the clauses [equiv t (a&b)];
+       3/ if [a&b] not expanded, then expand it;
+       4/ recurse on [a], [b] (to check they are consistent/totally evaluated)
+     + otherwise it should reduce to a blocked term,
+       expand what blocks it (and add to {!Sat}). Will return Some_expanded.
+
+     if all terms reduced to True, return All_true;
+     otherwise return Some_expanded
+   *)
+    let check () =
+      if not (List.for_all is_true_ !toplevel_goals_)
+      then (
+        if Config.progress then flush_progress();
+        Log.debugf 1
+          (fun k->
+             let pp_dep out = function
+               | Dep_cst c ->
+                 let _, nf = Reduce.get_nf (Term.const c) in
+                 Format.fprintf out
+                   "(@[%a@ nf:%a@ :expanded %B@])"
+                   Typed_cst.pp c Term.pp nf
+                   (match Typed_cst.as_undefined c with
+                     | None -> assert false
+                     | Some (_,_,i,_) -> i.cst_cases <> Lazy_none)
+               | Dep_uty uty ->
+                 Format.fprintf out
+                   "(@[%a@ :expanded %B@])"
+                   pp_uty uty (uty.uty_pair<>Lazy_none)
+               | Dep_bool_expr u ->
+                 let _, nf = Reduce.get_nf u in
+                 Format.fprintf out "(@[%a@ nf:%a@@])" Term.pp u Term.pp nf
+             in
+             let pp_lit out l =
+               let e, nf = Reduce.get_nf l in
+               Format.fprintf out
+                 "(@[<hv1>%a@ nf: %a@ exp: %a@ deps: (@[<hv>%a@])@])"
+                 Term.pp l Term .pp nf Explanation.pp e
+                 (Utils.pp_list pp_dep) nf.term_deps
+             in
+             k "(@[<hv1>status_watched_lit@ (@[<v>%a@])@])"
+               (Utils.pp_list pp_lit) !toplevel_goals_);
+        assert false;
+      )
+  end
 
   (* the "theory" part: propagations *)
   module M_th :
@@ -2745,17 +2872,17 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       Log.debugf 2
         (fun k->k "(@[<1>@{<green>assume_lit@}@ @[%a@]@])" Lit.pp lit);
       begin match Lit.view lit, Lit.sign lit with
-        | Lit_fresh _, _ -> ()
-        | Lit_atom t, sign ->
+        | Atom_fresh _, _ -> ()
+        | Atom_assert t, sign ->
           begin match Term.as_bi t with
             | Some bi ->
               assert_b_expr ~b_expr:bi ~sign t
             | None -> ()
           end
-        | Lit_assign(c, t), true -> assert_choice c t
-        | Lit_assign _, false -> ()
-        | Lit_uty_empty uty, true -> assert_uty uty Uty_empty
-        | Lit_uty_empty uty, false -> assert_uty uty Uty_nonempty
+        | Atom_assign(c, t), true -> assert_choice c t
+        | Atom_assign _, false -> ()
+        | Atom_uty_empty uty, true -> assert_uty uty Uty_empty
+        | Atom_uty_empty uty, false -> assert_uty uty Uty_nonempty
       end
 
     (* propagation from the bool solver *)
@@ -2783,11 +2910,10 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     let if_sat _slice = ()
   end
 
-  module M = Msat.Solver.Make(M_expr)(M_th)(struct end)
-
+  (* FIXME: no clauses, actually, only terms at toplevel! *)
   (* push one clause into [M], in the current level (not a lemma but
      an axiom) *)
-  let push_clause (c:Clause.t): unit =
+  let push_top_clause (c:Clause.t): unit =
     Log.debugf 2 (fun k->k "(@[<1>push_clause@ @[%a@]@])" Clause.pp c);
     (* reduce to normal form the literals, ensure they
          are added to the proper constant watchlist(s) *)
@@ -2797,70 +2923,6 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       |> Sequence.iter Watched_lit.watch_term;
     incr stat_num_clause_push;
     M.assume [Clause.lits c]
-
-  (** {2 Toplevel Goals}
-
-      List of toplevel goals to satisfy
-  *)
-
-  module Top_goals: sig
-    val push : term -> unit
-    val to_seq : term Sequence.t
-    val check: unit -> unit
-  end = struct
-    (* list of terms to fully evaluate *)
-    let toplevel_goals_ : term list ref = ref []
-
-    (* add [t] to the set of terms that must be evaluated *)
-    let push (t:term): unit =
-      toplevel_goals_ := t :: !toplevel_goals_;
-      ()
-
-    let to_seq k = List.iter k !toplevel_goals_
-
-    (* check that this term fully evaluates to [true] *)
-    let is_true_ (t:term): bool =
-      let _, t' = Reduce.compute_nf t in
-      assert (Term.equal t' (Reduce.get_nf t |> snd));
-      match t'.term_cell with
-        | True -> true
-        | _ -> false
-
-    let check () =
-      if not (List.for_all is_true_ !toplevel_goals_)
-      then (
-        if Config.progress then flush_progress();
-        Log.debugf 1
-          (fun k->
-             let pp_dep out = function
-               | Dep_cst c ->
-                 let _, nf = Reduce.get_nf (Term.const c) in
-                 Format.fprintf out
-                   "(@[%a@ nf:%a@ :expanded %B@])"
-                   Typed_cst.pp c Term.pp nf
-                   (match Typed_cst.as_undefined c with
-                     | None -> assert false
-                     | Some (_,_,i,_) -> i.cst_cases <> Lazy_none)
-               | Dep_uty uty ->
-                 Format.fprintf out
-                   "(@[%a@ :expanded %B@])"
-                   pp_uty uty (uty.uty_pair<>Lazy_none)
-               | Dep_bool_expr u ->
-                 let _, nf = Reduce.get_nf u in
-                 Format.fprintf out "(@[%a@ nf:%a@@])" Term.pp u Term.pp nf
-             in
-             let pp_lit out l =
-               let e, nf = Reduce.get_nf l in
-               Format.fprintf out
-                 "(@[<hv1>%a@ nf: %a@ exp: %a@ deps: (@[<hv>%a@])@])"
-                 Term.pp l Term .pp nf Explanation.pp e
-                 (Utils.pp_list pp_dep) nf.term_deps
-             in
-             k "(@[<hv1>status_watched_lit@ (@[<v>%a@])@])"
-               (Utils.pp_list pp_lit) !toplevel_goals_);
-        assert false;
-      )
-  end
 
   (** {2 Conversion} *)
 
@@ -2985,7 +3047,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         | Ast.Assert t ->
           let t = conv_term [] t in
           Top_goals.push t;
-          push_clause (Clause.make [Lit.atom t])
+          push_top_clause (Clause.make [Lit.atom t])
         | Ast.Goal (vars, t) ->
           (* skolemize *)
           let env, consts =
@@ -3001,7 +3063,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           List.iter add_cst_support_ consts;
           let t = conv_term env t in
           Top_goals.push t;
-          push_clause (Clause.make [Lit.atom t])
+          push_top_clause (Clause.make [Lit.atom t])
         | Ast.TyDecl id ->
           let rec ty = lazy (
             let ty0 = {
@@ -3409,7 +3471,8 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
        :num_clause_tautology %d@ \
        :num_equiv_lemmas %d@ \
        :num_propagations %d@ \
-       :num_watched_lits %d\
+       :num_watched_lits %d@ \
+       :num_calls_minisat %d \
        @])"
       !stat_num_cst_expanded
       !stat_num_uty_expanded
@@ -3417,6 +3480,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       !stat_num_clause_tautology
       !stat_num_equiv_lemmas
       !stat_num_propagations
+      !stat_num_calls_minisat
       (Watched_lit.size())
 
   let do_on_exit ~on_exit =
@@ -3476,7 +3540,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
              s := PS_depth_limited depth_lit;
              raise Exit
            ) else match Lit.view lit with
-             | Lit_assign (c,_) ->
+             | Atom_assign (c,_) ->
                begin match c.cst_kind with
                  | Cst_undef (_, i, _) when not i.cst_complete ->
                    s := PS_incomplete
@@ -3494,10 +3558,10 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     let expand_lit l =
       Lit.map l
         ~f:(fun view -> match view with
-          | Lit_assign (c,t) -> Lit_assign (c, deref_deep domains t)
-          | Lit_atom _
-          | Lit_fresh _
-          | Lit_uty_empty _ -> view)
+          | Atom_assign (c,t) -> Atom_assign (c, deref_deep domains t)
+          | Atom_assert _
+          | Atom_fresh _
+          | Atom_uty_empty _ -> view)
     in
     M.St.iter_elt
     |> Sequence.map
@@ -3559,7 +3623,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
             match status with
               | PS_depth_limited _ ->
                 (* negation of the previous limit *)
-                push_clause (Clause.make [Lit.neg cur_lit]);
+                push_top_clause (Clause.make [Lit.neg cur_lit]);
                 iter (ID.next ()) (* deeper! *)
               | PS_incomplete ->
                 do_on_exit ~on_exit;

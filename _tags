@@ -1,5 +1,5 @@
 <src/>: include
-<src/**/*.*>: package(containers), package(msat), \
+<src/**/*.*>: package(containers), package(minisat), \
               package(containers.sexp), package(containers.data), \
               package(sequence), package(tip_parser), package(unix)
 

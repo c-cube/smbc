@@ -86,7 +86,6 @@ let set_syntax_ s =
 
 let set_debug_ d =
   Log.set_debug d;
-  Msat.Log.set_debug d;
   ()
 
 let options =

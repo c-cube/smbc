@@ -5,5 +5,5 @@ PKG containers.sexp
 PKG containers.data
 PKG sequence
 PKG tip_parser
-PKG msat
+PKG minisat
 FLG -w +a-4-44-58@8
