@@ -42,11 +42,12 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
   let stat_num_uty_expanded = ref 0
   let stat_num_clause_push = ref 0
   let stat_num_clause_tautology = ref 0
+  let stat_num_equiv_lemmas = ref 0
 
   (* for objects that are expanded on demand only *)
   type 'a lazily_expanded =
-    | Lazy_some of 'a
     | Lazy_none
+    | Lazy_some of 'a
 
   (* main term cell *)
   type term = {
@@ -1307,7 +1308,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       let n_ = ref 0 in
       fun l ->
         let c = {
-          lits=CCList.sort_uniq ~cmp:Lit.compare l;
+          lits=l; (* CCList.sort_uniq ~cmp:Lit.compare l; *)
           id= !n_;
         } in
         incr n_;
@@ -2317,6 +2318,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     let to_lit = Lit.atom ~sign:true
     let pp = Term.pp
 
+    (* clause for [e => l] *)
     let propagate_lit_ (l:t) (e:explanation): unit =
       let c = to_lit l :: clause_guard_of_exp_ e |> Clause.make in
       Log.debugf 4
@@ -2325,6 +2327,16 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
             pp l pp (snd (Reduce.compute_nf l)) Clause.pp c);
       Clause.push_new c;
       ()
+
+    (* clauses that express [e => (a <=> b)] *)
+    let clauses_equiv (a:term) (b:term) (e:explanation): Clause.t list =
+      assert (not (Term.equal a b));
+      let a = Lit.atom a in
+      let b = Lit.atom b in
+      let guard = clause_guard_of_exp_ e in
+      let c1 = b :: Lit.neg a :: guard |> Clause.make in
+      let c2 = a :: Lit.neg b :: guard |> Clause.make in
+      [ c1; c2 ]
 
     (* set of literals whose boolean value is of interest *)
     let watched_ : unit Term.Tbl.t = Term.Tbl.create 256
@@ -2490,6 +2502,23 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
                 (Utils.pp_list pp_dep) new_t.term_deps
                 Explanation.pp e);
           List.iter (watch_dep t) new_t.term_deps;
+          (* also propagate at the SAT level that [t <=> new_t], if
+             [simplify t] is not a boolean connective but [new_t] is. *)
+          begin match
+              (fst (Term.abs t')).term_cell,
+              (fst (Term.abs new_t)).term_cell
+            with
+              | Builtin (B_and _ | B_or _ | B_equiv _ | B_imply _), _ -> ()
+              | _, Builtin (B_and _ | B_or _ | B_equiv _ | B_imply _) ->
+                Log.debugf 3
+                  (fun k->k
+                      "(@[<1>add_intermediate_lemma@ %a@ with: %a@ exp: (@[%a@])@])"
+                      Term.pp t Term.pp new_t Explanation.pp e);
+                let cs = clauses_equiv t new_t e in
+                Clause.push_new_l cs;
+                incr stat_num_equiv_lemmas;
+              | _ -> ()
+          end;
       end;
       ()
 
@@ -3299,12 +3328,14 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
        :num_uty_expanded %d@ \
        :num_clause_push %d@ \
        :num_clause_tautology %d@ \
+       :num_equiv_lemmas %d@ \
        :num_lits %d\
        @])"
       !stat_num_cst_expanded
       !stat_num_uty_expanded
       !stat_num_clause_push
       !stat_num_clause_tautology
+      !stat_num_equiv_lemmas
       (Watched_lit.size())
 
   let do_on_exit ~on_exit =
