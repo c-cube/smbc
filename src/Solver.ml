@@ -1060,92 +1060,6 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       pp out t
 
     let pp = pp_top ~ids:true
-
-    type graph_edge =
-      | GE_sub of int (* n-th subterm *)
-      | GE_nf (* pointer to normal_form *)
-      | GE_dep  (* dependencies on constants *)
-
-    let as_graph : (term, term * graph_edge * term) CCGraph.t =
-      CCGraph.make_labelled_tuple
-        (fun t ->
-           let sub =
-             begin match t.term_cell with
-               | True | False | Const _ | DB _ -> Sequence.empty
-               | App (f,l) when is_const f -> Sequence.of_list l
-               | App (f,l) -> Sequence.cons f (Sequence.of_list l)
-               | Quant (_,_,body)
-               | Mu body
-               | Fun (_, body) -> Sequence.return body
-               | If (a,b,c) -> Sequence.of_list [a;b;c]
-               | Builtin b -> builtin_to_seq b
-               | Match (u,m) ->
-                 Sequence.cons u (ID.Map.values m |> Sequence.map snd)
-               | Switch (u,_) -> Sequence.singleton u
-             end
-             |> Sequence.mapi (fun i t' -> GE_sub i, t')
-           and watched =
-             t.term_deps
-             |> Sequence.of_list
-             |> Sequence.filter_map
-               (function
-                 | Dep_cst c -> Some (GE_dep, const c)
-                 | Dep_bool_expr t -> Some (GE_dep, t)
-                 | Dep_uty _ -> None)
-           and nf = match t.term_nf with
-             | None -> Sequence.empty
-             | Some (t',_) -> Sequence.return (GE_nf, t')
-           in
-           Sequence.of_list [sub; watched; nf] |> Sequence.flatten)
-
-    (* print this set of terms (and their subterms) in DOT *)
-    let pp_dot out terms =
-      let pp_node out t = match t.term_cell with
-        | True -> CCFormat.string out "true"
-        | False -> CCFormat.string out "false"
-        | DB d -> DB.pp out d
-        | Const c ->
-          Typed_cst.pp out c
-        | App (f,_) ->
-          begin match f.term_cell with
-            | Const c -> Typed_cst.pp out c (* no boxing *)
-            | _ -> CCFormat.string out "@"
-          end
-        | If _ -> CCFormat.string out "if"
-        | Match _ -> CCFormat.string out "match"
-        | Switch _ -> CCFormat.string out "case"
-        | Fun (ty,_) -> Format.fprintf out "fun %a" Ty.pp ty
-        | Mu _ -> CCFormat.string out "mu"
-        | Quant (q,_,_) -> pp_quant out q
-        | Builtin b ->
-          CCFormat.string out
-            begin match b with
-              | B_not _ -> "not" | B_and _ -> "and" | B_equiv _ -> "<=>"
-              | B_or _ -> "or" | B_imply _ -> "=>" | B_eq _ -> "="
-            end
-      in
-      let attrs_v t =
-        [`Label (CCFormat.to_string pp_node t); `Shape "box"]
-      and attrs_e (_,e,_) = match e with
-        | GE_sub i -> [`Label (string_of_int i); `Weight 15]
-        | GE_nf ->
-          [`Label "nf"; `Style "dashed"; `Weight 0; `Color "green"]
-        | GE_dep ->
-          [`Style  "dotted"; `Weight 0; `Color "grey"]
-      in
-      let pp_ out terms =
-        CCGraph.Dot.pp_seq
-          ~tbl:(CCGraph.mk_table ~eq:equal ~hash:hash 256)
-          ~eq:equal
-          ~attrs_v
-          ~attrs_e
-          ~graph:as_graph
-          out
-          terms
-      in
-      Format.fprintf out "@[%a@]@." pp_ terms
-
-    let pp_dot_all out () = pp_dot out H.to_seq
   end
 
   let pp_lit out l =
@@ -2327,6 +2241,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
   module Term_graph : sig
     val add : term -> term -> bool_info_graph_edge_kind -> unit
     val mem : term -> term -> bool_info_graph_edge_kind -> bool
+    val pp_dot : term Sequence.t CCFormat.printer
   end = struct
     let mem a b k = match a.term_bool_info with
       | None -> false
@@ -2346,6 +2261,38 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       | None -> assert false
       | Some bi ->
         bi.bi_graph <- (b,k) :: bi.bi_graph
+
+    let as_graph : (term, term * bool_info_graph_edge_kind * term) CCGraph.t =
+      CCGraph.make_labelled_tuple
+        (fun t -> match t.term_bool_info with
+           | None -> Sequence.empty
+           | Some bi ->
+             bi.bi_graph
+             |> Sequence.of_list
+             |> Sequence.map CCPair.swap)
+
+    (* print this set of terms (and their relations) in DOT *)
+    let pp_dot out terms =
+      let pp_node t: string = CCFormat.sprintf "@[%a@]" Term.pp t in
+      let attrs_v t =
+        [`Label (pp_node t); `Shape "record"]
+      and attrs_e (_,e,_) = match e with
+        | BIG_conditional -> [`Style "dashed"; `Weight 15]
+        | BIG_equiv e ->
+          let lab = CCFormat.to_string Explanation.pp e in
+          [`Label lab; `Weight 1]
+      in
+      let pp_ out terms =
+        CCGraph.Dot.pp_seq
+          ~tbl:(CCGraph.mk_table ~eq:Term.equal ~hash:Term.hash 256)
+          ~eq:Term.equal
+          ~attrs_v
+          ~attrs_e
+          ~graph:as_graph
+          out
+          terms
+      in
+      Format.fprintf out "@[%a@]@." pp_ terms
   end
 
   (** {2 A literal communicated to the SAT solver}
@@ -3380,7 +3327,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
 
   (* print all terms reachable from watched literals *)
   let pp_term_graph out () =
-    Term.pp_dot out (Watched_lit.to_seq_term :> term Sequence.t)
+    Term_graph.pp_dot out (Watched_lit.to_seq_term :> term Sequence.t)
 
   let pp_stats out () : unit =
     Format.fprintf out

@@ -106,8 +106,6 @@ module Make(C:CONFIG)(Dummy : sig end) : sig
     include Intf.ORD with type t := t
     include Intf.HASH with type t := t
     include Intf.PRINT with type t := t
-
-    val pp_dot : t Sequence.t CCFormat.printer
   end
 
   (** {2 Literals} *)
