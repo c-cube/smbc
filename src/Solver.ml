@@ -97,8 +97,8 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
   and builtin =
     | B_not of term
     | B_eq of term * term
-    | B_and of term * term
-    | B_or of term * term
+    | B_and of term list
+    | B_or of term list
     | B_imply of term * term
     | B_equiv of term * term
 
@@ -602,8 +602,8 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
             in
             Hash.combine3 8 u.term_id hash_m
           | Builtin (B_not a) -> Hash.combine2 20 a.term_id
-          | Builtin (B_and (t1,t2)) -> Hash.combine3 21 t1.term_id t2.term_id
-          | Builtin (B_or (t1,t2)) -> Hash.combine3 22 t1.term_id t2.term_id
+          | Builtin (B_and l) -> Hash.combine2 21 (Hash.list sub_hash l)
+          | Builtin (B_or l) -> Hash.combine2 22 (Hash.list sub_hash l)
           | Builtin (B_imply (t1,t2)) -> Hash.combine3 23 t1.term_id t2.term_id
           | Builtin (B_equiv (t1,t2)) -> Hash.combine3 24 t1.term_id t2.term_id
           | Builtin (B_eq (t1,t2)) -> Hash.combine3 25 t1.term_id t2.term_id
@@ -639,8 +639,8 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           | Builtin b1, Builtin b2 ->
             begin match b1, b2 with
               | B_not a1, B_not a2 -> a1 == a2
-              | B_and (a1,b1), B_and (a2,b2)
-              | B_or (a1,b1), B_or (a2,b2)
+              | B_and l1, B_and l2
+              | B_or l1, B_or l2 -> CCList.equal term_equal_ l1 l2
               | B_eq (a1,b1), B_eq (a2,b2)
               | B_equiv (a1,b1), B_equiv (a2,b2)
               | B_imply (a1,b1), B_imply (a2,b2) -> a1 == a2 && b1 == b2
@@ -835,15 +835,40 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
 
     let builtin_ ~deps b =
       (* normalize a bit *)
-      let b = match b with
-        | B_eq (a,b) when a.term_id > b.term_id -> B_eq (b,a)
-        | B_and (a,b) when a.term_id > b.term_id -> B_and (b,a)
-        | B_equiv (a,b) when a.term_id > b.term_id -> B_equiv (b,a)
-        | B_or (a,b) when a.term_id > b.term_id -> B_or (b,a)
-        | _ -> b
-      in
-      let t = mk_term_ ~deps (Builtin b) ~ty:(DTy_direct Ty.prop) in
-      t
+      let mk b = mk_term_ ~deps (Builtin b) ~ty:(DTy_direct Ty.prop) in
+      begin match b with
+        | B_eq (a,b) when a.term_id > b.term_id -> B_eq (b,a) |> mk
+        | B_and l ->
+          let l =
+            CCList.flat_map
+              (fun sub -> match sub.term_cell with
+                 | True -> []
+                 | Builtin (B_and l') -> l'
+                 | _ -> [sub])
+              l
+          in
+          begin match l with
+            | [] -> true_
+            | [t] -> t
+            | _ -> B_and l |> mk
+          end
+        | B_or l ->
+          let l =
+            CCList.flat_map
+              (fun sub -> match sub.term_cell with
+                 | False -> []
+                 | Builtin (B_or l') -> l'
+                 | _ -> [sub])
+              l
+          in
+          begin match l with
+            | [] -> false_
+            | [t] -> t
+            | _ -> B_or l |> mk
+          end
+        | B_equiv (a,b) when a.term_id > b.term_id -> B_equiv (b,a) |> mk
+        | _ -> mk b
+      end
 
     let builtin b =
       let deps = match b with
@@ -876,8 +901,8 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     let forall = quant Forall
     let exists = quant Exists
 
-    let and_ a b = builtin (B_and (a,b))
-    let or_ a b = builtin (B_or (a,b))
+    let and_ l = builtin (B_and l)
+    let or_ l = builtin (B_or l)
     let imply a b = builtin (B_imply (a,b))
     let equiv a b = builtin (B_equiv (a,b))
     let eq a b =
@@ -885,55 +910,22 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       builtin (B_eq (a,b))
     let neq a b = not_ (eq a b)
 
-    let and_l = function
-      | [] -> true_
-      | [t] -> t
-      | a :: l -> List.fold_left and_ a l
-
-    let or_l = function
-      | [] -> false_
-      | [t] -> t
-      | a :: l -> List.fold_left or_ a l
-
-    let fold_map_builtin
-        (f:'a -> term -> 'a * term) (acc:'a) (b:builtin): 'a * builtin =
-      let fold_binary acc a b =
-        let acc, a = f acc a in
-        let acc, b = f acc b in
-        acc, a, b
-      in
-      match b with
-        | B_not t ->
-          let acc, t' = f acc t in
-          acc, B_not t'
-        | B_and (a,b) ->
-          let acc, a, b = fold_binary acc a b in
-          acc, B_and (a, b)
-        | B_or (a,b) ->
-          let acc, a, b = fold_binary acc a b in
-          acc, B_or (a, b)
-        | B_equiv (a,b) ->
-          let acc, a, b = fold_binary acc a b in
-          acc, B_equiv (a, b)
-        | B_eq (a,b) ->
-          let acc, a, b = fold_binary acc a b in
-          acc, B_eq (a, b)
-        | B_imply (a,b) ->
-          let acc, a, b = fold_binary acc a b in
-          acc, B_imply (a, b)
-
     let is_const t = match t.term_cell with
       | Const _ -> true
       | _ -> false
 
-    let map_builtin f b =
-      let (), b = fold_map_builtin (fun () t -> (), f t) () b in
-      b
+    let map_builtin f b = match b with
+      | B_not t -> B_not (f t)
+      | B_and l -> B_and (List.map f l)
+      | B_or l -> B_or (List.map f l)
+      | B_equiv (a,b) -> B_equiv (f a, f b)
+      | B_eq (a,b) -> B_eq (f a, f b)
+      | B_imply (a,b) -> B_imply (f a, f b)
 
     let builtin_to_seq b yield = match b with
       | B_not t -> yield t
-      | B_and (a,b)
-      | B_or (a,b)
+      | B_and l
+      | B_or l -> List.iter yield l
       | B_imply (a,b)
       | B_equiv (a,b)
       | B_eq (a,b) -> yield a; yield b
@@ -1046,10 +1038,10 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           fpf out "(@[switch %a@ (@[<hv>%a@])@])"
             pp t print_map (ID.Tbl.to_seq m.switch_tbl)
         | Builtin (B_not t) -> fpf out "(@[<hv1>not@ %a@])" pp t
-        | Builtin (B_and (a,b)) ->
-          fpf out "(@[<hv1>and@ %a@ %a@])" pp a pp b
-        | Builtin (B_or (a,b)) ->
-          fpf out "(@[<hv1>or@ %a@ %a@])" pp a pp b
+        | Builtin (B_and l) ->
+          fpf out "(@[<hv1>and@ %a@])" (Utils.pp_list pp) l
+        | Builtin (B_or l) ->
+          fpf out "(@[<hv1>or@ %a@])" (Utils.pp_list pp) l
         | Builtin (B_imply (a,b)) ->
           fpf out "(@[<hv1>=>@ %a@ %a@])" pp a pp b
         | Builtin (B_equiv (a,b)) ->
@@ -1862,15 +1854,17 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           begin match b' with
             | B_not {term_cell=True; _} -> Term.false_
             | B_not {term_cell=False; _} -> Term.true_
+            | B_equiv ({term_cell=True; _}, a)
+            | B_equiv (a, {term_cell=True; _}) -> a
+            | B_equiv ({term_cell=False; _}, a)
+            | B_equiv (a, {term_cell=False; _}) -> Term.not_ a
+            | B_imply ({term_cell=True; _}, a) -> a
+            | B_imply (a, {term_cell=False; _}) -> Term.not_ a
+            | B_imply (_, {term_cell=True; _})
+            | B_imply ({term_cell=False; _}, _) -> Term.true_
             | B_eq (a,b) when Term.equal a b -> Term.true_
-            | B_and (a, {term_cell=True; _})
-            | B_and ({term_cell=True; _}, a) -> a
-            | B_and (_, {term_cell=False; _})
-            | B_and ({term_cell=False; _}, _) -> Term.false_
-            | B_or (a, {term_cell=False; _})
-            | B_or ({term_cell=False; _}, a) -> a
-            | B_or (_, {term_cell=True; _})
-            | B_or ({term_cell=True; _}, _) -> Term.true_
+            | B_and l when CCList.Set.mem ~eq:Term.equal Term.false_ l -> Term.false_
+            | B_or l when CCList.Set.mem ~eq:Term.equal Term.true_ l -> Term.true_
             | _ -> Term.builtin b'
           end
         | If (a,b,c) ->
@@ -2006,11 +2000,11 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
                 | Forall, Uty_nonempty ->
                   (* [uty[n:] = a_n : uty[n+1:]], so the
                      [forall uty[n:] p] becomes [p a_n && forall uty[n+1:] p] *)
-                  let t' = Term.and_l [t1(); t2()] in
+                  let t' = Term.and_ [t1(); t2()] in
                   compute_nf_add e t'
                 | Exists, Uty_nonempty ->
                   (* converse of the forall case, it becomes a "or" *)
-                  let t' = Term.or_l [t1(); t2()] in
+                  let t' = Term.or_ [t1(); t2()] in
                   compute_nf_add e t'
               end
           end
@@ -2142,10 +2136,10 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
             let t' = if a==a' then t else Term.not_ a' in
             e_a, t'
         end
-      | B_and (_,_)
+      | B_and _
+      | B_or _
       | B_equiv  (_,_)
-      | B_imply (_,_)
-      | B_or (_,_) ->
+      | B_imply (_,_) ->
         let i = match t.term_bool_info with
           | None -> assert false
           | Some i -> i
@@ -2197,7 +2191,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
                  We need to evaluate the arguments further (e.g.
                  if they start with constructors) *)
               List.map2 Term.eq l1 l2
-              |> Term.and_l
+              |> Term.and_
               |> compute_nf_add e_ab
             )
             else e_ab, default()
@@ -2411,16 +2405,22 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
             info.bi_expanded <- true;
             let neg_ = Term.not_ in
             let clauses, subs = match bu with
-              | B_and (a,b) ->
-                [ [neg_ b_expr; a];
-                  [neg_ b_expr; b];
-                  [neg_ a; neg_ b; b_expr]],
-                [a;b]
-              | B_or (a,b) ->
-                [ [neg_ a; b_expr];
-                  [neg_ b; b_expr];
-                  [a; b; neg_ b_expr]],
-                [a;b]
+              | B_and l ->
+                let cs =
+                  (b_expr :: List.map neg_ l) ::
+                    (List.map
+                       (fun sub -> [neg_ b_expr; sub])
+                       l)
+                in
+                cs, l
+              | B_or l ->
+                let cs =
+                  (neg_ b_expr :: l) ::
+                  (List.map
+                     (fun sub -> [neg_ sub; b_expr])
+                     l)
+                in
+                cs, l
               | B_imply (a,b) ->
                 [ [a; b_expr];
                   [neg_ b; b_expr];
@@ -2896,8 +2896,8 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         let a = conv_term env a in
         let b = conv_term env b in
         begin match op with
-          | Ast.And -> Term.and_ a b
-          | Ast.Or -> Term.or_ a b
+          | Ast.And -> Term.and_ [a; b]
+          | Ast.Or -> Term.or_ [a; b]
           | Ast.Imply -> Term.imply a b
           | Ast.Eq ->
             if Ty.is_prop a.term_ty
@@ -3103,8 +3103,8 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
                 dom
             in
             match q with
-              | Forall -> Term.and_l l
-              | Exists -> Term.or_l l
+              | Forall -> Term.and_ l
+              | Exists -> Term.or_ l
           in
           aux t'
         | Match (u, m) ->
@@ -3134,6 +3134,8 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           let env = DB_env.singleton f in
           aux (Reduce.eval_db env f)
         | Builtin b ->
+          let is_true_ t = Term.equal t Term.true_ in
+          let is_false_ t = Term.equal t Term.false_ in
           begin match b, t.term_bool_info with
             | B_not f, _ ->
               let f = aux f in
@@ -3142,24 +3144,20 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
                 | False -> Term.true_
                 | _ -> Term.not_ f
               end
-            | B_and (a,b), Some bi ->
-              let a = aux a in
-              let b = aux b in
-              begin match a.term_cell, b.term_cell with
-                | True, True -> ret_bi_ bi true
-                | False, _
-                | _, False -> ret_bi_ bi false
-                | _ -> Term.and_ a b
-              end
-            | B_or (a,b), Some bi ->
-              let a = aux a in
-              let b = aux b in
-              begin match a.term_cell, b.term_cell with
-                | True, _
-                | _, True -> ret_bi_ bi true
-                | False, False -> ret_bi_ bi false
-                | _ -> Term.or_ a b
-              end
+            | B_and l, Some bi ->
+              let l = List.map aux l in
+              if List.for_all is_true_ l
+              then ret_bi_ bi true
+              else if List.exists is_false_ l
+              then ret_bi_ bi false
+              else Term.and_ l
+            | B_or l, Some bi ->
+              let l = List.map aux l in
+              if List.for_all is_false_ l
+              then ret_bi_ bi false
+              else if List.exists is_true_ l
+              then ret_bi_ bi true
+              else Term.or_ l
             | B_imply (a,b), Some bi ->
               let a = aux a in
               let b = aux b in
@@ -3189,7 +3187,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
                 | Some (c1,_,l1), Some (c2,_,l2) ->
                   if Typed_cst.equal c1 c2 then (
                     assert (List.length l1 = List.length l2);
-                    aux (Term.and_l (List.map2 Term.eq l1 l2))
+                    aux (Term.and_ (List.map2 Term.eq l1 l2))
                   ) else Term.false_
                 | _ ->
                   begin match Term.as_domain_elt a, Term.as_domain_elt b with

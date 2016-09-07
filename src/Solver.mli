@@ -85,21 +85,6 @@ module Make(C:CONFIG)(Dummy : sig end) : sig
   module Term : sig
     type t = term
 
-    val db : DB.t -> t
-    val const : cst -> t
-    val app : t -> t list -> t
-    val fun_ : Ty.t -> t -> t
-    val mu : t -> t
-    val match_ : t -> (Ty.t list * t) ID.Map.t -> t
-    val if_ : t -> t -> t -> t
-    val true_ : t
-    val false_ : t
-    val not_ : t -> t
-    val and_ : t -> t -> t
-    val or_ : t -> t -> t
-    val imply : t -> t -> t
-    val eq : t -> t -> t
-
     val ty : t -> Ty.t
 
     include Intf.EQ with type t := t
