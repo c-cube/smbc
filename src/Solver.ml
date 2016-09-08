@@ -276,6 +276,9 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
        Invariant: Lazy_none iif uty_pair = Lazy_none*)
   }
 
+  (* environment for evaluation: not-yet-evaluated terms *)
+  type eval_env = term db_env
+
   let pp_quant out = function
     | Forall -> CCFormat.string out "forall"
     | Exists -> CCFormat.string out "exists"
@@ -991,12 +994,191 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       pp out t
 
     let pp = pp_top ~ids:true
+
+    (* TODO: add a cache to {!eval_db}? *)
+
+    (* just evaluate the De Bruijn indices, and return
+       the explanations used to evaluate subterms *)
+    let eval_db (env:eval_env) (t:term) : term =
+      if DB_env.size env = 0
+      then t (* trivial *)
+      else (
+        let rec aux env t : term = match t.term_cell with
+          | DB d ->
+            begin match DB_env.get d env with
+              | None -> t
+              | Some t' -> t'
+            end
+          | Const _ -> t
+          | True
+          | False -> t
+          | Fun (ty, body) ->
+            let body' = aux (DB_env.push_none env) body in
+            if body==body' then t else fun_ ty body'
+          | Mu body ->
+            let body' = aux (DB_env.push_none env) body in
+            if body==body' then t else mu body'
+          | Quant (q, uty, body) ->
+            let body' = aux (DB_env.push_none env) body in
+            if body==body' then t else quant q uty body'
+          | Match (u, m) ->
+            let u = aux env u in
+            let m =
+              ID.Map.map
+                (fun (tys,rhs) ->
+                   tys, aux (DB_env.push_none_l tys env) rhs)
+                m
+            in
+            match_ u m
+          | Switch (u, m) ->
+            let u = aux env u in
+            (* NOTE: [m] should not contain De Bruijn indices at all *)
+            switch u m
+          | If (a,b,c) ->
+            let a' = aux env a in
+            let b' = aux env b in
+            let c' = aux env c in
+            if a==a' && b==b' && c==c' then t else if_ a' b' c'
+          | App (_,[]) -> assert false
+          | App (f, l) ->
+            let f' = aux env f in
+            let l' = aux_l env l in
+            if f==f' && CCList.equal (==) l l' then t else app f' l'
+          | Builtin b -> builtin (map_builtin (aux env) b)
+        and aux_l env l =
+          List.map (aux env) l
+        in
+        aux env t
+      )
+
+    (* simplify: evaluate without following current values of constants, boolean
+       expressions, etc. That is, compute the unconditional normal form
+       (the one in an empty SAT trail) *)
+    let rec simplify (t:term): term =
+      match t.term_cell with
+        | DB _ | True | False -> t
+        | Const c ->
+          begin match c.cst_kind with
+            | Cst_defined (_, rhs) ->
+              (* expand defined constants, and only them *)
+              simplify (Lazy.force rhs)
+            | Cst_undef _ | Cst_uninterpreted_dom_elt _ | Cst_cstor _ -> t
+          end
+        | Fun _ -> t (* no eval under lambda *)
+        | Mu body ->
+          (* [mu x. body] becomes [body[x := mu x. body]] *)
+          let env = DB_env.singleton t in
+          eval_db env body
+        | Quant _ -> t
+        | Builtin b ->
+          let b' = map_builtin simplify b in
+          begin match b' with
+            | B_not {term_cell=True; _} -> false_
+            | B_not {term_cell=False; _} -> true_
+            | B_equiv ({term_cell=True; _}, a)
+            | B_equiv (a, {term_cell=True; _}) -> a
+            | B_equiv ({term_cell=False; _}, a)
+            | B_equiv (a, {term_cell=False; _}) -> not_ a
+            | B_imply ({term_cell=True; _}, a) -> a
+            | B_imply (a, {term_cell=False; _}) -> not_ a
+            | B_imply (_, {term_cell=True; _})
+            | B_imply ({term_cell=False; _}, _) -> true_
+            | B_eq (a,b) when equal a b -> true_
+            | B_and l when CCList.Set.mem ~eq:equal false_ l -> false_
+            | B_or l when CCList.Set.mem ~eq:equal true_ l -> true_
+            | _ -> builtin b'
+          end
+        | If (a,b,c) ->
+          let a' = simplify a in
+          let default() =
+            if a==a' then t else if_ a' b c
+          in
+          begin match a'.term_cell with
+            | True -> simplify b
+            | False -> simplify c
+            | _ -> default()
+          end
+        | Match (u, m) ->
+          let u' = simplify u in
+          let default() =
+            if u==u' then t else match_ u' m
+          in
+          begin match as_cstor_app u' with
+            | Some (c, _, l) ->
+              begin
+                try
+                  let tys, rhs = ID.Map.find (Typed_cst.id c) m in
+                  if List.length tys = List.length l
+                  then (
+                    (* evaluate arguments *)
+                    let env = DB_env.push_l l DB_env.empty in
+                    (* replace in [rhs] *)
+                    let rhs = eval_db env rhs in
+                    (* evaluate new [rhs] *)
+                    simplify rhs
+                  )
+                  else default()
+                with Not_found -> assert false
+              end
+            | None -> default()
+          end
+        | Switch (u, m) ->
+          let u' = simplify u in
+          begin match as_domain_elt u' with
+            | Some (c_elt,_) ->
+              (* do a lookup for this value! *)
+              let rhs =
+                match ID.Tbl.get m.switch_tbl c_elt.cst_id with
+                  | Some rhs -> rhs
+                  | None ->
+                    (* add an entry, by generating a new RHS *)
+                    let rhs = m.switch_make_new () in
+                    ID.Tbl.add m.switch_tbl c_elt.cst_id rhs;
+                    rhs
+              in
+              (* continue evaluation *)
+              simplify rhs
+            | None ->
+              (* block again *)
+              if u==u' then t else switch u' m
+          end
+        | App ({term_cell=Const {cst_kind=Cst_cstor _; _}; _}, _) ->
+          t (* do not reduce under cstors *)
+        | App (f, l) ->
+          let f' = simplify f in
+          (* now beta-reduce if needed *)
+          simplify_app DB_env.empty f' l
+
+    and simplify_app env f l = match f.term_cell, l with
+      | Const {cst_kind=Cst_defined (_, lazy def_f); _}, l ->
+        (* reduce [f l] into [def_f l] when [f := def_f] *)
+        simplify_app env def_f l
+      | Fun (_ty, body), arg :: other_args ->
+        (* beta-reduce *)
+        assert (Ty.equal _ty arg.term_ty);
+        let new_env = DB_env.push arg env in
+        (* apply [body] to [other_args] *)
+        simplify_app new_env body other_args
+      | _ ->
+        (* cannot reduce, unless [f] reduces to something else. *)
+        let f' = eval_db env f |> simplify in
+        if equal f f'
+        then app f' l (* no more reduction *)
+        else simplify_app DB_env.empty f' l (* try it again *)
   end
 
   module Atom : sig
     type t = atom
+
     val make : atom_view -> t
+    (** Make an atom for this view.
+        Assume the view is normalized:
+
+        - [Atom_assert t]: [t] must be simplified and positive
+    *)
+
     val mlit : t -> M_lit.t
+    (** Unique Minisat literal for this boolean atom *)
 
     val view : t -> atom_view
     val id : t -> int
@@ -1043,7 +1225,8 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
 
     let make v =
       assert (match v with
-        | Atom_assert t -> not (Term.is_neg_ t)
+        | Atom_assert t ->
+          not (Term.is_neg_ t) && Term.equal t (Term.simplify t)
         | _ -> true);
       let a0 = {atom_id= -1; atom_view=v; } in
       let a = H.hashcons a0 in
@@ -1061,12 +1244,17 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     let compare a b = CCOrd.int_ a.atom_id b.atom_id
     let hash a = a.atom_id
 
-    let pp out a = match a.atom_view with
+    let pp_inner out a = match a.atom_view with
       | Atom_fresh i -> Format.fprintf out "#%a" ID.pp i
       | Atom_assert t -> Term.pp out t
       | Atom_assign (c,t) ->
         Format.fprintf out "(@[:= %a@ %a@])" Typed_cst.pp c Term.pp t
       | Atom_uty_empty u -> Format.fprintf out "(empty %a)" pp_uty u
+
+    let pp out a =
+      pp_inner out a;
+      if Config.pp_hashcons then Format.fprintf out "/%d" a.atom_id;
+      ()
   end
 
   (** {2 Literals} *)
@@ -1110,6 +1298,8 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     (* build literal, normalizing on the fly *)
     let make ~sign (v:atom_view): t = match v with
       | Atom_assert t ->
+        (* first, simplify; then take [atom (abs t)] *)
+        let t = Term.simplify t in
         let t, sign' = Term.abs t in
         let sign = if not sign' then not sign else sign in
         let lit_atom = Atom.make (Atom_assert t) in
@@ -1832,7 +2022,11 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     let flush_ () =
       while not (Queue.is_empty lemma_queue) do
         let c = Queue.pop lemma_queue in
-        Minisat.add_clause_l solver_ (Clause.to_minisat c);
+        let cm = Clause.to_minisat c in
+        Log.debugf 5
+          (fun k->k "(@[add_minisat_clause@ %a@ original: %a@])"
+              Minisat.pp_clause cm Clause.pp c);
+        Minisat.add_clause_l solver_ cm;
       done
 
     type res =
@@ -1865,71 +2059,9 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
   (** {2 Reduction to Normal Form} *)
 
   module Reduce : sig
-    type eval_env = term DB_env.t
-    val eval_db : eval_env -> term -> term
     val get_nf : term -> explanation * term * Timestamp.t
-    val simplify : term -> term
     val compute_nf : term -> explanation * term
   end = struct
-    (* environment for evaluation: not-yet-evaluated terms *)
-    type eval_env = term DB_env.t
-
-    (* TODO: add a cache to {!eval_db}? *)
-
-    (* just evaluate the De Bruijn indices, and return
-       the explanations used to evaluate subterms *)
-    let eval_db (env:eval_env) (t:term) : term =
-      if DB_env.size env = 0
-      then t (* trivial *)
-      else (
-        let rec aux env t : term = match t.term_cell with
-          | DB d ->
-            begin match DB_env.get d env with
-              | None -> t
-              | Some t' -> t'
-            end
-          | Const _ -> t
-          | True
-          | False -> t
-          | Fun (ty, body) ->
-            let body' = aux (DB_env.push_none env) body in
-            if body==body' then t else Term.fun_ ty body'
-          | Mu body ->
-            let body' = aux (DB_env.push_none env) body in
-            if body==body' then t else Term.mu body'
-          | Quant (q, uty, body) ->
-            let body' = aux (DB_env.push_none env) body in
-            if body==body' then t else Term.quant q uty body'
-          | Match (u, m) ->
-            let u = aux env u in
-            let m =
-              ID.Map.map
-                (fun (tys,rhs) ->
-                   tys, aux (DB_env.push_none_l tys env) rhs)
-                m
-            in
-            Term.match_ u m
-          | Switch (u, m) ->
-            let u = aux env u in
-            (* NOTE: [m] should not contain De Bruijn indices at all *)
-            Term.switch u m
-          | If (a,b,c) ->
-            let a' = aux env a in
-            let b' = aux env b in
-            let c' = aux env c in
-            if a==a' && b==b' && c==c' then t else Term.if_ a' b' c'
-          | App (_,[]) -> assert false
-          | App (f, l) ->
-            let f' = aux env f in
-            let l' = aux_l env l in
-            if f==f' && CCList.equal (==) l l' then t else Term.app f' l'
-          | Builtin b -> Term.builtin (Term.map_builtin (aux env) b)
-        and aux_l env l =
-          List.map (aux env) l
-        in
-        aux env t
-      )
-
     let cycle_check_tbl : unit Term.Tbl.t = Term.Tbl.create 32
 
     (* [cycle_check sub into] checks whether [sub] occurs in [into] under
@@ -1968,121 +2100,6 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       match t.term_nf with
         | None -> Explanation.empty, t, Timestamp.cur()
         | Some (new_t,e,time) -> e, new_t, time
-
-    (* simplify: evaluate without following current values of constants, boolean
-       expressions, etc. That is, compute the unconditional normal form
-       (the one in an empty SAT trail) *)
-    let rec simplify (t:term): term =
-      match t.term_cell with
-        | DB _ | True | False -> t
-        | Const c ->
-          begin match c.cst_kind with
-            | Cst_defined (_, rhs) ->
-              (* expand defined constants, and only them *)
-              simplify (Lazy.force rhs)
-            | Cst_undef _ | Cst_uninterpreted_dom_elt _ | Cst_cstor _ -> t
-          end
-        | Fun _ -> t (* no eval under lambda *)
-        | Mu body ->
-          (* [mu x. body] becomes [body[x := mu x. body]] *)
-          let env = DB_env.singleton t in
-          eval_db env body
-        | Quant _ -> t
-        | Builtin b ->
-          let b' = Term.map_builtin simplify b in
-          begin match b' with
-            | B_not {term_cell=True; _} -> Term.false_
-            | B_not {term_cell=False; _} -> Term.true_
-            | B_equiv ({term_cell=True; _}, a)
-            | B_equiv (a, {term_cell=True; _}) -> a
-            | B_equiv ({term_cell=False; _}, a)
-            | B_equiv (a, {term_cell=False; _}) -> Term.not_ a
-            | B_imply ({term_cell=True; _}, a) -> a
-            | B_imply (a, {term_cell=False; _}) -> Term.not_ a
-            | B_imply (_, {term_cell=True; _})
-            | B_imply ({term_cell=False; _}, _) -> Term.true_
-            | B_eq (a,b) when Term.equal a b -> Term.true_
-            | B_and l when CCList.Set.mem ~eq:Term.equal Term.false_ l -> Term.false_
-            | B_or l when CCList.Set.mem ~eq:Term.equal Term.true_ l -> Term.true_
-            | _ -> Term.builtin b'
-          end
-        | If (a,b,c) ->
-          let a' = simplify a in
-          let default() =
-            if a==a' then t else Term.if_ a' b c
-          in
-          begin match a'.term_cell with
-            | True -> simplify b
-            | False -> simplify c
-            | _ -> default()
-          end
-        | Match (u, m) ->
-          let u' = simplify u in
-          let default() =
-            if u==u' then t else Term.match_ u' m
-          in
-          begin match Term.as_cstor_app u' with
-            | Some (c, _, l) ->
-              begin
-                try
-                  let tys, rhs = ID.Map.find (Typed_cst.id c) m in
-                  if List.length tys = List.length l
-                  then (
-                    (* evaluate arguments *)
-                    let env = DB_env.push_l l DB_env.empty in
-                    (* replace in [rhs] *)
-                    let rhs = eval_db env rhs in
-                    (* evaluate new [rhs] *)
-                    simplify rhs
-                  )
-                  else default()
-                with Not_found -> assert false
-              end
-            | None -> default()
-          end
-        | Switch (u, m) ->
-          let u' = simplify u in
-          begin match Term.as_domain_elt u' with
-            | Some (c_elt,_) ->
-              (* do a lookup for this value! *)
-              let rhs =
-                match ID.Tbl.get m.switch_tbl c_elt.cst_id with
-                  | Some rhs -> rhs
-                  | None ->
-                    (* add an entry, by generating a new RHS *)
-                    let rhs = m.switch_make_new () in
-                    ID.Tbl.add m.switch_tbl c_elt.cst_id rhs;
-                    rhs
-              in
-              (* continue evaluation *)
-              simplify rhs
-            | None ->
-              (* block again *)
-              if u==u' then t else Term.switch u' m
-          end
-        | App ({term_cell=Const {cst_kind=Cst_cstor _; _}; _}, _) ->
-          t (* do not reduce under cstors *)
-        | App (f, l) ->
-          let f' = simplify f in
-          (* now beta-reduce if needed *)
-          simplify_app DB_env.empty f' l
-
-    and simplify_app env f l = match f.term_cell, l with
-      | Const {cst_kind=Cst_defined (_, lazy def_f); _}, l ->
-        (* reduce [f l] into [def_f l] when [f := def_f] *)
-        simplify_app env def_f l
-      | Fun (_ty, body), arg :: other_args ->
-        (* beta-reduce *)
-        assert (Ty.equal _ty arg.term_ty);
-        let new_env = DB_env.push arg env in
-        (* apply [body] to [other_args] *)
-        simplify_app new_env body other_args
-      | _ ->
-        (* cannot reduce, unless [f] reduces to something else. *)
-        let f' = eval_db env f |> simplify in
-        if Term.equal f f'
-        then Term.app f' l (* no more reduction *)
-        else simplify_app DB_env.empty f' l (* try it again *)
 
     (* compute the normal form of this term. We know at least one of its
        subterm(s) has been reduced *)
@@ -2123,7 +2140,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         | Mu body ->
           (* [mu x. body] becomes [body[x := mu x. body]] *)
           let env = DB_env.singleton t in
-          Explanation.empty, eval_db env body
+          Explanation.empty, Term.eval_db env body
         | Quant (q,uty,body) ->
           begin match Sat.value_uty uty with
             | None -> Explanation.empty, t
@@ -2133,7 +2150,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
                 | Lazy_some tup -> tup
               in
               let t1() =
-                eval_db (DB_env.singleton (Term.const c_head)) body
+                Term.eval_db (DB_env.singleton (Term.const c_head)) body
               in
               let t2() =
                 Term.quant q uty_tail body
@@ -2155,7 +2172,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         | Builtin b ->
           (* try boolean reductions, after trivial simplifications *)
           let e, t' =
-            let t' = simplify t in
+            let t' = Term.simplify t in
             if t==t' then compute_builtin ~term:t b else compute_nf t'
           in
           set_nf_ t t' e;
@@ -2190,7 +2207,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
                     (* evaluate arguments *)
                     let env = DB_env.push_l l DB_env.empty in
                     (* replace in [rhs] *)
-                    let rhs = eval_db env rhs in
+                    let rhs = Term.eval_db env rhs in
                     (* evaluate new [rhs] *)
                     compute_nf rhs
                   )
@@ -2249,7 +2266,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         compute_nf_app new_env e body other_args
       | _ ->
         (* cannot reduce, unless [f] reduces to something else. *)
-        let e_f, f' = eval_db env f |> compute_nf in
+        let e_f, f' = Term.eval_db env f |> compute_nf in
         let exp = Explanation.append e e_f in
         if Term.equal f f'
         then (
@@ -2555,6 +2572,11 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
             "(@[<hv1>@{<green>check_rec@}@ @[<1>term:@ %a@]@ \
              exp: %a@ deps: (@[<hv>%a@])@])"
             Term.pp t Explanation.pp e (Utils.pp_list pp_dep_full) nf.term_deps);
+      (* be sure to check every atom on the path (in the explanation),
+         because the SAT solver could attribute [a := true] where actually
+         [a] is partially evaluated or [false] *)
+      List.iter (check_lit st) (Explanation.to_list_uniq e);
+      (* propagate if nf=true/false; expand dependencies if nf is blocked *)
       begin match nf.term_cell with
         | True -> propagate_lit_ t e;
         | False -> propagate_lit_ (Term.not_ t) e;
@@ -2588,6 +2610,27 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           end
       end;
       nf
+
+    and check_ignore st t =
+      ignore (check_rec st t)
+
+    (* be sure that this literal's sub-atoms are also checked *)
+    and check_lit (st:state) (lit:Lit.t): unit =
+      begin match Lit.atom_view lit with
+        | Atom_assert t ->
+          let t_abs = Term.abs_fst t in
+          begin match t_abs.term_cell with
+            | Builtin (B_and l | B_or l) ->
+              List.iter (check_ignore st) l
+            | Builtin (B_imply (a,b) | B_equiv (a,b)) ->
+              check_ignore st a;
+              check_ignore st b
+            | _ -> ()
+          end;
+        | Atom_fresh _
+        | Atom_assign _
+        | Atom_uty_empty _ -> ()
+      end
 
     (* expand the given term dependency so that, later, it will be
        assigned a value by the SAT solver;
@@ -2690,7 +2733,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
               (fun sub ->
                  (* the subterms themselves must be expanded/checked, too *)
                  Term_graph.add b_expr sub BIG_conditional;
-                 ignore (check_rec st sub))
+                 check_ignore st sub)
               subs;
           );
       end
@@ -3032,7 +3075,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
             let l =
               List.map
                 (fun c_dom ->
-                   Reduce.eval_db (DB_env.singleton (Term.const c_dom)) body)
+                   Term.eval_db (DB_env.singleton (Term.const c_dom)) body)
                 dom
             in
             match q with
@@ -3050,7 +3093,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
                 | Some (tys, rhs) ->
                   assert (List.length tys = List.length args);
                   let env = DB_env.push_l args DB_env.empty in
-                  let rhs = Reduce.eval_db env rhs in
+                  let rhs = Term.eval_db env rhs in
                   aux rhs
           end
         | Switch (u, m) ->
@@ -3065,7 +3108,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           end
         | Mu f ->
           let env = DB_env.singleton f in
-          aux (Reduce.eval_db env f)
+          aux (Term.eval_db env f)
         | Builtin b ->
           let is_true_ t = Term.equal t Term.true_ in
           let is_false_ t = Term.equal t Term.false_ in
@@ -3143,7 +3186,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           aux_app env body tail
         | _, _ ->
           (* see if [f] reduces in [env] *)
-          let f' = aux (Reduce.eval_db env f) in
+          let f' = aux (Term.eval_db env f) in
           if Term.equal f f'
           then Term.app f l
           else aux_app DB_env.empty f' l
@@ -3317,6 +3360,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
             (* fine, we have a model. Just check that all values are fully
                expanded! *)
             let step_res = Main_step.run () in
+            Format.printf "%a@." pp_cur_trail ();
             begin match step_res with
               | Main_step.All_true ->
                 (* truly a model *)
