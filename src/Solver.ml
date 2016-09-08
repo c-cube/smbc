@@ -2552,8 +2552,9 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       let e, nf = Reduce.compute_nf t in
       Log.debugf 3
         (fun k->k
-            "(@[<hv1>@{<green>check_rec@}@ @[<1>term:@ %a@]@ deps: (@[<hv>%a@])@])"
-            Term.pp t (Utils.pp_list pp_dep_full) nf.term_deps);
+            "(@[<hv1>@{<green>check_rec@}@ @[<1>term:@ %a@]@ \
+             exp: %a@ deps: (@[<hv>%a@])@])"
+            Term.pp t Explanation.pp e (Utils.pp_list pp_dep_full) nf.term_deps);
       begin match nf.term_cell with
         | True -> propagate_lit_ t e;
         | False -> propagate_lit_ (Term.not_ t) e;
@@ -3375,11 +3376,6 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
             end
     in
     ID.reset ();
-    try
     iter (ID.current ())
-    with e ->
-      (* FIXME remove *)
-      Format.printf "trail: %a@." pp_cur_trail();
-      raise e
 end
 
