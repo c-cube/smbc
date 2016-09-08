@@ -136,21 +136,19 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
   and term_proxy = {
     proxy_for: term;
     (* the term this is standing for *)
-    proxy_deps: term_proxy_deps;
-    (* other proxies to check consistency of *)
     proxy_atom: atom lazy_t;
     (* the boolean atom. *)
     mutable proxy_expanded: bool;
     (* did we already expand this into CNF? *)
-    mutable proxy_last_checked: Timestamp.t;
+    mutable proxy_state: term_proxy_state;
     (* last time we checked this proxy's consistency *)
     mutable proxy_graph: proxy_graph_edge list;
     (* list of other boolean terms that are linked to this one *)
   }
 
-  and term_proxy_deps =
-    | Proxy_self
-    | Proxy_subs of term_proxy list
+  and term_proxy_state =
+    | Proxy_last_checked of Timestamp.t
+    | Proxy_being_checked
 
     (* edge of the boolean graph: destination + kind of edge *)
   and proxy_graph_edge = term_proxy * proxy_graph_edge_kind
@@ -885,6 +883,9 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     let hash = term_hash_
     let compare = term_cmp_
 
+    let is_true_ t = equal t true_
+    let is_false_ t = equal t false_
+
     module As_key = struct
         type t = term
         let compare = compare
@@ -1293,21 +1294,12 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     match t_abs.term_proxy with
       | Some p -> p, sign
       | None ->
-        (* only need to evaluate sub-proxies for boolean connectives *)
-        let deps = match t_abs.term_cell with
-          | Builtin (B_and l | B_or l) ->
-            Proxy_subs (List.map proxify_abs l)
-          | Builtin (B_imply (a,b) | B_equiv (a,b)) ->
-            Proxy_subs [proxify_abs a; proxify_abs b]
-          | _ -> Proxy_self
-        in
         (* [p], the proxy, refers to itself through its atom *)
         let rec p = {
           proxy_for=t_abs;
           proxy_atom=lazy (Atom.make (Atom_assert p));
           proxy_graph=[];
-          proxy_deps=deps;
-          proxy_last_checked=Timestamp.zero;
+          proxy_state=Proxy_last_checked Timestamp.zero;
           proxy_expanded=false;
         } in
         (* have [t_abs] point to [p] *)
@@ -2117,336 +2109,16 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       r
   end
 
-  (** {2 Reduction to Normal Form} *)
-
-  module Reduce : sig
-    val get_nf : term -> explanation * term * Timestamp.t
-    (** Current normal form, without any further computation *)
-
-    val compute_nf : term -> explanation * term
-    (** Compute the normal form of this term. *)
-
-    val compute_nf_full : on_proxy:(term_proxy -> unit) -> term -> explanation * term
-    (** Compute the normal form of this term.
-        @param on_proxy callback called on every single proxy met *)
-  end = struct
-    let cycle_check_tbl : unit Term.Tbl.t = Term.Tbl.create 32
-
-    (* [cycle_check sub into] checks whether [sub] occurs in [into] under
-       a non-empty path traversing only constructors. *)
-    let cycle_check_l ~(sub:term) (l:term list): bool =
-      let tbl_ = cycle_check_tbl in
-      Term.Tbl.clear tbl_;
-      let rec aux u =
-        Term.equal sub u
-        ||
-        begin
-          if Term.Tbl.mem tbl_ u then false
-          else (
-            Term.Tbl.add tbl_ u ();
-            match Term.as_cstor_app u with
-              | None -> false
-              | Some (_, _, l) -> List.exists aux l
-          )
-        end
-      in
-      List.exists aux l
-
-    (* set the normal form of [t], propagate to watchers *)
-    let set_nf_ t new_t (e:explanation) : unit =
-      if Term.equal t new_t then ()
-      else (
-        let now = Timestamp.cur() in
-        t.term_nf <- Some (new_t, e, now);
-        Log.debugf 5
-          (fun k->k
-              "(@[<hv1>set_nf@ @[%a@]@ @[%a@]@ explanation: @[<hv>%a@]@ time: %d@])"
-              Term.pp t Term.pp new_t Explanation.pp e (now:>int));
-      )
-
-    let get_nf t : explanation * term * Timestamp.t =
-      match t.term_nf with
-        | None -> Explanation.empty, t, Timestamp.cur()
-        | Some (new_t,e,time) -> e, new_t, time
-
-    (* compute the normal form of this term. We know at least one of its
-       subterm(s) has been reduced *)
-    let rec compute_nf_full ~on_proxy (t:term) : explanation * term =
-      (* follow the "normal form" pointer *)
-      let now = Timestamp.cur() in
-      match t.term_nf, t.term_proxy with
-        | Some (t', e, time), _ when time=now->
-          (* already computed, just return *)
-          e, t'
-        | _, Some p ->
-          (* avoid looping there *)
-          compute_nf_proxy ~on_proxy p
-        | None, None
-        | Some _, None ->
-          let e, nf = compute_nf_noncached ~on_proxy t in
-          set_nf_ t nf e;
-          e, nf
-
-    and compute_nf_noncached ~on_proxy t =
-      match t.term_cell with
-        | DB _ -> Explanation.empty, t
-        | True | False ->
-          Explanation.empty, t (* always trivial *)
-        | Const c ->
-          begin match c.cst_kind with
-            | Cst_defined (_, rhs) ->
-              (* expand defined constants *)
-              compute_nf_full ~on_proxy (Lazy.force rhs)
-            | Cst_undef (_, info, _) ->
-              begin match Sat.value_cst c info with
-                | None -> Explanation.empty, t (* no value in model *)
-                | Some (e, new_t) ->
-                  (* c := new_t, we can reduce *)
-                  compute_nf_add ~on_proxy e new_t
-              end
-            | Cst_uninterpreted_dom_elt _ | Cst_cstor _ ->
-              Explanation.empty, t
-          end
-        | Fun _ -> Explanation.empty, t (* no eval under lambda *)
-        | Mu body ->
-          (* [mu x. body] becomes [body[x := mu x. body]] *)
-          let env = DB_env.singleton t in
-          Explanation.empty, Term.eval_db env body
-        | Quant (q,uty,body) ->
-          begin match Sat.value_uty uty with
-            | None -> Explanation.empty, t
-            | Some (e, status) ->
-              let c_head, uty_tail = match uty.uty_pair with
-                | Lazy_none -> assert false
-                | Lazy_some tup -> tup
-              in
-              let t1() =
-                Term.eval_db (DB_env.singleton (Term.const c_head)) body
-              in
-              let t2() =
-                Term.quant q uty_tail body
-              in
-              begin match q, status with
-                | Forall, Uty_empty -> e, Term.true_
-                | Exists, Uty_empty -> e, Term.false_
-                | Forall, Uty_nonempty ->
-                  (* [uty[n:] = a_n : uty[n+1:]], so the
-                     [forall uty[n:] p] becomes [p a_n && forall uty[n+1:] p] *)
-                  let t' = Term.and_ [t1(); t2()] in
-                  compute_nf_add ~on_proxy e t'
-                | Exists, Uty_nonempty ->
-                  (* converse of the forall case, it becomes a "or" *)
-                  let t' = Term.or_ [t1(); t2()] in
-                  compute_nf_add ~on_proxy e t'
-              end
-          end
-        | Builtin b ->
-          (* try boolean reductions, after trivial simplifications *)
-          let e, t' =
-            let t' = Term.simplify t in
-            if t==t'
-            then compute_builtin ~on_proxy ~term:t b
-            else compute_nf_full ~on_proxy t'
-          in
-          set_nf_ t t' e;
-          e, t'
-        | If (a,b,c) ->
-          let e_a, a' = compute_nf_full ~on_proxy a in
-          let default() =
-            if a==a' then t else Term.if_ a' b c
-          in
-          let e_branch, t' = match a'.term_cell with
-            | True -> compute_nf_full ~on_proxy b
-            | False -> compute_nf_full ~on_proxy c
-            | _ -> Explanation.empty, default()
-          in
-          (* merge evidence from [a]'s normal form and [b/c]'s
-             normal form *)
-          let e = Explanation.append e_a e_branch in
-          set_nf_ t t' e;
-          e, t'
-        | Match (u, m) ->
-          let e_u, u' = compute_nf_full ~on_proxy u in
-          let default() =
-            if u==u' then t else Term.match_ u' m
-          in
-          let e_branch, t' = match Term.as_cstor_app u' with
-            | Some (c, _, l) ->
-              begin
-                try
-                  let tys, rhs = ID.Map.find (Typed_cst.id c) m in
-                  if List.length tys = List.length l
-                  then (
-                    (* evaluate arguments *)
-                    let env = DB_env.push_l l DB_env.empty in
-                    (* replace in [rhs] *)
-                    let rhs = Term.eval_db env rhs in
-                    (* evaluate new [rhs] *)
-                    compute_nf_full ~on_proxy rhs
-                  )
-                  else Explanation.empty, Term.match_ u' m
-                with Not_found -> assert false
-              end
-            | None -> Explanation.empty, default()
-          in
-          let e = Explanation.append e_u e_branch in
-          set_nf_ t t' e;
-          e, t'
-        | Switch (u, m) ->
-          let e_u, u' = compute_nf_full ~on_proxy u in
-          begin match Term.as_domain_elt u' with
-            | Some (c_elt,_) ->
-              (* do a lookup for this value! *)
-              let rhs =
-                match ID.Tbl.get m.switch_tbl c_elt.cst_id with
-                  | Some rhs -> rhs
-                  | None ->
-                    (* add an entry, by generating a new RHS *)
-                    let rhs = m.switch_make_new () in
-                    ID.Tbl.add m.switch_tbl c_elt.cst_id rhs;
-                    rhs
-              in
-              (* continue evaluation *)
-              compute_nf_add ~on_proxy e_u rhs
-            | None ->
-              (* block again *)
-              let t' = if u==u' then t else Term.switch u' m in
-              e_u, t'
-          end
-        | App ({term_cell=Const {cst_kind=Cst_cstor _; _}; _}, _) ->
-          Explanation.empty, t (* do not reduce under cstors *)
-        | App (f, l) ->
-          let e_f, f' = compute_nf_full ~on_proxy f in
-          (* now beta-reduce if needed *)
-          let e_reduce, new_t =
-            compute_nf_app ~on_proxy DB_env.empty Explanation.empty f' l
-          in
-          (* merge explanations *)
-          let e = Explanation.append e_reduce e_f in
-          set_nf_ t new_t e;
-          e, new_t
-        | Proxy p ->
-          compute_nf_proxy ~on_proxy p
-
-    and compute_nf_proxy ~on_proxy p =
-      on_proxy p;
-      (* now just trust the SAT solver's decision *)
-      begin match Sat.value_proxy p with
-        | None -> Explanation.empty, Term.proxy p
-        | Some (e, true) -> e, Term.true_
-        | Some (e, false) -> e, Term.false_
-      end
-
-    (* apply [f] to [l], until no beta-redex is found *)
-    and compute_nf_app ~on_proxy env e f l = match f.term_cell, l with
-      | Const {cst_kind=Cst_defined (_, lazy def_f); _}, l ->
-        (* reduce [f l] into [def_f l] when [f := def_f] *)
-        compute_nf_app ~on_proxy env e def_f l
-      | Fun (_ty, body), arg :: other_args ->
-        (* beta-reduce *)
-        assert (Ty.equal _ty arg.term_ty);
-        let new_env = DB_env.push arg env in
-        (* apply [body] to [other_args] *)
-        compute_nf_app ~on_proxy new_env e body other_args
-      | _ ->
-        (* cannot reduce, unless [f] reduces to something else. *)
-        let e_f, f' = Term.eval_db env f |> compute_nf_full ~on_proxy in
-        let exp = Explanation.append e e_f in
-        if Term.equal f f'
-        then (
-          (* no more reduction *)
-          let t' = Term.app f' l in
-          exp, t'
-        ) else (
-          (* try it again *)
-          compute_nf_app ~on_proxy DB_env.empty exp f' l
-        )
-
-    (* compute nf of [t], append [e] to the explanation *)
-    and compute_nf_add ~on_proxy (e : explanation) (t:term) : explanation * term =
-      let e', t' = compute_nf_full ~on_proxy t in
-      Explanation.append e e', t'
-
-    (* compute the builtin, assuming its components are
-       already reduced *)
-    and compute_builtin ~on_proxy ~term:(t:term) (bu:builtin)
-      : explanation * term
-      = match bu with
-      | B_not a ->
-        let e_a, a' = compute_nf_full ~on_proxy a in
-        begin match a'.term_cell with
-          | True -> e_a, Term.false_
-          | False -> e_a, Term.true_
-          | _ ->
-            let t' = if a==a' then t else Term.not_ a' in
-            e_a, t'
-        end
-      | B_and _
-      | B_or _
-      | B_equiv  (_,_)
-      | B_imply (_,_) ->
-        assert (t.term_proxy=None);
-        (* proxify now, resulting into a blocked evaluation *)
-        let p, sign = proxify t in
-        assert (t.term_proxy <> None);
-        assert sign;
-        assert (Sat.value_proxy p = None); (* proxy should be fresh *)
-        let new_t = Term.proxy p in
-        on_proxy p;
-        Explanation.empty, new_t
-      | B_eq (a,b) ->
-        assert (not (Ty.is_prop a.term_ty));
-        let e_a, a' = compute_nf_full ~on_proxy a in
-        let e_b, b' = compute_nf_full ~on_proxy b in
-        let e_ab = Explanation.append e_a e_b in
-        let default() =
-          if a==a' && b==b' then t else Term.eq a' b'
-        in
-        if Term.equal a' b'
-        then e_ab, Term.true_ (* syntactic *)
-        else begin match Term.as_cstor_app a', Term.as_cstor_app b' with
-          | Some (c1,ty1,l1), Some (c2,_,l2) ->
-            if not (Typed_cst.equal c1 c2)
-            then
-              (* [c1 ... = c2 ...] --> false, as distinct constructors
-                 can never be equal *)
-              e_ab, Term.false_
-            else if Typed_cst.equal c1 c2
-                 && List.length l1 = List.length l2
-                 && List.length l1 = List.length (fst (Ty.unfold ty1))
-            then (
-              (* same constructor, fully applied -> injectivity:
-                 arguments are pairwise equal.
-                 We need to evaluate the arguments further (e.g.
-                 if they start with constructors) *)
-              List.map2 Term.eq l1 l2
-              |> Term.and_
-              |> compute_nf_add ~on_proxy e_ab
-            )
-            else e_ab, default()
-          | Some (_, _, l), None when cycle_check_l ~sub:b' l ->
-            (* acyclicity rule *)
-            e_ab, Term.false_
-          | None, Some (_, _, l) when cycle_check_l ~sub:a' l ->
-            e_ab, Term.false_
-          | _ ->
-            begin match Term.as_domain_elt a', Term.as_domain_elt b' with
-              | Some (c1,ty1), Some (c2,ty2) ->
-                (* domain elements: they are all distinct *)
-                assert (Ty.equal ty1 ty2);
-                if Typed_cst.equal c1 c2
-                then e_ab, Term.true_
-                else e_ab, Term.false_
-              | _ -> e_ab, default()
-            end
-        end
-
-    let compute_nf t = compute_nf_full ~on_proxy:(fun _ ->()) t
-  end
-
   let pp_dep_full out = function
     | Dep_cst c ->
-      let _, nf = Reduce.compute_nf (Term.const c) in
+      let i = match Typed_cst.as_undefined c with
+        | None -> assert false
+        | Some (_,_,i,_) -> i
+      in
+      let nf = match Sat.value_cst c i with
+        | None -> Term.const c
+        | Some (_, t') -> t'
+      in
       Format.fprintf out
         "(@[%a@ nf:%a@ :expanded %B@])"
         Typed_cst.pp c Term.pp nf
@@ -2531,22 +2203,11 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       Format.fprintf out "@[%a@]@." pp_ ps
   end
 
-  let print_progress () : unit =
-    Printf.printf
-      "\r[%.2f] depth %d | expanded %d | clauses %d | \
-       lemmas %d | propagated %d%!"
-      (get_time())
-      (Iterative_deepening.current_depth() :> int)
-      !stat_num_cst_expanded
-      !stat_num_clause_push
-      !stat_num_clause_tautology
-      !stat_num_propagations
+  (** {2 Reduction to Normal Form + Checking}
 
-  let flush_progress (): unit =
-    (* TODO: find the proper code for "kill line" *)
-    Printf.printf "\r%-80d\r%!" 0
-
-  (** {2 Body of the main loop}
+      This module allows to compute the normal form of terms in the
+      current model, and to check the consistency of proxies at the
+      same time.
 
       for each top goal, apply the following recursive function:
 
@@ -2564,6 +2225,397 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
 
       - if all terms reduced to True and were not blocked, return All_check;
         otherwise return Some_expansions or Some_false
+
+      *)
+  module Reduce : sig
+    val get_nf : term -> explanation * term * Timestamp.t
+    (** Current normal form, without any further computation *)
+
+    type proxy_callback =
+      term_proxy ->
+      decided:term ->
+      computed:(Explanation.t * term) ->
+      unit
+    (** [f : proxy_callback] will be called with
+        [f p ~decided ~computed] once per proxy that is evaluated
+        by {!compute_nf_proxy}, where [decided] is the decided value
+        (maybe the proxy itself) and [computed] the actual computed value *)
+
+    val callback: proxy_callback ref
+
+    val compute_nf : term -> explanation * term
+    (** Compute the normal form of this term.
+        Calls {!callback} when it meets a proxy for the first time *)
+
+    val compute_nf_proxy : term_proxy -> Explanation.t * term
+    (** Compute the consistency of this proxy, and return its normal
+        form.
+        Calls {!callback} when it meets a proxy *)
+  end = struct
+    let cycle_check_tbl : unit Term.Tbl.t = Term.Tbl.create 32
+
+    (* [cycle_check sub into] checks whether [sub] occurs in [into] under
+       a non-empty path traversing only constructors. *)
+    let cycle_check_l ~(sub:term) (l:term list): bool =
+      let tbl_ = cycle_check_tbl in
+      Term.Tbl.clear tbl_;
+      let rec aux u =
+        Term.equal sub u
+        ||
+        begin
+          if Term.Tbl.mem tbl_ u then false
+          else (
+            Term.Tbl.add tbl_ u ();
+            match Term.as_cstor_app u with
+              | None -> false
+              | Some (_, _, l) -> List.exists aux l
+          )
+        end
+      in
+      List.exists aux l
+
+    (* set the normal form of [t], propagate to watchers *)
+    let set_nf_ t new_t (e:explanation) : unit =
+      if Term.equal t new_t then ()
+      else (
+        let now = Timestamp.cur() in
+        t.term_nf <- Some (new_t, e, now);
+        Log.debugf 5
+          (fun k->k
+              "(@[<hv1>set_nf@ @[%a@]@ @[%a@]@ explanation: @[<hv>%a@]@ time: %d@])"
+              Term.pp t Term.pp new_t Explanation.pp e (now:>int));
+      )
+
+    let get_nf t : explanation * term * Timestamp.t =
+      match t.term_nf with
+        | None -> Explanation.empty, t, Timestamp.cur()
+        | Some (new_t,e,time) -> e, new_t, time
+
+    type proxy_callback =
+      term_proxy ->
+      decided:term ->
+      computed:(Explanation.t * term) ->
+      unit
+
+    let callback : proxy_callback ref =
+      ref (fun _ ~decided:_ ~computed:_ -> assert false)
+
+    (* compute the normal form of this term. We know at least one of its
+       subterm(s) has been reduced *)
+    let rec compute_nf (t:term) : explanation * term =
+      (* follow the "normal form" pointer *)
+      let now = Timestamp.cur() in
+      match t.term_nf, t.term_proxy with
+        | Some (t', e, time), _ when time=now->
+          (* already computed, just return *)
+          e, t'
+        | _, Some p ->
+          begin match p.proxy_state with
+            | Proxy_being_checked ->
+              (* ignore the proxy's decided value, evaluate normally *)
+              compute_nf_noncached p.proxy_for
+            | Proxy_last_checked _ ->
+              (* memoize *)
+              let e, nf = compute_nf_proxy p in
+              set_nf_ t nf e;
+              e, nf
+          end
+        | None, None
+        | Some _, None ->
+          let e, nf = compute_nf_noncached t in
+          set_nf_ t nf e;
+          e, nf
+
+    and compute_nf_proxy p = match p.proxy_state with
+      | Proxy_being_checked ->
+        compute_nf p.proxy_for (* ignore proxy *)
+      | Proxy_last_checked last ->
+        let now = Timestamp.cur() in
+        let e, decided = match Sat.value_proxy p with
+          | None -> Explanation.empty, Term.proxy p (* well, trivial *)
+          | Some (e, true) -> e, Term.true_
+          | Some (e, false) -> e, Term.false_
+        in
+        (* only call [f] once per timestamp ! *)
+        if last < now then (
+          (* compute the term's value, without proxy *)
+          p.proxy_state <- Proxy_being_checked;
+          let e_nf, nf = compute_nf p.proxy_for in
+          p.proxy_state <- Proxy_last_checked now;
+          !callback p ~decided ~computed:(e_nf,nf);
+        );
+        e, decided
+
+    and compute_nf_noncached t =
+      match t.term_cell with
+        | DB _ -> Explanation.empty, t
+        | True | False ->
+          Explanation.empty, t (* always trivial *)
+        | Const c ->
+          begin match c.cst_kind with
+            | Cst_defined (_, rhs) ->
+              (* expand defined constants *)
+              compute_nf (Lazy.force rhs)
+            | Cst_undef (_, info, _) ->
+              begin match Sat.value_cst c info with
+                | None -> Explanation.empty, t (* no value in model *)
+                | Some (e, new_t) ->
+                  (* c := new_t, we can reduce *)
+                  compute_nf_add e new_t
+              end
+            | Cst_uninterpreted_dom_elt _ | Cst_cstor _ ->
+              Explanation.empty, t
+          end
+        | Fun _ -> Explanation.empty, t (* no eval under lambda *)
+        | Mu body ->
+          (* [mu x. body] becomes [body[x := mu x. body]] *)
+          let env = DB_env.singleton t in
+          Explanation.empty, Term.eval_db env body
+        | Quant (q,uty,body) ->
+          begin match Sat.value_uty uty with
+            | None -> Explanation.empty, t
+            | Some (e, status) ->
+              let c_head, uty_tail = match uty.uty_pair with
+                | Lazy_none -> assert false
+                | Lazy_some tup -> tup
+              in
+              let t1() =
+                Term.eval_db (DB_env.singleton (Term.const c_head)) body
+              in
+              let t2() =
+                Term.quant q uty_tail body
+              in
+              begin match q, status with
+                | Forall, Uty_empty -> e, Term.true_
+                | Exists, Uty_empty -> e, Term.false_
+                | Forall, Uty_nonempty ->
+                  (* [uty[n:] = a_n : uty[n+1:]], so the
+                     [forall uty[n:] p] becomes [p a_n && forall uty[n+1:] p] *)
+                  let t' = Term.and_ [t1(); t2()] in
+                  compute_nf_add e t'
+                | Exists, Uty_nonempty ->
+                  (* converse of the forall case, it becomes a "or" *)
+                  let t' = Term.or_ [t1(); t2()] in
+                  compute_nf_add e t'
+              end
+          end
+        | Builtin b ->
+          (* try boolean reductions, after trivial simplifications *)
+          let e, t' =
+            let t' = Term.simplify t in
+            if t==t'
+            then compute_builtin ~term:t b
+            else compute_nf t'
+          in
+          set_nf_ t t' e;
+          e, t'
+        | If (a,b,c) ->
+          let e_a, a' = compute_nf a in
+          let default() =
+            if a==a' then t else Term.if_ a' b c
+          in
+          let e_branch, t' = match a'.term_cell with
+            | True -> compute_nf b
+            | False -> compute_nf c
+            | _ -> Explanation.empty, default()
+          in
+          (* merge evidence from [a]'s normal form and [b/c]'s
+             normal form *)
+          let e = Explanation.append e_a e_branch in
+          set_nf_ t t' e;
+          e, t'
+        | Match (u, m) ->
+          let e_u, u' = compute_nf u in
+          let default() =
+            if u==u' then t else Term.match_ u' m
+          in
+          let e_branch, t' = match Term.as_cstor_app u' with
+            | Some (c, _, l) ->
+              begin
+                try
+                  let tys, rhs = ID.Map.find (Typed_cst.id c) m in
+                  if List.length tys = List.length l
+                  then (
+                    (* evaluate arguments *)
+                    let env = DB_env.push_l l DB_env.empty in
+                    (* replace in [rhs] *)
+                    let rhs = Term.eval_db env rhs in
+                    (* evaluate new [rhs] *)
+                    compute_nf rhs
+                  )
+                  else Explanation.empty, Term.match_ u' m
+                with Not_found -> assert false
+              end
+            | None -> Explanation.empty, default()
+          in
+          let e = Explanation.append e_u e_branch in
+          set_nf_ t t' e;
+          e, t'
+        | Switch (u, m) ->
+          let e_u, u' = compute_nf u in
+          begin match Term.as_domain_elt u' with
+            | Some (c_elt,_) ->
+              (* do a lookup for this value! *)
+              let rhs =
+                match ID.Tbl.get m.switch_tbl c_elt.cst_id with
+                  | Some rhs -> rhs
+                  | None ->
+                    (* add an entry, by generating a new RHS *)
+                    let rhs = m.switch_make_new () in
+                    ID.Tbl.add m.switch_tbl c_elt.cst_id rhs;
+                    rhs
+              in
+              (* continue evaluation *)
+              compute_nf_add e_u rhs
+            | None ->
+              (* block again *)
+              let t' = if u==u' then t else Term.switch u' m in
+              e_u, t'
+          end
+        | App ({term_cell=Const {cst_kind=Cst_cstor _; _}; _}, _) ->
+          Explanation.empty, t (* do not reduce under cstors *)
+        | App (f, l) ->
+          let e_f, f' = compute_nf f in
+          (* now beta-reduce if needed *)
+          let e_reduce, new_t =
+            compute_nf_app DB_env.empty Explanation.empty f' l
+          in
+          (* merge explanations *)
+          let e = Explanation.append e_reduce e_f in
+          set_nf_ t new_t e;
+          e, new_t
+        | Proxy p -> compute_nf_proxy p
+
+    (* apply [f] to [l], until no beta-redex is found *)
+    and compute_nf_app env e f l = match f.term_cell, l with
+      | Const {cst_kind=Cst_defined (_, lazy def_f); _}, l ->
+        (* reduce [f l] into [def_f l] when [f := def_f] *)
+        compute_nf_app env e def_f l
+      | Fun (_ty, body), arg :: other_args ->
+        (* beta-reduce *)
+        assert (Ty.equal _ty arg.term_ty);
+        let new_env = DB_env.push arg env in
+        (* apply [body] to [other_args] *)
+        compute_nf_app new_env e body other_args
+      | _ ->
+        (* cannot reduce, unless [f] reduces to something else. *)
+        let e_f, f' = Term.eval_db env f |> compute_nf in
+        let exp = Explanation.append e e_f in
+        if Term.equal f f'
+        then (
+          (* no more reduction *)
+          let t' = Term.app f' l in
+          exp, t'
+        ) else (
+          (* try it again *)
+          compute_nf_app DB_env.empty exp f' l
+        )
+
+    (* compute nf of [t], append [e] to the explanation *)
+    and compute_nf_add (e : explanation) (t:term) : explanation * term =
+      let e', t' = compute_nf t in
+      Explanation.append e e', t'
+
+    (* compute the builtin, assuming its components are
+       already reduced *)
+    and compute_builtin ~term:(t:term) (bu:builtin)
+      : explanation * term
+      = match bu with
+      | B_not a ->
+        let e_a, a' = compute_nf a in
+        begin match a'.term_cell with
+          | True -> e_a, Term.false_
+          | False -> e_a, Term.true_
+          | _ ->
+            let t' = if a==a' then t else Term.not_ a' in
+            e_a, t'
+        end
+      | B_and l ->
+        let e, l = CCList.fold_map compute_nf_add Explanation.empty l in
+        if List.for_all Term.is_true_ l
+        then e, Term.true_
+        else if List.exists Term.is_false_ l (* FIXME shortcut *)
+        then e, Term.false_
+        else Explanation.empty, Term.and_ l
+      | B_or l ->
+        let e, l = CCList.fold_map compute_nf_add Explanation.empty l in
+        if List.for_all Term.is_false_ l
+        then e, Term.false_
+        else if List.exists Term.is_true_ l (* FIXME shortcut *)
+        then e, Term.true_
+        else Explanation.empty, Term.or_ l
+      | B_imply (a,b) ->
+        let e_a, a = compute_nf a in
+        let e_b, b = compute_nf b in
+        let e_ab = Explanation.append e_a e_b in
+        begin match a.term_cell, b.term_cell with
+          | _, True
+          | False, _  -> e_ab, Term.true_
+          | True, False -> e_ab, Term.false_
+          | _ -> Explanation.empty, Term.imply a b
+        end
+      | B_equiv (a,b) ->
+        let e_a, a = compute_nf a in
+        let e_b, b = compute_nf b in
+        let e_ab = Explanation.append e_a e_b in
+        begin match a.term_cell, b.term_cell with
+          | True, True
+          | False, False -> e_ab, Term.true_
+          | True, False
+          | False, True -> e_ab, Term.false_
+          | _ when Term.equal a b -> e_ab, Term.true_
+          | _ -> Explanation.empty, Term.equiv a b
+        end
+      | B_eq (a,b) ->
+        assert (not (Ty.is_prop a.term_ty));
+        let e_a, a' = compute_nf a in
+        let e_b, b' = compute_nf b in
+        let e_ab = Explanation.append e_a e_b in
+        let default() =
+          if a==a' && b==b' then t else Term.eq a' b'
+        in
+        if Term.equal a' b'
+        then e_ab, Term.true_ (* syntactic *)
+        else begin match Term.as_cstor_app a', Term.as_cstor_app b' with
+          | Some (c1,ty1,l1), Some (c2,_,l2) ->
+            if not (Typed_cst.equal c1 c2)
+            then
+              (* [c1 ... = c2 ...] --> false, as distinct constructors
+                 can never be equal *)
+              e_ab, Term.false_
+            else if Typed_cst.equal c1 c2
+                 && List.length l1 = List.length l2
+                 && List.length l1 = List.length (fst (Ty.unfold ty1))
+            then (
+              (* same constructor, fully applied -> injectivity:
+                 arguments are pairwise equal.
+                 We need to evaluate the arguments further (e.g.
+                 if they start with constructors) *)
+              List.map2 Term.eq l1 l2
+              |> Term.and_
+              |> compute_nf_add e_ab
+            )
+            else e_ab, default()
+          | Some (_, _, l), None when cycle_check_l ~sub:b' l ->
+            (* acyclicity rule *)
+            e_ab, Term.false_
+          | None, Some (_, _, l) when cycle_check_l ~sub:a' l ->
+            e_ab, Term.false_
+          | _ ->
+            begin match Term.as_domain_elt a', Term.as_domain_elt b' with
+              | Some (c1,ty1), Some (c2,ty2) ->
+                (* domain elements: they are all distinct *)
+                assert (Ty.equal ty1 ty2);
+                if Typed_cst.equal c1 c2
+                then e_ab, Term.true_
+                else e_ab, Term.false_
+              | _ -> e_ab, default()
+            end
+        end
+  end
+
+  (** {2 Body of the main loop}
+
   *)
   module Main_step : sig
     (** Result of running one iteration of the main loop, assuming
@@ -2611,11 +2663,6 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
 
     let top_goals k = List.iter k !toplevel_goals_
 
-    type state = {
-      mutable some_expansions: bool;
-      mutable all_goals_true: bool;
-    }
-
     (* clause for [e => l] *)
     let clause_imply (l:lit) (e:explanation): Clause.t =
       let c = l :: clause_guard_of_exp_ e |> Clause.make in
@@ -2629,76 +2676,17 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       let c2 = a :: Lit.neg b :: guard |> Clause.make in
       [ c1; c2 ]
 
-    (* check that [t] is fully evaluated in the current model, and return its
-       value. *)
-    let rec check_rec (st:state) (p:term_proxy): bool option =
-      match Sat.value_proxy p with
-        | None -> None (* well, trivial *)
-        | Some (_, b_decided) ->
-          let now = Timestamp.cur() in
-          (* only check once! *)
-          if p.proxy_last_checked<now then (
-            p.proxy_last_checked <- now;
-            check_rec_with st p ~decided:b_decided
-          );
-          Some b_decided
+    let some_expansions : bool ref = ref false
+    let all_goals_true : bool ref = ref true
 
-    and check_rec_with st p ~decided = match p.proxy_deps with
-      | Proxy_subs l ->
-        List.iter (check_ignore st) l
-      | Proxy_self ->
-        (* compute and, maybe, propagate *)
-        let e_nf, nf =
-          Reduce.compute_nf_full ~on_proxy:(check_ignore st) p.proxy_for
-        in
-        begin match nf.term_cell, decided with
-          | True, true
-          | False, false -> () (* checks *)
-          | True, false
-          | False, true ->
-            (* conflict clause *)
-            let lit = Lit.assert_proxy ~sign:(not decided) p in
-            let c = clause_imply lit e_nf in
-            Log.debugf 4
-              (fun k->k
-                  "(@[<hv1>@{<green>propagate_lit@}@ %a@ nf: %a@ clause: %a@])"
-                  pp_proxy_ p Term.pp nf Clause.pp c);
-            incr stat_num_propagations;
-            st.some_expansions <- true;
-            Sat.push_new c;
-          | _ ->
-            assert (nf.term_deps <> []);
-            (* another term. We must expand its  dependencies so
-               it can expand further *)
-            List.iter (expand_and_check_dep st) nf.term_deps;
-            (* add [e => (p <=> nf)] to the graph *)
-            let p_nf, p_nf_sign = proxify nf in
-            if not (eq_proxy_ p p_nf)
-            && not (Term_graph.mem p p_nf (GE_equiv e_nf)) then (
-              Log.debugf 3
-                (fun k->k
-                    "(@[<1>add_intermediate_lemma@ %a@ with: %a@ exp: (@[%a@])@])"
-                    pp_proxy_ p pp_proxy_ p_nf Explanation.pp e_nf);
-              Term_graph.add p p_nf (GE_equiv e_nf);
-              let cs =
-                clauses_equiv
-                  (Lit.assert_proxy p)
-                  (Lit.assert_proxy ~sign:p_nf_sign p_nf)
-                  e_nf
-              in
-              Sat.push_new_l cs;
-              st.some_expansions <- true;
-              incr stat_num_equiv_lemmas;
-            )
-        end
-
-    and check_ignore st t =
-      ignore (check_rec st t)
+    let reset_state(): unit =
+      some_expansions := false;
+      all_goals_true := true;
+      ()
 
     (* expand the given term dependency so that, later, it will be
-       assigned a value by the SAT solver;
-       in the case of boolean connectives, also check their sub-formulas *)
-    and expand_and_check_dep (st:state) (d:term_dep): unit =
+       assigned a value by the SAT solver *)
+    let expand_dep (d:term_dep): unit =
       begin match d with
         | Dep_cst c ->
           let ty, info = match c.cst_kind with
@@ -2721,7 +2709,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
               let lits = List.map (Lit.cst_choice c) l in
               info.cst_cases_lits <- Lazy_some lits;
               incr stat_num_cst_expanded;
-              st.some_expansions <- true;
+              some_expansions := true;
               Sat.push_new_l clauses
             | Lazy_some _ -> ()
           end
@@ -2740,7 +2728,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
                     pp_uty uty Typed_cst.pp c_head pp_uty uty_tail depth);
               uty.uty_pair <- Lazy_some (c_head, uty_tail);
               incr stat_num_uty_expanded;
-              st.some_expansions <- true;
+              some_expansions := true;
               Sat.push_new_l clauses
             | Lazy_some _ -> ()
           end
@@ -2748,7 +2736,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           (* check whether [b_expr] is expanded *)
           if not p.proxy_expanded then (
             p.proxy_expanded <- true;
-            st.some_expansions <- true;
+            some_expansions := true;
             let neg_ = Term.not_ in
             let t = p.proxy_for in
             let (clauses:term list list) = match p.proxy_for.term_cell with
@@ -2774,7 +2762,6 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
                   [neg_ a; b; neg_ t];
                 ]
               | _ ->
-                assert (p.proxy_deps = Proxy_self);
                 []
             in
             let clauses =
@@ -2787,34 +2774,81 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           );
       end
 
+    (* callback that will check proxies *)
+    let on_proxy p ~decided ~computed : unit =
+      let e_nf, nf = computed in
+      (* check consistency *)
+      begin match nf.term_cell, decided.term_cell with
+        | True, True
+        | False, False -> () (* checks *)
+        | True, False
+        | False, True ->
+          (* force the SAT solver to decide the same as [computed] *)
+          let lit = Lit.assert_proxy ~sign:(Term.is_true_ nf) p in
+          let c = clause_imply lit e_nf in
+          Log.debugf 4
+            (fun k->k
+                "(@[<hv1>@{<green>propagate_lit@}@ %a@ nf: %a@ clause: %a@])"
+                pp_proxy_ p Term.pp nf Clause.pp c);
+          incr stat_num_propagations;
+          some_expansions := true;
+          Sat.push_new c;
+        | _ ->
+          assert (nf.term_deps <> []);
+          (* another term. We must expand its dependencies so
+             it can reduce further *)
+          List.iter expand_dep nf.term_deps;
+          (* add [e => (p <=> nf)] to the graph *)
+          let p_nf, p_nf_sign = proxify nf in
+          if not (eq_proxy_ p p_nf)
+          && not (Term_graph.mem p p_nf (GE_equiv e_nf)) then (
+            Log.debugf 3
+              (fun k->k
+                  "(@[<1>add_intermediate_lemma@ %a@ with: %a@ exp: (@[%a@])@])"
+                  pp_proxy_ p pp_proxy_ p_nf Explanation.pp e_nf);
+            Term_graph.add p p_nf (GE_equiv e_nf);
+            let cs =
+              clauses_equiv
+                (Lit.assert_proxy p)
+                (Lit.assert_proxy ~sign:p_nf_sign p_nf)
+                e_nf
+            in
+            Sat.push_new_l cs;
+            some_expansions := true;
+            incr stat_num_equiv_lemmas;
+          )
+      end
+
+    (* set callback for expanding and checking proxies *)
+    let () =
+      Reduce.callback := on_proxy
+
     (* check that [t], a toplevel goal, is fully expanded, and return [true] iff
        it reduces to [Term.true_] in the current model. *)
-    let check_top (st:state) (p:term_proxy)(sign:bool): unit =
-      let b_opt = check_rec st p in
+    let check_top (p:term_proxy)(sign:bool): unit =
+      let _, nf = Reduce.compute_nf_proxy p in
       (* check that the goal is true *)
-      let is_true = match b_opt with
-        | None -> false
-        | Some b -> b=sign
+      let is_true = match nf.term_cell, sign with
+        | True, true
+        | False, false -> true
+        | _ -> false
       in
       Log.debugf 2
         (fun k->k "(@[<hv1>check_top@ goal: %a@ sign: %B nf: %a@])"
-            pp_proxy_ p sign CCFormat.(opt bool) b_opt);
+            pp_proxy_ p sign Term.pp nf);
       if not is_true then (
-        st.all_goals_true <- false;
+        all_goals_true := false;
       );
       ()
 
     let run (): res =
       let now = Timestamp.cur() in
+      reset_state();
       Log.debugf 2
         (fun k->k "(@[@{<green>main_step_run@}@ time: %a@])" Timestamp.pp now);
-      let st = {
-        some_expansions=false;
-        all_goals_true=true;
-      } in
-      List.iter (fun (p,sign) -> check_top st p sign) !toplevel_goals_;
-      if st.some_expansions then Some_expansions
-      else if st.all_goals_true then All_true
+      List.iter (fun (p,sign) -> check_top p sign) !toplevel_goals_;
+      if !some_expansions then Some_expansions
+      else if !all_goals_true then All_true
       else Some_false
   end
 
@@ -3027,11 +3061,27 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
 
   (** {2 Main} *)
 
+  let print_progress () : unit =
+    Printf.printf
+      "\r[%.2f] depth %d | expanded %d | clauses %d | \
+       lemmas %d | propagated %d%!"
+      (get_time())
+      (Iterative_deepening.current_depth() :> int)
+      !stat_num_cst_expanded
+      !stat_num_clause_push
+      !stat_num_clause_tautology
+      !stat_num_propagations
+
+  let flush_progress (): unit =
+    (* TODO: find the proper code for "kill line" *)
+    Printf.printf "\r%-80d\r%!" 0
+
   type unknown =
     | U_timeout
     | U_max_depth
     | U_incomplete
 
+  (* TODO: convert to AST terms, and move checking outside (to AST) *)
   module Model = struct
     type domain = cst list
 
@@ -3078,11 +3128,6 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
             in
             Some msg
           | _ -> None)
-
-    (* helper to return a boolean, checking consistency with [bi] *)
-    let ret_proxy_ p b = match Sat.value_proxy p with
-      | None -> if b then Term.true_ else Term.false_
-      | Some (_, b') -> assert (b=b'); if b then Term.true_ else Term.false_
 
     (* eval term [t] under model [m] *)
     let eval_ (m:t) t =
@@ -3156,15 +3201,11 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           let env = DB_env.singleton f in
           aux (Term.eval_db env f)
         | Proxy p ->
-          let nf = aux p.proxy_for in
-          begin match nf.term_cell with
-            | True -> ret_proxy_ p true
-            | False -> ret_proxy_ p false
-            | _ -> nf
+          begin match Sat.value_proxy p with
+            | None -> t
+            | Some (_, b) -> if b then Term.true_ else Term.false_
           end
         | Builtin b ->
-          let is_true_ t = Term.equal t Term.true_ in
-          let is_false_ t = Term.equal t Term.false_ in
           begin match b with
             | B_not f ->
               let f = aux f in
@@ -3175,16 +3216,16 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
               end
             | B_and l ->
               let l = List.map aux l in
-              if List.for_all is_true_ l
+              if List.for_all Term.is_true_ l
               then Term.true_
-              else if List.exists is_false_ l
+              else if List.exists Term.is_false_ l
               then Term.false_
               else Term.and_ l
             | B_or l ->
               let l = List.map aux l in
-              if List.for_all is_false_ l
+              if List.for_all Term.is_false_ l
               then Term.false_
-              else if List.exists is_true_ l
+              else if List.exists Term.is_true_ l
               then Term.true_
               else Term.or_ l
             | B_imply (a,b) ->
@@ -3422,7 +3463,6 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
             (* fine, we have a model. Just check that all values are fully
                expanded! *)
             let step_res = Main_step.run () in
-            Format.printf "%a@." pp_cur_trail ();
             begin match step_res with
               | Main_step.All_true ->
                 (* truly a model *)
@@ -3436,6 +3476,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
                 do_on_exit ~on_exit;
                 if check then (
                   Log.debugf 1 (fun k->k "checking model…");
+                  Log.debugf 5 (fun k->k "(@[<1>candidate model: %a@])" Model.pp m);
                   Model.check m
                 );
                 Sat m
