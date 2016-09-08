@@ -6,8 +6,7 @@ let get_time : unit -> float =
   fun () ->
     Unix.gettimeofday() -. start
 
-module M = Minisat
-module M_lit = M.Lit
+module M_lit = Minisat.Lit
 
 type minisat_clause = M_lit.t list
 
@@ -50,15 +49,20 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
   (** {2 Timestamps: number of calls to Minisat} *)
   module Timestamp : sig
     type t = private int
+    val zero : t
     val cur : unit -> t
-    val incr : unit -> unit
+    val incr : unit -> unit (* increment time *)
+    val pp : t CCFormat.printer
   end = struct
     type t = int
-    let n_ = ref 0
+    let n_ = ref 1
+    let zero = 0
     let cur() = !n_
     let incr () =
-      Log.debugf 2 (fun k->k "(@[incr_timestamp@ old: %d@])" !n_);
-      incr n_
+      Log.debugf 4 (fun k->k "(@[incr_timestamp@ old: %d@])" !n_);
+      incr n_;
+      ()
+    let pp = Format.pp_print_int
   end
 
   (* for objects that are expanded on demand only *)
@@ -896,7 +900,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
 
     let is_neg_ t = match t.term_cell with
       | Builtin (B_not _)
-      | False -> true 
+      | False -> true
       | _ -> false
 
     let is_blocked_by (t:t) ~(dep:term_dep): bool =
@@ -996,6 +1000,8 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
 
     val view : t -> atom_view
     val id : t -> int
+    val num_atoms: unit -> int
+    val all_atoms : unit -> t list
     val equal : t -> t -> bool
     val hash : t -> int
     val compare : t -> t -> int
@@ -1027,11 +1033,25 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         let set_id a i = a.atom_id <- (i+1) (* avoid 0 *)
       end)
 
+    (* keep a list of all atoms, to prevent them from being garbage collected
+       (which would make a given term map to several literals, duplicating
+       search effort) *)
+    let all_atoms_ : t list ref = ref []
+
+    let num_atoms() = List.length !all_atoms_
+    let all_atoms() = !all_atoms_
+
     let make v =
       assert (match v with
         | Atom_assert t -> not (Term.is_neg_ t)
         | _ -> true);
-      H.hashcons {atom_id= -1; atom_view=v; }
+      let a0 = {atom_id= -1; atom_view=v; } in
+      let a = H.hashcons a0 in
+      (* [a] is new? then prevent it from being GC'd *)
+      if a==a0 then (
+        CCList.Ref.push all_atoms_ a;
+      );
+      a
 
     let mlit a = M_lit.make a.atom_id
 
@@ -1057,13 +1077,13 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     val sign : t -> bool
     val atom : t -> atom
     val atom_view : t -> atom_view
+    val of_atom : atom -> t
     val map : f:(atom_view -> atom_view) -> t -> t
     val as_atom : t -> Atom.t * bool
     val as_assert : t -> (term * bool) option
     val mlit : t -> M_lit.t
     val fresh_with : ID.t -> t
     val fresh : unit -> t
-    val dummy : t
     val assert_ : ?sign:bool -> term -> t
     val eq : term -> term -> t
     val neq : term -> term -> t
@@ -1098,6 +1118,8 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         let lit_atom = Atom.make v in
         {lit_sign=sign; lit_atom}
 
+    let of_atom (a:atom): t = make ~sign:true a.atom_view
+
     (* map [f] on the view *)
     let map ~f lit =
       let v = f lit.lit_atom.atom_view in
@@ -1114,8 +1136,6 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         let id = ID.makef "#fresh_%d" !n in
         incr n;
         make ~sign:true (Atom_fresh id)
-
-    let dummy = fresh()
 
     let assert_ ?(sign=true) (t:term) : t = make ~sign (Atom_assert t)
 
@@ -1374,7 +1394,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     val expand_uninterpreted_slice :
       ty_uninterpreted_slice ->
       cst * ty_uninterpreted_slice * Clause.t list
-  
+
     val expand_cases : cst -> Ty.t -> cst_info -> term list * Clause.t list
   end = struct
     (* make a fresh constant, with a unique name *)
@@ -1703,6 +1723,8 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       | V_true
       | V_false
 
+    val pp_value : value CCFormat.printer
+
     val value : Lit.t -> value
 
     val value_cst : cst -> cst_info -> (Explanation.t * term) option
@@ -1722,19 +1744,34 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     val push_new_l : Clause.t list -> unit
     (** Push clauses into a queue before it is fed to the SAT solver *)
 
-    val flush : unit -> unit
-    (** Actually try to send clauses to the SAT solver.
-        @raise Minisat.Unsat if it results in a conflict *)
+    type res =
+      | Sat
+      | Unsat
+
+    val last_call : unit -> Timestamp.t * res
+    (** Time and result of last call *)
+
+    val solve : assumptions:Lit.t list -> unit -> res
+    (** Actually try to send clauses to the SAT solver, then call
+        its solve function with the given assumptions.
+        Assumes that {!Timestamp.incr} was called prior to {!solve},
+        that is, that [last_call() |> fst] returns an obsolete timestamp.
+        @param assumptions local assumptions *)
   end = struct
     type value = Minisat.value =
       | V_undef
       | V_true
       | V_false
 
-    (* unique instance of minisat *)
-    let solver_ = M.create()
+    let pp_value out = function
+      | V_undef -> CCFormat.string out "undef"
+      | V_true -> CCFormat.string out "true"
+      | V_false -> CCFormat.string out "false"
 
-    let value l = M.value solver_ (Lit.mlit l)
+    (* unique instance of minisat *)
+    let solver_ = Minisat.create()
+
+    let value l = Minisat.value solver_ (Lit.mlit l)
 
     let value_cst c info = match info.cst_cases_lits with
       | Lazy_none -> assert (info.cst_cases=Lazy_none); None
@@ -1762,6 +1799,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     let value_bi (i:bool_info) = match i.bi_lit with
       | Lazy_none -> None
       | Lazy_some lit ->
+        assert (Lit.sign lit);
         begin match value lit with
           | V_undef -> None
           | V_true -> Some (Explanation.return lit, true)
@@ -1791,13 +1829,37 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
 
     let push_new_l = List.iter push_new
 
-    let flush () =
+    let flush_ () =
       while not (Queue.is_empty lemma_queue) do
         let c = Queue.pop lemma_queue in
-        M.add_clause_l solver_ (Clause.to_minisat c);
+        Minisat.add_clause_l solver_ (Clause.to_minisat c);
       done
 
-    (* TODO: also a solve method? *)
+    type res =
+      | Sat
+      | Unsat
+
+    let last_call_ = ref (Timestamp.zero, Sat)
+
+    let last_call () = !last_call_
+
+    let solve ~assumptions () =
+      incr stat_num_calls_minisat;
+      let now = Timestamp.cur () in
+      assert (fst !last_call_ < now);
+      let r =
+        try
+          flush_ ();
+          let assumptions =
+            List.map Lit.mlit assumptions |> Array.of_list
+          in
+          Minisat.solve ~assumptions solver_;
+          Sat
+        with Minisat.Unsat ->
+          Unsat
+      in
+      last_call_ := now, r;
+      r
   end
 
   (** {2 Reduction to Normal Form} *)
@@ -1894,11 +1956,12 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     let set_nf_ t new_t (e:explanation) : unit =
       if Term.equal t new_t then ()
       else (
-        t.term_nf <- Some (new_t, e, Timestamp.cur());
+        let now = Timestamp.cur() in
+        t.term_nf <- Some (new_t, e, now);
         Log.debugf 5
           (fun k->k
-              "(@[<hv1>set_nf@ @[%a@]@ @[%a@]@ :explanation @[<hv>%a@]@])"
-              Term.pp t Term.pp new_t Explanation.pp e);
+              "(@[<hv1>set_nf@ @[%a@]@ @[%a@]@ explanation: @[<hv>%a@]@ time: %d@])"
+              Term.pp t Term.pp new_t Explanation.pp e (now:>int));
       )
 
     let get_nf t : explanation * term * Timestamp.t =
@@ -2030,14 +2093,13 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         | Some (t', e, time) when time=now->
           (* already computed, just return *)
           e, t'
-        | None 
+        | None
         | Some _ ->
           let e, nf = compute_nf_noncached t in
           set_nf_ t nf e;
           e, nf
 
     and compute_nf_noncached t =
-      assert (t.term_nf = None);
       match t.term_cell with
         | DB _ -> Explanation.empty, t
         | True | False ->
@@ -2231,22 +2293,6 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           | Some (e, true) -> e, Term.true_
           | Some (e, false) -> e, Term.false_
         end
-      | B_eq (a,b) when Ty.is_prop a.term_ty ->
-        let e_a, a' = compute_nf a in
-        let e_b, b' = compute_nf b in
-        let e_ab = Explanation.append e_a e_b in
-        begin match a'.term_cell, b'.term_cell with
-          | True, True
-          | False, False -> e_ab, Term.true_
-          | True, False
-          | False, True -> e_ab, Term.false_
-          | _ when Term.equal a' b' -> e_ab, Term.true_
-          | _ ->
-            let t' =
-              if a==a' && b==b' then t else Term.eq a' b'
-            in
-            e_ab, t'
-        end
       | B_eq (a,b) ->
         assert (not (Ty.is_prop a.term_ty));
         let e_a, a' = compute_nf a in
@@ -2295,6 +2341,23 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         end
   end
 
+  let pp_dep_full out = function
+    | Dep_cst c ->
+      let _, nf = Reduce.compute_nf (Term.const c) in
+      Format.fprintf out
+        "(@[%a@ nf:%a@ :expanded %B@])"
+        Typed_cst.pp c Term.pp nf
+        (match Typed_cst.as_undefined c with
+          | None -> assert false
+          | Some (_,_,i,_) -> i.cst_cases <> Lazy_none)
+    | Dep_uty uty ->
+      Format.fprintf out
+        "(@[%a@ :expanded %B@])"
+        pp_uty uty (uty.uty_pair<>Lazy_none)
+    | Dep_bool_expr u ->
+      let _, nf = Reduce.compute_nf u in
+      Format.fprintf out "(@[%a@ nf:%a@@])" Term.pp u Term.pp nf
+
   (* from explanation [e1, e2, ..., en] build the guard
          [e1 & e2 & ... & en => …], that is, the clause
          [not e1 | not e2 | ... | not en] *)
@@ -2309,7 +2372,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       a link [t -> t'] means either:
 
       - [t <=> t'] under some assumptions,
-      - [t <=> t' OP u] where OP is a boolean connective 
+      - [t <=> t' OP u] where OP is a boolean connective
   *)
   module Term_graph : sig
     val add : term -> term -> bool_info_graph_edge_kind -> unit
@@ -2376,86 +2439,159 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       Format.fprintf out "@[%a@]@." pp_ terms
   end
 
-  (** {2 A literal communicated to the SAT solver}
+  let print_progress () : unit =
+    Printf.printf
+      "\r[%.2f] depth %d | expanded %d | clauses %d | \
+       lemmas %d | propagated %d%!"
+      (get_time())
+      (Iterative_deepening.current_depth() :> int)
+      !stat_num_cst_expanded
+      !stat_num_clause_push
+      !stat_num_clause_tautology
+      !stat_num_propagations
 
-      A watched literal is a particular boolean term
-      (literal of the shape [Atom_assert t], conceptually) whose truth value
-      is of interest to the SAT solver. The SAT solver might decide
-      its value, or smbc might compute the literal's value through evaluation
-      and propagate it into the SAT solver. *)
+  let flush_progress (): unit =
+    (* TODO: find the proper code for "kill line" *)
+    Printf.printf "\r%-80d\r%!" 0
 
-  (* FIXME: should become useless, Top_goals is enough
-  module Watched_lit : sig
-    type t = private term
+  (** {2 Body of the main loop}
 
-    val to_lit : t -> Lit.t
-    val pp : t CCFormat.printer
-    val watch : t -> unit
-    val watch_term : term -> unit
-    val update_watches_of : t -> unit
-    val update_watches_of_term : term -> unit
-    val is_watched : t -> bool
-    val size : unit -> int
-    val to_seq : t Sequence.t
-    val to_seq_term : term Sequence.t
+      for each top goal, apply the following recursive function:
+
+      - take a boolean term [t] of interest (initially, the goal)
+      - evaluate it in the current model
+        + if it reduces to true/false under E, propagate to minisat
+         (and add to the graph?)
+        + if it reduces to, say, [a & b],
+          * add to the graph
+          * add to Sat the clauses [equiv t (a&b)];
+          * if [a&b] not expanded, then expand it;
+          * recurse on [a], [b] (to check they are consistent/totally evaluated)
+        + otherwise it should reduce to a blocked term,
+         expand what blocks it (and add to {!Sat}). Will return Some_expanded.
+
+      - if all terms reduced to True and were not blocked, return All_check;
+        otherwise return Some_expansions or Some_false
+  *)
+  module Main_step : sig
+    (** Result of running one iteration of the main loop, assuming
+        last call to the solver returned SAT. *)
+    type res =
+      | All_true
+      | Some_false
+      | Some_expansions
+
+    val pp_res : res CCFormat.printer
+
+    val add_top_goal : term -> unit
+    (** add [t] to the set of terms that must be evaluated *)
+
+    val top_goals : term Sequence.t
+    (** All toplevel goals so far *)
+
+    val run : unit -> res
+    (** Run the main loop, checking all toplevel goals (recursively) in
+        the current model. *)
   end = struct
-    type t = term
-    (* actually, the watched lit is [Lit.atom t], but we link
-       [t] directly because this way we have direct access to its
-       normal form.
+    type res =
+      | All_true
+      | Some_false
+      | Some_expansions
 
-       Invariant:
-       [t.term_bool_info = Some bi]
-       [bi.bi_watched_status = WS_watched something]
-    *)
+    let pp_res out = function
+      | All_true -> CCFormat.string out "all_true"
+      | Some_false  -> CCFormat.string out "some_false"
+      | Some_expansions -> CCFormat.string out "some_expansions"
 
-    let to_lit = Lit.atom ~sign:true
-    let pp = Term.pp
+    (* list of terms to fully evaluate *)
+    let toplevel_goals_ : term list ref = ref []
 
-    (* clause for [e => l] *)
-    let propagate_lit_ (l:t) (e:explanation): unit =
-      let bi = match (Term.abs_fst l).term_bool_info with
-        | None -> assert false | Some i -> i
-      in
-      (* only propagate for non-forwarded lits *)
-      if not bi.bi_forwarded then (
-        let c = to_lit l :: clause_guard_of_exp_ e |> Clause.make in
-        Log.debugf 4
-          (fun k->k
-              "(@[<hv1>@{<green>propagate_lit@}@ %a@ nf: %a@ \
-               clause: %a@ forwarded: %B@])"
-              pp l pp (snd (Reduce.compute_nf l)) Clause.pp c bi.bi_forwarded);
-        incr stat_num_propagations;
-        Clause.push_new c;
-      );
+    (* add a toplevel goal [g] means:
+       - remembering it so we can check its value later
+       - asserting the unit clause [g] to the SAT solver *)
+    let add_top_goal g =
+      Log.debugf 2 (fun k->k "(@[<1>add_toplevel_goal@ %a@])" Term.pp g);
+      CCList.Ref.push toplevel_goals_ g;
+      Sat.push_new (Clause.make [Lit.assert_ g]);
+      ()
+
+    let top_goals k = List.iter k !toplevel_goals_
+
+    type state = {
+      mutable some_expansions: bool;
+      mutable all_goals_true: bool;
+    }
+
+    (* Assert a clause for [e => l] *)
+    let propagate_lit_ (t:term) (e:explanation): unit =
+      (* TODO: check if already in the graph? *)
+      let c = Lit.assert_ t :: clause_guard_of_exp_ e |> Clause.make in
+      Log.debugf 4
+        (fun k->k
+            "(@[<hv1>@{<green>propagate_lit@}@ %a@ nf: %a@ clause: %a@])"
+            Term.pp t Term.pp (snd (Reduce.compute_nf t)) Clause.pp c);
+      incr stat_num_propagations;
+      Sat.push_new c;
       ()
 
     (* clauses that express [e => (a <=> b)] *)
     let clauses_equiv (a:term) (b:term) (e:explanation): Clause.t list =
       assert (not (Term.equal a b));
-      let a = Lit.atom a in
-      let b = Lit.atom b in
+      let a = Lit.assert_ a in
+      let b = Lit.assert_ b in
       let guard = clause_guard_of_exp_ e in
       let c1 = b :: Lit.neg a :: guard |> Clause.make in
       let c2 = a :: Lit.neg b :: guard |> Clause.make in
       [ c1; c2 ]
 
-    (* entry point to the list of watched terms *)
-    let first_watched_ : term option ref = ref None
-
-    let is_watched (t:t) : bool = match t.term_bool_info with
-      | Some {bi_watched_status=WS_watched _; _} -> true
-      | _ -> false
-
-    (* build watched lit, enforcing invariants *)
-    let of_term (t:term): t =
+    (* check that [t] is fully evaluated in the current model, and return its
+       normal form. *)
+    let rec check_rec (st:state) (t:term): term =
       assert (Ty.is_prop t.term_ty);
-      let t, _ = Term.abs t in
-      t
+      (* start by computing the normal form *)
+      let e, nf = Reduce.compute_nf t in
+      Log.debugf 3
+        (fun k->k
+            "(@[<hv1>@{<green>check_rec@}@ @[<1>term:@ %a@]@ deps: (@[<hv>%a@])@])"
+            Term.pp t (Utils.pp_list pp_dep_full) nf.term_deps);
+      begin match nf.term_cell with
+        | True -> propagate_lit_ t e;
+        | False -> propagate_lit_ (Term.not_ t) e;
+        | _ ->
+          assert (nf.term_deps <> []); (* bool term: must reduce to true/false *)
+          (* expand dependencies (if needed) and check their
+             sub-terms, in the case of connectives *)
+          List.iter (expand_and_check_dep st) nf.term_deps;
+          (* abs(nf), useful because we care about the shape, not the sign *)
+          let nf_abs = Term.abs_fst nf in
+          begin match nf_abs.term_cell with
+            | Builtin (B_not _) -> assert false (* abs *)
+            | _ when Term.equal t nf -> () (* trivial equivalence *)
+            | Builtin (B_and _ | B_or _ | B_equiv _ | B_imply _) ->
+              (* add [e => (t <=> nf)] to the SAT solver, so it can know
+                 about the boolean structure of the problem *)
+              let t_abs = Term.abs_fst t in
+              if not (Term_graph.mem t_abs nf_abs (BIG_equiv e))
+              then (
+                Log.debugf 3
+                  (fun k->k
+                      "(@[<1>add_intermediate_lemma@ %a@ with: %a@ exp: (@[%a@])@])"
+                      Term.pp t Term.pp nf Explanation.pp e);
+                Term_graph.add t_abs nf_abs (BIG_equiv e);
+                (* no abs() here, the signs will work properly *)
+                let cs = clauses_equiv t nf e in
+                Sat.push_new_l cs;
+                incr stat_num_equiv_lemmas;
+              )
+            | _ -> ()
+          end
+      end;
+      nf
 
     (* expand the given term dependency so that, later, it will be
-       assigned a value by the SAT solver *)
-    let rec expand_dep (d:term_dep): unit =
+       assigned a value by the SAT solver;
+       in the case of boolean connectives, also check their sub-formulas *)
+    and expand_and_check_dep (st:state) (d:term_dep): unit =
       begin match d with
         | Dep_cst c ->
           let ty, info = match c.cst_kind with
@@ -2475,8 +2611,11 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
                 (fun k->k "(@[<1>expand_cst@ @[%a@]@ :into (@[%a@])@ :depth %d@])"
                     Typed_cst.pp c (Utils.pp_list Term.pp) l depth);
               info.cst_cases <- Lazy_some l;
+              let lits = List.map (Lit.cst_choice c) l in
+              info.cst_cases_lits <- Lazy_some lits;
               incr stat_num_cst_expanded;
-              Clause.push_new_l clauses
+              st.some_expansions <- true;
+              Sat.push_new_l clauses
             | Lazy_some _ -> ()
           end
         | Dep_uty uty ->
@@ -2494,7 +2633,8 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
                     pp_uty uty Typed_cst.pp c_head pp_uty uty_tail depth);
               uty.uty_pair <- Lazy_some (c_head, uty_tail);
               incr stat_num_uty_expanded;
-              Clause.push_new_l clauses
+              st.some_expansions <- true;
+              Sat.push_new_l clauses
             | Lazy_some _ -> ()
           end
         | Dep_bool_expr b_expr ->
@@ -2506,6 +2646,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           (* check whether [b_expr] is expanded *)
           if not info.bi_expanded then (
             info.bi_expanded <- true;
+            st.some_expansions <- true;
             let neg_ = Term.not_ in
             let clauses, subs = match bu with
               | B_and l ->
@@ -2543,386 +2684,45 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
             Log.debugf 4
               (fun k->k "(@[<hv1>expand_CNF@ %a@ @[<hv2>:clauses@ %a@]@])"
                   Term.pp b_expr (Utils.pp_list Clause.pp) clauses);
-            Clause.push_new_l clauses;
+            Sat.push_new_l clauses;
             List.iter
               (fun sub ->
-                 Term_graph.add b_expr sub BIG_conditional)
+                 (* the subterms themselves must be expanded/checked, too *)
+                 Term_graph.add b_expr sub BIG_conditional;
+                 ignore (check_rec st sub))
               subs;
-            (* the subterms themselves must be watched/expanded, too *)
-            List.iter watch_term subs;
           );
       end
 
-    and watch_dep (t:t) (d:term_dep) : unit =
-      expand_dep d;
-      begin match d with
-        | Dep_cst c ->
-          let _ty, info = match c.cst_kind with
-            | Cst_undef (ty,i,_) -> ty,i
-            | Cst_defined _ | Cst_cstor _ | Cst_uninterpreted_dom_elt _ ->
-              assert false
-          in
-          Poly_set.add info.cst_watched t;
-        | Dep_uty uty ->
-          Poly_set.add uty.uty_watched t;
-        | Dep_bool_expr b_expr ->
-          let info = match b_expr.term_bool_info with
-            | Some i -> i
-            | None -> assert false
-          in
-          (* add [t] to the watchlist *)
-          if not (Term.equal b_expr t)
-          then Poly_set.add (Lazy.force info.bi_watching) t;
-      end
-
-    (* [t] being a watched literal, its evaluation can be blocked by some
-       dependencies (constants, boolean connectives, etc.).
-       We need to expand those blocking dependencies so that the SAT solver
-       can eventually pick a value for them and so  that evaluation can
-       proceed forward.
-
-       We also need to register [t] to the watchlist of those dependencies
-       so that [t] is recomputed when those dependencies are assigned. *)
-    and update_watches_of (t:t): unit =
-      assert (Ty.is_prop t.term_ty);
-      (* first, ensure that [t] is properly watched even upon backtracking *)
-      let t' = Reduce.simplify t in
-      List.iter (watch_dep t) t'.term_deps;
-      (* then, update the current normal form, which might have other deps *)
-      let e, new_t = Reduce.compute_nf t in
-      (* if [new_t = true/false], propagate literal *)
-      begin match new_t.term_cell with
-        | True -> propagate_lit_ t e (*TODO: only if not currently delegating to CNF *)
-        | False -> propagate_lit_ (Term.not_ t) e
-        | _ ->
-          (* partially evaluated literal: add [t] (not its
-             temporary normal form) to the watch list of every
-             blocking constant *)
-          Log.debugf 4
-            (fun k->k
-                "(@[<1>update_watches@ %a@ @[<1>:normal_form@ %a@]@ \
-                 :deps (@[%a@])@ :exp @[<hv>%a@]@])"
-                Term.pp t Term.pp new_t
-                (Utils.pp_list pp_dep) new_t.term_deps
-                Explanation.pp e);
-          List.iter (watch_dep t) new_t.term_deps;
-          (* also propagate at the SAT level that [t <=> new_t], if
-             [simplify t] is not a boolean connective but [new_t] is. *)
-          begin match
-              (Term.abs_fst t').term_cell,
-              (Term.abs_fst new_t).term_cell
-            with
-              | Builtin (B_and _ | B_or _ | B_equiv _ | B_imply _), _ -> ()
-              | _, Builtin (B_and _ | B_or _ | B_equiv _ | B_imply _) ->
-                if not (Term_graph.mem t new_t (BIG_equiv e))
-                then (
-                  Log.debugf 3
-                    (fun k->k
-                        "(@[<1>add_intermediate_lemma@ %a@ with: %a@ exp: (@[%a@])@])"
-                        Term.pp t Term.pp new_t Explanation.pp e);
-                  Term_graph.add t new_t (BIG_equiv e);
-                  let cs = clauses_equiv t new_t e in
-                  Clause.push_new_l cs;
-                  incr stat_num_equiv_lemmas;
-                  (* also, notice that now the term is forwarded, no need to
-                     propagate its values *)
-                  let bi = match t.term_bool_info with
-                    | None -> assert false
-                    | Some i -> i
-                  in
-                  Backtrack.push_bi_forwarded bi;
-                  bi.bi_forwarded <- true;
-                );
-              | _ -> ()
-          end;
-      end;
-      ()
-
-    and watch (t:t) = match t.term_cell, t.term_bool_info with
-      | True, _
-      | False, _ -> ()
-      | _, None -> assert false
-      | _, Some ({bi_watched_status=WS_not_watched; _} as bi) ->
-        Log.debugf 3
-          (fun k->k "(@[<1>@{<green>watch_lit@}@ %a@])" pp t);
-        (* add to the linked list *)
-        bi.bi_watched_status <- WS_watched !first_watched_;
-        first_watched_ := Some t;
-        (* also ensure its dependencies are going to be refined *)
-        update_watches_of t;
-      | _, Some _ -> () (* already watched *)
-
-    and watch_term t = watch (of_term t)
-
-    let update_watches_of_term t = update_watches_of (of_term t)
-
-    let to_seq yield =
-      let rec aux : t option -> unit = function
-        | None -> ()
-        | Some t ->
-          yield t;
-          match t.term_bool_info with
-            | Some {bi_watched_status=WS_watched next; _} -> aux next
-            | _ -> assert false
-      in
-      aux !first_watched_
-
-    let to_seq_term = to_seq
-
-    let size () = Sequence.length to_seq
-  end
-  *)
-
-  let print_progress () : unit =
-    Printf.printf
-      "\r[%.2f] depth %d | expanded %d | clauses %d | \
-       lemmas %d | propagated %d%!"
-      (get_time())
-      (Iterative_deepening.current_depth() :> int)
-      !stat_num_cst_expanded
-      !stat_num_clause_push
-      !stat_num_clause_tautology
-      !stat_num_propagations
-
-  (* TODO: find the proper code for "kill line" *)
-  let flush_progress (): unit =
-    Printf.printf "\r%-80d\r%!" 0
-
-  (** {2 Toplevel Goals}
-
-      List of toplevel goals to satisfy. The solver will stop when all of
-      them evaluate to true, or when Unsat is reached, or when time runs out.
-  *)
-  module Top_goals: sig
-    val push : term -> unit
-    val to_seq : term Sequence.t
-    val check: unit -> unit
-  end = struct
-    (* list of terms to fully evaluate *)
-    let toplevel_goals_ : term list ref = ref []
-
-    (* add [t] to the set of terms that must be evaluated *)
-    let push = CCList.Ref.push toplevel_goals_
-
-    let to_seq k = List.iter k !toplevel_goals_
-
-    (* check that this term fully evaluates to [true] in the current model *)
-    let is_true_ (t:term): bool =
-      let _, t' = Reduce.compute_nf t in
-      match t'.term_cell with
+    (* check that [t], a toplevel goal, is fully expanded, and return [true] iff
+       it reduces to [Term.true_] in the current model. *)
+    let check_top (st:state) (t:term): unit =
+      let nf = check_rec st t in
+      (* now check that the goal is true *)
+      let is_true = match nf.term_cell with
         | True -> true
         | _ -> false
+      in
+      Log.debugf 2
+        (fun k->k "(@[<hv1>check_top@ goal: %a@ nf: %a@])" Term.pp t Term.pp nf);
+      if not is_true then (
+        st.all_goals_true <- false;
+      );
+      ()
 
-(* FIXME: this is now the main loop.
-   
-   It should return something like
-   All_true | Some_expanded?
-
-   TODO:
-   for each top goal, apply the following recursive function:
-
-   - take a boolean term [t] of interest
-   - evaluate it in the current model
-     + if it reduces to true/false under E, propagate to minisat
-       (and add to the graph?)
-     + if it reduces to (not)(a & b),
-       1/ add to the graph
-       2/ add to Sat the clauses [equiv t (a&b)];
-       3/ if [a&b] not expanded, then expand it;
-       4/ recurse on [a], [b] (to check they are consistent/totally evaluated)
-     + otherwise it should reduce to a blocked term,
-       expand what blocks it (and add to {!Sat}). Will return Some_expanded.
-
-     if all terms reduced to True, return All_true;
-     otherwise return Some_expanded
-   *)
-    let check () =
-      if not (List.for_all is_true_ !toplevel_goals_)
-      then (
-        if Config.progress then flush_progress();
-        Log.debugf 1
-          (fun k->
-             let pp_dep out = function
-               | Dep_cst c ->
-                 let _, nf = Reduce.get_nf (Term.const c) in
-                 Format.fprintf out
-                   "(@[%a@ nf:%a@ :expanded %B@])"
-                   Typed_cst.pp c Term.pp nf
-                   (match Typed_cst.as_undefined c with
-                     | None -> assert false
-                     | Some (_,_,i,_) -> i.cst_cases <> Lazy_none)
-               | Dep_uty uty ->
-                 Format.fprintf out
-                   "(@[%a@ :expanded %B@])"
-                   pp_uty uty (uty.uty_pair<>Lazy_none)
-               | Dep_bool_expr u ->
-                 let _, nf = Reduce.get_nf u in
-                 Format.fprintf out "(@[%a@ nf:%a@@])" Term.pp u Term.pp nf
-             in
-             let pp_lit out l =
-               let e, nf = Reduce.get_nf l in
-               Format.fprintf out
-                 "(@[<hv1>%a@ nf: %a@ exp: %a@ deps: (@[<hv>%a@])@])"
-                 Term.pp l Term .pp nf Explanation.pp e
-                 (Utils.pp_list pp_dep) nf.term_deps
-             in
-             k "(@[<hv1>status_watched_lit@ (@[<v>%a@])@])"
-               (Utils.pp_list pp_lit) !toplevel_goals_);
-        assert false;
-      )
+    let run (): res =
+      let now = Timestamp.cur() in
+      Log.debugf 2
+        (fun k->k "(@[@{<green>main_step_run@}@ time: %a@])" Timestamp.pp now);
+      let st = {
+        some_expansions=false;
+        all_goals_true=true;
+      } in
+      List.iter (check_top st) !toplevel_goals_;
+      if st.some_expansions then Some_expansions
+      else if st.all_goals_true then All_true
+      else Some_false
   end
-
-  (* the "theory" part: propagations *)
-  module M_th :
-    Msat.Theory_intf.S
-    with type formula = M_expr.t
-     and type proof = M_expr.proof
-  = struct
-    type formula = M_expr.t
-    type proof = M_expr.proof
-
-    type level = Backtrack.level
-
-    let dummy = Backtrack.dummy_level
-
-    (* increment and return level *)
-    let current_level () =
-      Backtrack.push_level ();
-      Backtrack.cur_level ()
-
-    let backtrack = Backtrack.backtrack
-
-    exception Conflict of Clause.t
-
-    (* push clauses from {!lemma_queue} into the slice *)
-    let flush_new_clauses_into_slice slice =
-      if Queue.is_empty Clause.conflicts then
-        while not (Queue.is_empty Clause.lemma_queue) do
-          let c = Queue.pop Clause.lemma_queue in
-          Log.debugf 5 (fun k->k "(@[<2>push_lemma@ %a@])" Clause.pp c);
-          let lits = Clause.lits c in
-          slice.TI.push lits ();
-        done
-      else (
-        let c = Queue.pop Clause.conflicts in
-        Queue.clear Clause.conflicts;
-        raise (Conflict c)
-      )
-
-    (* assert [c := new_t], or conflict *)
-    let assert_choice (c:cst)(new_t:term) : unit =
-      let _, _, info, _ = Typed_cst.as_undefined_exn c in
-      begin match info.cst_cur_case with
-        | None ->
-          let e = Explanation.return (Lit.cst_choice c new_t) in
-          Backtrack.push_set_cst_case_ info;
-          info.cst_cur_case <- Some (e, new_t);
-          Poly_set.iter Watched_lit.update_watches_of_term info.cst_watched
-        | Some (_,new_t') ->
-          Log.debugf 1
-            (fun k->k "(@[<hv1>assert_choice %a@ :to %a@ :cur %a@])"
-                Typed_cst.pp c Term.pp new_t Term.pp new_t');
-          assert (Term.equal new_t new_t');
-      end
-
-    let assert_uty
-        (uty:ty_uninterpreted_slice)
-        (status:ty_uninterpreted_status)
-      : unit =
-      Log.debugf 2
-        (fun k->k "(@[<1>@{<green>assume_uty@}@ @[%a@] %a@])"
-        pp_uty uty pp_uty_status status);
-      begin match uty.uty_status with
-        | None ->
-          let e = Explanation.return (Lit.uty_choice_status uty status) in
-          Backtrack.push_uty_status uty;
-          uty.uty_status <- Some (e, status);
-          Poly_set.iter Watched_lit.update_watches_of_term uty.uty_watched
-        | Some (_, ((Uty_empty | Uty_nonempty) as s)) ->
-          Log.debugf 1
-            (fun k->k "(@[<hv1>assert_uty %a@ :to %a@ :cur %a@])"
-                pp_uty uty pp_uty_status status pp_uty_status s);
-          assert (s = status)
-      end
-
-    (* assert another atom *)
-    let assert_b_expr ~b_expr ~sign (t:term): unit =
-      Log.debugf 2
-        (fun k->k "(@[<1>@{<green>assume_b_expr@}@ @[%a@]@ sign: %B@])"
-        Term.pp t sign);
-      begin match b_expr.bi_decided with
-        | None ->
-          Backtrack.push_bi_status b_expr;
-          let e = Explanation.return (Lit.atom ~sign t) in
-          b_expr.bi_decided <- Some (e, sign);
-          Poly_set.iter
-            Watched_lit.update_watches_of_term
-            (Lazy.force b_expr.bi_watching);
-        | Some (_, sign') ->
-          (* already assigned, check consistency *)
-          assert (sign=sign');
-      end
-
-    (* handle a literal assumed by the SAT solver:
-       - set the value of the corresponding boolean expr/constant/type slice,
-         if any
-       - re-compute the value of every watched literal that was blocked
-         by the literal *)
-    let assume_lit (lit:Lit.t) : unit =
-      Log.debugf 2
-        (fun k->k "(@[<1>@{<green>assume_lit@}@ @[%a@]@])" Lit.pp lit);
-      begin match Lit.view lit, Lit.sign lit with
-        | Atom_fresh _, _ -> ()
-        | Atom_assert t, sign ->
-          begin match Term.as_bi t with
-            | Some bi ->
-              assert_b_expr ~b_expr:bi ~sign t
-            | None -> ()
-          end
-        | Atom_assign(c, t), true -> assert_choice c t
-        | Atom_assign _, false -> ()
-        | Atom_uty_empty uty, true -> assert_uty uty Uty_empty
-        | Atom_uty_empty uty, false -> assert_uty uty Uty_nonempty
-      end
-
-    (* propagation from the bool solver *)
-    let assume slice =
-      let start = slice.TI.start in
-      assert (slice.TI.length > 0);
-      (* do the propagations in a local frame *)
-      if Config.progress then print_progress();
-      try
-        (* first, empty the tautology queue *)
-        flush_new_clauses_into_slice slice;
-        for i = start to start + slice.TI.length - 1 do
-          let lit = slice.TI.get i in
-          assume_lit lit;
-        done;
-        flush_new_clauses_into_slice slice;
-        TI.Sat
-      with Conflict conflict_clause ->
-        Log.debugf 3
-          (fun k->k "(@[<1>raise_inconsistent@ %a@])"
-              Clause.pp conflict_clause);
-        TI.Unsat (Clause.lits conflict_clause, ())
-
-    (* TODO: move checking code from Main_loop here? *)
-    let if_sat _slice = ()
-  end
-
-  (* FIXME: no clauses, actually, only terms at toplevel! *)
-  (* push one clause into [M], in the current level (not a lemma but
-     an axiom) *)
-  let push_top_clause (c:Clause.t): unit =
-    Log.debugf 2 (fun k->k "(@[<1>push_clause@ @[%a@]@])" Clause.pp c);
-    (* reduce to normal form the literals, ensure they
-         are added to the proper constant watchlist(s) *)
-    Clause.to_seq c
-      |> Sequence.filter_map Lit.as_atom
-      |> Sequence.map fst
-      |> Sequence.iter Watched_lit.watch_term;
-    incr stat_num_clause_push;
-    M.assume [Clause.lits c]
 
   (** {2 Conversion} *)
 
@@ -3046,8 +2846,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       match st with
         | Ast.Assert t ->
           let t = conv_term [] t in
-          Top_goals.push t;
-          push_top_clause (Clause.make [Lit.atom t])
+          Main_step.add_top_goal t;
         | Ast.Goal (vars, t) ->
           (* skolemize *)
           let env, consts =
@@ -3062,8 +2861,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           (* model should contain values of [consts] *)
           List.iter add_cst_support_ consts;
           let t = conv_term env t in
-          Top_goals.push t;
-          push_top_clause (Clause.make [Lit.atom t])
+          Main_step.add_top_goal t;
         | Ast.TyDecl id ->
           let rec ty = lazy (
             let ty0 = {
@@ -3071,8 +2869,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
               uty_parent=None;
               uty_offset=0; (* root *)
               uty_pair=Lazy_none;
-              uty_status=None;
-              uty_watched=Poly_set.create 16 ~eq:term_equal_;
+              uty_lit_empty=Lazy_none;
             } in
             Ty.atomic id (Uninterpreted ty0)
           ) in
@@ -3189,7 +2986,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           | _ -> None)
 
     (* helper to return a boolean, checking consistency with [bi] *)
-    let ret_bi_ bi b = match bi.bi_decided with
+    let ret_bi_ bi b = match Sat.value_bi bi with
       | None -> if b then Term.true_ else Term.false_
       | Some (_, b') -> assert (b=b'); if b then Term.true_ else Term.false_
 
@@ -3355,7 +3152,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     (* check model *)
     let check (m:t) =
       let bad =
-        Top_goals.to_seq
+        Main_step.top_goals
         |> Sequence.find
           (fun t ->
              let t' = eval_ m t in
@@ -3418,7 +3215,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     aux t
 
   let rec find_domain_ (uty:ty_uninterpreted_slice): cst list =
-    match uty.uty_status, uty.uty_pair with
+    match Sat.value_uty uty, uty.uty_pair with
       | None, _
       | _, Lazy_none -> assert false
       | Some (_, Uty_empty), _ -> []
@@ -3450,17 +3247,9 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     in
     Model.make ~consts ~domains:doms
 
-  let clause_of_mclause (c:M.St.clause): Clause.t =
-    M.Proof.to_list c |> List.map (fun a -> a.M.St.lit) |> Clause.make
-
-  (* convert unsat-core *)
-  let clauses_of_unsat_core (core:M.St.clause list): Clause.t Sequence.t =
-    Sequence.of_list core
-    |> Sequence.map clause_of_mclause
-
   (* print all terms reachable from watched literals *)
   let pp_term_graph out () =
-    Term_graph.pp_dot out (Watched_lit.to_seq_term :> term Sequence.t)
+    Term_graph.pp_dot out Main_step.top_goals
 
   let pp_stats out () : unit =
     Format.fprintf out
@@ -3471,7 +3260,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
        :num_clause_tautology %d@ \
        :num_equiv_lemmas %d@ \
        :num_propagations %d@ \
-       :num_watched_lits %d@ \
+       :num_atoms %d@ \
        :num_calls_minisat %d \
        @])"
       !stat_num_cst_expanded
@@ -3480,37 +3269,14 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       !stat_num_clause_tautology
       !stat_num_equiv_lemmas
       !stat_num_propagations
+      (Atom.num_atoms ())
       !stat_num_calls_minisat
-      (Watched_lit.size())
 
   let do_on_exit ~on_exit =
     List.iter (fun f->f()) on_exit;
     ()
 
   let add_statement_l = Conv.add_statement_l
-
-  let pp_proof out p =
-    let pp_step_res out p =
-      let {M.Proof.conclusion; _ } = M.Proof.expand p in
-      let conclusion = clause_of_mclause conclusion in
-      Clause.pp out conclusion
-    in
-    let pp_step out = function
-      | M.Proof.Lemma () -> Format.fprintf out "(@[<1>lemma@ ()@])"
-      | M.Proof.Resolution (p1, p2, _) ->
-        Format.fprintf out "(@[<1>resolution@ %a@ %a@])"
-          pp_step_res p1 pp_step_res p2
-      | _ -> CCFormat.string out "<other>"
-    in
-    Format.fprintf out "(@[<v>";
-    M.Proof.fold
-      (fun () {M.Proof.conclusion; step } ->
-         let conclusion = clause_of_mclause conclusion in
-         Format.fprintf out "(@[<hv1>step@ %a@ @[<1>from:@ %a@]@])@,"
-           Clause.pp conclusion pp_step step)
-      () p;
-    Format.fprintf out "@])";
-    ()
 
   type proof_status =
     | PS_depth_limited of Lit.t
@@ -3523,58 +3289,16 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     | PS_complete -> CCFormat.string out "complete"
     | PS_incomplete -> CCFormat.string out "incomplete"
 
-  (* check dependencies of the unsat-core:
-     - if it depends on depth-limit, not UNSAT
-     - if some constant has been refined incompletely, UNKNOWN
-     - otherwise, truly UNSAT
-  *)
-  let proof_status depth_lit core: proof_status =
-    let s = ref PS_complete in
-    try
-      clauses_of_unsat_core core
-      |> Sequence.flat_map Clause.to_seq
-      |> Sequence.iter
-        (fun lit ->
-           if Lit.equal depth_lit (Lit.abs lit)
-           then (
-             s := PS_depth_limited depth_lit;
-             raise Exit
-           ) else match Lit.view lit with
-             | Atom_assign (c,_) ->
-               begin match c.cst_kind with
-                 | Cst_undef (_, i, _) when not i.cst_complete ->
-                   s := PS_incomplete
-                 | _ -> ()
-               end
-             | _ -> ()
-        );
-      !s
-    with Exit ->
-      !s
-
-  (* trail: list of [(literal, level)] *)
-  let get_trail ~domains (): (Lit.t * int) list =
-    (* deref recursively some parts of the literal *)
-    let expand_lit l =
-      Lit.map l
-        ~f:(fun view -> match view with
-          | Atom_assign (c,t) -> Atom_assign (c, deref_deep domains t)
-          | Atom_assert _
-          | Atom_fresh _
-          | Atom_uty_empty _ -> view)
+  (* print the current Minisat model *)
+  let pp_cur_trail out () =
+    let pp_atom out a =
+      let lit = Lit.of_atom a in
+      let v = Sat.value lit in
+      Format.fprintf out "(@[<1>%a@ value: %a@])"
+        Lit.pp lit Sat.pp_value v
     in
-    M.St.iter_elt
-    |> Sequence.map
-      (function
-        | M.St.E_lit _ -> assert false
-        | M.St.E_var v ->
-          let lev = v.M.St.v_level in
-          let a = v.M.St.pa in
-          let lit = a.M.St.lit |> expand_lit in
-          let lit = if a.M.St.is_true then lit else Lit.neg lit in
-          lit, lev)
-    |> Sequence.to_list
-    |> List.sort (CCFun.compose_binop snd CCOrd.int_) (* sort by level *)
+    Format.fprintf out "(@[<hv1>trail@ %a@])"
+      (Utils.pp_list pp_atom) (Atom.all_atoms ())
 
   let solve ?(on_exit=[]) ?(pp_trail=false) ?(check=true) () =
     let module ID = Iterative_deepening in
@@ -3584,46 +3308,63 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         do_on_exit ~on_exit;
         Unknown U_max_depth
       | ID.At (cur_depth, cur_lit) ->
+        (* new timestamp *)
+        Timestamp.incr();
         (* restrict depth *)
-        match M.solve ~assumptions:[cur_lit] () with
-          | M.Sat _ ->
-            let m = compute_model_ () in
-            Log.debugf 1
-              (fun k->k "@{<Yellow>** found SAT@} at depth %a"
-                  ID.pp cur_depth);
-            if pp_trail then (
-              let pp_lit out (lit,lev) =
-                Format.fprintf out "(@[<1>%a@ level: %d@])" Lit.pp lit lev
-              in
-              Format.printf "(@[<2>trail@ @[<hv>%a@]@])@."
-                (Utils.pp_list pp_lit)
-                (get_trail ~domains:m.Model.domains ());
-            );
-            do_on_exit ~on_exit;
-            if check then (
-              Log.debugf 1 (fun k->k "checking model…");
-              Model.check m
-            );
-            Sat m
-          | M.Unsat us ->
-            (* check if [max depth] literal involved in proof;
-               - if not, truly UNSAT
-               - if yes, try next level
-            *)
-            let p = us.SI.get_proof () in
-            Log.debugf 4 (fun k->k "proof: @[%a@]@." pp_proof p);
-            let core = p |> M.unsat_core in
-            assert (Lit.equal (Lit.abs cur_lit) cur_lit);
-            let status = proof_status cur_lit core in
+        match Sat.solve ~assumptions:[cur_lit] () with
+          | Sat.Sat ->
+            (* fine, we have a model. Just check that all values are fully
+               expanded! *)
+            let step_res = Main_step.run () in
+            begin match step_res with
+              | Main_step.All_true ->
+                (* truly a model *)
+                let m = compute_model_ () in
+                Log.debugf 1
+                  (fun k->k "@{<Yellow>** found SAT@} at depth %a"
+                      ID.pp cur_depth);
+                if pp_trail then (
+                  Format.printf "(@[<2>trail@ @[<hv>%a@]@])@." pp_cur_trail ();
+                );
+                do_on_exit ~on_exit;
+                if check then (
+                  Log.debugf 1 (fun k->k "checking model…");
+                  Model.check m
+                );
+                Sat m
+              | Main_step.Some_expansions
+              | Main_step.Some_false ->
+                (* not everything was expanded, or some constraints failed,
+                   try again (with same state) *)
+                Log.debugf 2
+                  (fun k->k
+                      "@{<Yellow>** SAT but incomplete, continue@}@ (res %a) \
+                       at depth %a" Main_step.pp_res step_res ID.pp cur_depth);
+                iter state
+            end
+          | Sat.Unsat ->
+            Timestamp.incr();
+            (* check if still unsat without the assumption *)
+            let status = match Sat.solve ~assumptions:[] () with
+              | Sat.Unsat ->
+                (* truly unsat *)
+                (* TODO: check if at least one incomplete literal was
+                   expanded, in which case, return PS_incomplete *)
+                PS_complete
+              | Sat.Sat ->
+                (* clearly, the conflict needs [cur_lit] *)
+                PS_depth_limited cur_lit
+            in
             Log.debugf 1
               (fun k->k
                   "@{<Yellow>** found Unsat@} at depth %a;@ \
                    status: %a"
                   ID.pp cur_depth pp_proof_status status);
-            match status with
+            assert (Lit.equal (Lit.abs cur_lit) cur_lit);
+            begin match status with
               | PS_depth_limited _ ->
                 (* negation of the previous limit *)
-                push_top_clause (Clause.make [Lit.neg cur_lit]);
+                Sat.push_new (Clause.make [Lit.neg cur_lit]);
                 iter (ID.next ()) (* deeper! *)
               | PS_incomplete ->
                 do_on_exit ~on_exit;
@@ -3631,8 +3372,14 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
               | PS_complete ->
                 do_on_exit ~on_exit;
                 Unsat
+            end
     in
     ID.reset ();
+    try
     iter (ID.current ())
+    with e ->
+      (* FIXME remove *)
+      Format.printf "trail: %a@." pp_cur_trail();
+      raise e
 end
 

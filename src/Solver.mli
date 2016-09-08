@@ -100,7 +100,7 @@ module Make(C:CONFIG)(Dummy : sig end) : sig
     val neg : t -> t
     val eq : term -> term -> t
     val neq : term -> term -> t
-    val atom : ?sign:bool -> term -> t
+    val assert_ : ?sign:bool -> term -> t
 
     include Intf.EQ with type t := t
     include Intf.ORD with type t := t
