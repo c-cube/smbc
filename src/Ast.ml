@@ -38,6 +38,7 @@ module Var = struct
   let ty v = v.ty
 
   let equal a b = ID.equal a.id b.id
+  let compare a b = ID.compare a.id b.id
   let pp out v = ID.pp out v.id
   let to_sexp f v = S.of_list [ID.to_sexp v.id; f v.ty]
 end
@@ -110,6 +111,12 @@ module Ty = struct
     in
     S.of_list (ID.to_sexp d.data_id :: cstors)
 
+  module Map = CCMap.Make(struct
+      type _t = t
+      type t = _t
+      let compare = compare
+    end)
+
   let ill_typed fmt =
     CCFormat.ksprintf
       ~f:(fun s -> raise (Ill_typed s))
@@ -134,6 +141,7 @@ and term_cell =
   | App of term * term list
   | If of term * term * term
   | Match of term * (var list * term) ID.Map.t
+  | Switch of term * term ID.Map.t (* switch on constants *)
   | Let of var * term * term
   | Fun of var * term
   | Forall of var * term
@@ -170,12 +178,20 @@ let rec term_to_sexp t = match t.term with
       (ID.Map.to_list m
        |> List.map
          (fun (c,(vars, rhs)) -> match vars with
-            | [] -> S.of_list [ID.to_sexp c; term_to_sexp rhs]
+            | [] -> S.of_list [S.atom "case"; ID.to_sexp c; term_to_sexp rhs]
             | _::_ ->
               S.of_list
-                [ S.of_list (ID.to_sexp c :: List.map var_sexp_ vars);
+                [ S.of_list (S.atom "case" :: ID.to_sexp c :: List.map var_sexp_ vars);
                   term_to_sexp rhs]
          )))
+    |> S.of_list
+  | Switch (t, m) ->
+    (S.atom "switch" :: term_to_sexp t ::
+      (ID.Map.to_list m
+       |> List.map
+         (fun (c, rhs) ->
+            S.of_list [S.atom "case"; ID.to_sexp c; term_to_sexp rhs])
+         ))
     |> S.of_list
   | Let (v,t,u) ->
     S.of_list [S.atom "let"; var_sexp_ v; term_to_sexp t; term_to_sexp u]
@@ -275,6 +291,10 @@ let match_ t m =
            ID.pp c1 ID.pp c Ty.pp rhs1.ty Ty.pp rhs.ty)
     m;
   mk_ (Match (t,m)) rhs1.ty
+
+let switch u m =
+  let _, t1 = ID.Map.choose m in
+  mk_ (Switch (u,m)) t1.ty
 
 let let_ v t u =
   if not (Ty.equal (Var.ty v) t.ty)
@@ -741,3 +761,52 @@ let parse ~include_dir ~file syn =
   let ctx = Ctx.create ~include_dir () in
   try Result.Ok (parse_file_exn ctx ~file syn)
   with e -> Result.Error (Printexc.to_string e)
+
+(** {2 Environment} *)
+
+type env_entry =
+  | E_uninterpreted_ty
+  | E_uninterpreted_cst (* domain element *)
+  | E_const of Ty.t
+  | E_data of Ty.t ID.Map.t (* list of cstors *)
+  | E_cstor of Ty.t (* datatype it belongs to *)
+  | E_defined of Ty.t * term (* if defined *)
+
+type env = {
+  defs: env_entry ID.Map.t;
+}
+(** Environment with definitions and goals *)
+
+let env_empty = {
+  defs=ID.Map.empty;
+}
+
+let add_def id def env = { defs=ID.Map.add id def env.defs}
+
+let env_add_statement env st =
+  match st with
+    | Data l ->
+      List.fold_left
+        (fun env {Ty.data_id; data_cstors} ->
+           let map = add_def data_id (E_data data_cstors) env in
+           ID.Map.fold
+             (fun c_id c_ty map -> add_def c_id (E_cstor c_ty) map)
+             data_cstors map)
+        env l
+    | TyDecl id -> add_def id E_uninterpreted_ty env
+    | Decl (id,ty) -> add_def id (E_const ty) env
+    | Define l ->
+      List.fold_left
+        (fun map (id,ty,def) -> add_def id (E_defined (ty,def)) map)
+        env l
+    | Goal _
+    | Assert _ -> env
+
+let env_of_statements seq =
+  Sequence.fold env_add_statement env_empty seq
+
+let env_find_def env id =
+  try Some (ID.Map.find id env.defs)
+  with Not_found -> None
+
+let env_add_def env id def = add_def id def env

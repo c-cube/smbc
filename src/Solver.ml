@@ -42,6 +42,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
   let stat_num_uty_expanded = ref 0
   let stat_num_clause_push = ref 0
   let stat_num_clause_tautology = ref 0
+  let stat_num_propagations = ref 0
 
   (* for objects that are expanded on demand only *)
   type 'a lazily_expanded =
@@ -277,9 +278,6 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     let is_data t =
       match t.ty_cell with | Atomic (_, Data _) -> true | _ -> false
 
-    let is_arrow t =
-      match t.ty_cell with | Arrow _ -> true | _ -> false
-
     let unfold ty : t list * t =
       let rec aux acc ty = match ty.ty_cell with
         | Arrow (a,b) -> aux (a::acc) b
@@ -323,45 +321,16 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
   module DB_env = struct
     type 'a t = 'a db_env
 
-    let is_empty e = e.db_size = 0
-    let equal eq_x e1 e2 =
-      e1.db_size = e2.db_size
-      && CCList.equal (CCOpt.equal eq_x) e1.db_st e2.db_st
-    let to_list e = e.db_st
-    let hash h e = Hash.(list (opt h)) e.db_st
     let push x env = { db_size=env.db_size+1; db_st=Some x :: env.db_st }
     let push_l l env = List.fold_left (fun e x -> push x e) env l
     let push_none env =
       { db_size=env.db_size+1; db_st=None::env.db_st }
     let push_none_l l env = List.fold_left (fun e _ -> push_none e) env l
-    let map f e = {e with db_st = List.map f e.db_st }
-    let mapi f e = {e with db_st = List.mapi f e.db_st }
     let empty = {db_st=[]; db_size=0}
-    let of_list l = push_l l empty
     let singleton x = {db_st=[Some x]; db_size=1}
-    let take n e =
-      if n >= e.db_size then e
-      else { db_size=n; db_st=CCList.take n e.db_st}
-    let append e1 e2 =
-      { db_size=e1.db_size+e2.db_size; db_st = e1.db_st @ e2.db_st }
     let size env = env.db_size
     let get ((n,_):DB.t) env : _ option =
       if n < env.db_size then List.nth env.db_st n else None
-
-    let pp pp_x out e =
-      let l =
-        e.db_st
-        |> List.mapi (fun i o -> i,o)
-        |> CCList.filter_map
-          (function (_,None) -> None | (i,Some x) -> Some (i,x))
-      in
-      match l with
-        | [] -> ()
-        | _ ->
-          let pp_pair out (i,x) =
-            Format.fprintf out "@[%d: %a@]" i pp_x x
-          in
-          CCFormat.list ~start:"" ~stop:"" ~sep:"," pp_pair out l
   end
 
   let term_equal_ a b = a==b
@@ -372,7 +341,6 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     type t = cst
 
     let id t = t.cst_id
-    let kind t = t.cst_kind
 
     let ty_of_kind = function
       | Cst_defined (ty, _)
@@ -665,14 +633,20 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
 
     let sorted_merge_ l1 l2 = CCList.sorted_merge_uniq ~cmp:compare l1 l2
 
-    let cmp_term_dep_ a b = match a, b with
+    let cmp_term_dep_ a b =
+      let to_int_ = function
+        | Dep_cst _ -> 0
+        | Dep_uty _ -> 1
+      in
+      match a, b with
       | Dep_cst c1, Dep_cst c2 -> Typed_cst.compare c1 c2
       | Dep_uty u1, Dep_uty u2 ->
         let (<?>) = CCOrd.(<?>) in
         Ty.compare (Lazy.force u1.uty_self) (Lazy.force u2.uty_self)
         <?> (CCOrd.int_, u1.uty_offset, u2.uty_offset)
-      | Dep_cst _, Dep_uty _ -> 1
-      | Dep_uty _, Dep_cst _ -> -1
+      | Dep_cst _, _
+      | Dep_uty _, _
+        -> CCOrd.int_ (to_int_ a) (to_int_ b)
 
     (* build a term. If it's new, add it to the watchlist
        of every member of [watching] *)
@@ -1090,38 +1064,34 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     if l.lit_sign then pp_lit_view out l.lit_view
     else Format.fprintf out "(@[@<1>¬@ %a@])" pp_lit_view l.lit_view
 
-  module Explanation = struct
-    type t = explanation
-    let empty : t = E_empty
-    let return e = E_leaf e
-    let append s1 s2 = match s1, s2 with
-      | E_empty, _ -> s2
-      | _, E_empty -> s1
-      | _ -> E_append (s1, s2)
-
-    let is_empty = function
-      | E_empty -> true
-      | E_leaf _
-      | E_append _ -> false (* by smart cstor *)
-
-    let rec to_seq e yield = match e with
-      | E_empty -> ()
-      | E_leaf x -> yield x
-      | E_append (a,b) -> to_seq a yield; to_seq b yield
-
-    let to_list_uniq e =
-      to_seq e
-      |> Sequence.to_rev_list
-      |> CCList.sort_uniq ~cmp:cmp_lit
-
-    let pp out e =
-      Format.fprintf out "(@[%a@])"
-        (Utils.pp_list pp_lit) (to_list_uniq e)
-  end
-
   (* FIXME: make a specific data structure *)
   (** {2 Literals} *)
-  module Lit = struct
+  module Lit : sig
+    type t = lit
+    val neg : t -> t
+    val abs : t -> t
+    val sign : t -> bool
+    val view : t -> lit_view
+    val as_atom : t -> (term * bool) option
+    val fresh_with : ID.t -> t
+    val fresh : unit -> t
+    val dummy : t
+    val atom : ?sign:bool -> term -> t
+    val eq : term -> term -> t
+    val neq : term -> term -> t
+    val cst_choice : cst -> term -> t
+    val uty_choice_empty : ty_uninterpreted_slice -> t
+    val uty_choice_nonempty : ty_uninterpreted_slice -> t
+    val uty_choice_status : ty_uninterpreted_slice -> ty_uninterpreted_status -> t
+    val hash : t -> int
+    val compare : t -> t -> int
+    val equal : t -> t -> bool
+    val print : t CCFormat.printer
+    val pp : t CCFormat.printer
+    val norm : t -> t * FI.negated
+    module Set : CCSet.S with type elt = t
+    module Tbl : CCHashtbl.S with type key = t
+  end = struct
     type t = lit
 
     let neg l = {l with lit_sign=not l.lit_sign}
@@ -1170,13 +1140,62 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     let pp = pp_lit
     let print = pp
 
-    module Map = Term.Map
-    module Tbl = Term.Tbl
-
-    (** {6 Normalization} *)
-
     let norm l =
       if l.lit_sign then l, FI.Same_sign else neg l, FI.Negated
+
+    module Set = CCSet.Make(struct type t = lit let compare=compare end)
+    module Tbl = CCHashtbl.Make(struct type t = lit let equal=equal let hash=hash end)
+  end
+
+  let pp_dep out = function
+    | Dep_cst c -> Typed_cst.pp out c
+    | Dep_uty uty -> pp_uty out uty
+
+  module Explanation = struct
+    type t = explanation
+    let empty : t = E_empty
+    let return e = E_leaf e
+    let append s1 s2 = match s1, s2 with
+      | E_empty, _ -> s2
+      | _, E_empty -> s1
+      | _ -> E_append (s1, s2)
+    let cons e s = append (return e) s
+
+    let is_empty = function
+      | E_empty -> true
+      | E_leaf _
+      | E_append _ -> false (* by smart cstor *)
+
+    let rec to_seq e yield = match e with
+      | E_empty -> ()
+      | E_leaf x -> yield x
+      | E_append (a,b) -> to_seq a yield; to_seq b yield
+
+    let to_list e =
+      let rec aux acc = function
+        | E_empty -> acc
+        | E_leaf x -> x::acc
+        | E_append (a,b) -> aux (aux acc a) b
+      in
+      aux [] e
+
+    let to_list_uniq e =
+      to_seq e
+      |> Sequence.to_rev_list
+      |> Lit.Set.of_list
+      |> Lit.Set.to_list
+
+    let equal a b =
+      let la = to_list a in
+      let lb = to_list b in
+      (* double inclusion *)
+      let mem l x = List.exists (fun y -> Lit.equal x y) l in
+      List.for_all (mem lb) la
+      && List.for_all (mem la) lb
+
+    let pp out e =
+      Format.fprintf out "(@[%a@])"
+        (Utils.pp_list Lit.pp) (to_list_uniq e)
   end
 
   (** {2 Clauses} *)
@@ -1691,8 +1710,36 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       by_ty, List.rev_append other_clauses case_clauses
   end
 
-  (** {2 Reduction to Normal Form} *)
+  let pp_dep_full out = function
+    | Dep_cst c ->
+      let i = match Typed_cst.as_undefined c with
+        | None -> assert false
+        | Some (_,_,i,_) -> i
+      in
+      let nf = match i.cst_cur_case with
+        | None -> Term.const c
+        | Some (_, t') -> t'
+      in
+      Format.fprintf out
+        "(@[%a@ nf:%a@ :expanded %B@])"
+        Typed_cst.pp c Term.pp nf
+        (match Typed_cst.as_undefined c with
+          | None -> assert false
+          | Some (_,_,i,_) -> i.cst_cases <> Lazy_none)
+    | Dep_uty uty ->
+      Format.fprintf out
+        "(@[%a@ :expanded %B@])"
+        pp_uty uty (uty.uty_pair<>Lazy_none)
 
+  (* from explanation [e1, e2, ..., en] build the guard
+         [e1 & e2 & ... & en => …], that is, the clause
+         [not e1 | not e2 | ... | not en] *)
+  let clause_guard_of_exp_ (e:explanation): Lit.t list =
+    Explanation.to_list e
+    |> List.map Lit.neg (* this is a guard! *)
+    |> CCList.sort_uniq ~cmp:Lit.compare
+
+  (** {2 Reduction to Normal Form} *)
   module Reduce = struct
     (* environment for evaluation: not-yet-evaluated terms *)
     type eval_env = term DB_env.t
@@ -2092,15 +2139,6 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           e, Lit.atom ~sign:(Lit.sign lit) t'
   end
 
-  (* from explanation [e1, e2, ..., en] build the guard
-         [e1 & e2 & ... & en => …], that is, the clause
-         [not e1 | not e2 | ... | not en] *)
-  let clause_guard_of_exp_ (e:explanation): Lit.t list =
-    Explanation.to_seq e
-    |> Sequence.map Lit.neg (* this is a guard! *)
-    |> Sequence.to_rev_list
-    |> CCList.sort_uniq ~cmp:Lit.compare
-
   (** {2 A literal asserted to SAT}
 
       We watch those literals depending on the set of constants
@@ -2127,26 +2165,29 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     let to_lit = Lit.atom ~sign:true
     let pp = Term.pp
 
+    (* clause for [e => l] *)
+    let clause_imply (l:lit) (e:explanation): Clause.t =
+      let c = l :: clause_guard_of_exp_ e |> Clause.make in
+      c
+
     let propagate_lit_ (l:t) (e:explanation): unit =
-      let c = to_lit l :: clause_guard_of_exp_ e |> Clause.make in
+      let c = clause_imply (to_lit l) e in
       Log.debugf 4
         (fun k->k
             "(@[<hv1>@{<green>propagate_lit@}@ %a@ nf: %a@ clause: %a@])"
             pp l pp (snd (Reduce.compute_nf l)) Clause.pp c);
+      incr stat_num_propagations;
       Clause.push_new c;
       ()
 
-    (* add [t] to the list of literals that watch the constant [c] *)
-    let watch_cst_ (t:t)(c:cst) : unit =
-      assert (Ty.is_prop t.term_ty);
-      Log.debugf 2
-        (fun k->k "(@[<1>watch_cst@ %a@ %a@])" Typed_cst.pp c Term.pp t);
+    (* expand the given constant so that, later, it will be
+       assigned a value by the SAT solver *)
+    let expand_cst (c:cst): unit =
       let ty, info = match c.cst_kind with
         | Cst_undef (ty,i,_) -> ty,i
         | Cst_defined _ | Cst_cstor _ | Cst_uninterpreted_dom_elt _ ->
           assert false
       in
-      Poly_set.add info.cst_watched t;
       (* we should never have to expand a meta that is too deep *)
       let depth = info.cst_depth in
       assert (depth <= (Iterative_deepening.current_depth() :> int));
@@ -2156,21 +2197,15 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           (* [c] is blocking, not too deep, but not expanded *)
           let l, clauses = Expand.expand_cases c ty info in
           Log.debugf 2
-            (fun k->k "(@[<1>expand_cases@ @[%a@]@ :into (@[%a@])@ :depth %d@])"
+            (fun k->k "(@[<1>expand_cst@ @[%a@]@ :into (@[%a@])@ :depth %d@])"
                 Typed_cst.pp c (Utils.pp_list Term.pp) l depth);
           info.cst_cases <- Lazy_some l;
           incr stat_num_cst_expanded;
           Clause.push_new_l clauses
         | Lazy_some _ -> ()
-      end;
-      ()
+      end
 
-    (* add [t] to the list of literals that watch this slice *)
-    let watch_uty (t:t)(uty:ty_uninterpreted_slice) : unit =
-      assert (Ty.is_prop t.term_ty);
-      Log.debugf 2
-        (fun k->k "(@[<1>watch_uty@ %a@ %a@])" pp_uty uty Term.pp t);
-      Poly_set.add uty.uty_watched t;
+    let expand_uty (uty:ty_uninterpreted_slice): unit =
       (* we should never have to expand a type slice that is too deep *)
       let depth = uty.uty_offset in
       assert (depth <= (Iterative_deepening.current_depth() :> int));
@@ -2180,13 +2215,36 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           (* [uty] is blocking, not too deep, but not expanded *)
           let c_head, uty_tail, clauses = Expand.expand_uninterpreted_slice uty in
           Log.debugf 2
-            (fun k->k "(@[<1>expand_uty@ @[%a@]@ :into (@[%a ++@ %a@])@ :depth %d@])"
+            (fun k->k
+                "(@[<1>expand_uty@ @[%a@]@ :into (@[%a ++@ %a@])@ :depth %d@])"
                 pp_uty uty Typed_cst.pp c_head pp_uty uty_tail depth);
           uty.uty_pair <- Lazy_some (c_head, uty_tail);
           incr stat_num_uty_expanded;
           Clause.push_new_l clauses
         | Lazy_some _ -> ()
-      end;
+      end
+
+    (* add [t] to the list of literals that watch the constant [c] *)
+    let watch_cst_ (t:t)(c:cst) : unit =
+      assert (Ty.is_prop t.term_ty);
+      Log.debugf 2
+        (fun k->k "(@[<1>watch_cst@ %a@ %a@])" Typed_cst.pp c Term.pp t);
+      let _, info = match c.cst_kind with
+        | Cst_undef (ty,i,_) -> ty,i
+        | Cst_defined _ | Cst_cstor _ | Cst_uninterpreted_dom_elt _ ->
+          assert false
+      in
+      Poly_set.add info.cst_watched t;
+      expand_cst c;
+      ()
+
+    (* add [t] to the list of literals that watch this slice *)
+    let watch_uty (t:t)(uty:ty_uninterpreted_slice) : unit =
+      assert (Ty.is_prop t.term_ty);
+      Log.debugf 2
+        (fun k->k "(@[<1>watch_uty@ %a@ %a@])" pp_uty uty Term.pp t);
+      Poly_set.add uty.uty_watched t;
+      expand_uty uty;
       ()
 
     let watch_dep (t:t) (d:term_dep) : unit = match d with
@@ -2220,18 +2278,14 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
 
     let update_watches_of_term = update_watches_of
 
-    let watched_ : unit Lit.Tbl.t = Lit.Tbl.create 256
-
-      (* TODO: if [lit] is new, do on-the-fly CNF of its inner formula
-         (break not/and/or, maybe explore a bit the equalities eagerly?).
-      *)
+    let watched_ : unit Term.Tbl.t = Term.Tbl.create 256
 
     let watch (lit:t) =
       let lit, _ = Term.abs lit in
-      if not (Lit.Tbl.mem watched_ lit) then (
+      if not (Term.Tbl.mem watched_ lit) then (
         Log.debugf 3
           (fun k->k "(@[<1>@{<green>watch_lit@}@ %a@])" pp lit);
-        Lit.Tbl.add watched_ lit ();
+        Term.Tbl.add watched_ lit ();
         (* also ensure it is watched properly *)
         update_watches_of lit;
       )
@@ -2240,11 +2294,11 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
 
     let is_watched (lit:t) : bool =
       let lit, _ = Term.abs lit in
-      Lit.Tbl.mem watched_ lit
+      Term.Tbl.mem watched_ lit
 
-    let to_seq = Lit.Tbl.keys watched_
+    let to_seq = Term.Tbl.keys watched_
 
-    let size () = Lit.Tbl.length watched_
+    let size () = Term.Tbl.length watched_
   end
 
   (** {2 Sat Solver} *)
@@ -2474,6 +2528,8 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
   (* list of constants we are interested in *)
   let model_support_ : Typed_cst.t list ref = ref []
 
+  let model_env_ : Ast.env ref = ref Ast.env_empty
+
   (* list of (uninterpreted) types we are interested in *)
   let model_utys : Ty.t list ref = ref []
 
@@ -2565,6 +2621,8 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
             m
         in
         Term.match_ u m
+      | Ast.Switch _ ->
+        errorf "cannot convert switch %a" Ast.pp_term t
       | Ast.Let (v,t,u) ->
         (* substitute on the fly *)
         let t = conv_term env t in
@@ -2585,6 +2643,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     let add_statement st =
       Log.debugf 2
         (fun k->k "(@[add_statement@ @[%a@]@])" Ast.pp_statement st);
+      model_env_ := Ast.env_add_statement !model_env_ st;
       match st with
         | Ast.Assert t ->
           let t = conv_term [] t in
@@ -2675,6 +2734,81 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
             l
 
     let add_statement_l = List.iter add_statement
+
+    module A = Ast
+
+    let rec ty_to_ast (t:Ty.t): A.Ty.t = match t.ty_cell with
+      | Prop -> A.Ty.Prop
+      | Atomic (id,_) -> A.Ty.const id
+      | Arrow (a,b) -> A.Ty.arrow (ty_to_ast a) (ty_to_ast b)
+
+    let fresh_var =
+      let n = ref 0 in
+      fun ty ->
+        let id = ID.makef "x%d" !n in
+        incr n;
+        A.Var.make id (ty_to_ast ty)
+
+    let with_var ty env ~f =
+      let v = fresh_var ty in
+      let env = DB_env.push (A.var v) env in
+      f v env
+
+    let with_vars tys env ~f =
+      let vars = List.map fresh_var tys in
+      let env = DB_env.push_l (List.map A.var vars) env in
+      f vars env
+
+    let term_to_ast (t:term): Ast.term =
+      let rec aux env t = match t.term_cell with
+        | True -> A.true_
+        | False -> A.false_
+        | DB d ->
+          begin match DB_env.get d env with
+            | Some t' -> t'
+            | None -> errorf "cannot find DB %a in env" Term.pp t
+          end
+        | Const cst -> A.const cst.cst_id (ty_to_ast t.term_ty)
+        | App (f,l) -> A.app (aux env f) (List.map (aux env) l)
+        | Fun (ty,bod) ->
+          with_var ty env
+            ~f:(fun v env -> A.fun_ v (aux env bod))
+        | Mu _ -> assert false
+        | If (a,b,c) -> A.if_ (aux env a)(aux env b) (aux env c)
+        | Match (u,m) ->
+          let u = aux env u in
+          let m =
+            ID.Map.map
+              (fun (tys,rhs) ->
+                 with_vars tys env ~f:(fun vars env -> vars, aux env rhs))
+              m
+          in
+          A.match_ u m
+        | Switch (u,m) ->
+          let u = aux env u in
+          let m =
+            ID.Tbl.to_seq m.switch_tbl
+            |> Sequence.map (fun (c,rhs) -> c, aux env rhs)
+            |> ID.Map.of_seq
+          in
+          A.switch u m
+        | Quant (q,uty,bod) ->
+          let lazy ty = uty.uty_self in
+          with_var ty env
+            ~f:(fun v env ->
+              let bod = aux env bod in
+              match q with
+                | Forall -> A.forall v bod
+                | Exists -> A.exists v bod)
+        | Builtin b ->
+          begin match b with
+            | B_not t -> A.not_ (aux env t)
+            | B_and (a,b,_,_) -> A.and_ (aux env a) (aux env b)
+            | B_or (a,b) -> A.or_ (aux env a) (aux env b)
+            | B_eq (a,b) -> A.eq (aux env a) (aux env b)
+            | B_imply (a,b) -> A.imply (aux env a) (aux env b)
+          end
+      in aux DB_env.empty t
   end
 
   (** {2 Main} *)
@@ -2683,218 +2817,6 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     | U_timeout
     | U_max_depth
     | U_incomplete
-
-  module Model = struct
-    type t = {
-      domains: cst list Ty.Tbl.t;
-      (* uninterpreted type -> its domain *)
-      consts: term Typed_cst.Map.t;
-      (* constant -> its value *)
-    }
-
-    let make ~consts ~domains = {consts; domains}
-
-    let pp out (m:t) =
-      let pp_cst_name out c = ID.pp_name out (Typed_cst.id c) in
-      let pp_dom out (ty,l) =
-        Format.fprintf out "(@[<1>type@ %a@ (@[<hv>%a@])@])"
-          Ty.pp ty (Utils.pp_list pp_cst_name) l
-      and pp_pair out (c,t) =
-        Format.fprintf out "(@[<1>val@ %a@ %a@])"
-          ID.pp_name (Typed_cst.id c)
-          (Term.pp_top ~ids:false) t
-      in
-      Format.fprintf out "(@[<v>%a@,%a@])"
-        (Utils.pp_list pp_dom)
-        (Ty.Tbl.to_list m.domains)
-        (Utils.pp_list pp_pair)
-        (Typed_cst.Map.to_list m.consts)
-
-    exception Bad_model of t * term * term
-
-    let () = Printexc.register_printer
-        (function
-          | Bad_model (m,t,t') ->
-            let msg = CCFormat.sprintf
-                "@[<hv2>Bad model:@ goal `@[%a@]`@ evaluates to `@[%a@]`,@ \
-                 not true,@ in model @[%a@]@."
-                Term.pp t Term.pp t' pp m
-            in
-            Some msg
-          | _ -> None)
-
-    (* eval term [t] under model [m] *)
-    let eval_ (m:t) t =
-      let rec aux t =
-        (*
-        Format.printf "@[<2>eval %a@ in [@[<hv>%a@]]@]@."
-          Term.pp t (DB_env.pp Term.pp) env;
-           *)
-        match t.term_cell with
-        | True
-        | False
-        | DB _ -> t
-        | Const {cst_kind=Cst_defined(_,lazy t'); _} -> aux t'
-        | Const ({cst_kind=Cst_undef(_,_,_); _} as c) ->
-          begin match Typed_cst.Map.get c m.consts with
-            | None -> t
-            | Some t' -> aux t'
-          end
-        | Const _ -> t
-        | App (f,l) ->
-          (* here, call by value *)
-          let l = List.map aux l in
-          aux_app DB_env.empty f l
-        | If (a,b,c) ->
-          let a = aux a in
-          begin match a.term_cell with
-            | True -> aux b
-            | False -> aux c
-            | _ -> Term.if_ a b c
-          end
-        | Fun _ -> t
-        | Quant (q,uty,body) ->
-          let lazy ty = uty.uty_self in
-          let dom =
-            try Ty.Tbl.find m.domains ty
-            with Not_found -> errorf "could not find type %a in model" Ty.pp ty
-          in
-          (* expand into and/or over the domain *)
-          let t' =
-            let l =
-              List.map
-                (fun c_dom ->
-                   Reduce.eval_db (DB_env.singleton (Term.const c_dom)) body)
-                dom
-            in
-            match q with
-              | Forall -> Term.and_l l
-              | Exists -> Term.or_l l
-          in
-          aux t'
-        | Match (u, m) ->
-          let u = aux u in
-          begin match Term.as_cstor_app u with
-            | None -> Term.match_ u m
-            | Some (c, _, args) ->
-              match ID.Map.get c.cst_id m with
-                | None -> Term.match_ u m
-                | Some (tys, rhs) ->
-                  assert (List.length tys = List.length args);
-                  let env = DB_env.push_l args DB_env.empty in
-                  let rhs = Reduce.eval_db env rhs in
-                  aux rhs
-          end
-        | Switch (u, m) ->
-          let u = aux u in
-          begin match Reduce.as_uninterpreted_dom_elt u with
-            | None -> Term.switch u m
-            | Some id ->
-              begin match ID.Tbl.get m.switch_tbl id with
-                | Some rhs -> aux rhs
-                | None -> Term.switch u m
-              end
-          end
-        | Mu f ->
-          let env = DB_env.singleton f in
-          aux (Reduce.eval_db env f)
-        | Builtin (B_not f) ->
-          let f = aux f in
-          begin match f.term_cell with
-            | True -> Term.false_
-            | False -> Term.true_
-            | _ -> Term.not_ f
-          end
-        | Builtin (B_and (_,_,a,b)) ->
-          let a = aux a in
-          let b = aux b in
-          begin match a.term_cell, b.term_cell with
-            | True, True -> Term.true_
-            | False, _
-            | _, False -> Term.false_
-            | _ -> Term.and_ a b
-          end
-        | Builtin (B_or (a,b)) ->
-          let a = aux a in
-          let b = aux b in
-          begin match a.term_cell, b.term_cell with
-            | True, _
-            | _, True -> Term.true_
-            | False, False -> Term.false_
-            | _ -> Term.or_ a b
-          end
-        | Builtin (B_imply (a,b)) ->
-          let a = aux a in
-          let b = aux b in
-          begin match a.term_cell, b.term_cell with
-            | _, True
-            | False, _  -> Term.true_
-            | True, False -> Term.false_
-            | _ -> Term.imply a b
-          end
-        | Builtin (B_eq (a,b)) when Ty.is_prop a.term_ty ->
-          let a = aux a in
-          let b = aux b in
-          begin match a.term_cell, b.term_cell with
-            | True, True
-            | False, False -> Term.true_
-            | True, False
-            | False, True -> Term.false_
-            | _ when Term.equal a b -> Term.true_
-            | _ -> Term.eq a b
-          end
-        | Builtin (B_eq (a,b)) ->
-          let a = aux a in
-          let b = aux b in
-          begin match Term.as_cstor_app a, Term.as_cstor_app b with
-            | Some (c1,_,l1), Some (c2,_,l2) ->
-              if Typed_cst.equal c1 c2 then (
-                assert (List.length l1 = List.length l2);
-                aux (Term.and_l (List.map2 Term.eq l1 l2))
-              ) else Term.false_
-            | _ ->
-              begin match Term.as_domain_elt a, Term.as_domain_elt b with
-                | Some (c1,ty1), Some (c2,ty2) ->
-                  (* domain elements: they are all distinct *)
-                  assert (Ty.equal ty1 ty2);
-                  if Typed_cst.equal c1 c2
-                  then Term.true_
-                  else Term.false_
-                | _ ->
-                    Term.eq a b
-              end
-
-          end
-      and aux_app env f l = match f.term_cell, l with
-        | Const {cst_kind=Cst_defined(_, lazy def_f); _}, _ ->
-          aux_app env def_f l
-        | Fun (_, body), arg :: tail ->
-          let env = DB_env.push arg env in
-          aux_app env body tail
-        | _, _ ->
-          (* see if [f] reduces in [env] *)
-          let f' = aux (Reduce.eval_db env f) in
-          if Term.equal f f'
-          then Term.app f l
-          else aux_app DB_env.empty f' l
-      in
-      aux t
-
-    (* check model *)
-    let check (m:t) =
-      let bad =
-        Top_goals.to_seq
-        |> Sequence.find
-          (fun t ->
-             let t' = eval_ m t in
-             match t'.term_cell with
-               | True -> None
-               | _ -> Some (t, t'))
-      in
-      match bad with
-        | None -> ()
-        | Some (t,t') -> raise (Bad_model (m, t, t'))
-  end
 
   type model = Model.t
   let pp_model = Model.pp
@@ -2955,6 +2877,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         c_head :: find_domain_ uty_tail
 
   let compute_model_ () : model =
+    let env = !model_env_ in
     (* compute domains of uninterpreted types *)
     let doms =
       !model_utys
@@ -2973,11 +2896,28 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         (fun c ->
            (* find normal form of [c] *)
            let t = Term.const c in
-           let t = deref_deep doms t in
-           c, t)
-      |> Typed_cst.Map.of_seq
+           let t = deref_deep doms t |> Conv.term_to_ast in
+           c.cst_id, t)
+      |> ID.Map.of_seq
     in
-    Model.make ~consts ~domains:doms
+    (* now we can convert domains *)
+    let domains =
+      Ty.Tbl.to_seq doms
+      |> Sequence.map
+        (fun (ty,dom) -> Conv.ty_to_ast ty, List.map Typed_cst.id dom)
+      |> Ast.Ty.Map.of_seq
+    in
+    Model.make ~env ~consts ~domains
+
+  let model_check m =
+    Log.debugf 1 (fun k->k "checking model…");
+    Log.debugf 5 (fun k->k "(@[<1>candidate model: %a@])" Model.pp m);
+    let goals =
+      Top_goals.to_seq
+      |> Sequence.map Conv.term_to_ast
+      |> Sequence.to_list
+    in
+    Model.check m ~goals
 
   let clause_of_mclause (c:M.St.clause): Clause.t =
     M.Proof.to_list c |> List.map (fun a -> a.M.St.lit) |> Clause.make
@@ -2999,12 +2939,14 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
        :num_clause_push %d@ \
        :num_clause_tautology %d@ \
        :num_lits %d\
+       :num_propagations %d@ \
        @])"
       !stat_num_cst_expanded
       !stat_num_uty_expanded
       !stat_num_clause_push
       !stat_num_clause_tautology
       (Watched_lit.size())
+      !stat_num_propagations
 
   let do_on_exit ~on_exit =
     List.iter (fun f->f()) on_exit;
@@ -3081,10 +3023,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
               (fun k->k "@{<Yellow>** found SAT@} at depth %a"
                   ID.pp cur_depth);
             do_on_exit ~on_exit;
-            if check then (
-              Log.debugf 1 (fun k->k "checking model…");
-              Model.check m
-            );
+            if check then model_check m;
             Sat m
           | M.Unsat us ->
             (* check if [max depth] literal involved in proof;

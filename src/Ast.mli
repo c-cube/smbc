@@ -23,6 +23,7 @@ module Var : sig
   val ty : 'a t -> 'a
 
   val equal : 'a t -> 'a t -> bool
+  val compare : 'a t -> 'a t -> int
   val pp : _ t CCFormat.printer
   val to_sexp : 'ty to_sexp -> 'ty t to_sexp
 end
@@ -59,6 +60,8 @@ module Ty : sig
 
   val data_to_sexp : data -> sexp
 
+  module Map : CCMap.S with type key = t
+
   (** {2 Error Handling} *)
 
   val ill_typed : ('a, Format.formatter, unit, 'b) format4 -> 'a
@@ -82,6 +85,7 @@ and term_cell =
   | App of term * term list
   | If of term * term * term
   | Match of term * (var list * term) ID.Map.t
+  | Switch of term * term ID.Map.t (* switch on constants *)
   | Let of var * term * term
   | Fun of var * term
   | Forall of var * term
@@ -113,6 +117,7 @@ val const : ID.t -> Ty.t -> term
 val app : term -> term list -> term
 val if_ : term -> term -> term -> term
 val match_ : term -> (var list * term) ID.Map.t -> term
+val switch : term -> term ID.Map.t -> term
 val let_ : var -> term -> term -> term
 val fun_ : var -> term -> term
 val fun_l : var list -> term -> term
@@ -163,3 +168,29 @@ val string_of_syntax : syntax -> string
 
 val parse : include_dir:string -> file:string -> syntax -> statement list or_error
 (** Parse the given file, type-check, etc.  *)
+
+(** {2 Environment} *)
+
+type env_entry =
+  | E_uninterpreted_ty
+  | E_uninterpreted_cst (* domain element *)
+  | E_const of Ty.t
+  | E_data of Ty.t ID.Map.t (* list of cstors *)
+  | E_cstor of Ty.t
+  | E_defined of Ty.t * term (* if defined *)
+
+type env = {
+  defs: env_entry ID.Map.t;
+}
+(** Environment with definitions and goals *)
+
+val env_empty : env
+
+val env_add_statement : env -> statement -> env
+
+val env_of_statements: statement Sequence.t -> env
+
+val env_find_def : env -> ID.t -> env_entry option
+
+val env_add_def : env -> ID.t -> env_entry -> env
+

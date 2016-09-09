@@ -127,16 +127,7 @@ module Make(C:CONFIG)(Dummy : sig end) : sig
 
   (** {2 Main} *)
 
-  module Model : sig
-    type t = private {
-      domains: Typed_cst.t list Ty.Tbl.t;
-      (* uninterpreted type -> its domain *)
-      consts: term Typed_cst.Map.t;
-      (* constant -> its value *)
-    }
-
-    val pp : t CCFormat.printer
-  end
+  type model = Model.t
 
   type unknown =
     | U_timeout
