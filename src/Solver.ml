@@ -46,6 +46,26 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
   let stat_num_propagations = ref 0
   let stat_num_equiv_lemmas = ref 0
 
+  (** {2 Timestamps: labels a state of the SAT solver} *)
+  module Timestamp : sig
+    type t = private int
+    val zero : t
+    val cur : unit -> t
+    val incr : unit -> unit (* increment time *)
+    val pp : t CCFormat.printer
+  end = struct
+    type t = int
+    let n_ = ref 1
+    let zero = 0
+    let cur() = !n_
+    let incr () =
+      Log.debugf 4 (fun k->k "(@[incr_timestamp@ old: %d@])" !n_);
+      incr n_;
+      ()
+    let pp = Format.pp_print_int
+  end
+
+
   (* for objects that are expanded on demand only *)
   type 'a lazily_expanded =
     | Lazy_none
@@ -56,8 +76,10 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     mutable term_id: int; (* unique ID *)
     mutable term_ty: ty_h;
     term_cell: term_cell;
-    mutable term_nf: compute_res option;
-      (* normal form + explanation of why *)
+    mutable term_nf: (Timestamp.t * compute_res) option;
+    (* normal form + explanation of why *)
+    mutable term_simplify: term option;
+    (* cache of simplified form *)
     mutable term_deps: term_dep list;
     (* set of undefined constants
        that can make evaluation go further *)
@@ -149,7 +171,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
   and watch_set = term_proxy Poly_set.t
 
   and term_proxy_compute_state =
-    | Proxy_inert
+    | Proxy_checked of Timestamp.t
     | Proxy_being_checked
 
     (* edge of the boolean graph: destination + kind of edge *)
@@ -183,7 +205,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
 
   (* bag of atomic explanations. It is optimized for traversal
      and fast cons/snoc/append *)
-  and explanation=
+  and explanation =
     | E_empty
     | E_leaf of lit
     | E_append of explanation * explanation
@@ -517,7 +539,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
 
     type stack_cell =
       | S_set_nf of
-          term * compute_res option
+          term * (Timestamp.t * compute_res) option
           (* t1.nf <- t2 *)
       | S_set_cst_case of
           cst_info * (explanation * term) option
@@ -672,6 +694,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         term_ty=Ty.prop;
         term_cell=if b then True else False;
         term_nf=None;
+        term_simplify=None;
         term_deps=[];
         term_proxy=None;
       } in
@@ -717,6 +740,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         term_id= -1;
         term_ty=Ty.prop; (* will be changed *)
         term_cell=cell;
+        term_simplify=None;
         term_nf=None;
         term_deps=[];
         term_proxy=None;
@@ -1127,7 +1151,14 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     (* simplify: evaluate without following current values of constants, boolean
        expressions, etc. That is, compute the unconditional normal form
        (the one in an empty SAT trail) *)
-    let rec simplify (t:term): term =
+    let rec simplify (t:term): term = match t.term_simplify with
+      | Some t' -> t'
+      | None ->
+        let t' = simplify_noncached t in
+        t.term_simplify <- Some t';
+        t'
+
+    and simplify_noncached t =
       match t.term_cell with
         | DB _ | True | False -> t
         | Const c ->
@@ -1359,7 +1390,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           proxy_graph=[];
           proxy_status=None;
           proxy_expanded=false;
-          proxy_compute_state=Proxy_inert;
+          proxy_compute_state=Proxy_checked Timestamp.zero;
           proxy_watched=Poly_set.create 16 ~eq:eq_proxy_;
         } in
         (* have [t_abs] point to [p] *)
@@ -1578,8 +1609,9 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     let make =
       let n_ = ref 0 in
       fun l ->
+        let lits = Lit.Set.of_list l |> Lit.Set.elements in
         let c = {
-          lits=l; (* CCList.sort_uniq ~cmp:Lit.compare l; *)
+          lits;
           id= !n_;
         } in
         incr n_;
@@ -2105,7 +2137,8 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
   let clause_guard_of_exp_ (e:explanation): Lit.t list =
     Explanation.to_list e
     |> List.map Lit.neg (* this is a guard! *)
-    |> CCList.sort_uniq ~cmp:Lit.compare
+    |> Lit.Set.of_list
+    |> Lit.Set.to_list
 
   (** {2 Global Constraint Graph}
 
@@ -2135,7 +2168,9 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         a.proxy_graph
 
     let add a b k =
-      a.proxy_graph <- (b,k) :: a.proxy_graph
+      if not (mem a b k) then (
+        a.proxy_graph <- (b,k) :: a.proxy_graph
+      )
 
     let as_graph : (term_proxy, _ * proxy_graph_edge_kind * _) CCGraph.t =
       CCGraph.make_labelled_tuple
@@ -2210,11 +2245,12 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
 
     (* set the normal form of [t], propagate to watchers *)
     let set_nf_ t (res:compute_res) : unit =
+      let now = Timestamp.cur() in
       match t.term_nf with
-        | Some old_res when eq_nf res.nf old_res.nf -> ()
+        | Some (time, old_res) when time=now && eq_nf res.nf old_res.nf -> ()
         | _ ->
           Backtrack.push_set_nf_ t;
-          t.term_nf <- Some res;
+          t.term_nf <- Some (now, res);
           Log.debugf 5
             (fun k->k
                 "(@[<hv1>set_nf@ @[%a@]@ @[%a@]@])"
@@ -2253,9 +2289,10 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     let rec compute_nf_term (t:term) : compute_res =
       (* follow the "normal form" pointer *)
       match t.term_nf with
-        | Some ({nf=(NF_true | NF_false | NF_proxy _); _} as res) ->
+        | Some (_, ({nf=(NF_true | NF_false | NF_proxy _); _} as res)) ->
           res (* cannot reduce further *)
-        | Some old_res ->
+        | Some (time, res) when time=Timestamp.cur() -> res (* up-to-date *)
+        | Some (_, old_res) ->
           let res = compute_nf_nf old_res.nf in
           let res = merge_res old_res ~into:res in
           (* path compression here *)
@@ -2447,7 +2484,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
             | None ->
               (* block again *)
               let t' = if u==u' then t else Term.switch u' m in
-              compute_nf_add res_u t'
+              return_term_add res_u t'
           end
         | App ({term_cell=Const {cst_kind=Cst_cstor _; _}; _}, _) ->
           return_term t (* do not reduce under cstors *)
@@ -2458,7 +2495,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           compute_nf_app DB_env.empty res_f f' l
         | Proxy p ->
           begin match p.proxy_compute_state with
-            | Proxy_inert -> return (NF_proxy (p, true))
+            | Proxy_checked _ -> return (NF_proxy (p, true))
             | Proxy_being_checked ->
               (* we compute the actual value! *)
               compute_nf_term p.proxy_for
@@ -2585,6 +2622,9 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       that the given term_proxy must be updated on computations.
   *)
   module Consistency_check : sig
+    val expand_proxy : term_proxy -> unit
+    (** Expand the definition, if any *)
+
     val update : term_proxy -> unit
     (** Re-compute the value of this proxy, checking consistency
         on the fly.
@@ -2715,8 +2755,10 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
                (* expand sub-proxies recursively *)
                List.iter
                  (fun lit -> match Lit.as_assert lit with
-                    | Some (p', _) -> expand_proxy p'
-                    | None -> ())
+                    | Some (p', _) when not (eq_proxy_ p p') ->
+                      Term_graph.add p p' GE_conditional;
+                      expand_proxy p'
+                    | Some _ | None -> ())
                  lits;
                Clause.make lits)
         in
@@ -2739,22 +2781,26 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
 
     (* re-compute the normal form of this proxy, and propagate information
        to the SAT solver in case of conflict, expand blocking dependencies etc. *)
-    and update (p:term_proxy): unit =
+    and update (p:term_proxy): unit = match p.proxy_compute_state with
+      | Proxy_being_checked -> assert false
+      | Proxy_checked t when t = Timestamp.cur() -> () (* already done *)
+      | Proxy_checked t ->
+        assert (t < Timestamp.cur());
+        update_noncached p
+
+    and update_noncached p: unit =
       let {nf=decided; _} = Reduce.compute_nf_proxy p in
-      (* compute the actual normal form, bypassing the partial
-         model's assignment *)
-      assert (p.proxy_compute_state=Proxy_inert);
-      let old_state = p.proxy_compute_state in
+      (* compute the actual normal form, bypassing the partial model's assignment *)
       p.proxy_compute_state <- Proxy_being_checked;
       let computed_res = Reduce.compute_nf_term p.proxy_for in
       Log.debugf 4
         (fun k->k
             "(@[<hv1>consistency_update@ %a@ decided: %a@ nf: %a@])"
             pp_proxy_ p pp_nf decided pp_compute_res computed_res);
+      (* we have updated the status at the current timestamp, save it *)
+      p.proxy_compute_state <- Proxy_checked (Timestamp.cur());
       (* update proxies used for computing the normal form *)
       List.iter update computed_res.proxies;
-      (* restore state (now that actual value was computed) *)
-      p.proxy_compute_state <- old_state;
       (* check consistency *)
       begin match computed_res.nf, decided with
         | NF_true, NF_true
@@ -2804,6 +2850,8 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
                 pp p pp_nf computed_res.nf
                 (Utils.pp_list pp_dep_full) t_nf.term_deps);
           assert (t_nf.term_deps <> []);
+          (* watch the dependencies of [t_nf] so that we know when
+             to re-update [p] *)
           List.iter (watch_dep p) t_nf.term_deps
       end
   end
@@ -2830,6 +2878,8 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     let add_top_goal g =
       Log.debugf 2 (fun k->k "(@[<1>add_toplevel_goal@ %a@])" Term.pp g);
       let g_proxy, g_sign = proxify g in
+      (* be sure it is expanded, etc. *)
+      Consistency_check.expand_proxy g_proxy;
       CCList.Ref.push toplevel_goals_ (g_proxy, g_sign);
       let lit = Lit.assert_proxy ~sign:g_sign g_proxy in
       Clause.push_new (Clause.make [lit]);
@@ -2888,8 +2938,46 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       !stat_num_propagations
 
   let flush_progress (): unit =
-    (* TODO: find the proper code for "kill line" *)
-    Printf.printf "\r%-80d\r%!" 0
+    Printf.printf "\x1b[2K%!"
+
+  (* check some invariants *)
+  let check_invs_ (): unit =
+    let eval_lit (lit:lit): bool option =
+      let sign = Lit.sign lit in
+      match Lit.atom_view lit with
+        | Atom_assert p ->
+          CCOpt.map
+            (fun (_,s) -> if sign then s else not s)
+            (Partial_model.value_proxy p)
+        | Atom_fresh _ ->
+          (* Format.printf "fresh lit %a@." Lit.pp lit; *)
+          None (* TODO? *)
+        | Atom_assign (c,t) ->
+          let _, _, i, _ = Typed_cst.as_undefined_exn c in
+          Partial_model.value_cst c i
+          |> CCOpt.map
+            (fun (_,t') -> let s = Term.equal t t' in if sign then s else not s)
+        | Atom_uty_empty uty ->
+          Partial_model.value_uty uty
+          |> CCOpt.map (function (_,Uty_empty) -> sign | (_,Uty_nonempty) -> not sign)
+    in
+    let bad_clause =
+      Clause.all_
+      |> Sequence.find
+        (fun c ->
+           let is_false =
+             List.for_all
+               (fun lit -> eval_lit lit = Some false) (Clause.lits c)
+           in
+           if is_false then Some c else None)
+    in
+    begin match bad_clause with
+      | None -> ()
+      | Some c ->
+        Format.printf "bad clause: @[%a@]@." Clause.pp c;
+        assert false
+    end;
+    ()
 
   (* the "theory" part: propagations *)
   module M_th :
@@ -2925,6 +3013,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       let _, _, info, _ = Typed_cst.as_undefined_exn c in
       begin match info.cst_cur_case with
         | None ->
+          Timestamp.incr(); (* invalidate previous cached values *)
           let e = Explanation.return (Lit.cst_choice c new_t) in
           Backtrack.push_set_cst_case_ info;
           info.cst_cur_case <- Some (e, new_t);
@@ -2946,6 +3035,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         pp_uty uty pp_uty_status status);
       begin match uty.uty_status with
         | None ->
+          Timestamp.incr(); (* invalidate previous cached values *)
           let e = Explanation.return (Lit.uty_choice_status uty status) in
           Backtrack.push_uty_status uty;
           uty.uty_status <- Some (e, status);
@@ -2964,6 +3054,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         pp_proxy_ p b);
       begin match p.proxy_status with
         | None ->
+          Timestamp.incr(); (* invalidate previous cached values *)
           Backtrack.push_proxy_status p;
           p.proxy_status <- Some (e, b);
           (* TODO: only update if the current NF is blocked by [c] *)
@@ -3009,8 +3100,10 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       TI.Sat
 
     let if_sat _slice =
+      Log.debug 1 "(if_sat)";
       assert (Queue.is_empty Clause.lemma_queue);
       assert (Toplevel_goals.check_all ());
+      check_invs_ ();
       ()
   end
 
@@ -3411,13 +3504,20 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
            let t = deref_deep doms t |> Conv.term_to_ast in
            c.cst_id, t)
       |> ID.Map.of_seq
-    in
     (* now we can convert domains *)
-    let domains =
+    and domains =
       Ty.Tbl.to_seq doms
       |> Sequence.map
         (fun (ty,dom) -> Conv.ty_to_ast ty, List.map Typed_cst.id dom)
       |> Ast.Ty.Map.of_seq
+    in
+    let env =
+      Ast.Ty.Map.to_seq domains
+      |> Sequence.fold
+        (fun env (_,dom) ->
+           List.fold_left
+             (fun env c -> Ast.env_add_def env c Ast.E_uninterpreted_cst) env dom)
+        env
     in
     Model.make ~env ~consts ~domains
 
