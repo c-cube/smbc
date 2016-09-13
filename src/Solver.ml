@@ -49,6 +49,17 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     | Lazy_some of 'a
     | Lazy_none
 
+  type named_var = ID.t
+  (* named variable *)
+
+  type register = int
+  (* register for storing sub-terms in memoization trees *)
+
+  module IntMap = CCMap.Make(CCInt)
+
+  type 'a registers = 'a IntMap.t
+  (* map from registers to something *)
+
   (* main term cell *)
   type term = {
     mutable term_id: int; (* unique ID *)
@@ -75,6 +86,9 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     | Switch of term * switch_cell (* function table *)
     | Quant of quant * ty_uninterpreted_slice * term
       (* quantification on finite types *)
+    | Delegate of delegate
+    | Memo_call of memo_call
+      (* call to memoized function. *)
     | Builtin of builtin
 
   and db = int * ty_h
@@ -96,6 +110,50 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     | B_and of term * term * term * term (* parallel and *)
     | B_or of term * term
     | B_imply of term * term
+
+(* delegation: the variable is a local alias to the given term.
+
+   Once [delegate_to] reduces to a WHNF with constructor [c t1...tn],
+   the delegate_var [x = delegate_to] reduces to
+   [c (delegate_to t1)...(delegate_to tn)] (with fresh variables)] *)
+  and delegate = {
+    delegate_var: named_var;
+    (* variable standing for the head constructor of [delegate_to] *)
+    delegate_to: term;
+    (* term being evaluated into a constructor form *)
+    delegate_cur: term;
+    (* current form (the one whose evaluation is blocked) *)
+  }
+
+  (* memoization table for some function *)
+  and memo_tbl = {
+    memo_fun: ID.t; (* function name *)
+    memo_cst: cst lazy_t; (* the typed constant *)
+    memo_ty: ty_h; (* type of function (with [memo_arity] arguments) *)
+    memo_arity: int; (* num of arguments *)
+    memo_def: term lazy_t; (* the function definition (has type [memo_ty]) *)
+    mutable memo_dtree: memo_decision_tree;
+    (* the partial pattern-match tree storing the
+       current subset of memoized values for this function.
+       Invariant: the tree matches registers from 0...n in that order.
+       *)
+  }
+
+  (* a call to a memoized function *)
+  and memo_call = {
+    mc_tbl: memo_tbl;
+    mc_computation: term; (* the term being computed, in case of cache miss *)
+    mc_registers: term registers; (* current registers for matching *)
+    mc_dt: memo_decision_tree; (* current sub-tree *)
+    mc_expl: explanation; (* explanation that lead there *)
+  }
+
+  and memo_decision_tree =
+    | Memo_fail (* cache miss *)
+    | Memo_yield of term (* term depends on the current subst *)
+    | Memo_match of register * memo_decision_tree ID.Map.t  (* pattern match *)
+    | Memo_if of register * memo_decision_tree * memo_decision_tree (* if *)
+    | Memo_pass of register * memo_decision_tree (* no need to match *)
 
   (* a table [m] from values of type [switch_ty_arg]
      to terms of type [switch_ty_ret],
@@ -137,6 +195,9 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     | Lit_atom of term
     | Lit_assign of cst * term
     | Lit_uty_empty of ty_uninterpreted_slice
+    | Lit_delegate of named_var * term * explanation
+    (* v := t with explanation. [t] should be a constructor applied to
+       delegates *)
 
   and cst = {
     cst_id: ID.t;
@@ -147,7 +208,12 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     | Cst_undef of ty_h * cst_info * ty_uninterpreted_slice option
     | Cst_cstor of ty_h
     | Cst_uninterpreted_dom_elt of ty_h (* uninterpreted domain constant *)
-    | Cst_defined of ty_h * term lazy_t
+    | Cst_defined of ty_h * term lazy_t * cst_memo_status
+
+  and cst_memo_status =
+    | Cst_trivial (* memoizable but too trivial *)
+    | Cst_not_memoizable
+    | Cst_memoizable of memo_tbl
 
   and cst_info = {
     cst_depth: int;
@@ -343,7 +409,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     let id t = t.cst_id
 
     let ty_of_kind = function
-      | Cst_defined (ty, _)
+      | Cst_defined (ty, _, _)
       | Cst_undef (ty, _, _)
       | Cst_uninterpreted_dom_elt ty
       | Cst_cstor ty -> ty
@@ -355,7 +421,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       let _, ret = Ty.unfold ty in
       assert (Ty.is_data ret);
       make id (Cst_cstor ty)
-    let make_defined id ty t = make id (Cst_defined (ty, t))
+    let make_defined id ty t memo = make id (Cst_defined (ty, t, memo))
     let make_uty_dom_elt id ty = make id (Cst_uninterpreted_dom_elt ty)
 
     let make_undef ?parent ?exist_if ?slice id ty =
@@ -414,6 +480,19 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
   let hash_uty uty =
     Hash.combine3 104 (Ty.hash (Lazy.force uty.uty_self)) uty.uty_offset
 
+  let eq_memo_tbl t1 t2 = ID.equal t1.memo_fun t2.memo_fun
+
+  let eq_memo_call_ a b =
+    eq_memo_tbl a.mc_tbl b.mc_tbl &&
+    term_equal_ a.mc_computation b.mc_computation &&
+    IntMap.equal term_equal_ a.mc_registers b.mc_registers
+
+  let hash_memo_call m =
+    let h_reg =
+      Hash.seq (Hash.pair Hash.int term_hash_) (IntMap.to_seq m.mc_registers)
+    in
+    Hash.combine3 1234 (ID.hash m.mc_tbl.memo_fun) h_reg
+
   let cmp_lit a b =
     let c = CCOrd.bool_ a.lit_sign b.lit_sign in
     if c<>0 then c
@@ -423,6 +502,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         | Lit_atom _ -> 1
         | Lit_assign _ -> 2
         | Lit_uty_empty _ -> 3
+        | Lit_delegate _ -> 4
       in
       match a.lit_view, b.lit_view with
         | Lit_fresh i1, Lit_fresh i2 -> ID.compare i1 i2
@@ -430,10 +510,14 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         | Lit_assign (c1,t1), Lit_assign (c2,t2) ->
           CCOrd.(Typed_cst.compare c1 c2 <?> (term_cmp_, t1, t2))
         | Lit_uty_empty u1, Lit_uty_empty u2 -> cmp_uty u1 u2
+        | Lit_delegate (v1,t1,_), Lit_delegate(v2,t2,_) ->
+          CCOrd.(ID.compare v1 v2 <?> (term_cmp_, t1, t2))
         | Lit_fresh _, _
         | Lit_atom _, _
         | Lit_assign _, _
-        | Lit_uty_empty _, _ ->
+        | Lit_uty_empty _, _
+        | Lit_delegate _, _
+          ->
           CCOrd.int_ (int_of_cell_ a.lit_view) (int_of_cell_ b.lit_view)
 
   let hash_lit a =
@@ -444,6 +528,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       | Lit_assign (c,t) ->
         Hash.combine4 3 (Hash.bool sign) (Typed_cst.hash c) (term_hash_ t)
       | Lit_uty_empty uty -> Hash.combine3 4 (Hash.bool sign) (hash_uty uty)
+      | Lit_delegate (v,t,_) -> Hash.combine3 5 (ID.hash v) (term_hash_ t)
 
   let pp_uty out uty =
     let n = uty.uty_offset in
@@ -551,7 +636,13 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           | Switch (t, tbl) ->
             Hash.combine3 31 (sub_hash t) tbl.switch_id
           | Quant (q,ty,bod) ->
-            Hash.combine4 31 (Hash.poly q) (hash_uty ty) (sub_hash bod)
+            Hash.combine4 32 (Hash.poly q) (hash_uty ty) (sub_hash bod)
+          | Delegate d ->
+            Hash.combine4 33
+              (ID.hash d.delegate_var)
+              (sub_hash d.delegate_to)
+              (sub_hash d.delegate_cur)
+          | Memo_call m -> hash_memo_call m
 
         (* equality that relies on physical equality of subterms *)
         let equal t1 t2 : bool = match t1.term_cell, t2.term_cell with
@@ -590,6 +681,11 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           | Mu t1, Mu t2 -> t1==t2
           | Quant (q1,ty1,bod1), Quant (q2,ty2,bod2) ->
             q1=q2 && equal_uty ty1 ty2 && bod1==bod2
+          | Delegate d1, Delegate d2 ->
+            ID.equal d1.delegate_var d2.delegate_var &&
+            term_equal_ d1.delegate_to d2.delegate_to &&
+            term_equal_ d1.delegate_cur d2.delegate_cur
+          | Memo_call m1, Memo_call m2 -> eq_memo_call_ m1 m2
           | True, _
           | False, _
           | DB _, _
@@ -602,6 +698,8 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           | Mu _, _
           | Switch _, _
           | Quant _, _
+          | Delegate _, _
+          | Memo_call _, _
             -> false
 
         let set_id t i = t.term_id <- i
@@ -791,6 +889,49 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       let deps = Term_dep_uty uty in
       mk_term_ ~deps ~ty:(DTy_direct Ty.prop) (Quant (q,uty,body))
 
+    let delegate (d:delegate): t =
+      let deps = Term_dep_sub d.delegate_cur in
+      mk_term_ ~deps ~ty:(DTy_direct d.delegate_to.term_ty) (Delegate d)
+
+    (* create a new delegate variable for this term *)
+    let delegate_term (t:t): t =
+      let v = ID.make "x" in
+      delegate {delegate_var=v; delegate_to=t; delegate_cur=t}
+
+    (* map [delegate_term] over each term *)
+    let delegate_terms (l:term list): term list =
+      List.mapi
+        (fun i arg ->
+           let v = ID.makef "x_%d" i in
+           delegate
+             {delegate_var=v; delegate_to=arg; delegate_cur=arg})
+        l
+
+    let memo_call (m:memo_call): t =
+      let _, ty = Ty.unfold m.mc_tbl.memo_ty in
+      let deps = Term_dep_sub m.mc_computation in
+      mk_term_ ~ty:(DTy_direct ty) ~deps (Memo_call m)
+
+    (* call the memoized function *)
+    let memo_call_init (f:memo_tbl) (args:t list) (e:explanation): t =
+      assert (f.memo_arity = List.length args);
+      (* create new delegates for the arguments *)
+      let mc_top_args = delegate_terms args in
+      let mc_registers =
+        CCList.Idx.foldi
+          (fun m i del -> IntMap.add i del m)
+          IntMap.empty mc_top_args
+      in
+      let mc_computation = app_cst (Lazy.force f.memo_cst) args in
+      let mc = {
+        mc_tbl=f;
+        mc_computation;
+        mc_registers;
+        mc_dt=f.memo_dtree;
+        mc_expl=e;
+      } in
+      memo_call mc
+
     let forall = quant Forall
     let exists = quant Exists
 
@@ -884,6 +1025,9 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           | Quant (_, _, body)
           | Mu body
           | Fun (_, body) -> aux body
+          | Delegate d -> aux d.delegate_to
+          | Memo_call m ->
+            (m.mc_registers |> IntMap.to_seq |> Sequence.map snd) aux
       in
       aux t
 
@@ -953,6 +1097,11 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           in
           fpf out "(@[switch %a@ (@[<hv>%a@])@])"
             pp t print_map (ID.Tbl.to_seq m.switch_tbl)
+        | Delegate d ->
+          fpf out "(@[<1>delegate@ %a@ %a@])"
+            ID.pp d.delegate_var pp d.delegate_to
+        | Memo_call m ->
+          fpf out "(@[<1>memo_call@ %a@])" pp m.mc_computation
         | Builtin (B_not t) -> fpf out "(@[<hv1>not@ %a@])" pp t
         | Builtin (B_and (_, _, a,b)) ->
           fpf out "(@[<hv1>and@ %a@ %a@])" pp a pp b
@@ -971,22 +1120,36 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       | GE_sub of int (* n-th subterm *)
       | GE_nf (* pointer to normal_form *)
       | GE_dep  (* dependencies on constants *)
-
-
   end
 
-  let pp_lit out l =
+  let rec to_seq_explanation_ e yield = match e with
+    | E_empty -> ()
+    | E_leaf x -> yield x
+    | E_append (a,b) -> to_seq_explanation_ a yield; to_seq_explanation_ b yield
+
+  let explanation_to_list_uniq_ e : lit list =
+    to_seq_explanation_ e
+    |> Sequence.to_rev_list
+    |> CCList.sort_uniq ~cmp:cmp_lit
+
+  let rec pp_lit out l =
     let pp_lit_view out = function
       | Lit_fresh i -> Format.fprintf out "#%a" ID.pp i
       | Lit_atom t -> Term.pp out t
       | Lit_assign (c,t) ->
         Format.fprintf out "(@[:= %a@ %a@])" Typed_cst.pp c Term.pp t
       | Lit_uty_empty u -> Format.fprintf out "(empty %a)" pp_uty u
+      | Lit_delegate (v,t,e) ->
+        Format.fprintf out "(@[<1>@[<1>%a@ <- %a@]@ expl: %a@])"
+          ID.pp v Term.pp t pp_explanation e
     in
     if l.lit_sign then pp_lit_view out l.lit_view
     else Format.fprintf out "(@[@<1>¬@ %a@])" pp_lit_view l.lit_view
 
-  (* FIXME: make a specific data structure *)
+  and pp_explanation out e =
+    Format.fprintf out "(@[%a@])"
+      (Utils.pp_list pp_lit) (explanation_to_list_uniq_ e)
+
   (** {2 Literals} *)
   module Lit : sig
     type t = lit
@@ -997,6 +1160,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     val as_atom : t -> (term * bool) option
     val fresh_with : ID.t -> t
     val fresh : unit -> t
+    val delegate : named_var -> term -> explanation -> t
     val dummy : t
     val atom : ?sign:bool -> term -> t
     val eq : term -> term -> t
@@ -1012,7 +1176,6 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     val pp : t CCFormat.printer
     val norm : t -> t * FI.negated
     module Set : CCSet.S with type elt = t
-    module Tbl : CCHashtbl.S with type key = t
   end = struct
     type t = lit
 
@@ -1043,6 +1206,9 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       let sign = if not sign' then not sign else sign in
       make ~sign (Lit_atom t)
 
+    let delegate v to_ e =
+      make ~sign:true (Lit_delegate (v,to_,e))
+
     let eq a b = atom ~sign:true (Term.eq a b)
     let neq a b = atom ~sign:false (Term.eq a b)
     let cst_choice c t = make ~sign:true (Lit_assign (c, t))
@@ -1066,10 +1232,20 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       if l.lit_sign then l, FI.Same_sign else neg l, FI.Negated
 
     module Set = CCSet.Make(struct type t = lit let compare=compare end)
-    module Tbl = CCHashtbl.Make(struct type t = lit let equal=equal let hash=hash end)
   end
 
-  module Explanation = struct
+  module Explanation : sig
+    type t = explanation
+    val empty : t
+    val return : lit -> t
+    val cons : lit -> t -> t
+    val append : t -> t -> t
+    val is_empty : t -> bool
+    val to_seq : t -> lit Sequence.t
+    val to_list : t -> lit list
+    val to_list_uniq : t -> lit list
+    val pp : t CCFormat.printer
+  end = struct
     type t = explanation
     let empty : t = E_empty
     let return e = E_leaf e
@@ -1077,17 +1253,14 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       | E_empty, _ -> s2
       | _, E_empty -> s1
       | _ -> E_append (s1, s2)
-    let cons e s = append (return e) s
+    let cons x e = append (return x) e
 
     let is_empty = function
       | E_empty -> true
       | E_leaf _
       | E_append _ -> false (* by smart cstor *)
 
-    let rec to_seq e yield = match e with
-      | E_empty -> ()
-      | E_leaf x -> yield x
-      | E_append (a,b) -> to_seq a yield; to_seq b yield
+    let to_seq = to_seq_explanation_
 
     let to_list e =
       let rec aux acc = function
@@ -1097,23 +1270,9 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       in
       aux [] e
 
-    let to_list_uniq e =
-      to_seq e
-      |> Sequence.to_rev_list
-      |> Lit.Set.of_list
-      |> Lit.Set.to_list
+    let to_list_uniq = explanation_to_list_uniq_
 
-    let equal a b =
-      let la = to_list a in
-      let lb = to_list b in
-      (* double inclusion *)
-      let mem l x = List.exists (fun y -> Lit.equal x y) l in
-      List.for_all (mem lb) la
-      && List.for_all (mem la) lb
-
-    let pp out e =
-      Format.fprintf out "(@[%a@])"
-        (Utils.pp_list Lit.pp) (to_list_uniq e)
+    let pp = pp_explanation
   end
 
   (** {2 Clauses} *)
@@ -1712,6 +1871,11 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
             let l' = aux_l env l in
             if f==f' && CCList.equal (==) l l' then t else Term.app f' l'
           | Builtin b -> Term.builtin (Term.map_builtin (aux env) b)
+          | Delegate d ->
+            let d' = {d with delegate_to=aux env d.delegate_to} in
+            Term.delegate d'
+          | Memo_call _ ->
+            t (* NOTE: should not contain De Bruijn indices *)
         and aux_l env l =
           List.map (aux env) l
         in
@@ -1786,7 +1950,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           Explanation.empty, t (* always trivial *)
         | Const c ->
           begin match c.cst_kind with
-            | Cst_defined (_, rhs) ->
+            | Cst_defined (_, rhs, _) ->
               (* expand defined constants *)
               compute_nf (Lazy.force rhs)
             | Cst_undef (_, {cst_cur_case=Some (e,new_t); _}, _) ->
@@ -1898,6 +2062,14 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           end
         | App ({term_cell=Const {cst_kind=Cst_cstor _; _}; _}, _) ->
           Explanation.empty, t (* do not reduce under cstors *)
+        | App ({term_cell=
+                  Const
+                    {cst_kind=
+                       Cst_defined (ty, _, Cst_memoizable tbl);_}; _}, l)
+          when List.length l = List.length (Ty.unfold ty |> fst) ->
+          (* fully applied memoizable function: transfer to a memoized call *)
+          let t' = Term.memo_call_init tbl l Explanation.empty in
+          compute_nf t'
         | App (f, l) ->
           let e_f, f' = compute_nf f in
           (* now beta-reduce if needed *)
@@ -1908,10 +2080,32 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           let e = Explanation.append e_reduce e_f in
           set_nf_ t new_t e;
           e, new_t
+        | Delegate d ->
+          let e_to_, to_ = compute_nf d.delegate_to in
+          begin match to_.term_cell, Term.as_cstor_app to_ with
+            | True, _
+            | False, _ ->
+              (* success, finish delegating *)
+              let lit = Lit.delegate d.delegate_var to_ e_to_ in
+              Explanation.return lit, to_
+            | _, Some (cstor, _, args) ->
+              (* success, finish delegating, but delegate immediate subterms
+                 instead of returning [to_] directly *)
+              let subs = Term.delegate_terms args in
+              let to_delegated = Term.app_cst cstor subs in
+              let lit = Lit.delegate d.delegate_var to_delegated e_to_ in
+              Explanation.return lit, to_delegated
+            | _, None ->
+              (* [to_] doesn't yet evaluate to a constructor, return
+                 the same term, waiting for *)
+              Explanation.empty, t
+          end
+        | Memo_call m ->
+          compute_nf_memo_call m
 
     (* apply [f] to [l], until no beta-redex is found *)
     and compute_nf_app env e f l = match f.term_cell, l with
-      | Const {cst_kind=Cst_defined (_, lazy def_f); _}, l ->
+      | Const {cst_kind=Cst_defined (_, lazy def_f, _); _}, l ->
         (* reduce [f l] into [def_f l] when [f := def_f] *)
         compute_nf_app env e def_f l
       | Fun (_ty, body), arg :: other_args ->
@@ -2047,11 +2241,72 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
             end
         end
 
+    (* compute and memoize *)
+    and compute_nf_memo_call (m:memo_call): explanation * term =
+      let rec aux (m:memo_call): explanation * term =
+        match m.mc_dt with
+          | Memo_pass (i, dt') ->
+            assert (IntMap.mem i m.mc_registers);
+            aux {m with mc_dt=dt'}
+          | Memo_fail ->
+            (* fallback on the regular computation *)
+            let e_nf, nf = compute_nf m.mc_computation in
+            let full_expl = Explanation.append e_nf m.mc_expl in
+            if nf.term_deps=[] then (
+              (* normal form! memoize it, and return it.
+                 The explanation plays two roles here:
+                 - finding the input patterns that were used to evaluate
+                   the function (through delegates)
+                 - explaining the reductions in the arguments needed to
+                   obtain those patterns from the actual (lazy) arguments
+              *)
+              let vars, expl =
+                Explanation.to_seq full_expl
+                |> Sequence.fold
+                  (fun (vars,e) lit -> match Lit.view lit with
+                     | Lit_delegate (v, t, e_vt) ->
+                       assert (Lit.sign lit);
+                       (* v:=t with explanation e_vt, now we keep the
+                          definition of [v] and return [e_vt] *)
+                       (v,t)::vars, Explanation.append e_vt e
+                     | _ -> vars, Explanation.cons lit e)
+                  ([], Explanation.empty)
+              in
+              (* update memo table *)
+              update_memo_tbl m vars expl nf;
+              (* return the normal form *)
+              expl, nf
+            ) else (
+              (* hold there for now *)
+              let m' = {
+                m with
+                mc_computation=nf;
+                mc_expl=full_expl;
+              } in
+              Explanation.empty, Term.memo_call m'
+            )
+          | Memo_yield t ->
+            (* evaluate *)
+            assert false (* TODO: substitute? return [t]... *)
+      in
+      aux m
+
+    (* update memo table by adding an entry into it *)
+    and update_memo_tbl (m:memo_call) vars expl nf: unit =
+      (* TODO:
+         - compute input pattern (use m.mc_registers + vars)
+         - compute abstract normal form from nf + expl (replace metas with vars)
+         - insert pattern->normal form into the memo_tbl (should replace
+         a Fail path) *)
+      assert false
+
     let compute_nf_lit (lit:lit): explanation * lit =
       match Lit.view lit with
         | Lit_fresh _
         | Lit_assign (_,_)
-        | Lit_uty_empty _ -> Explanation.empty, lit
+        | Lit_uty_empty _
+        | Lit_delegate _
+          -> Explanation.empty, lit
         | Lit_atom t ->
           let e, t' = compute_nf t in
           e, Lit.atom ~sign:(Lit.sign lit) t'
@@ -2338,6 +2593,9 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         | Lit_uty_empty uty ->
           let status = if Lit.sign lit then Uty_empty else Uty_nonempty in
           assert_uty uty status
+        | Lit_delegate _ ->
+          (* those literals should never show up in the SAT solver *)
+          assert false
       end
 
     (* propagation from the bool solver *)
@@ -2637,8 +2895,26 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
             (fun (id,ty,rhs) ->
                let ty = conv_ty ty in
                let rhs = lazy (conv_term [] rhs) in
-               let cst = lazy (
-                 Typed_cst.make_defined id ty rhs
+               (* FIXME: see if
+                  - closed function (no metas inside)
+                  - does not depend on Cst_not_memoizable IDs*)
+               let ty_args, _ = Ty.unfold ty in
+               let memo_arity = List.length ty_args in
+               let memo_dtree =
+                 let l = CCList.range 0 (memo_arity-1) in
+                 List.fold_right (fun i rhs -> Memo_pass (i,rhs)) l Memo_fail
+               in
+               let rec memo_tbl = lazy {
+                 memo_fun=id;
+                 memo_cst=cst;
+                 memo_ty=ty;
+                 memo_arity;
+                 memo_dtree;
+                 memo_def=rhs;
+               }
+               and cst = lazy (
+                 let memo = Cst_memoizable (Lazy.force memo_tbl) in
+                 Typed_cst.make_defined id ty rhs memo
                ) in
                ID.Tbl.add decl_ty_ id cst)
             l;
@@ -2726,6 +3002,10 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
             | B_eq (a,b) -> A.eq (aux env a) (aux env b)
             | B_imply (a,b) -> A.imply (aux env a) (aux env b)
           end
+        | Delegate d -> aux env d.delegate_to
+        | Memo_call _ ->
+          (* we could convert [f top_args], but this should never happen *)
+          errorf "cannot convert memo_call to Ast"
       in aux DB_env.empty t
   end
 
@@ -2783,6 +3063,9 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         | Fun (ty,body) -> Term.fun_ ty (aux body)
         | Mu body -> Term.mu (aux body)
         | Builtin b -> Term.builtin (Term.map_builtin aux b)
+        | Delegate d -> aux d.delegate_to
+        | Memo_call _ ->
+          assert false (* not a proper value *)
     in
     aux t
 
@@ -2844,10 +3127,6 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
   let clauses_of_unsat_core (core:M.St.clause list): Clause.t Sequence.t =
     Sequence.of_list core
     |> Sequence.map clause_of_mclause
-
-  (* print all terms reachable from watched literals *)
-  let pp_term_graph out () =
-    Term.pp_dot out (Watched_lit.to_seq :> term Sequence.t)
 
   let pp_stats out () : unit =
     Format.fprintf out
