@@ -142,18 +142,28 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
   (* a call to a memoized function *)
   and memo_call = {
     mc_tbl: memo_tbl;
-    mc_computation: term; (* the term being computed, in case of cache miss *)
-    mc_registers: term registers; (* current registers for matching *)
-    mc_dt: memo_decision_tree; (* current sub-tree *)
-    mc_expl: explanation; (* explanation that lead there *)
+    mc_blocking: term; (* term blocking evaluation (in all states) *)
+    mc_initial_term: term; (* original term being computed *)
+    mc_state: memo_call_state;
   }
+
+  and memo_call_state =
+    | MCS_lookup of explanation * term registers * memo_decision_tree
+    | MCS_computing of explanation * term (* current term + explanation *)
 
   and memo_decision_tree =
     | Memo_fail (* cache miss *)
-    | Memo_yield of term (* term depends on the current subst *)
-    | Memo_match of register * memo_decision_tree ID.Map.t  (* pattern match *)
+    | Memo_yield of memo_term (* term depends on the current [mc_registers] *)
+    | Memo_match of register * (register list * memo_decision_tree) ID.Map.t
     | Memo_if of register * memo_decision_tree * memo_decision_tree (* if *)
     | Memo_pass of register * memo_decision_tree (* no need to match *)
+
+  (* description of values/patterns for memoization purposes *)
+  and memo_term =
+    | MT_reg of register
+    | MT_app of cst * memo_term list
+    | MT_true
+    | MT_false
 
   (* a table [m] from values of type [switch_ty_arg]
      to terms of type [switch_ty_ret],
@@ -484,14 +494,23 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
 
   let eq_memo_call_ a b =
     eq_memo_tbl a.mc_tbl b.mc_tbl &&
-    term_equal_ a.mc_computation b.mc_computation &&
-    IntMap.equal term_equal_ a.mc_registers b.mc_registers
+    term_equal_ a.mc_initial_term b.mc_initial_term &&
+    begin match a.mc_state, b.mc_state with
+      | MCS_computing (_,t1), MCS_computing (_,t2) -> term_equal_ t1 t2
+      | MCS_lookup (_, regs1,_), MCS_lookup (_, regs2,_) ->
+        IntMap.equal term_equal_ regs1 regs2
+      | MCS_computing _, _
+      | MCS_lookup _, _ -> false
+    end
 
   let hash_memo_call m =
-    let h_reg =
-      Hash.seq (Hash.pair Hash.int term_hash_) (IntMap.to_seq m.mc_registers)
+    let h_state = match m.mc_state with
+      | MCS_computing (_,t) -> term_hash_ t
+      | MCS_lookup (_, regs,_) ->
+        Hash.seq (Hash.pair Hash.int term_hash_) (IntMap.to_seq regs)
     in
-    Hash.combine3 1234 (ID.hash m.mc_tbl.memo_fun) h_reg
+    Hash.combine4 1234
+      (ID.hash m.mc_tbl.memo_fun) (term_hash_ m.mc_initial_term) h_state
 
   let cmp_lit a b =
     let c = CCOrd.bool_ a.lit_sign b.lit_sign in
@@ -908,27 +927,26 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         l
 
     let memo_call (m:memo_call): t =
-      let _, ty = Ty.unfold m.mc_tbl.memo_ty in
-      let deps = Term_dep_sub m.mc_computation in
-      mk_term_ ~ty:(DTy_direct ty) ~deps (Memo_call m)
+      let deps = Term_dep_sub m.mc_blocking in
+      mk_term_ ~ty:(DTy_direct m.mc_blocking.term_ty) ~deps (Memo_call m)
 
     (* call the memoized function *)
-    let memo_call_init (f:memo_tbl) (args:t list) (e:explanation): t =
+    let memo_call_init (f:memo_tbl) (args:t list): t =
+      assert (f.memo_arity > 0);
       assert (f.memo_arity = List.length args);
       (* create new delegates for the arguments *)
-      let mc_top_args = delegate_terms args in
-      let mc_registers =
+      let args = delegate_terms args in
+      let regs =
         CCList.Idx.foldi
           (fun m i del -> IntMap.add i del m)
-          IntMap.empty mc_top_args
+          IntMap.empty args
       in
-      let mc_computation = app_cst (Lazy.force f.memo_cst) args in
+      let initial_term = app_cst (Lazy.force f.memo_cst) args in
       let mc = {
         mc_tbl=f;
-        mc_computation;
-        mc_registers;
-        mc_dt=f.memo_dtree;
-        mc_expl=e;
+        mc_blocking=initial_term;
+        mc_initial_term=initial_term;
+        mc_state=MCS_lookup (E_empty, regs, f.memo_dtree);
       } in
       memo_call mc
 
@@ -1026,8 +1044,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           | Mu body
           | Fun (_, body) -> aux body
           | Delegate d -> aux d.delegate_to
-          | Memo_call m ->
-            (m.mc_registers |> IntMap.to_seq |> Sequence.map snd) aux
+          | Memo_call m -> aux m.mc_blocking
       in
       aux t
 
@@ -1101,7 +1118,13 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           fpf out "(@[<1>delegate@ %a@ %a@])"
             ID.pp d.delegate_var pp d.delegate_to
         | Memo_call m ->
-          fpf out "(@[<1>memo_call@ %a@])" pp m.mc_computation
+          let pp_st out = function
+            | MCS_lookup (_, _, _) -> fpf out "lookup"
+            | MCS_computing (_, t) -> fpf out "(@[computing@ %a@])" pp t
+          in
+          (* TODO: also print current state *)
+          fpf out "(@[<1>memo_call@ %a@ state: %a@])"
+            pp m.mc_initial_term pp_st m.mc_state
         | Builtin (B_not t) -> fpf out "(@[<hv1>not@ %a@])" pp t
         | Builtin (B_and (_, _, a,b)) ->
           fpf out "(@[<hv1>and@ %a@ %a@])" pp a pp b
@@ -1116,10 +1139,58 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
 
     let pp = pp_top ~ids:true
 
-    type graph_edge =
-      | GE_sub of int (* n-th subterm *)
-      | GE_nf (* pointer to normal_form *)
-      | GE_dep  (* dependencies on constants *)
+    let map
+      : f:('b_acc -> t-> t) ->
+        bind:('b_acc -> ty_h -> 'b_acc) ->
+      'b_acc -> t -> t
+      = fun ~f ~bind b_acc t -> match t.term_cell with
+        | True
+        | False
+        | Const _
+        | DB _ -> t
+        | App (hd,l) ->
+          app (f b_acc hd) (List.map (f b_acc) l)
+        | Fun (ty,body) ->
+          let b_acc = bind b_acc ty in
+          fun_ ty (f b_acc body)
+        | Mu t ->
+          let b_acc = bind b_acc t.term_ty in
+          mu (f b_acc t)
+        | If (a,b,c) ->
+          if_ (f b_acc a) (f b_acc b) (f b_acc c)
+        | Match (u,m) ->
+          let u = f b_acc u in
+          let m =
+            ID.Map.map
+              (fun (tys, rhs) ->
+                 let b_acc = List.fold_left bind b_acc tys in
+                 tys, f b_acc rhs)
+              m
+          in
+          match_ u m
+        | Switch (u,m) ->
+          let u = f b_acc u in
+          let m = {
+            m with
+              switch_tbl=
+                ID.Tbl.to_seq m.switch_tbl
+                |> Sequence.map (fun (c,rhs) -> c, f b_acc rhs)
+                |> ID.Tbl.of_seq;
+          } in
+          switch u m
+        | Quant (q,uty,body) ->
+          let b_acc = bind b_acc (Lazy.force uty.uty_self) in
+          quant q uty (f b_acc body)
+        | Delegate d ->
+          let d = {
+            d with
+            delegate_to=f b_acc d.delegate_to;
+            delegate_cur=f b_acc d.delegate_cur;
+          } in
+          delegate d
+        | Memo_call _ -> t
+        | Builtin b ->
+          builtin (map_builtin (f b_acc) b)
   end
 
   let rec to_seq_explanation_ e yield = match e with
@@ -1816,6 +1887,30 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     |> List.map Lit.neg (* this is a guard! *)
     |> CCList.sort_uniq ~cmp:Lit.compare
 
+  module Memo_utils : sig
+    val find_register : term registers -> int -> term
+    (* find the content of this register, or fails *)
+
+    val subst : term registers -> memo_term -> term
+    (* TODO: something to add [memo_term,memo_term] to a [memo_tbl]
+       as a pattern->yield pair *)
+  end = struct
+    let find_register (r:_ registers) (i:int): term =
+      try IntMap.find i r
+      with Not_found ->
+        errorf "cannot find register %d@ in @[<hv>%a@]"
+          i (IntMap.print ~start:"" ~stop:"" CCFormat.int Term.pp) r
+
+    let rec subst regs t = match t with
+      | MT_true -> Term.true_
+      | MT_false -> Term.false_
+      | MT_app (cst,l) ->
+        let l = List.map (subst regs) l in
+        Term.app_cst cst l
+      | MT_reg i ->
+        find_register regs i
+  end
+
   (** {2 Reduction to Normal Form} *)
   module Reduce = struct
     (* environment for evaluation: not-yet-evaluated terms *)
@@ -2067,8 +2162,9 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
                     {cst_kind=
                        Cst_defined (ty, _, Cst_memoizable tbl);_}; _}, l)
           when List.length l = List.length (Ty.unfold ty |> fst) ->
+          assert (tbl.memo_arity > 0);
           (* fully applied memoizable function: transfer to a memoized call *)
-          let t' = Term.memo_call_init tbl l Explanation.empty in
+          let t' = Term.memo_call_init tbl l in
           compute_nf t'
         | App (f, l) ->
           let e_f, f' = compute_nf f in
@@ -2244,14 +2340,79 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     (* compute and memoize *)
     and compute_nf_memo_call (m:memo_call): explanation * term =
       let rec aux (m:memo_call): explanation * term =
-        match m.mc_dt with
-          | Memo_pass (i, dt') ->
-            assert (IntMap.mem i m.mc_registers);
-            aux {m with mc_dt=dt'}
-          | Memo_fail ->
+        match m.mc_state with
+          | MCS_lookup (e, regs, Memo_pass (i, dt')) ->
+            assert (IntMap.mem i regs);
+            aux {m with mc_state=MCS_lookup (e, regs, dt') }
+          | MCS_lookup (_, _, Memo_fail) ->
             (* fallback on the regular computation *)
-            let e_nf, nf = compute_nf m.mc_computation in
-            let full_expl = Explanation.append e_nf m.mc_expl in
+            let m' = {
+              m with
+                mc_state=MCS_computing (Explanation.empty, m.mc_initial_term)
+            } in
+            aux m'
+          | MCS_lookup (e, regs, Memo_yield res) ->
+            (* substitute the registers' content. No explanation is needed,
+               since the function is pure. *)
+            let t = Memo_utils.subst regs res in
+            e, t
+          | MCS_lookup (e, regs, (Memo_match (i, dt_map) as dt)) ->
+            (* evaluate [regs[i]] into a constructor and follow the
+               corresponding branch *)
+            let t = Memo_utils.find_register regs i in
+            let e_t, t = compute_nf t in
+            let new_e = Explanation.append e_t e in
+            begin match Term.as_cstor_app t with
+              | None ->
+                (* need to reduce [t] further… *)
+                let m' = {
+                  m with
+                    mc_blocking=t;
+                    mc_state=MCS_lookup (new_e, regs, dt);
+                } in
+                Explanation.empty, Term.memo_call m'
+              | Some (cstor, _, args) ->
+                begin match ID.Map.get cstor.cst_id dt_map with
+                  | None ->
+                    let state = MCS_computing (Explanation.empty, m.mc_initial_term) in
+                    aux {m with mc_state=state } (* fail *)
+                  | Some (sub_regs, dt') ->
+                    (* found a branch for this constructor *)
+                    assert (List.length sub_regs = List.length args);
+                    (* push args in registers *)
+                    let regs' =
+                      List.fold_left2
+                        (fun regs reg arg ->
+                           assert (not (IntMap.mem reg regs));
+                           IntMap.add reg arg regs)
+                        regs sub_regs args
+                    in
+                    aux {m with mc_state=MCS_lookup (new_e, regs', dt')}
+                end
+            end
+          | MCS_lookup (e, regs, (Memo_if (i, then_, else_) as dt)) ->
+            (* evaluate [regs[i]] into a boolean, and follow the corresponding
+               branch *)
+            let t = Memo_utils.find_register regs i in
+            let e_t, t = compute_nf t in
+            let new_e = Explanation.append e_t e in
+            begin match t.term_cell with
+              | True -> aux {m with mc_state=MCS_lookup(new_e, regs, then_)}
+              | False -> aux {m with mc_state=MCS_lookup(new_e, regs, else_)}
+              | _ ->
+                (* need to reduce further *)
+                let m' = {
+                  m with
+                    mc_blocking=t;
+                    mc_state=MCS_lookup(new_e, regs, dt)
+                } in
+                Explanation.empty, Term.memo_call m'
+            end
+          | MCS_computing (e, t) ->
+            (* currently in a cache miss, just compute and memoize once we
+               get a value *)
+            let e_nf, nf = compute_nf t in
+            let new_e = Explanation.append e_nf e in
             if nf.term_deps=[] then (
               (* normal form! memoize it, and return it.
                  The explanation plays two roles here:
@@ -2259,9 +2420,14 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
                    the function (through delegates)
                  - explaining the reductions in the arguments needed to
                    obtain those patterns from the actual (lazy) arguments
+
+                 NOTE: we might ask for a strong normal form here, but
+                 it would make evaluation for memoized functions different
+                 from evaluation of other expressions.
+                 or: we could evaluate the recursive calls?
               *)
               let vars, expl =
-                Explanation.to_seq full_expl
+                Explanation.to_seq new_e
                 |> Sequence.fold
                   (fun (vars,e) lit -> match Lit.view lit with
                      | Lit_delegate (v, t, e_vt) ->
@@ -2280,14 +2446,11 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
               (* hold there for now *)
               let m' = {
                 m with
-                mc_computation=nf;
-                mc_expl=full_expl;
+                mc_state=MCS_computing (new_e, nf);
+                mc_blocking=nf;
               } in
               Explanation.empty, Term.memo_call m'
             )
-          | Memo_yield t ->
-            (* evaluate *)
-            assert false (* TODO: substitute? return [t]... *)
       in
       aux m
 
@@ -2298,6 +2461,14 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
          - compute abstract normal form from nf + expl (replace metas with vars)
          - insert pattern->normal form into the memo_tbl (should replace
          a Fail path) *)
+      Log.debugf 3
+        (fun k->
+         let pp_var out (v,t) =
+           Format.fprintf out "(@[<-@ %a@ %a@]" ID.pp v Term.pp t
+         in
+         k "(@[<hv1>update_memo_tbl@ %a@ vars: (@[%a@])@ nf: %a@ expl: %a@])"
+           ID.pp m.mc_tbl.memo_fun (Utils.pp_list pp_var) vars
+           Term.pp nf Explanation.pp expl);
       assert false
 
     let compute_nf_lit (lit:lit): explanation * lit =
@@ -2895,28 +3066,35 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
             (fun (id,ty,rhs) ->
                let ty = conv_ty ty in
                let rhs = lazy (conv_term [] rhs) in
-               (* FIXME: see if
-                  - closed function (no metas inside)
-                  - does not depend on Cst_not_memoizable IDs*)
                let ty_args, _ = Ty.unfold ty in
                let memo_arity = List.length ty_args in
-               let memo_dtree =
-                 let l = CCList.range 0 (memo_arity-1) in
-                 List.fold_right (fun i rhs -> Memo_pass (i,rhs)) l Memo_fail
+               let cst =
+                 (* FIXME: also require that:
+                    - closed function (no metas inside)
+                    - does not depend on Cst_not_memoizable IDs*)
+                 if memo_arity > 0 then (
+                   let memo_dtree =
+                     let l = CCList.range 0 (memo_arity-1) in
+                     List.fold_right (fun i rhs -> Memo_pass (i,rhs)) l Memo_fail
+                   in
+                   let rec memo_tbl = lazy {
+                     memo_fun=id;
+                     memo_cst=cst;
+                     memo_ty=ty;
+                     memo_arity;
+                     memo_dtree;
+                     memo_def=rhs;
+                   }
+                   and cst = lazy (
+                     let memo = Cst_memoizable (Lazy.force memo_tbl) in
+                     Typed_cst.make_defined id ty rhs memo
+                   ) in
+                   cst
+                 ) else (* not a function, memoizing makes no sense *)
+                   lazy (Typed_cst.make_defined id ty rhs Cst_trivial)
                in
-               let rec memo_tbl = lazy {
-                 memo_fun=id;
-                 memo_cst=cst;
-                 memo_ty=ty;
-                 memo_arity;
-                 memo_dtree;
-                 memo_def=rhs;
-               }
-               and cst = lazy (
-                 let memo = Cst_memoizable (Lazy.force memo_tbl) in
-                 Typed_cst.make_defined id ty rhs memo
-               ) in
-               ID.Tbl.add decl_ty_ id cst)
+               ID.Tbl.add decl_ty_ id cst
+            )
             l;
           (* force thunks *)
           List.iter
