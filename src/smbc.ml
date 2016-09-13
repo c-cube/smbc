@@ -29,15 +29,8 @@ let solve ~config (ast:Ast.statement list) : unit =
   let module S = Solver.Make(Conf)(struct end) in
   let print_term_graph = match config.dot_term_graph with
     | None -> []
-    | Some file ->
-      let doit() =
-        Log.debugf 1 (fun k->k "print term graph in `%s`" file);
-        CCIO.with_out file
-          (fun oc ->
-             let fmt = Format.formatter_of_out_channel oc in
-             S.pp_term_graph fmt ())
-      in
-      [doit]
+    | Some _ ->
+      failwith "dot printing: not implemented"
   in
   let on_exit =
     print_term_graph
