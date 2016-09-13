@@ -1147,10 +1147,6 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     module Tbl = CCHashtbl.Make(struct type t = lit let equal=equal let hash=hash end)
   end
 
-  let pp_dep out = function
-    | Dep_cst c -> Typed_cst.pp out c
-    | Dep_uty uty -> pp_uty out uty
-
   module Explanation = struct
     type t = explanation
     let empty : t = E_empty
