@@ -1076,6 +1076,14 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         | Const ({cst_kind=Cst_uninterpreted_dom_elt ty; _} as c) -> Some (c,ty)
         | _ -> None
 
+    (* unfold the function into [list of args, body] *)
+    let unfold_fun (t:t): ty_h list * t =
+      let rec aux acc t = match t.term_cell with
+        | Fun (ty, bod) -> aux (ty::acc) bod
+        | _ -> List.rev acc, t
+      in
+      aux [] t
+
     let fpf = Format.fprintf
 
     let pp_top ~ids out t =
