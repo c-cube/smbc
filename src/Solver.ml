@@ -121,8 +121,8 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     (* variable standing for the head constructor of [delegate_to] *)
     delegate_to: term;
     (* term being evaluated into a constructor form *)
-    delegate_cur: term;
-    (* current form (the one whose evaluation is blocked) *)
+    delegate_expl: explanation;
+    (* explanation *)
   }
 
   (* memoization table for some function *)
@@ -515,7 +515,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     Hash.combine4 1234
       (ID.hash m.mc_tbl.memo_fun) (term_hash_ m.mc_initial_term) h_state
 
-  let cmp_lit a b =
+  let rec cmp_lit a b =
     let c = CCOrd.bool_ a.lit_sign b.lit_sign in
     if c<>0 then c
     else
@@ -532,8 +532,12 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         | Lit_assign (c1,t1), Lit_assign (c2,t2) ->
           CCOrd.(Typed_cst.compare c1 c2 <?> (term_cmp_, t1, t2))
         | Lit_uty_empty u1, Lit_uty_empty u2 -> cmp_uty u1 u2
-        | Lit_delegate (v1,t1,_), Lit_delegate(v2,t2,_) ->
-          CCOrd.(ID.compare v1 v2 <?> (term_cmp_, t1, t2))
+        | Lit_delegate (v1,t1,e1), Lit_delegate(v2,t2,e2) ->
+          CCOrd.(
+            ID.compare v1 v2
+            <?> (term_cmp_, t1, t2)
+            <?> (cmp_expl, e1, e2)
+          )
         | Lit_fresh _, _
         | Lit_atom _, _
         | Lit_assign _, _
@@ -542,7 +546,26 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           ->
           CCOrd.int_ (int_of_cell_ a.lit_view) (int_of_cell_ b.lit_view)
 
-  let hash_lit a =
+  (* comparison of explanations as ordered sequences of literals *)
+  and cmp_expl (e1:explanation)(e2:explanation): int =
+    let rec aux l1 l2 = match l1, l2 with
+      | [], [] -> 0
+      | [], _ -> -1
+      | _, [] -> 1
+      | E_empty :: l1', _ -> aux l1' l2
+      | _, E_empty :: l2' -> aux l1 l2'
+      | E_append (a,b) :: l1', _ -> aux (a::b::l1') l2
+      | _, E_append (a,b) :: l2' -> aux l1 (a::b::l2')
+      | E_leaf a :: l1', E_leaf b :: l2' ->
+        let c = cmp_lit a b in
+        if c=0 then aux l1' l2' else c
+    in
+    aux [e1] [e2]
+
+  let eq_lit a b = (cmp_lit a b) = 0
+  let eq_expl a b = (cmp_expl a b) = 0
+
+  let rec hash_lit a =
     let sign = a.lit_sign in
     match a.lit_view with
       | Lit_fresh i -> Hash.combine3 1 (Hash.bool sign) (ID.hash i)
@@ -550,7 +573,13 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       | Lit_assign (c,t) ->
         Hash.combine4 3 (Hash.bool sign) (Typed_cst.hash c) (term_hash_ t)
       | Lit_uty_empty uty -> Hash.combine3 4 (Hash.bool sign) (hash_uty uty)
-      | Lit_delegate (v,t,_) -> Hash.combine3 5 (ID.hash v) (term_hash_ t)
+      | Lit_delegate (v,t,e) ->
+        Hash.combine4 5 (ID.hash v) (term_hash_ t) (hash_expl e)
+
+  and hash_expl e = match e with
+    | E_empty -> 0
+    | E_leaf l -> hash_lit l
+    | E_append (a,b) -> Hash.combine2 (hash_expl a) (hash_expl b)
 
   let pp_uty out uty =
     let n = uty.uty_offset in
@@ -663,7 +692,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
             Hash.combine4 33
               (ID.hash d.delegate_var)
               (sub_hash d.delegate_to)
-              (sub_hash d.delegate_cur)
+              (hash_expl d.delegate_expl)
           | Memo_call m -> hash_memo_call m
 
         (* equality that relies on physical equality of subterms *)
@@ -706,7 +735,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           | Delegate d1, Delegate d2 ->
             ID.equal d1.delegate_var d2.delegate_var &&
             term_equal_ d1.delegate_to d2.delegate_to &&
-            term_equal_ d1.delegate_cur d2.delegate_cur
+            eq_expl d1.delegate_expl d2.delegate_expl
           | Memo_call m1, Memo_call m2 -> eq_memo_call_ m1 m2
           | True, _
           | False, _
@@ -912,13 +941,13 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       mk_term_ ~deps ~ty:(DTy_direct Ty.prop) (Quant (q,uty,body))
 
     let delegate (d:delegate): t =
-      let deps = Term_dep_sub d.delegate_cur in
+      let deps = Term_dep_sub d.delegate_to in
       mk_term_ ~deps ~ty:(DTy_direct d.delegate_to.term_ty) (Delegate d)
 
     (* create a new delegate variable for this term *)
     let delegate_term (t:t): t =
       let v = ID.make "x" in
-      delegate {delegate_var=v; delegate_to=t; delegate_cur=t}
+      delegate {delegate_var=v; delegate_to=t; delegate_expl=E_empty}
 
     (* map [delegate_term] over each term *)
     let delegate_terms (l:term list): term list =
@@ -926,32 +955,12 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         (fun i arg ->
            let v = ID.makef "x_%d" i in
            delegate
-             {delegate_var=v; delegate_to=arg; delegate_cur=arg})
+             {delegate_var=v; delegate_to=arg; delegate_expl=E_empty})
         l
 
     let memo_call (m:memo_call): t =
       let deps = Term_dep_sub m.mc_blocking in
       mk_term_ ~ty:(DTy_direct m.mc_blocking.term_ty) ~deps (Memo_call m)
-
-    (* call the memoized function *)
-    let memo_call_init (f:memo_tbl) (args:t list): t =
-      assert (f.memo_arity > 0);
-      assert (f.memo_arity = List.length args);
-      (* create new delegates for the arguments *)
-      let args = delegate_terms args in
-      let regs =
-        CCList.Idx.foldi
-          (fun m i del -> IntMap.add i del m)
-          IntMap.empty args
-      in
-      let initial_term = app_cst (Lazy.force f.memo_cst) args in
-      let mc = {
-        mc_tbl=f;
-        mc_blocking=initial_term;
-        mc_initial_term=initial_term;
-        mc_state=MCS_lookup (E_empty, regs, f.memo_dtree);
-      } in
-      memo_call mc
 
     let forall = quant Forall
     let exists = quant Exists
@@ -1196,7 +1205,6 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           let d = {
             d with
             delegate_to=f b_acc d.delegate_to;
-            delegate_cur=f b_acc d.delegate_cur;
           } in
           delegate d
         | Memo_call _ -> t
@@ -1288,7 +1296,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     if l.lit_sign then pp_lit_view out l.lit_view
     else Format.fprintf out "(@[@<1>¬@ %a@])" pp_lit_view l.lit_view
 
-  and pp_explanation out e =
+  and pp_explanation out (e:explanation) =
     Format.fprintf out "(@[%a@])"
       (Utils.pp_list pp_lit) (explanation_to_list_uniq_ e)
 
@@ -1960,11 +1968,16 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
 
   module Memo_utils : sig
     val find_register : term registers -> int -> term
-    (* find the content of this register, or fails *)
+    (** find the content of this register, or fails *)
 
     val subst : term registers -> memo_term -> term
+    (** Substitute registers in this memo_term, and convert to normal term *)
+
     (* TODO: something to add [memo_term,memo_term] to a [memo_tbl]
        as a pattern->yield pair *)
+
+    val memo_call_init : memo_tbl -> term list -> term
+    (** Apply the memoized function to this list of arguments *)
   end = struct
     let find_register (r:_ registers) (i:int): term =
       try IntMap.find i r
@@ -2003,7 +2016,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         mc_tbl=f;
         mc_blocking=initial_term;
         mc_initial_term=initial_term;
-        mc_state=MCS_lookup (E_empty, regs, f.memo_dtree);
+        mc_state=MCS_lookup (Explanation.empty, regs, f.memo_dtree);
       } in
       Term.memo_call mc
   end
@@ -2052,6 +2065,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         | None -> Explanation.empty, t
         | Some (new_t,e) -> e, new_t
 
+    (* FIXME: remove *)
     let as_uninterpreted_dom_elt (t:term): ID.t option =
       match t.term_cell with
         | Const {cst_kind=Cst_uninterpreted_dom_elt _; cst_id; _} -> Some cst_id
@@ -2197,7 +2211,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           when List.length l = List.length (Ty.unfold ty |> fst) ->
           assert (tbl.memo_arity > 0);
           (* fully applied memoizable function: transfer to a memoized call *)
-          let t' = Term.memo_call_init tbl l in
+          let t' = Memo_utils.memo_call_init tbl l in
           compute_nf t'
         | App (f, l) ->
           let e_f, f' = compute_nf f in
@@ -2210,24 +2224,29 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           set_nf_ t new_t e;
           e, new_t
         | Delegate d ->
-          let e_to_, to_ = compute_nf d.delegate_to in
+          (* here, keep explanations apart *)
+          let e_delegate, to_ = compute_nf d.delegate_to in
           begin match to_.term_cell, Term.as_cstor_app to_ with
             | True, _
             | False, _ ->
               (* success, finish delegating *)
-              let lit = Lit.delegate d.delegate_var to_ e_to_ in
+              let lit = Lit.delegate d.delegate_var to_ e_delegate in
               Explanation.return lit, to_
             | _, Some (cstor, _, args) ->
               (* success, finish delegating, but delegate immediate subterms
                  instead of returning [to_] directly *)
               let subs = Term.delegate_terms args in
               let to_delegated = Term.app_cst cstor subs in
-              let lit = Lit.delegate d.delegate_var to_delegated e_to_ in
+              let lit =
+                Lit.delegate d.delegate_var to_delegated e_delegate
+              in
               Explanation.return lit, to_delegated
             | _, None ->
-              (* [to_] doesn't yet evaluate to a constructor, return
-                 the same term, waiting for *)
-              Explanation.empty, t
+              (* [to_] doesn't yet evaluate to a constructor, return the
+                 intermediate form,
+                 waiting for its evaluation to progress further *)
+              let d' = {d with delegate_to=to_; delegate_expl=e_delegate} in
+              Explanation.empty, Term.delegate d'
           end
         | Memo_call m ->
           compute_nf_memo_call m
@@ -2245,7 +2264,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         compute_nf_app new_env e body other_args
       | _ ->
         (* cannot reduce, unless [f] reduces to something else. *)
-        let e_f, f' = Term.eval_db env f |> compute_nf in
+        let e_f, f' = compute_nf (Term.eval_db env f) in
         let exp = Explanation.append e e_f in
         if Term.equal f f'
         then (
@@ -2302,6 +2321,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       | B_and (a,b,c,d) ->
         (* evaluate [c] and [d], but only provide some explanation
            once their conjunction reduces to [true] or [false].
+           In case of [false], discard the explanation of the other component.
 
            We first compute only [c], in case it is [False]. *)
         let e_a, c' = compute_nf a in
@@ -2459,7 +2479,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
                  from evaluation of other expressions.
                  or: we could evaluate the recursive calls?
               *)
-              let vars, expl =
+              let delegate_assignments, expl =
                 Explanation.to_seq new_e
                 |> Sequence.fold
                   (fun (vars,e) lit -> match Lit.view lit with
@@ -2472,7 +2492,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
                   ([], Explanation.empty)
               in
               (* update memo table *)
-              update_memo_tbl m vars expl nf;
+              update_memo_tbl m delegate_assignments nf;
               (* return the normal form *)
               expl, nf
             ) else (
@@ -2488,7 +2508,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       aux m
 
     (* update memo table by adding an entry into it *)
-    and update_memo_tbl (m:memo_call) vars expl nf: unit =
+    and update_memo_tbl (m:memo_call) delegate_assignments nf: unit =
       (* TODO:
          - compute input pattern (use m.mc_registers + vars)
          - compute abstract normal form from nf + expl (replace metas with vars)
@@ -2499,9 +2519,9 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
          let pp_var out (v,t) =
            Format.fprintf out "(@[<-@ %a@ %a@]" ID.pp v Term.pp t
          in
-         k "(@[<hv1>update_memo_tbl@ %a@ vars: (@[%a@])@ nf: %a@ expl: %a@])"
-           ID.pp m.mc_tbl.memo_fun (Utils.pp_list pp_var) vars
-           Term.pp nf Explanation.pp expl);
+         k "(@[<hv1>update_memo_tbl@ %a@ vars: (@[%a@])@ nf: %a@])"
+           ID.pp m.mc_tbl.memo_fun (Utils.pp_list pp_var) delegate_assignments
+           Term.pp nf);
       assert false
 
     let compute_nf_lit (lit:lit): explanation * lit =
