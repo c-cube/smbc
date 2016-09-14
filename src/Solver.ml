@@ -3099,13 +3099,13 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
             (fun (id,ty,rhs) ->
                let ty = conv_ty ty in
                let rhs = lazy (conv_term [] rhs) in
-               let ty_args, _ = Ty.unfold ty in
+               let ty_args, ty_ret = Ty.unfold ty in
                let memo_arity = List.length ty_args in
                let cst =
                  (* FIXME: also require that:
                     - closed function (no metas inside)
                     - does not depend on Cst_not_memoizable IDs*)
-                 if memo_arity > 0 then (
+                 if memo_arity > 0 && Ty.is_prop ty_ret then (
                    let memo_dtree =
                      let l = CCList.range 0 (memo_arity-1) in
                      List.fold_right (fun i rhs -> Memo_pass (i,rhs)) l Memo_fail
