@@ -259,6 +259,9 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     db_size: int;
   }
 
+  (* environment for evaluation: not-yet-evaluated terms *)
+  and eval_env = term db_env
+
   (* Hashconsed type *)
   and ty_h = {
     mutable ty_id: int;
@@ -1191,6 +1194,66 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         | Memo_call _ -> t
         | Builtin b ->
           builtin (map_builtin (f b_acc) b)
+
+    (* just evaluate the De Bruijn indices, and return
+       the explanations used to evaluate subterms *)
+    let eval_db (env:eval_env) (t:term) : term =
+      if DB_env.size env = 0
+      then t (* trivial *)
+      else (
+        let rec aux env t : term = match t.term_cell with
+          | DB d ->
+            begin match DB_env.get d env with
+              | None -> t
+              | Some t' -> t'
+            end
+          | Const _ -> t
+          | True
+          | False -> t
+          | Fun (ty, body) ->
+            let body' = aux (DB_env.push_none env) body in
+            if body==body' then t else fun_ ty body'
+          | Mu body ->
+            let body' = aux (DB_env.push_none env) body in
+            if body==body' then t else mu body'
+          | Quant (q, uty, body) ->
+            let body' = aux (DB_env.push_none env) body in
+            if body==body' then t else quant q uty body'
+          | Match (u, m) ->
+            let u = aux env u in
+            let m =
+              ID.Map.map
+                (fun (tys,rhs) ->
+                   tys, aux (DB_env.push_none_l tys env) rhs)
+                m
+            in
+            match_ u m
+          | Switch (u, m) ->
+            let u = aux env u in
+            (* NOTE: [m] should not contain De Bruijn indices at all *)
+            switch u m
+          | If (a,b,c) ->
+            let a' = aux env a in
+            let b' = aux env b in
+            let c' = aux env c in
+            if a==a' && b==b' && c==c' then t else if_ a' b' c'
+          | App (_,[]) -> assert false
+          | App (f, l) ->
+            let f' = aux env f in
+            let l' = aux_l env l in
+            if f==f' && CCList.equal (==) l l' then t else app f' l'
+          | Builtin b -> builtin (map_builtin (aux env) b)
+          | Delegate d ->
+            let d' = {d with delegate_to=aux env d.delegate_to} in
+            delegate d'
+          | Memo_call _ ->
+            t (* NOTE: should not contain De Bruijn indices *)
+        and aux_l env l =
+          List.map (aux env) l
+        in
+        aux env t
+      )
+
   end
 
   let rec to_seq_explanation_ e yield = match e with
@@ -1909,74 +1972,36 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         Term.app_cst cst l
       | MT_reg i ->
         find_register regs i
+
+    (* call the memoized function *)
+    let memo_call_init (f:memo_tbl) (args:term list): term =
+      assert (f.memo_arity > 0);
+      assert (f.memo_arity = List.length args);
+      (* create new delegates for the arguments *)
+      let args = Term.delegate_terms args in
+      let regs =
+        CCList.Idx.foldi
+          (fun m i del -> IntMap.add i del m)
+          IntMap.empty args
+      in
+      (* the unevaluated body of the function applied to those arguments *)
+      let initial_term =
+        let env = DB_env.push_l args DB_env.empty in
+        let ty_args, body = Term.unfold_fun (Lazy.force f.memo_def) in
+        assert (List.length ty_args = DB_env.size env);
+        Term.eval_db env body
+      in
+      let mc = {
+        mc_tbl=f;
+        mc_blocking=initial_term;
+        mc_initial_term=initial_term;
+        mc_state=MCS_lookup (E_empty, regs, f.memo_dtree);
+      } in
+      Term.memo_call mc
   end
 
   (** {2 Reduction to Normal Form} *)
   module Reduce = struct
-    (* environment for evaluation: not-yet-evaluated terms *)
-    type eval_env = term DB_env.t
-
-    (* TODO: add a cache to {!eval_db}? *)
-
-    (* just evaluate the De Bruijn indices, and return
-       the explanations used to evaluate subterms *)
-    let eval_db (env:eval_env) (t:term) : term =
-      if DB_env.size env = 0
-      then t (* trivial *)
-      else (
-        let rec aux env t : term = match t.term_cell with
-          | DB d ->
-            begin match DB_env.get d env with
-              | None -> t
-              | Some t' -> t'
-            end
-          | Const _ -> t
-          | True
-          | False -> t
-          | Fun (ty, body) ->
-            let body' = aux (DB_env.push_none env) body in
-            if body==body' then t else Term.fun_ ty body'
-          | Mu body ->
-            let body' = aux (DB_env.push_none env) body in
-            if body==body' then t else Term.mu body'
-          | Quant (q, uty, body) ->
-            let body' = aux (DB_env.push_none env) body in
-            if body==body' then t else Term.quant q uty body'
-          | Match (u, m) ->
-            let u = aux env u in
-            let m =
-              ID.Map.map
-                (fun (tys,rhs) ->
-                   tys, aux (DB_env.push_none_l tys env) rhs)
-                m
-            in
-            Term.match_ u m
-          | Switch (u, m) ->
-            let u = aux env u in
-            (* NOTE: [m] should not contain De Bruijn indices at all *)
-            Term.switch u m
-          | If (a,b,c) ->
-            let a' = aux env a in
-            let b' = aux env b in
-            let c' = aux env c in
-            if a==a' && b==b' && c==c' then t else Term.if_ a' b' c'
-          | App (_,[]) -> assert false
-          | App (f, l) ->
-            let f' = aux env f in
-            let l' = aux_l env l in
-            if f==f' && CCList.equal (==) l l' then t else Term.app f' l'
-          | Builtin b -> Term.builtin (Term.map_builtin (aux env) b)
-          | Delegate d ->
-            let d' = {d with delegate_to=aux env d.delegate_to} in
-            Term.delegate d'
-          | Memo_call _ ->
-            t (* NOTE: should not contain De Bruijn indices *)
-        and aux_l env l =
-          List.map (aux env) l
-        in
-        aux env t
-      )
-
     let cycle_check_tbl : unit Term.Tbl.t = Term.Tbl.create 32
 
     (* [cycle_check sub into] checks whether [sub] occurs in [into] under
@@ -2058,7 +2083,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         | Mu body ->
           (* [mu x. body] becomes [body[x := mu x. body]] *)
           let env = DB_env.singleton t in
-          Explanation.empty, eval_db env body
+          Explanation.empty, Term.eval_db env body
         | Quant (q,uty,body) ->
           begin match uty.uty_status with
             | None -> Explanation.empty, t
@@ -2068,7 +2093,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
                 | Lazy_some tup -> tup
               in
               let t1() =
-                eval_db (DB_env.singleton (Term.const c_head)) body
+                Term.eval_db (DB_env.singleton (Term.const c_head)) body
               in
               let t2() =
                 Term.quant q uty_tail body
@@ -2122,7 +2147,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
                     (* evaluate arguments *)
                     let env = DB_env.push_l l DB_env.empty in
                     (* replace in [rhs] *)
-                    let rhs = eval_db env rhs in
+                    let rhs = Term.eval_db env rhs in
                     (* evaluate new [rhs] *)
                     compute_nf rhs
                   )
@@ -2212,7 +2237,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         compute_nf_app new_env e body other_args
       | _ ->
         (* cannot reduce, unless [f] reduces to something else. *)
-        let e_f, f' = eval_db env f |> compute_nf in
+        let e_f, f' = Term.eval_db env f |> compute_nf in
         let exp = Explanation.append e e_f in
         if Term.equal f f'
         then (
