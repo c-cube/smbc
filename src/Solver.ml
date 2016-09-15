@@ -1057,23 +1057,39 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
 
     let fpf = Format.fprintf
 
+    let pp_mc_dt out d = match d.mc_dt_cell with
+      | Memo_fail -> CCFormat.string out "fail"
+      | Memo_yield -> CCFormat.string out "yield"
+      | Memo_if (r,_,_) -> Format.fprintf out "if %d" (fst r)
+      | Memo_match (r, _) -> Format.fprintf out "match %d" (fst r)
+
+    let pp_reg out (i,_) = Format.fprintf out "reg_%d" i
+
+    let pp_sym_value out = function
+      | Memo_true -> CCFormat.string out "true"
+      | Memo_false -> CCFormat.string out "false"
+      | Memo_cstor (c,_,[]) -> Format.fprintf out "(cstor %a)" ID.pp c.cst_id
+      | Memo_cstor (c,_,regs) ->
+        Format.fprintf out "(cstor %a %a)" ID.pp c.cst_id (Utils.pp_list pp_reg) regs
+      | Memo_dom_elt c -> Format.fprintf out "(dom_elt %a)" ID.pp c.cst_id
+
     let pp_mc_ pp_term out m =
-      let pp_dt out d = match d.mc_dt_cell with
-        | Memo_fail -> CCFormat.string out "fail"
-        | Memo_yield -> CCFormat.string out "yield"
-        | Memo_if (r,_,_) -> Format.fprintf out "if %d" (fst r)
-        | Memo_match (r, _) -> Format.fprintf out "match %d" (fst r)
-      and pp_regs out m =
+      let pp_regs out m =
         Format.fprintf out "(@[<hv>%a@])"
-          (IntMap.print ~start:"" ~stop:"" CCFormat.int pp_term) m
+          (IntMap.print ~start:"" ~stop:"" ~arrow:":=" CCFormat.int pp_term) m
+      and pp_symbs out m =
+        Format.fprintf out "(@[<hv>%a@])"
+          (IntMap.print ~start:"" ~stop:"" ~arrow:":=" CCFormat.int pp_sym_value) m
       in
       Format.fprintf out
-        "(@[<hv2>memo_call %a@ offset: %d@ term: %a@ dt: %a@ regs: %a@ blocking: %a@])"
+        "(@[<hv2>memo_call %a@ offset: %d@ term: %a@ dt: %a\
+         @ regs: %a@ symbs: %a@ blocking: %a@])"
         ID.pp m.mc_tbl.memo_fun
         m.mc_offset
         pp_term (Lazy.force m.mc_dt.mc_dt_term)
-        pp_dt m.mc_dt
+        pp_mc_dt m.mc_dt
         pp_regs m.mc_concrete_terms
+        pp_symbs m.mc_symb_values
         pp_term m.mc_blocking
 
     let pp_top ~ids out t =
@@ -2412,6 +2428,9 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         (* return the normal form, with concrete values replacing registers *)
         let lazy term = m.mc_dt.mc_dt_term in
         let nf_concrete = Memo_utils.subst m.mc_concrete_terms term in
+        Log.debugf 5
+          (fun k->k "(@[memo: yield %a@ expl: %a@])"
+              Term.pp nf_concrete Explanation.pp m.mc_explanation);
         m.mc_explanation, nf_concrete
 
       and aux_if m (i,_) then_ else_ = match as_value m i with
@@ -2450,7 +2469,6 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         begin match nf_symb.term_deps with
           | [] ->
             (* reached a normal form! *)
-            Format.printf "%a@." Term.pp nf_symb;
             assert (Memo_utils.is_value nf_symb);
             m.mc_dt.mc_dt_cell <- Memo_yield;
             aux_yield m
@@ -2519,6 +2537,9 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
                   end
                 in
                 (* remove "fail", replace with new decision *)
+                Log.debugf 5
+                  (fun k->k "(@[<hv1>memo_set_cell@ %a@ %a@])"
+                      Term.pp_mc m Term.pp_mc_dt {m.mc_dt with mc_dt_cell=new_cell});
                 m.mc_dt.mc_dt_cell <- new_cell;
                 (* recurse into sub-tree *)
                 aux {m with mc_dt=sub_tree}
