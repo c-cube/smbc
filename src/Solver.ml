@@ -1192,7 +1192,12 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         | Quant (q,uty,body) ->
           let b_acc = bind b_acc (Lazy.force uty.uty_self) in
           quant q uty (f b_acc body)
-        | Memo_call _ -> t
+        | Memo_call m ->
+          let m = {
+            m with
+              mc_concrete_terms=IntMap.map (f b_acc) m.mc_concrete_terms;
+          } in
+          memo_call m
         | Builtin b ->
           builtin (map_builtin (f b_acc) b)
 
