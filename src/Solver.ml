@@ -944,7 +944,8 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         | App ({term_cell=Const {cst_kind=Cst_cstor _; _}; _} as f, l) ->
           (* auto-push inside applications, so that constructors always are
              values *)
-          app f (List.map (subst regs) l)
+          let l' = List.map (subst regs) l in
+          if CCList.equal term_equal_ l l' then t else app f l'
         | Reg r -> subst_reg regs r (* substitute now *)
         | Subst (regs', u) ->
           (* compose, on the fly *)
@@ -2297,7 +2298,8 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
                       Memo_reg_concrete (propagate_subst regs t)
                     | Memo_reg_symb v -> Memo_reg_symb v)
                   m.mc_registers
-          } in
+          } |> mk_memo_call
+          in
           Term.memo_call m
         | Subst (regs', u) ->
           (* compose substitutions *)
@@ -2591,6 +2593,8 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
             m.mc_dt.mc_dt_cell <- Memo_yield;
             aux_yield m
           | Dep_reg ((r_idx,_) as r) :: _ ->
+            (* TODO: use CCList.find here, to check all deps,
+               increase parallelism *)
             (* evaluation has not reached a value yet, because of
                register [r1], corresponding to some concrete term *)
             begin match as_value m r_idx with
