@@ -43,6 +43,8 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
   let stat_num_clause_push = ref 0
   let stat_num_clause_tautology = ref 0
   let stat_num_propagations = ref 0
+  let stat_num_memoized = ref 0
+  let stat_num_memo_hit = ref 0
 
   (* for objects that are expanded on demand only *)
   type 'a lazily_expanded =
@@ -59,6 +61,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     mutable term_id: int; (* unique ID *)
     mutable term_ty: ty_h;
     term_cell: term_cell;
+    mutable term_contains_regs: bool; (* any registers? *)
     mutable term_nf: (term * explanation) option;
       (* normal form + explanation of why *)
     mutable term_deps: term_dep list;
@@ -125,14 +128,18 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
 
   (* a call to a memoized function.
      Invariants:
-     [forall r in mc_concrete_terms, r < mc_offset] *)
+     [forall r in mc_registers, r < mc_offset] *)
   and memo_call = {
     mc_tbl: memo_tbl;
     mc_deps: term_dep list; (* term blocking evaluation (in all states) *)
     mc_dt: memo_decision_tree; (* current position in the decision tree *)
-    mc_concrete_terms: term registers; (* register -> concrete term *)
+    mc_registers: memo_register_content registers; (* register -> concrete term *)
     mc_explanation: explanation; (* explanations so far (when evaluating arguments) *)
   }
+
+  and memo_register_content =
+    | Memo_reg_symb of memo_symbolic_value
+    | Memo_reg_concrete of term
 
   and memo_symbolic_value =
     | Memo_true
@@ -376,6 +383,8 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
 
   let eq_reg (i1,ty1)(i2,ty2) = i1=i2 && Ty.equal ty1 ty2
 
+  let hash_reg (i,ty) = Hash.combine3 12345 i (Ty.hash ty)
+
   (** {2 Typed De Bruijn indices} *)
   module DB = struct
     type t = db
@@ -486,15 +495,43 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
 
   let eq_memo_tbl t1 t2 = ID.equal t1.memo_fun t2.memo_fun
 
+  let eq_memo_sym a b = match a, b with
+    | Memo_true, Memo_true
+    | Memo_false, Memo_false -> true
+    | Memo_cstor (c1,_,l1), Memo_cstor (c2,_,l2) ->
+      Typed_cst.equal c1 c2 && CCList.equal eq_reg l1 l2
+    | Memo_dom_elt c1, Memo_dom_elt c2 -> Typed_cst.equal c1 c2
+    | Memo_true, _
+    | Memo_false, _
+    | Memo_cstor _, _
+    | Memo_dom_elt _, _ -> false
+
+  let hash_memo_sym = function
+    | Memo_true -> 1
+    | Memo_false -> 2
+    | Memo_cstor (c,_,l) ->
+      Hash.combine3 3 (Typed_cst.hash c) (Hash.list hash_reg l)
+    | Memo_dom_elt c -> Hash.combine2 4 (Typed_cst.hash c)
+
   let eq_memo_call_ a b =
+    let eq_memo_reg a b = match a,b with
+      | Memo_reg_concrete a, Memo_reg_concrete b -> term_equal_ a b
+      | Memo_reg_symb a, Memo_reg_symb b -> eq_memo_sym a b
+      | Memo_reg_concrete _, _
+      | Memo_reg_symb _, _ -> false
+    in
     eq_memo_tbl a.mc_tbl b.mc_tbl &&
     term_equal_ (Lazy.force a.mc_dt.mc_dt_term) (Lazy.force b.mc_dt.mc_dt_term) &&
-    IntMap.equal term_equal_ a.mc_concrete_terms b.mc_concrete_terms
+    IntMap.equal eq_memo_reg a.mc_registers b.mc_registers
 
   let hash_memo_call m =
+    let hash_memo_reg_ = function
+      | Memo_reg_concrete t -> term_hash_ t
+      | Memo_reg_symb v -> hash_memo_sym v
+    in
     (* defines the relation between concrete arguments and symbolic registers *)
     let h_concrete =
-      Hash.seq (Hash.pair Hash.int term_hash_) (IntMap.to_seq m.mc_concrete_terms)
+      Hash.seq (Hash.pair Hash.int hash_memo_reg_) (IntMap.to_seq m.mc_registers)
     in
     (* the memo call is equivalent to this term on the symbolic side *)
     let h_symb = term_hash_ (Lazy.force m.mc_dt.mc_dt_term) in
@@ -729,6 +766,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         term_id= -1;
         term_ty=Ty.prop;
         term_cell=if b then True else False;
+        term_contains_regs=false;
         term_nf=None;
         term_deps=[];
       } in
@@ -771,6 +809,8 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       | Dep_reg _, _
         -> CCOrd.int_ (to_int_ a) (to_int_ b)
 
+    let contains_regs (t:t): bool = t.term_contains_regs
+
     (* build a term. If it's new, add it to the watchlist
        of every member of [watching] *)
     let mk_term_ ~(deps:deps) cell ~(ty:delayed_ty) : term =
@@ -778,6 +818,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         term_id= -1;
         term_ty=Ty.prop; (* will be changed *)
         term_cell=cell;
+        term_contains_regs=false; (* will be changed *)
         term_nf=None;
         term_deps=[];
       } in
@@ -787,6 +828,28 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         t.term_ty <- begin match ty with
           | DTy_direct ty -> ty
           | DTy_lazy f -> f ()
+        end;
+        (* regs *)
+        t.term_contains_regs <- begin match t.term_cell with
+          | True | False | DB _ | Const _ -> false
+          | Reg _ -> true
+          | App (f, l) -> contains_regs f || List.exists contains_regs l
+          | Fun (_, body) | Mu body | Quant (_, _, body) -> contains_regs body
+          | Switch _ -> false
+          | If (a,b,c) -> contains_regs a || contains_regs b || contains_regs c
+          | Match (u,m) ->
+            contains_regs u || ID.Map.exists (fun _ (_,rhs) -> contains_regs rhs) m
+          | Memo_call m ->
+            IntMap.exists
+              (fun _ v -> match v with
+                 | Memo_reg_concrete t -> contains_regs t
+                 | Memo_reg_symb _ -> false)
+              m.mc_registers
+          | Builtin (B_not t) -> contains_regs t
+          | Builtin (B_and (a,b,c,d)) ->
+            contains_regs a || contains_regs b || contains_regs c || contains_regs d
+          | Builtin (B_or (a,b) | B_eq (a,b) | B_imply (a,b)) ->
+            contains_regs a || contains_regs b
         end;
         (* compute evaluation dependencies *)
         let deps = match deps with
@@ -1073,10 +1136,15 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         Format.fprintf out "(cstor %a %a)" ID.pp c.cst_id (Utils.pp_list pp_reg) regs
       | Memo_dom_elt c -> Format.fprintf out "(dom_elt %a)" ID.pp c.cst_id
 
+    let pp_memo_reg pp_term out = function
+      | Memo_reg_concrete t -> pp_term out t
+      | Memo_reg_symb s -> pp_sym_value out s
+
     let pp_mc_ pp_term out m =
       let pp_regs out m =
         Format.fprintf out "(@[<hv>%a@])"
-          (IntMap.print ~start:"" ~stop:"" ~arrow:":=" CCFormat.int pp_term) m
+          (IntMap.print ~start:"" ~stop:"" ~arrow:":="
+             CCFormat.int (pp_memo_reg pp_term)) m
       in
       let lazy t = m.mc_dt.mc_dt_term in
       Format.fprintf out
@@ -1085,7 +1153,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         ID.pp m.mc_tbl.memo_fun
         pp_term t
         pp_mc_dt m.mc_dt
-        pp_regs m.mc_concrete_terms
+        pp_regs m.mc_registers
         (Utils.pp_list pp_dep) m.mc_deps
         (Utils.pp_list pp_dep) t.term_deps
 
@@ -1192,7 +1260,12 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         | Memo_call m ->
           let m = {
             m with
-              mc_concrete_terms=IntMap.map (f b_acc) m.mc_concrete_terms;
+            mc_registers=
+              IntMap.map
+                (function
+                  | Memo_reg_symb s -> Memo_reg_symb s
+                  | Memo_reg_concrete t -> Memo_reg_concrete (f b_acc t))
+                m.mc_registers;
           } in
           memo_call m
         | Builtin b ->
@@ -1949,7 +2022,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     val find_register : 'a registers -> int -> 'a
     (** find the content of this register, or fails *)
 
-    val subst : term registers -> term -> term
+    val subst : memo_register_content registers -> term -> term
     (** Substitute registers in this term *)
 
     val is_value : term -> bool
@@ -1959,16 +2032,24 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       try IntMap.find i r
       with Not_found -> errorf "cannot find register %d" i
 
-    let rec subst regs t = match t.term_cell with
-      | Reg (i,_) ->
-        begin match IntMap.get i regs with
-          | None -> t
-          | Some t' -> t'
-        end
-      | _ ->
-        Term.map () t
-          ~bind:(fun () _ -> ())
-          ~f:(fun _ t' -> subst regs t')
+    let rec subst regs t =
+      if Term.contains_regs t
+      then match t.term_cell with
+        | Reg r -> subst_reg regs r
+        | _ ->
+          Term.map () t
+            ~bind:(fun () _ -> ())
+            ~f:(fun _ t' -> subst regs t')
+      else t
+
+    and subst_reg regs (i,ty) = match IntMap.get i regs with
+      | None -> Term.reg (i,ty)
+      | Some (Memo_reg_concrete t') -> t'
+      | Some (Memo_reg_symb Memo_true) -> Term.true_
+      | Some (Memo_reg_symb Memo_false) -> Term.false_
+      | Some (Memo_reg_symb (Memo_dom_elt c)) -> Term.const c
+      | Some (Memo_reg_symb (Memo_cstor (c,_,l))) ->
+        Term.app_cst c (List.map (subst_reg regs) l)
 
     let is_value t = match t.term_cell with
       | True
@@ -2326,32 +2407,31 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
 
     (* compute and memoize *)
     and compute_nf_memo_call (m:memo_call): explanation * term =
+      let add_reg (m:memo_call)(i:int)(v:memo_register_content): memo_call =
+        {m with mc_registers=IntMap.add i v m.mc_registers}
+      in
+      let add_reg_sym m i v = add_reg m i (Memo_reg_symb v) in
+      let add_reg_concrete m i v = add_reg m i (Memo_reg_concrete v) in
       (* try and see whether the given register evaluates to a concrete value.
            @return the new memo_call (possibly updated with new registers)
            and [Some symbolic_value], or [None] *)
-      let as_value (m:memo_call) (r:int) : memo_call * memo_symbolic_value option =
-        let t_concrete = Memo_utils.find_register m.mc_concrete_terms r in
+      let as_value_noncached
+          m r (t_concrete:term): memo_call * memo_symbolic_value option =
         let e_concrete, nf_concrete = compute_nf t_concrete in
         (* add explanation now *)
         let m =
-          if Explanation.is_empty e_concrete &&
-             Term.equal t_concrete nf_concrete
+          if Explanation.is_empty e_concrete
           then m (* same old *)
           else
-            {m with
-               mc_explanation=Explanation.append e_concrete m.mc_explanation;
-               mc_concrete_terms=IntMap.add r nf_concrete m.mc_concrete_terms;
-            } |> mk_memo_call
+            {m with mc_explanation=Explanation.append e_concrete m.mc_explanation; }
         in
         begin match nf_concrete.term_cell with
           | True ->
             let v = Memo_true in
-            assert (m.mc_deps=[]);
-            m, Some v
+            add_reg_sym m r v, Some v
           | False ->
             let v = Memo_false in
-            assert (m.mc_deps=[]);
-            m, Some v
+            add_reg_sym m r v, Some v
           | _ ->
             begin match
                 Term.as_cstor_app nf_concrete,
@@ -2364,19 +2444,19 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
                     CCList.fold_map
                       (fun (n,c_regs) arg ->
                          let reg = n, arg.term_ty in
-                         (n+1, IntMap.add n arg c_regs), reg)
-                      (m.mc_dt.mc_dt_offset, m.mc_concrete_terms) args
+                         (n+1, IntMap.add n (Memo_reg_concrete arg) c_regs), reg)
+                      (m.mc_dt.mc_dt_offset, m.mc_registers) args
                   in
                   let v = Memo_cstor (cstor, ty, sub_regs) in
-                  let m = {m with mc_concrete_terms=concrete_regs;} in
+                  let m = {m with mc_registers=concrete_regs;} in
                   m, Some v
                 | None, Some (dom_elt,_) ->
                   let v = Memo_dom_elt dom_elt in
-                  m, Some v
+                  add_reg_sym m r v, Some v
                 | None, None ->
                   (* not a value yet, something blocks *)
                   assert (m.mc_deps<>[]);
-                  m, None
+                  add_reg_concrete m r nf_concrete, None
             end
         end
       (* substitute [reg] with [by] in [t], and reduce. Typically used
@@ -2386,6 +2466,11 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         let e, nf = compute_nf t' in
         assert (Explanation.is_empty e);
         nf
+      in
+      let as_value (m:memo_call) (r:int) : memo_call * memo_symbolic_value option =
+        match Memo_utils.find_register m.mc_registers r with
+          | Memo_reg_symb v -> m, Some v
+          | Memo_reg_concrete t -> as_value_noncached m r t
       in
       (* main traversal of the memo decision tree *)
       let rec aux (m:memo_call): explanation * term =
@@ -2401,9 +2486,10 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
 
       and aux_yield m =
         assert (m.mc_dt.mc_dt_cell = Memo_yield);
+        incr stat_num_memo_hit;
         (* return the normal form, with concrete values replacing registers *)
         let lazy term = m.mc_dt.mc_dt_term in
-        let nf_concrete = Memo_utils.subst m.mc_concrete_terms term in
+        let nf_concrete = Memo_utils.subst m.mc_registers term in
         Log.debugf 5
           (fun k->k "(@[memo: yield %a@ expl: %a@])"
               Term.pp nf_concrete Explanation.pp m.mc_explanation);
@@ -2446,6 +2532,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           | [] ->
             (* reached a normal form! *)
             assert (Memo_utils.is_value nf_symb);
+            incr stat_num_memoized;
             m.mc_dt.mc_dt_cell <- Memo_yield;
             aux_yield m
           | Dep_reg ((r_idx,_) as r) :: _ ->
@@ -2467,12 +2554,14 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
                     (* decision tree node is a if/then/else *)
                     let then_ = {
                       mc_dt_term=lazy
-                        (apply_reg ~reg:r_idx ~by:Term.true_ nf_symb);
+                        (apply_reg nf_symb ~reg:r_idx
+                           ~by:(Memo_reg_concrete Term.true_));
                       mc_dt_offset=m.mc_dt.mc_dt_offset;
                       mc_dt_cell=Memo_fail;
                     } and else_ = {
                       mc_dt_term=lazy
-                        (apply_reg ~reg:r_idx ~by:Term.false_ nf_symb);
+                        (apply_reg nf_symb ~reg:r_idx
+                           ~by:(Memo_reg_concrete Term.false_));
                       mc_dt_offset=m.mc_dt.mc_dt_offset;
                       mc_dt_cell=Memo_fail;
                     } in
@@ -2504,7 +2593,8 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
                              let sub = {
                                mc_dt_offset=new_offset;
                                mc_dt_term=lazy (
-                                 apply_reg nf_symb ~reg:r_idx ~by:symb_term);
+                                 apply_reg nf_symb ~reg:r_idx
+                                   ~by:(Memo_reg_concrete symb_term));
                                mc_dt_cell=Memo_fail;
                              } in
                              cstor.cst_id, (sub_regs, sub))
@@ -2551,13 +2641,13 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       (* put arguments into registers *)
       let regs =
         CCList.Idx.foldi
-          (fun m i arg -> IntMap.add i arg m)
+          (fun m i arg -> IntMap.add i (Memo_reg_concrete arg) m)
           IntMap.empty args
       in
       let mc = {
         mc_tbl=f;
         mc_deps=[]; (* fake *)
-        mc_concrete_terms=regs;
+        mc_registers=regs;
         mc_dt=f.memo_dtree;
         mc_explanation=expl;
       } |> mk_memo_call
@@ -2575,8 +2665,10 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
          concrete terms contained in those registers. *)
       let deref_deps (d:term_dep): term_dep list = match d with
         | Dep_reg (i,_) ->
-          let t = Memo_utils.find_register m.mc_concrete_terms i in
-          t.term_deps
+          begin match Memo_utils.find_register m.mc_registers i with
+            | Memo_reg_concrete t -> t.term_deps
+            | Memo_reg_symb _ -> []
+          end
         | _ -> [d]
       in
       let deps = CCList.flat_map deref_deps t.term_deps in
@@ -3423,8 +3515,10 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
        :num_uty_expanded %d@ \
        :num_clause_push %d@ \
        :num_clause_tautology %d@ \
-       :num_lits %d\
+       :num_lits %d@ \
        :num_propagations %d@ \
+       :num_memoized %d@ \
+       :num_memo_hit %d@ \
        @])"
       !stat_num_cst_expanded
       !stat_num_uty_expanded
@@ -3432,6 +3526,8 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       !stat_num_clause_tautology
       (Watched_lit.size())
       !stat_num_propagations
+      !stat_num_memoized
+      !stat_num_memo_hit
 
   let do_on_exit ~on_exit =
     List.iter (fun f->f()) on_exit;
