@@ -24,6 +24,9 @@ module type CONFIG = sig
   val pp_hashcons: bool
 end
 
+(* FIXME move into config *)
+let max_memo_depth = 16
+
 (** {2 The Main Solver} *)
 
 module Make(Config : CONFIG)(Dummy : sig end) = struct
@@ -155,6 +158,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
   and memo_decision_tree = {
     mc_dt_offset: int; (* next free register *)
     mc_dt_term: term lazy_t; (* current term (as symbolic evaluation) *)
+    mc_dt_depth: int; (* depth of decision tree *)
     mutable mc_dt_cell: memo_decision_tree_cell; (* tree shape *)
   }
 
@@ -162,6 +166,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
   and memo_decision_tree_cell =
     | Memo_fail (* cache miss *)
     | Memo_yield (* yield the [mc_dt_tree], depends on registers *)
+    | Memo_too_deep (* abandon memoization *)
     | Memo_match of register * (register list * memo_decision_tree) ID.Map.t
     | Memo_if of register * memo_decision_tree * memo_decision_tree (* if *)
 
@@ -1163,6 +1168,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     let pp_mc_dt out d = match d.mc_dt_cell with
       | Memo_fail -> CCFormat.string out "fail"
       | Memo_yield -> CCFormat.string out "yield"
+      | Memo_too_deep -> CCFormat.string out "too_deep"
       | Memo_if (r,_,_) -> Format.fprintf out "if %d" (fst r)
       | Memo_match (r, _) -> Format.fprintf out "match %d" (fst r)
 
@@ -1189,7 +1195,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       let lazy t = m.mc_dt.mc_dt_term in
       Format.fprintf out
         "(@[<hv1>memo_call %a@ term: %a@ \
-         dt: %a @ regs: %a@ blocking: %a@ blocking_sym %a@])"
+         dt: %a @ regs: %a@ blocking: (@[%a@])@ blocking_sym (@[%a@])@])"
         ID.pp m.mc_tbl.memo_fun
         pp_term t
         pp_mc_dt m.mc_dt
@@ -2489,7 +2495,6 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
                   add_reg_sym m r v, Some v
                 | None, None ->
                   (* not a value yet, something blocks *)
-                  assert (m.mc_deps<>[]);
                   add_reg_concrete m r nf_concrete, None
             end
         end
@@ -2511,7 +2516,15 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         Log.debugf 5
           (fun k->k "(@[compute_nf_memo_call@ %a@])" Term.pp_mc m);
         match m.mc_dt.mc_dt_cell with
-          | Memo_fail -> aux_fail m
+          | Memo_fail ->
+            (* unexplored branch of the tree. First, check depth *)
+            if m.mc_dt.mc_dt_depth > max_memo_depth
+            then (
+              m.mc_dt.mc_dt_cell <- Memo_too_deep;
+              aux_too_deep m
+            )
+            else aux_fail m
+          | Memo_too_deep -> aux_too_deep m
           | Memo_yield -> aux_yield m
           | Memo_match (reg, map) ->
             aux_match m reg map
@@ -2556,6 +2569,14 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           (* blocked, for now *)
           Explanation.empty, Term.memo_call m
 
+      (* for computations that run too deep.
+         take the symbolic term, substitute concrete registers, and evaluate *)
+      and aux_too_deep m =
+        assert (m.mc_dt.mc_dt_cell = Memo_too_deep);
+        let lazy t = m.mc_dt.mc_dt_term in
+        let t = Term.subst m.mc_registers t in
+        compute_nf_add m.mc_explanation t
+
       (* in case of failure *)
       and aux_fail m =
         assert (m.mc_dt.mc_dt_cell = Memo_fail);
@@ -2591,12 +2612,14 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
                         (apply_reg nf_symb ~reg:r_idx
                            ~by:(Memo_reg_concrete Term.true_));
                       mc_dt_offset=m.mc_dt.mc_dt_offset;
+                      mc_dt_depth=m.mc_dt.mc_dt_depth+1;
                       mc_dt_cell=Memo_fail;
                     } and else_ = {
                       mc_dt_term=lazy
                         (apply_reg nf_symb ~reg:r_idx
                            ~by:(Memo_reg_concrete Term.false_));
                       mc_dt_offset=m.mc_dt.mc_dt_offset;
+                      mc_dt_depth=m.mc_dt.mc_dt_depth+1;
                       mc_dt_cell=Memo_fail;
                     } in
                     set_cell (Memo_if (r, then_, else_));
@@ -2629,6 +2652,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
                                mc_dt_term=lazy (
                                  apply_reg nf_symb ~reg:r_idx
                                    ~by:(Memo_reg_concrete symb_term));
+                               mc_dt_depth=m.mc_dt.mc_dt_depth+1;
                                mc_dt_cell=Memo_fail;
                              } in
                              cstor.cst_id, (sub_regs, sub))
@@ -3302,6 +3326,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
                    (* create root memoization tree *)
                    let memo_dtree = {
                      mc_dt_cell=Memo_fail;
+                     mc_dt_depth=0;
                      mc_dt_offset=memo_arity;
                      mc_dt_term=lazy (
                        let _, body = Term.unfold_fun (Lazy.force rhs) in
