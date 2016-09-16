@@ -130,7 +130,6 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
   and memo_call = {
     mc_tbl: memo_tbl;
     mc_blocking: term; (* term blocking evaluation (in all states) *)
-    mc_offset: int; (* next free register *)
     mc_dt: memo_decision_tree; (* current position in the decision tree *)
     mc_concrete_terms: term registers; (* register -> concrete term *)
     mc_symb_values: memo_symbolic_value registers; (* register -> symbolic value *)
@@ -148,6 +147,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
      or yield (cache hit). As time goes, the tree grows and contains more
      and more yields. *)
   and memo_decision_tree = {
+    mc_dt_offset: int; (* next free register *)
     mc_dt_term: term lazy_t; (* current term (as symbolic evaluation) *)
     mutable mc_dt_cell: memo_decision_tree_cell; (* tree shape *)
   }
@@ -1082,10 +1082,9 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           (IntMap.print ~start:"" ~stop:"" ~arrow:":=" CCFormat.int pp_sym_value) m
       in
       Format.fprintf out
-        "(@[<hv2>memo_call %a@ offset: %d@ term: %a@ dt: %a\
+        "(@[<hv2>memo_call %a@ term: %a@ dt: %a\
          @ regs: %a@ symbs: %a@ blocking: %a@])"
         ID.pp m.mc_tbl.memo_fun
-        m.mc_offset
         pp_term (Lazy.force m.mc_dt.mc_dt_term)
         pp_mc_dt m.mc_dt
         pp_regs m.mc_concrete_terms
@@ -2002,7 +2001,6 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       let mc = {
         mc_tbl=f;
         mc_blocking;
-        mc_offset=n;
         mc_concrete_terms=regs;
         mc_symb_values=IntMap.empty;
         mc_dt=f.memo_dtree;
@@ -2393,12 +2391,13 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
                         (fun (n,c_regs) arg ->
                            let reg = n, arg.term_ty in
                            (n+1, IntMap.add n arg c_regs), reg)
-                        (m.mc_offset, m.mc_concrete_terms) args
+                        (m.mc_dt.mc_dt_offset, m.mc_concrete_terms) args
                     in
                     let v = Memo_cstor (cstor, ty, sub_regs) in
                     {m with
                        mc_symb_values=IntMap.add r v m.mc_symb_values;
-                       mc_concrete_terms=concrete_regs;},
+                       mc_concrete_terms=concrete_regs;
+                    },
                     Some v
                   | None, Some (dom_elt,_) ->
                     let v = Memo_dom_elt dom_elt in
@@ -2490,10 +2489,12 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
                       let then_ = {
                         mc_dt_term=lazy
                           (apply_reg ~reg:r_idx ~by:Term.true_ nf_symb);
+                        mc_dt_offset=m.mc_dt.mc_dt_offset;
                         mc_dt_cell=Memo_fail;
                       } and else_ = {
                         mc_dt_term=lazy
                           (apply_reg ~reg:r_idx ~by:Term.false_ nf_symb);
+                        mc_dt_offset=m.mc_dt.mc_dt_offset;
                         mc_dt_cell=Memo_fail;
                       } in
                       Memo_if (r, then_, else_),
@@ -2510,15 +2511,16 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
                                  Ty.unfold (Typed_cst.ty cstor)
                                in
                                (* allocate sub-registers *)
-                               let _, sub_regs =
+                               let new_offset, sub_regs =
                                  CCList.fold_map
                                    (fun n ty_arg -> n+1, (n, ty_arg))
-                                   m.mc_offset ty_args
+                                   m.mc_dt.mc_dt_offset ty_args
                                in
                                let symb_term =
                                  Term.app_cst cstor (List.map Term.reg sub_regs)
                                in
                                let sub = {
+                                 mc_dt_offset=new_offset;
                                  mc_dt_term=lazy (
                                    apply_reg nf_symb ~reg:r_idx ~by:symb_term);
                                  mc_dt_cell=Memo_fail;
@@ -3151,6 +3153,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
                    (* create root memoization tree *)
                    let memo_dtree = {
                      mc_dt_cell=Memo_fail;
+                     mc_dt_offset=memo_arity;
                      mc_dt_term=lazy (
                        let _, body = Term.unfold_fun (Lazy.force rhs) in
                        let regs =
