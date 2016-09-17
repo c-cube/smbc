@@ -166,8 +166,12 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     | Memo_fail (* cache miss *)
     | Memo_yield (* yield the [mc_dt_tree], depends on registers *)
     | Memo_too_deep (* abandon memoization *)
-    | Memo_match of register * (register list * memo_decision_tree) ID.Map.t
-    | Memo_if of register * memo_decision_tree * memo_decision_tree (* if *)
+    | Memo_single of int * memo_decision_tree_decide
+    | Memo_multi of memo_decision_tree_decide IntMap.t (* parallel choice *)
+
+  and memo_decision_tree_decide =
+    | Memo_match of (register list * memo_decision_tree) ID.Map.t
+    | Memo_if of memo_decision_tree * memo_decision_tree (* if *)
 
   (* a table [m] from values of type [switch_ty_arg]
      to terms of type [switch_ty_ret],
@@ -1165,12 +1169,19 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
 
     let fpf = Format.fprintf
 
+    let pp_mc_dt_decide out = function
+      | Memo_if (_,_) -> CCFormat.string out "if"
+      | Memo_match _ -> CCFormat.string out "match"
+
     let pp_mc_dt out d = match d.mc_dt_cell with
       | Memo_fail -> CCFormat.string out "fail"
       | Memo_yield -> CCFormat.string out "yield"
       | Memo_too_deep -> CCFormat.string out "too_deep"
-      | Memo_if (r,_,_) -> Format.fprintf out "if %d" (fst r)
-      | Memo_match (r, _) -> Format.fprintf out "match %d" (fst r)
+      | Memo_single (i,m) ->
+        Format.fprintf out "(@[%d %a@])" i pp_mc_dt_decide m
+      | Memo_multi m ->
+        Format.fprintf out "(@[%a@])"
+          (IntMap.print ~start:"" ~stop:"" CCFormat.int pp_mc_dt_decide) m
 
     let pp_reg out (i,_) = Format.fprintf out "reg_%d" i
 
@@ -2527,10 +2538,12 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
             else aux_fail m
           | Memo_too_deep -> aux_too_deep m
           | Memo_yield -> aux_yield m
-          | Memo_match (reg, map) ->
-            aux_match m reg map
-          | Memo_if (reg, then_, else_) ->
-            aux_if m reg then_ else_
+          | Memo_single (i, decide) ->
+            begin match as_value m i with
+              | _, None -> Explanation.empty, Term.memo_call m
+              | m, Some v -> aux_decide m decide v
+            end
+          | Memo_multi map -> aux_multi m map
 
       and aux_yield m =
         assert (m.mc_dt.mc_dt_cell = Memo_yield);
@@ -2543,18 +2556,40 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
               Term.pp nf_concrete Explanation.pp m.mc_explanation);
         m.mc_explanation, nf_concrete
 
-      and aux_if m (i,_) then_ else_ = match as_value m i with
-        | m, Some Memo_true ->
-          {m with mc_dt=then_} |> mk_memo_call |> aux
-        | m, Some Memo_false ->
-          {m with mc_dt=else_} |> mk_memo_call |> aux
-        | _, Some _ -> assert false (* typing *)
-        | m, None ->
-          (* blocked, for now *)
-          Explanation.empty, Term.memo_call m
+      (* follow the first branch of [m] whose register evaluates to a value,
+         or block *)
+      and aux_multi m map =
+        let res =
+          IntMap.to_seq map
+          |> Sequence.find
+            (fun (i, decide) -> match as_value m i with
+               | _, None -> None
+               | m, Some v -> Some (m, decide, v))
+        in
+        begin match res with
+          | None ->
+            (* blocked, for now *)
+            Explanation.empty, Term.memo_call m
+          | Some (m, decide, v) ->
+            (* can decide on this register *)
+            aux_decide m decide v
+        end
 
-      and aux_match m (i,_) dt_map = match as_value m i with
-        | m, Some (Memo_cstor (cstor, _, sub_regs)) ->
+      and aux_decide m (decide:memo_decision_tree_decide) v = match decide with
+        | Memo_match map ->
+          aux_match m v map
+        | Memo_if (then_, else_) ->
+          aux_if m v then_ else_
+
+      and aux_if m v then_ else_ = match v with
+        | Memo_true ->
+          {m with mc_dt=then_} |> mk_memo_call |> aux
+        | Memo_false ->
+          {m with mc_dt=else_} |> mk_memo_call |> aux
+        | _ -> assert false (* typing *)
+
+      and aux_match m v dt_map = match v with
+        | Memo_cstor (cstor, _, sub_regs) ->
           (* follow corresponding branch *)
           begin match ID.Map.get cstor.cst_id dt_map with
             | Some (sub_regs', sub_dt) ->
@@ -2562,13 +2597,10 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
               {m with mc_dt=sub_dt} |> mk_memo_call |> aux
             | None ->
               errorf
-                "decision tree on reg %d@ does not have branch for cstor %a"
-                i ID.pp cstor.cst_id
+                "decision tree on val %a@ does not have branch for cstor %a"
+                Term.pp_sym_value v ID.pp cstor.cst_id
           end
-        | _, Some _ -> assert false (* typing *)
-        | m, None ->
-          (* blocked, for now *)
-          Explanation.empty, Term.memo_call m
+        | _ -> assert false (* typing *)
 
       (* for computations that run too deep.
          take the symbolic term, substitute concrete registers, and evaluate *)
@@ -2601,99 +2633,94 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
             aux_yield m
           | l ->
             (* evaluation has not reached a value yet, because of
-               some registers, corresponding to some concrete terms *)
-            let val_opt =
-              CCList.find_map
-                (function
-                  | Dep_reg ((r_idx,_) as r) ->
-                    begin match as_value m r_idx with
-                      | m, Some v -> Some (m, r, v)
-                      | _, None -> None
-                    end
-                  | dep ->
-                    Log.debugf 1
-                      (fun k->k
-                          "unexpected concrete dep %a in symbolic computation" pp_dep dep);
-                    assert false)
-                l
+               some registers, corresponding to some concrete terms.
+               We therefore expand the tree with a one- or multi-way decision
+               on blocking registers *)
+            let map =
+              List.fold_left
+                (fun map dep -> match dep with
+                   | Dep_reg (r_idx,ty) ->
+                     if IntMap.mem r_idx map then map
+                     else begin match Ty.view ty with
+                       | Arrow _ -> assert false
+                       | Prop ->
+                         let decide = aux_mk_if m r_idx nf_symb in
+                         IntMap.add r_idx decide map
+                       | Atomic (_, Data cstors) ->
+                         let decide = aux_mk_match m r_idx cstors nf_symb in
+                         IntMap.add r_idx decide map
+                       | Atomic (_, Uninterpreted _uty) ->
+                         assert false (* TODO *)
+                     end
+                   | dep ->
+                     Log.debugf 1
+                       (fun k->k
+                           "unexpected concrete dep %a in symbolic computation"
+                           pp_dep dep);
+                     assert false)
+                IntMap.empty l
             in
-            begin match val_opt with
-              | None ->
-                (* all concrete terms corresponding to registers are blocked *)
-                Explanation.empty, Term.memo_call m
-              | Some (m, ((r_idx,_) as r), v) ->
-                (* register does not block any longer. proceed! *)
-                begin match v with
-                  | Memo_true | Memo_false ->
-                    (* decision tree node is a if/then/else *)
-                    let then_ = {
-                      mc_dt_term=lazy
-                        (apply_reg nf_symb ~reg:r_idx
-                           ~by:(Memo_reg_concrete Term.true_));
-                      mc_dt_offset=m.mc_dt.mc_dt_offset;
-                      mc_dt_depth=m.mc_dt.mc_dt_depth+1;
-                      mc_dt_cell=Memo_fail;
-                    } and else_ = {
-                      mc_dt_term=lazy
-                        (apply_reg nf_symb ~reg:r_idx
-                           ~by:(Memo_reg_concrete Term.false_));
-                      mc_dt_offset=m.mc_dt.mc_dt_offset;
-                      mc_dt_depth=m.mc_dt.mc_dt_depth+1;
-                      mc_dt_cell=Memo_fail;
-                    } in
-                    set_cell m (Memo_if (r, then_, else_));
-                    let sub_tree =
-                      if v=Memo_true then then_ else else_
-                    in
-                    {m with mc_dt=sub_tree} |> mk_memo_call |> aux
-                  | Memo_cstor (cstor, ty, sub_regs) ->
-                    let _, ty_ret = Ty.unfold ty in
-                    (* make a shallow match node *)
-                    let dt_map = match ty_ret.ty_cell with
-                      | Atomic (_, Data cstors) ->
-                        Sequence.of_list cstors
-                        |> Sequence.map
-                          (fun (lazy cstor) ->
-                             let ty_args, _ =
-                               Ty.unfold (Typed_cst.ty cstor)
-                             in
-                             (* allocate sub-registers *)
-                             let new_offset, sub_regs =
-                               CCList.fold_map
-                                 (fun n ty_arg -> n+1, (n, ty_arg))
-                                 m.mc_dt.mc_dt_offset ty_args
-                             in
-                             let symb_term =
-                               Term.app_cst cstor (List.map Term.reg sub_regs)
-                             in
-                             let sub = {
-                               mc_dt_offset=new_offset;
-                               mc_dt_term=lazy (
-                                 apply_reg nf_symb ~reg:r_idx
-                                   ~by:(Memo_reg_concrete symb_term));
-                               mc_dt_depth=m.mc_dt.mc_dt_depth+1;
-                               mc_dt_cell=Memo_fail;
-                             } in
-                             cstor.cst_id, (sub_regs, sub))
-                        |> ID.Map.of_seq
-                      | _ -> assert false
-                    in
-                    (* which of the branches shall we follow? *)
-                    let sub_dt =
-                      try
-                        let sub_regs', dt = ID.Map.find cstor.cst_id dt_map in
-                        assert (CCList.equal eq_reg sub_regs sub_regs');
-                        dt
-                      with Not_found ->
-                        errorf "wrong constructor %a" ID.pp cstor.cst_id
-                    in
-                    set_cell m (Memo_match (r, dt_map));
-                    {m with mc_dt=sub_dt} |> mk_memo_call |> aux
-                  | Memo_dom_elt _ ->
-                    assert false (* TODO: extensible switch table in memo_dt *)
-                end
-            end
+            assert (not (IntMap.is_empty map));
+            let i, decide = IntMap.choose map in
+            let new_dt =
+              if IntMap.is_empty (IntMap.remove i map)
+              then Memo_single (i, decide) (* singleton *)
+              else Memo_multi map
+            in
+            set_cell m new_dt;
+            aux m (* recurse *)
         end
+
+      (* decide on a datatype *)
+      and aux_mk_match m r_idx cstors nf_symb: memo_decision_tree_decide =
+        let map =
+          Sequence.of_list cstors
+          |> Sequence.map
+            (fun (lazy cstor) ->
+               let ty_args, _ =
+                 Ty.unfold (Typed_cst.ty cstor)
+               in
+               (* allocate sub-registers *)
+               let new_offset, sub_regs =
+                 CCList.fold_map
+                   (fun n ty_arg -> n+1, (n, ty_arg))
+                   m.mc_dt.mc_dt_offset ty_args
+               in
+               let symb_term =
+                 Term.app_cst cstor (List.map Term.reg sub_regs)
+               in
+               let sub = {
+                 mc_dt_offset=new_offset;
+                 mc_dt_term=lazy (
+                   apply_reg nf_symb ~reg:r_idx
+                     ~by:(Memo_reg_concrete symb_term));
+                 mc_dt_depth=m.mc_dt.mc_dt_depth+1;
+                 mc_dt_cell=Memo_fail;
+               } in
+               cstor.cst_id, (sub_regs, sub))
+          |> ID.Map.of_seq
+        in
+        Memo_match map
+
+      (* decide on a boolean *)
+      and aux_mk_if m r_idx nf_symb : memo_decision_tree_decide =
+        (* decision tree node is a if/then/else *)
+        let then_ = {
+          mc_dt_term=lazy
+            (apply_reg nf_symb ~reg:r_idx
+               ~by:(Memo_reg_concrete Term.true_));
+          mc_dt_offset=m.mc_dt.mc_dt_offset;
+          mc_dt_depth=m.mc_dt.mc_dt_depth+1;
+          mc_dt_cell=Memo_fail;
+        } and else_ = {
+          mc_dt_term=lazy
+            (apply_reg nf_symb ~reg:r_idx
+               ~by:(Memo_reg_concrete Term.false_));
+          mc_dt_offset=m.mc_dt.mc_dt_offset;
+          mc_dt_depth=m.mc_dt.mc_dt_depth+1;
+          mc_dt_cell=Memo_fail;
+        } in
+        Memo_if (then_, else_)
       in
       aux m
 
@@ -3333,7 +3360,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
                     - does not depend on Cst_not_memoizable IDs
                     - some CLI "memoization" flag is true
                  *)
-                 if memo_arity > 0 && Ty.is_prop ty_ret 
+                 if memo_arity > 0 && Ty.is_prop ty_ret
                  then (
                    (* create root memoization tree *)
                    let memo_dtree = {
