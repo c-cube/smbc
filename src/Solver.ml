@@ -126,7 +126,6 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     memo_dtree: memo_decision_tree;
     (* the partial pattern-match tree storing the
        current subset of memoized values for this function.
-       Invariant: the tree matches registers from 0...n in that order.
      *)
   }
 
@@ -162,7 +161,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     mutable mc_dt_cell: memo_decision_tree_cell; (* tree shape *)
   }
 
-   (* TODO: add "switch" for memoizing on uninterpreted types *)
+  (* TODO: add "switch" for memoizing on uninterpreted types *)
   and memo_decision_tree_cell =
     | Memo_fail (* cache miss *)
     | Memo_yield (* yield the [mc_dt_tree], depends on registers *)
@@ -2579,6 +2578,14 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         let t = Term.subst m.mc_registers t in
         compute_nf_add m.mc_explanation t
 
+      and set_cell m new_cell =
+        (* remove "fail", replace with new decision *)
+        Log.debugf 5
+          (fun k->k "(@[<hv1>memo_set_cell@ %a@ %a@])"
+              Term.pp_mc m Term.pp_mc_dt {m.mc_dt with mc_dt_cell=new_cell});
+        assert (m.mc_dt.mc_dt_cell = Memo_fail);
+        m.mc_dt.mc_dt_cell <- new_cell;
+
       (* in case of failure *)
       and aux_fail m =
         assert (m.mc_dt.mc_dt_cell = Memo_fail);
@@ -2592,21 +2599,29 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
             incr stat_num_memoized;
             m.mc_dt.mc_dt_cell <- Memo_yield;
             aux_yield m
-          | Dep_reg ((r_idx,_) as r) :: _ ->
-            (* TODO: use CCList.find here, to check all deps,
-               increase parallelism *)
+          | l ->
             (* evaluation has not reached a value yet, because of
-               register [r1], corresponding to some concrete term *)
-            begin match as_value m r_idx with
-              | m, Some v ->
-                let set_cell new_cell =
-                  (* remove "fail", replace with new decision *)
-                  Log.debugf 5
-                    (fun k->k "(@[<hv1>memo_set_cell@ %a@ %a@])"
-                        Term.pp_mc m Term.pp_mc_dt {m.mc_dt with mc_dt_cell=new_cell});
-                  assert (m.mc_dt.mc_dt_cell = Memo_fail);
-                  m.mc_dt.mc_dt_cell <- new_cell;
-                in
+               some registers, corresponding to some concrete terms *)
+            let val_opt =
+              CCList.find_map
+                (function
+                  | Dep_reg ((r_idx,_) as r) ->
+                    begin match as_value m r_idx with
+                      | m, Some v -> Some (m, r, v)
+                      | _, None -> None
+                    end
+                  | dep ->
+                    Log.debugf 1
+                      (fun k->k
+                          "unexpected concrete dep %a in symbolic computation" pp_dep dep);
+                    assert false)
+                l
+            in
+            begin match val_opt with
+              | None ->
+                (* all concrete terms corresponding to registers are blocked *)
+                Explanation.empty, Term.memo_call m
+              | Some (m, ((r_idx,_) as r), v) ->
                 (* register does not block any longer. proceed! *)
                 begin match v with
                   | Memo_true | Memo_false ->
@@ -2626,7 +2641,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
                       mc_dt_depth=m.mc_dt.mc_dt_depth+1;
                       mc_dt_cell=Memo_fail;
                     } in
-                    set_cell (Memo_if (r, then_, else_));
+                    set_cell m (Memo_if (r, then_, else_));
                     let sub_tree =
                       if v=Memo_true then then_ else else_
                     in
@@ -2672,20 +2687,12 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
                       with Not_found ->
                         errorf "wrong constructor %a" ID.pp cstor.cst_id
                     in
-                    set_cell (Memo_match (r, dt_map));
+                    set_cell m (Memo_match (r, dt_map));
                     {m with mc_dt=sub_dt} |> mk_memo_call |> aux
                   | Memo_dom_elt _ ->
                     assert false (* TODO: extensible switch table in memo_dt *)
                 end
-              | m, None ->
-                (* the concrete term is blocked *)
-                Explanation.empty, Term.memo_call m
             end
-          | dep :: _ ->
-            Log.debugf 1
-              (fun k->k
-                  "unexpected concrete dep %a in symbolic computation" pp_dep dep);
-            assert false (* purely symbolic computation *)
         end
       in
       aux m
@@ -3326,7 +3333,8 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
                     - does not depend on Cst_not_memoizable IDs
                     - some CLI "memoization" flag is true
                  *)
-                 if memo_arity > 0 && Ty.is_prop ty_ret then (
+                 if memo_arity > 0 && Ty.is_prop ty_ret 
+                 then (
                    (* create root memoization tree *)
                    let memo_dtree = {
                      mc_dt_cell=Memo_fail;
