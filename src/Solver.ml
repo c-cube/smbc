@@ -155,11 +155,11 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     (* the term this is standing for *)
     proxy_atom: atom lazy_t;
     (* the boolean atom, used to interface to the SAT solver. *)
-    mutable proxy_expanded: bool;
+    mutable proxy_expansion: proxy_expansion;
     (* did we already expand this into CNF? *)
     mutable proxy_status: (explanation * bool) option;
     (* current decision *)
-    mutable proxy_compute_state: term_proxy_compute_state;
+    mutable proxy_compute_state: proxy_compute_state;
     (* evaluation switch: either take the model value, or the actual term *)
     mutable proxy_graph: proxy_graph_edge list;
     (* list of other boolean terms that are linked to this one *)
@@ -170,7 +170,15 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
 
   and watch_set = term_proxy Poly_set.t
 
-  and term_proxy_compute_state =
+  and proxy_expansion =
+    | Proxy_not_expanded
+    | Proxy_CNF
+    | Proxy_eval
+    (* need to evaluate the term, is all *)
+    | Proxy_unif of unif_set ref
+    (* backtrackable pointer to the current unification problem *)
+
+  and proxy_compute_state =
     | Proxy_checked of Timestamp.t
     | Proxy_being_checked
 
@@ -180,6 +188,13 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
   and proxy_graph_edge_kind =
     | GE_conditional (* linked by CNF *)
     | GE_equiv of explanation (* equivalent to this other terms under assumptions *)
+
+  (* unification problem: conjunction of equalities *)
+  and unif_set = {
+    unif_set_eqns: unif_eqn list;
+    unif_set_expl: explanation; (* accumulated so far *)
+  }
+  and unif_eqn = term * term * explanation
 
   (* a table [m] from values of type [switch_ty_arg]
      to terms of type [switch_ty_ret],
@@ -550,6 +565,8 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       | S_set_proxy_status of
           term_proxy * (explanation * bool) option
           (* atom.status <- value *)
+      | S_set_unif_set of
+          term_proxy * unif_set
 
     type stack = stack_cell CCVector.vector
 
@@ -565,6 +582,11 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           | S_set_cst_case (info, c) -> info.cst_cur_case <- c;
           | S_set_uty (uty, s) -> uty.uty_status <- s;
           | S_set_proxy_status (p, s) -> p.proxy_status <- s;
+          | S_set_unif_set (p, set) ->
+            begin match p.proxy_expansion with
+              | Proxy_unif r -> r := set
+              | Proxy_not_expanded | Proxy_eval | Proxy_CNF -> assert false
+            end
       done;
       ()
 
@@ -586,6 +608,13 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
 
     let push_proxy_status (p:term_proxy) =
       CCVector.push st_ (S_set_proxy_status (p, p.proxy_status))
+
+    let push_unif_set (p:term_proxy) =
+      begin match p.proxy_expansion with
+        | Proxy_unif r ->
+          CCVector.push st_ (S_set_unif_set (p, !r))
+        | Proxy_not_expanded | Proxy_CNF | Proxy_eval -> assert false
+      end
   end
 
   let new_switch_id_ =
@@ -1389,7 +1418,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           proxy_atom=lazy (Atom.make (Atom_assert p));
           proxy_graph=[];
           proxy_status=None;
-          proxy_expanded=false;
+          proxy_expansion=Proxy_not_expanded;
           proxy_compute_state=Proxy_checked Timestamp.zero;
           proxy_watched=Poly_set.create 16 ~eq:eq_proxy_;
         } in
@@ -2215,34 +2244,16 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     val compute_nf_term : term -> compute_res
     (** Compute the normal form of this term. *)
 
+    val compute_nf_term_rec_non_bool : term -> compute_res * term
+    (** Recursive computation of this term, which must not have
+        type prop. *)
+
     val compute_nf_nf : normal_form -> compute_res
     (** See if the given normal form can evaluate further in the
         current partial model *)
 
     val compute_nf_proxy : term_proxy -> compute_res
   end = struct
-    let cycle_check_tbl : unit Term.Tbl.t = Term.Tbl.create 32
-
-    (* [cycle_check sub into] checks whether [sub] occurs in [into] under
-       a non-empty path traversing only constructors. *)
-    let cycle_check_l ~(sub:term) (l:term list): bool =
-      let tbl_ = cycle_check_tbl in
-      Term.Tbl.clear tbl_;
-      let rec aux u =
-        Term.equal sub u
-        ||
-        begin
-          if Term.Tbl.mem tbl_ u then false
-          else (
-            Term.Tbl.add tbl_ u ();
-            match Term.as_cstor_app u with
-              | None -> false
-              | Some (_, _, l) -> List.exists aux l
-          )
-        end
-      in
-      List.exists aux l
-
     (* set the normal form of [t], propagate to watchers *)
     let set_nf_ t (res:compute_res) : unit =
       let now = Timestamp.cur() in
@@ -2271,8 +2282,6 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       | _ -> return ?proxies ?e (NF_term t)
 
     let add_expl ~e r = {r with expl = Explanation.append e r.expl }
-
-    let return_add res nf = {res with nf; }
 
     let return_term_add {proxies; expl=e; _} t =
       return_term ~proxies ~e t
@@ -2329,17 +2338,6 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         | NF_term _
         | NF_true
         | NF_false -> res
-
-    (* same as {!compute_nf_term}, for non boolean terms, with a shortcut
-       to the normal form (which MUST be a NF_term) *)
-    and compute_nf_term_non_bool (t:term): compute_res * term =
-      assert (not (Ty.is_prop t.term_ty));
-      let res = compute_nf_term t in
-      let t' = match res.nf with
-        | NF_true | NF_false | NF_proxy _ -> assert false (* typing *)
-        | NF_term u->u
-      in
-      res, t'
 
     (* same as {!compute_nf_term_rec} for non boolean terms *)
     and compute_nf_term_rec_non_bool (t:term): compute_res * term =
@@ -2557,52 +2555,18 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         assert sign;
         assert (t.term_proxy <> None); (* after proxify *)
         return (NF_proxy (p, true))
-      | B_eq (a,b) ->
+      | B_eq (a,_) ->
         assert (not (Ty.is_prop a.term_ty));
-        let res_a, a' = compute_nf_term_non_bool a in
-        let res_b, b' = compute_nf_term_non_bool b in
-        let res_ab = merge_res res_a ~into:res_b in
-        let default() =
-          if a==a' && b==b' then t else Term.eq a' b'
-        in
-        if Term.equal a' b'
-        then return_add res_ab NF_true (* syntactic *)
-        else begin match Term.as_cstor_app a', Term.as_cstor_app b' with
-          | Some (c1,ty1,l1), Some (c2,_,l2) ->
-            if not (Typed_cst.equal c1 c2)
-            then
-              (* [c1 ... = c2 ...] --> false, as distinct constructors
-                 can never be equal *)
-              return_add res_ab NF_false
-            else if Typed_cst.equal c1 c2
-                 && List.length l1 = List.length l2
-                 && List.length l1 = List.length (fst (Ty.unfold ty1))
-            then (
-              (* same constructor, fully applied -> injectivity:
-                 arguments are pairwise equal.
-                 We need to evaluate the arguments further (e.g.
-                 if they start with constructors) *)
-              List.map2 Term.eq l1 l2
-              |> Term.and_
-              |> compute_nf_add res_ab
-            )
-            else return_term_add res_ab (default())
-          | Some (_, _, l), None when cycle_check_l ~sub:b' l ->
-            (* acyclicity rule *)
-            return_add res_ab NF_false
-          | None, Some (_, _, l) when cycle_check_l ~sub:a' l ->
-            return_add res_ab NF_false
+        let t = Term.simplify t in
+        begin match t.term_cell with
+          | True -> return NF_true
+          | False -> return NF_false
           | _ ->
-            begin match Term.as_domain_elt a', Term.as_domain_elt b' with
-              | Some (c1,ty1), Some (c2,ty2) ->
-                (* domain elements: they are all distinct *)
-                assert (Ty.equal ty1 ty2);
-                if Typed_cst.equal c1 c2
-                then return_add res_ab NF_true
-                else return_add res_ab NF_false
-              | _ ->
-                return_term_add res_ab (default())
-            end
+            (* proxify *)
+            let p, sign = proxify t in
+            assert sign;
+            assert (t.term_proxy <> None); (* after proxify *)
+            return (NF_proxy (p, true))
         end
 
     let compute_nf_proxy (p:term_proxy): compute_res =
@@ -2610,6 +2574,274 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         | None -> return (NF_proxy (p,true))
         | Some (e,true) -> return ~e NF_true
         | Some (e,false) -> return ~e NF_false
+  end
+
+  let pp_unif out (set:unif_set) =
+    let pp_eqn out (a,b,_) =
+      Format.fprintf out "(@[<hv1>=?=@ %a@ %a@])" Term.pp a Term.pp b
+    in
+    Format.fprintf out "(@[%a@])" (Utils.pp_list pp_eqn) set.unif_set_eqns
+
+  (** {2 Unification} *)
+  module Unif : sig
+    val simplify : unif_set -> unif_set
+    (** Simplify the given set of constraints, regardless of any model *)
+
+    val reduce : unif_set -> unif_set
+        (** Reduce given set of constraints to another set of constraints
+        in the current model *)
+
+    type update_nf =
+      | U_true of explanation
+      | U_false of explanation
+      | U_set of unif_set
+
+    type update_res = {
+      update_propagate: (explanation * lit) list;
+      update_deps: term_dep list;
+      update_proxies: term_proxy list;
+      update_nf: update_nf;
+    }
+    (** After some update, we get a new normal form (set of constraints
+        or true/false), and possibly some propagations and dependencies
+        blocking evaluation.
+
+        [update_propagate] means
+        [expl => (set => lit)] for each [(expl, lit) in update_propagate]
+        Invariant: the propagated literals are all of the
+        form [cst_choice] or [uty_empty], i.e. decisions *)
+
+    val update : unif_set -> update_res
+    (** In the current model, reduce the set, and return a result that
+        indicates the new set of constraints or true/false,
+        and maybe some literals to propagate under assumptions *)
+  end = struct
+    let simplify set = set (* TODO *)
+
+    let reduce set = set (* TODO *)
+
+    type unif_pair =
+      | UP_none
+      | UP_cstor of cst * cst (* cstor *) * term list
+      | UP_uty of cst * ty_uninterpreted_slice * cst (* dom elt *)
+
+    (* [as_unif_pair a b] returns [c, cstor, args] if the set [{a,b}] is
+       [const c, app cstor args] where [c] is a meta and [cstor] a constructor *)
+    let as_unif_pair (a:term)(b:term): unif_pair =
+      let match_pair a b =
+        match Term.as_cst_undef a, Term.as_cstor_app b, b.term_cell with
+          | Some (cst, _, _, _), Some (cstor, _, args), _ ->
+            UP_cstor (cst, cstor, args)
+          | Some (cst, _, _, Some uty), None,
+            Const ({cst_kind=Cst_uninterpreted_dom_elt _; _} as u) ->
+            UP_uty (cst, uty, u)
+          | _ -> UP_none
+      in
+      begin match match_pair a b with
+        | UP_none -> match_pair b a
+        | res -> res
+      end
+
+    type update_nf =
+      | U_true of explanation
+      | U_false of explanation
+      | U_set of unif_set (* not finished yet *)
+
+    type update_res = {
+      update_propagate: (explanation * lit) list;
+      update_deps: term_dep list;
+      update_proxies: term_proxy list;
+      update_nf: update_nf;
+    }
+
+    let cycle_check_tbl : unit Term.Tbl.t = Term.Tbl.create 32
+
+    (* [cycle_check sub into] checks whether [sub] occurs in [into] under
+       a non-empty path traversing only constructors. *)
+    let cycle_check_l ~(sub:term) (l:term list): bool =
+      let tbl_ = cycle_check_tbl in
+      Term.Tbl.clear tbl_;
+      let rec aux u =
+        Term.equal sub u
+        ||
+        begin
+          if Term.Tbl.mem tbl_ u then false
+          else (
+            Term.Tbl.add tbl_ u ();
+            match Term.as_cstor_app u with
+              | None -> false
+              | Some (_, _, l) -> List.exists aux l
+          )
+        end
+      in
+      List.exists aux l
+
+    exception Yield_false of explanation
+
+    let get_cases (cst:cst): term list lazily_expanded = match cst.cst_kind with
+      | Cst_undef (_, i, _) -> i.cst_cases
+      | _ -> assert false
+
+    type update_state = {
+      mutable new_expl: explanation;
+      mutable new_eqns: unif_eqn list;
+      mutable l_propagate: (explanation * lit) list;
+      mutable l_proxies: term_proxy list; (* to update *)
+      to_process: unif_eqn Queue.t; (* eqns yet to solve *)
+    }
+
+    let add_expl st e = st.new_expl <- Explanation.append e st.new_expl
+    let add_eqn st e = st.new_eqns <- e :: st.new_eqns
+    let add_propagate st p = st.l_propagate <- p :: st.l_propagate
+    let add_proxy st p = st.l_proxies <- p :: st.l_proxies
+    let add_proxies st = List.iter (add_proxy st)
+    let push_eqn st e = Queue.push e st.to_process
+
+    (* TODO: also, in case [cstor args = (match t with …)] where
+       - all branch start with a constructor
+       - at most one branch has the proper cstor
+       reduce to [cstor args = the branch, t = the pattern] *)
+
+    (* try to unify [a,b] directly, if one of them is a meta and
+       the other a WHNF value *)
+    let try_unif_direct st ((a,b,e_ab) as eqn): unit = match as_unif_pair a b with
+      | UP_cstor (c, cstor, args) ->
+        begin match get_cases c with
+          | Lazy_some cases ->
+            (* which case corresponds to [cstor]? *)
+            let case,sub_metas =
+              CCList.find_map
+                (fun t -> match Term.as_cstor_app t with
+                   | Some (cstor', _, sub_metas) ->
+                     if Typed_cst.equal cstor cstor'
+                     then Some (t,sub_metas)
+                     else None
+                   | None -> assert false)
+                cases
+              |> (function
+                | Some x->x
+                | None -> assert false (* wrong cstor?! *)
+              )
+            in
+            assert (List.length sub_metas = List.length args);
+            (* propagate [cst := case] *)
+            let lit_case = Lit.cst_choice c case in
+            add_propagate st (e_ab,lit_case);
+            (* deal with sub-problems recursively *)
+            List.iter2
+              (fun sub_meta arg ->
+                 let eqn = sub_meta, arg, Explanation.return lit_case in
+                 push_eqn st eqn)
+              sub_metas args;
+            incr stat_num_unif;
+          | Lazy_none ->
+            (* not expanded, must wait *)
+            add_eqn st eqn;
+        end
+      | UP_uty (c, uty, dom_elt) ->
+        (* [c=dom_elt] depends on [uty] *)
+        (* TODO:
+           - assert [uty] is unfolded deep enough to contain dom_elt
+           - assert [c=dom_elt] *)
+        assert false
+      | UP_none -> push_eqn st eqn (* must delay *)
+
+    let try_solve_eqn (st:update_state) ((a,b,e_ab) as eqn): unit =
+      let res_a, a = Reduce.compute_nf_term_rec_non_bool a in
+      let res_b, b = Reduce.compute_nf_term_rec_non_bool b in
+      let e_ab =
+        e_ab |> Explanation.append res_a.expl |> Explanation.append res_b.expl
+      in
+      add_proxies st res_a.proxies;
+      add_proxies st res_b.proxies;
+      (* check now *)
+      if Term.equal a b
+      then
+        (* equation is solved, just add explanation *)
+        add_expl st e_ab
+      else begin match Term.as_cstor_app a, Term.as_cstor_app b with
+        | Some (c1,_,l1), Some (c2,_,l2) ->
+          if not (Typed_cst.equal c1 c2)
+          then
+            (* [c1 ... = c2 ...] --> false, as distinct constructors
+               can never be equal *)
+            raise (Yield_false e_ab)
+          else (
+            assert (Typed_cst.equal c1 c2);
+            assert (List.length l1 = List.length l2); (* typing *)
+            (* same constructor -> injectivity:
+               we unify the arguments pairwise.
+               Even if all arguments are not provided,
+               we can use extensionality *)
+            List.iter2
+              (fun a1 b1 -> push_eqn st (a1,b1,e_ab))
+              l1 l2
+          )
+        | Some (_, _, l), None when cycle_check_l ~sub:b l ->
+          (* acyclicity rule *)
+          raise (Yield_false e_ab)
+        | None, Some (_, _, l) when cycle_check_l ~sub:a l ->
+          raise (Yield_false e_ab)
+        | _ ->
+          begin match Term.as_domain_elt a, Term.as_domain_elt b with
+            | Some (c1,_), Some (c2,_) ->
+              (* domain elements: true or false *)
+              if Typed_cst.equal c1 c2
+              then add_expl st e_ab
+              else raise (Yield_false e_ab)
+            | _ ->
+              (* try with meta variables *)
+              try_unif_direct st eqn
+          end
+      end
+
+    (* update set of constraints to a new set *)
+    let update set =
+      let state = {
+        new_expl=set.unif_set_expl;
+        new_eqns=[];
+        l_propagate=[];
+        l_proxies=[];
+        to_process=Queue.create();
+      } in
+      (* check for the unification-like cases:
+         [?x=cstor(a1,a2)] is equivalent to
+         [?x:=cstor(?y,?z) & ?y=a & ?z=b] (by expansion of ?x) *)
+      try
+        (* solve equations, recursively *)
+        List.iter (fun tup -> Queue.push tup state.to_process) set.unif_set_eqns;
+        while not (Queue.is_empty state.to_process) do
+          try_solve_eqn state (Queue.pop state.to_process);
+        done;
+        begin match state.new_eqns with
+          | [] ->
+            (* true, since every equation is solved *)
+            { update_propagate= state.l_propagate;
+              update_nf=U_true state.new_expl;
+              update_proxies=state.l_proxies;
+              update_deps=[]
+            }
+          | eqns ->
+            (* new set *)
+            let deps =
+              CCList.flat_map
+                (fun (a,b,_) -> a.term_deps @ b.term_deps)
+                state.new_eqns
+            and new_set =
+              {unif_set_eqns=eqns; unif_set_expl=state.new_expl;}
+            in
+            { update_propagate=state.l_propagate;
+              update_nf=U_set new_set;
+              update_proxies=state.l_proxies;
+              update_deps=deps;
+            }
+        end
+      with Yield_false e ->
+        { update_propagate=[];
+          update_nf=U_false e;
+          update_proxies=state.l_proxies;
+          update_deps=[];
+        }
   end
 
   (** {2 Consistency Checking}
@@ -2728,150 +2960,86 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       expand_uty uty;
       ()
 
-    type unif_pair =
-      | UP_none
-      | UP_cstor of cst * cst (* cstor *) * term list
-      | UP_bool of cst * bool
-      | UP_uty of cst * ty_uninterpreted_slice * cst (* dom elt *)
-
-    (* [as_unif_pair a b] returns [c, cstor, args] if the set [{a,b}] is
-       [const c, app cstor args] where [c] is a meta and [cstor] a constructor *)
-    let as_unif_pair (a:term)(b:term): unif_pair =
-      let match_pair a b =
-        match Term.as_cst_undef a, Term.as_cstor_app b, b.term_cell with
-          | Some (cst, _, _, _), Some (cstor, _, args), _ ->
-            UP_cstor (cst, cstor, args)
-          | Some (cst, _, _, _), None, True -> UP_bool (cst, true)
-          | Some (cst, _, _, _), None, False -> UP_bool (cst, false)
-          | Some (cst, _, _, Some uty), None,
-            Const ({cst_kind=Cst_uninterpreted_dom_elt _; _} as u) ->
-            UP_uty (cst, uty, u)
-          | _ -> UP_none
-      in
-      begin match match_pair a b with
-        | UP_none -> match_pair b a
-        | res -> res
-      end
-
     let rec expand_proxy (p:term_proxy): unit =
+      (* check whether [b_expr] is expanded already *)
+      begin match p.proxy_expansion with
+        | Proxy_unif _
+        | Proxy_eval
+        | Proxy_CNF -> ()
+        | Proxy_not_expanded ->
+          let neg_ = Term.not_ in
+          let t = p.proxy_for in
+          begin match t.term_cell with
+            | Builtin (B_not _) -> assert false
+            | Builtin (B_and l) ->
+              (t :: List.map neg_ l) ::
+                (List.map (fun sub -> [neg_ t; sub]) l)
+              |> expand_builtin_clauses p
+            | Builtin (B_or l) ->
+              (neg_ t :: l) ::
+                (List.map (fun sub -> [neg_ sub; t]) l)
+              |> expand_builtin_clauses p
+            | Builtin (B_imply (a,b)) ->
+              [ [a; t ];
+                [neg_ b; t];
+                [neg_ a; b; neg_ t]]
+              |> expand_builtin_clauses p
+            | Builtin (B_equiv (a,b)) ->
+              [ [neg_ a; neg_ b; t];
+                [a; b; t];
+                [a; neg_ b; neg_ t];
+                [neg_ a; b; neg_ t]]
+              |> expand_builtin_clauses p
+          | Builtin (B_eq (a,b)) ->
+            expand_unif p a b;
+          | _ ->
+            p.proxy_expansion <- Proxy_eval;
+            (* expand [t]'s dependencies *)
+            List.iter expand_dep t.term_deps;
+            ()
+          end;
+      end;
       (* in the case of a non-connective, the dependencies might be
          expanded already, so we update now *)
       update p;
-      (* check whether [b_expr] is expanded *)
-      if not p.proxy_expanded then (
-        p.proxy_expanded <- true;
-        let neg_ = Term.not_ in
-        let assert_ t = Lit.assert_ t in
-        let clauses_of_terms = List.map (List.map assert_) in
-        let t = p.proxy_for in
-        let default_clauses () =
-          (* expand [t]'s dependencies *)
-          List.iter expand_dep t.term_deps;
-          []
-        in
-        let (clauses:lit list list) = match t.term_cell with
-          | Builtin (B_not _) -> assert false
-          | Builtin (B_and l) ->
-            (t :: List.map neg_ l) ::
-              (List.map (fun sub -> [neg_ t; sub]) l)
-            |> clauses_of_terms
-          | Builtin (B_or l) ->
-            (neg_ t :: l) ::
-              (List.map (fun sub -> [neg_ sub; t]) l)
-            |> clauses_of_terms
-          | Builtin (B_imply (a,b)) ->
-            [ [a; t ];
-              [neg_ b; t];
-              [neg_ a; b; neg_ t]]
-            |> clauses_of_terms
-          | Builtin (B_equiv (a,b)) ->
-            [ [neg_ a; neg_ b; t];
-              [a; b; t];
-              [a; neg_ b; neg_ t];
-              [neg_ a; b; neg_ t]]
-            |> clauses_of_terms
-          | Builtin (B_eq (a,b)) ->
-            (* check for the unification-like cases:
-               [?x=cstor(a1,a2)] is equivalent to 
-               [?x:=cstor(?y,?z) & ?y=a & ?z=b] (by expansion of ?x) *)
-            begin match as_unif_pair a b with
-              | UP_cstor (c, cstor, args) ->
-                begin match expand_cst_maybe c with
-                  | Some cases ->
-                    (* which case corresponds to [cstor]? *)
-                    let case,sub_metas =
-                      CCList.find_map
-                        (fun t -> match Term.as_cstor_app t with
-                           | Some (cstor', _, sub_metas) ->
-                             if Typed_cst.equal cstor cstor'
-                             then Some (t,sub_metas)
-                             else None
-                           | None -> assert false)
-                        cases
-                      |> (function
-                        | Some x->x
-                        | None -> assert false (* wrong cstor?! *)
-                      )
-                    in
-                    assert (List.length sub_metas = List.length args);
-                    let lit_eq = Lit.assert_ t in
-                    let lit_case = Lit.cst_choice c case in
-                    let lits_sub = 
-                      List.map2
-                        (fun sub_meta arg -> Lit.eq sub_meta arg)
-                        sub_metas args
-                    in
-                    let c_direct_1 =
-                      [Lit.neg lit_eq; lit_case]
-                    and c_direct_2 =
-                      List.map (fun lit_sub -> [Lit.neg lit_eq; lit_sub]) lits_sub
-                    and c_indirect =
-                      lit_eq :: Lit.neg lit_case :: List.map Lit.neg lits_sub
-                    in
-                    incr stat_num_unif;
-                    c_direct_1 :: c_indirect :: c_direct_2
-                  | None -> default_clauses() (* too deep *)
-                end
-              | UP_bool (c, b) ->
-                (* [c=true] is equivalent to [c:=true] and to [not (c:=false)] *)
-                let lit_eq = Lit.assert_ t in
-                let lit_c_true = Lit.cst_choice c Term.true_ in
-                let lit_c_false = Lit.cst_choice c Term.false_ in
-                let lit_same, lit_opp =
-                  if b then lit_c_true, lit_c_false else lit_c_false, lit_c_true
-                in
-                incr stat_num_unif;
-                [ [Lit.neg lit_eq; lit_same];
-                  [Lit.neg lit_eq; Lit.neg lit_opp];
-                  [lit_eq; Lit.neg lit_same];
-                  [lit_eq; lit_opp];]
-              | UP_uty (c, uty, dom_elt) ->
-                (* [c=dom_elt] depends on [uty] *)
-                assert false (* TODO *)
-              | UP_none -> default_clauses()
-            end
-          | _ ->
-            default_clauses ()
-        in
-        let clauses =
-          clauses
-          |> List.rev_map
-            (fun lits ->
-               (* expand sub-proxies recursively *)
-               List.iter
-                 (fun lit -> match Lit.as_assert lit with
-                    | Some (p', _) when not (eq_proxy_ p p') ->
-                      Term_graph.add p p' GE_conditional;
-                      expand_proxy p'
-                    | Some _ | None -> ())
-                 lits;
-               Clause.make lits)
-        in
-        Log.debugf 4
-          (fun k->k "(@[<hv1>expand_proxy@ %a@ @[<hv2>:clauses@ (@[%a@])@]@])"
-              Term.pp t (Utils.pp_list Clause.pp) clauses);
-        Clause.push_new_l clauses;
-      );
+      ()
+
+    (* given proxy expands as a list of clauses *)
+    and expand_builtin_clauses (p:term_proxy) (clauses:term list list): unit =
+      p.proxy_expansion <- Proxy_CNF;
+      let assert_ t = Lit.assert_ t in
+      let clauses =
+        clauses
+        |> List.rev_map
+          (fun lits ->
+             let lits = List.map assert_ lits in
+             (* expand sub-proxies recursively *)
+             List.iter
+               (fun lit -> match Lit.as_assert lit with
+                  | Some (p', _) when not (eq_proxy_ p p') ->
+                    Term_graph.add p p' GE_conditional;
+                    expand_proxy p'
+                  | Some _ | None -> ())
+               lits;
+             Clause.make lits)
+      in
+      Log.debugf 4
+        (fun k->k "(@[<hv1>expand_proxy@ %a@ @[<hv2>:clauses@ (@[%a@])@]@])"
+            Term.pp p.proxy_for (Utils.pp_list Clause.pp) clauses);
+      Clause.push_new_l clauses;
+      ()
+
+    (* proxy expands as a unification problem [a=b] *)
+    and expand_unif (p:term_proxy)(a:term)(b:term): unit =
+      assert (p.proxy_expansion = Proxy_not_expanded);
+      let set = {
+        unif_set_eqns=[a, b, Explanation.empty];
+        unif_set_expl=Explanation.empty;
+      } |> Unif.simplify in
+      p.proxy_expansion <- Proxy_unif (ref set);
+      Log.debugf 4
+        (fun k->k "(@[<hv1>expand_proxy@ %a@ @[<hv2>:unif@ (@[%a@])@]@])"
+            Term.pp p.proxy_for pp_unif set);
       ()
 
     and expand_dep = function
@@ -2891,9 +3059,30 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       | Proxy_checked t when t = Timestamp.cur() -> () (* already done *)
       | Proxy_checked t ->
         assert (t < Timestamp.cur());
-        update_noncached p
+        begin match p.proxy_expansion with
+          | Proxy_not_expanded ->
+            (* expand, and try again *)
+            expand_proxy p;
+            update p
+          | Proxy_CNF -> ()
+          | Proxy_eval -> update_eval p
+          | Proxy_unif set -> update_unif p set
+        end
 
-    and update_noncached p: unit =
+    and propagate_lit (lit:lit)(e:explanation): unit =
+      let c = clause_imply lit e in
+      Log.debugf 4
+        (fun k->k
+            "(@[<hv1>@{<green>propagate_lit@}@ %a@ clause: %a@])"
+            Lit.pp lit Clause.pp c);
+      incr stat_num_propagations;
+      Clause.push_new c;
+      ()
+
+    (* [p] is decided by evaluation, we evaluate the term and see if is
+       compatible with the current assignment of [p] *)
+    and update_eval (p:term_proxy): unit =
+      assert (p.proxy_expansion = Proxy_eval);
       let {nf=decided; _} = Reduce.compute_nf_proxy p in
       (* compute the actual normal form, bypassing the partial model's assignment *)
       p.proxy_compute_state <- Proxy_being_checked;
@@ -2915,13 +3104,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           (* force the SAT solver to decide the same as [computed] *)
           let sign = computed_res.nf = NF_true in
           let lit = Lit.assert_proxy ~sign p in
-          let c = clause_imply lit computed_res.expl in
-          Log.debugf 4
-            (fun k->k
-                "(@[<hv1>@{<green>propagate_lit@}@ %a@ nf: %a@ clause: %a@])"
-                pp_proxy_ p pp_nf computed_res.nf Clause.pp c);
-          incr stat_num_propagations;
-          Clause.push_new c;
+          propagate_lit lit computed_res.expl;
         | NF_proxy (p', sign), _ when eq_proxy_ p p' ->
           (* nothing to propagate (only depends on decision) *)
           assert sign;
@@ -2958,6 +3141,56 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           (* watch the dependencies of [t_nf] so that we know when
              to re-update [p] *)
           List.iter (watch_dep p) t_nf.term_deps
+      end
+
+    and update_unif (p:term_proxy) (set:unif_set ref): unit =
+      let {nf=decided; _} = Reduce.compute_nf_proxy p in
+      Log.debugf 4
+        (fun k->k
+            "(@[<hv1>consistency_update_unif@ %a@ decided: %a@ set: %a@])"
+            pp_proxy_ p pp_nf decided pp_unif !set);
+      begin match decided with
+        | NF_true
+        | NF_false ->
+          let res = Unif.update !set in
+          (* propagate some literals that must be true for [p] to be
+             true, under some explanations (subset of current model) *)
+          let cs =
+            List.map
+              (fun (e,lit) ->
+                 let lits =
+                   Lit.assert_proxy ~sign:false p :: lit :: clause_guard_of_exp_ e
+                 in
+                 Clause.make lits)
+              res.Unif.update_propagate
+          in
+          Clause.push_new_l cs;
+          (* ensure we expand the blocking atoms *)
+          List.iter
+            (function
+              | Dep_cst c -> expand_cst_maybe c |> ignore
+              | Dep_proxy p -> expand_proxy p
+              | Dep_uty uty -> assert false (* TODO: expand only if not too deep *)
+            )
+            res.Unif.update_deps;
+          (* ... and that we update the proxies *)
+          List.iter update res.Unif.update_proxies;
+          (* if we reached true or false, propagate *)
+          begin match res.Unif.update_nf with
+            | Unif.U_true e ->
+              let lit = Lit.assert_proxy p in
+              propagate_lit lit e;
+            | Unif.U_false e ->
+              let lit = Lit.assert_proxy ~sign:false p in
+              propagate_lit lit e;
+            | Unif.U_set set' ->
+              Backtrack.push_unif_set p;
+              set := set';
+          end;
+        | NF_proxy (p',_) ->
+          assert (eq_proxy_ p p');
+          () (* not decided *)
+        | NF_term _ -> assert false
       end
   end
 
