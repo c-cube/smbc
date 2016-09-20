@@ -41,9 +41,9 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
   let stat_num_cst_expanded = ref 0
   let stat_num_uty_expanded = ref 0
   let stat_num_clause_push = ref 0
-  let stat_num_propagations = ref 0
   let stat_num_clause_tautology = ref 0
   let stat_num_propagations = ref 0
+  let stat_num_unif = ref 0
   let stat_num_equiv_lemmas = ref 0
 
   (** {2 Timestamps: labels a state of the SAT solver} *)
@@ -2647,8 +2647,9 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       [ c1; c2 ]
 
     (* expand the given constant so that, later, it will be
-       assigned a value by the SAT solver *)
-    let expand_cst (c:cst): unit =
+       assigned a value by the SAT solver
+       @return its list of cases *)
+    let expand_cst_ (c:cst): term list =
       let ty, info = match c.cst_kind with
         | Cst_undef (ty,i,_) -> ty,i
         | Cst_defined _ | Cst_cstor _ | Cst_uninterpreted_dom_elt _ ->
@@ -2667,9 +2668,25 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
                 Typed_cst.pp c (Utils.pp_list Term.pp) l depth);
           info.cst_cases <- Lazy_some l;
           incr stat_num_cst_expanded;
-          Clause.push_new_l clauses
-        | Lazy_some _ -> ()
+          Clause.push_new_l clauses;
+          l
+        | Lazy_some l -> l
       end
+
+    let expand_cst (c:cst) : unit = ignore (expand_cst_ c)
+
+    (* if [c] is not too deep, expand it and return [Some l] where [l] is
+       its list of cases. *)
+    let expand_cst_maybe (c:cst): term list option =
+      let info = match c.cst_kind with
+        | Cst_undef (_,i,_) -> i
+        | Cst_defined _ | Cst_cstor _ | Cst_uninterpreted_dom_elt _ ->
+          assert false
+      in
+      let depth = info.cst_depth in
+      if depth <= (Iterative_deepening.current_depth() :> int)
+      then Some (expand_cst_ c)
+      else None
 
     (* add [t] to the list of literals that watch the constant [c] *)
     let watch_cst_ (t:t)(c:cst) : unit =
@@ -2711,6 +2728,31 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       expand_uty uty;
       ()
 
+    type unif_pair =
+      | UP_none
+      | UP_cstor of cst * cst (* cstor *) * term list
+      | UP_bool of cst * bool
+      | UP_uty of cst * ty_uninterpreted_slice * cst (* dom elt *)
+
+    (* [as_unif_pair a b] returns [c, cstor, args] if the set [{a,b}] is
+       [const c, app cstor args] where [c] is a meta and [cstor] a constructor *)
+    let as_unif_pair (a:term)(b:term): unif_pair =
+      let match_pair a b =
+        match Term.as_cst_undef a, Term.as_cstor_app b, b.term_cell with
+          | Some (cst, _, _, _), Some (cstor, _, args), _ ->
+            UP_cstor (cst, cstor, args)
+          | Some (cst, _, _, _), None, True -> UP_bool (cst, true)
+          | Some (cst, _, _, _), None, False -> UP_bool (cst, false)
+          | Some (cst, _, _, Some uty), None,
+            Const ({cst_kind=Cst_uninterpreted_dom_elt _; _} as u) ->
+            UP_uty (cst, uty, u)
+          | _ -> UP_none
+      in
+      begin match match_pair a b with
+        | UP_none -> match_pair b a
+        | res -> res
+      end
+
     let rec expand_proxy (p:term_proxy): unit =
       (* in the case of a non-connective, the dependencies might be
          expanded already, so we update now *)
@@ -2719,39 +2761,102 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       if not p.proxy_expanded then (
         p.proxy_expanded <- true;
         let neg_ = Term.not_ in
+        let assert_ t = Lit.assert_ t in
+        let clauses_of_terms = List.map (List.map assert_) in
         let t = p.proxy_for in
-        let (clauses:term list list) = match t.term_cell with
+        let default_clauses () =
+          (* expand [t]'s dependencies *)
+          List.iter expand_dep t.term_deps;
+          []
+        in
+        let (clauses:lit list list) = match t.term_cell with
           | Builtin (B_not _) -> assert false
           | Builtin (B_and l) ->
             (t :: List.map neg_ l) ::
-              (List.map
-                 (fun sub -> [neg_ t; sub])
-                 l)
+              (List.map (fun sub -> [neg_ t; sub]) l)
+            |> clauses_of_terms
           | Builtin (B_or l) ->
             (neg_ t :: l) ::
-              (List.map
-                 (fun sub -> [neg_ sub; t])
-                 l)
+              (List.map (fun sub -> [neg_ sub; t]) l)
+            |> clauses_of_terms
           | Builtin (B_imply (a,b)) ->
             [ [a; t ];
               [neg_ b; t];
               [neg_ a; b; neg_ t]]
+            |> clauses_of_terms
           | Builtin (B_equiv (a,b)) ->
             [ [neg_ a; neg_ b; t];
               [a; b; t];
               [a; neg_ b; neg_ t];
-              [neg_ a; b; neg_ t];
-            ]
+              [neg_ a; b; neg_ t]]
+            |> clauses_of_terms
+          | Builtin (B_eq (a,b)) ->
+            (* check for the unification-like cases:
+               [?x=cstor(a1,a2)] is equivalent to 
+               [?x:=cstor(?y,?z) & ?y=a & ?z=b] (by expansion of ?x) *)
+            begin match as_unif_pair a b with
+              | UP_cstor (c, cstor, args) ->
+                begin match expand_cst_maybe c with
+                  | Some cases ->
+                    (* which case corresponds to [cstor]? *)
+                    let case,sub_metas =
+                      CCList.find_map
+                        (fun t -> match Term.as_cstor_app t with
+                           | Some (cstor', _, sub_metas) ->
+                             if Typed_cst.equal cstor cstor'
+                             then Some (t,sub_metas)
+                             else None
+                           | None -> assert false)
+                        cases
+                      |> (function
+                        | Some x->x
+                        | None -> assert false (* wrong cstor?! *)
+                      )
+                    in
+                    assert (List.length sub_metas = List.length args);
+                    let lit_eq = Lit.assert_ t in
+                    let lit_case = Lit.cst_choice c case in
+                    let lits_sub = 
+                      List.map2
+                        (fun sub_meta arg -> Lit.eq sub_meta arg)
+                        sub_metas args
+                    in
+                    let c_direct_1 =
+                      [Lit.neg lit_eq; lit_case]
+                    and c_direct_2 =
+                      List.map (fun lit_sub -> [Lit.neg lit_eq; lit_sub]) lits_sub
+                    and c_indirect =
+                      lit_eq :: Lit.neg lit_case :: List.map Lit.neg lits_sub
+                    in
+                    incr stat_num_unif;
+                    c_direct_1 :: c_indirect :: c_direct_2
+                  | None -> default_clauses() (* too deep *)
+                end
+              | UP_bool (c, b) ->
+                (* [c=true] is equivalent to [c:=true] and to [not (c:=false)] *)
+                let lit_eq = Lit.assert_ t in
+                let lit_c_true = Lit.cst_choice c Term.true_ in
+                let lit_c_false = Lit.cst_choice c Term.false_ in
+                let lit_same, lit_opp =
+                  if b then lit_c_true, lit_c_false else lit_c_false, lit_c_true
+                in
+                incr stat_num_unif;
+                [ [Lit.neg lit_eq; lit_same];
+                  [Lit.neg lit_eq; Lit.neg lit_opp];
+                  [lit_eq; Lit.neg lit_same];
+                  [lit_eq; lit_opp];]
+              | UP_uty (c, uty, dom_elt) ->
+                (* [c=dom_elt] depends on [uty] *)
+                assert false (* TODO *)
+              | UP_none -> default_clauses()
+            end
           | _ ->
-            (* expand [t]'s dependencies *)
-            List.iter expand_dep t.term_deps;
-            []
+            default_clauses ()
         in
         let clauses =
           clauses
           |> List.rev_map
             (fun lits ->
-               let lits = List.map (fun t->Lit.assert_ t) lits in
                (* expand sub-proxies recursively *)
                List.iter
                  (fun lit -> match Lit.as_assert lit with
@@ -2929,13 +3034,14 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
   let print_progress () : unit =
     Printf.printf
       "\r[%.2f] depth %d | expanded %d | clauses %d | \
-       lemmas %d | propagated %d%!"
+       lemmas %d | propagated %d | unif_expand %d%!"
       (get_time())
       (Iterative_deepening.current_depth() :> int)
       !stat_num_cst_expanded
       !stat_num_clause_push
       !stat_num_clause_tautology
       !stat_num_propagations
+      !stat_num_unif
 
   let flush_progress (): unit =
     Printf.printf "\x1b[2K%!"
@@ -3558,6 +3664,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
        :num_clause_tautology %d@ \
        :num_equiv_lemmas %d@ \
        :num_propagations %d@ \
+       :num_unif %d@ \
        :num_atoms %d@ \
        @])"
       !stat_num_cst_expanded
@@ -3566,6 +3673,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       !stat_num_clause_tautology
       !stat_num_equiv_lemmas
       !stat_num_propagations
+      !stat_num_unif
       (Atom.num_atoms ())
 
   let do_on_exit ~on_exit =
