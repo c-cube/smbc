@@ -1779,12 +1779,6 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
 
     val expand_cases : cst -> Ty.t -> cst_info -> term list * Clause.t list
 
-    val expand_cst_unsafe : cst -> term list
-    (** expand the given constant so that, later, it will be
-        assigned a value by the SAT solver
-        @return its list of cases
-        @raise Assert_failure if the cst is too deep *)
-
     val expand_cst_maybe : cst -> term list option
     (** expand [c] iff it is not too deep; return its list of cases *)
   end = struct
@@ -2929,7 +2923,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           assert false
       in
       Poly_set.add info.cst_watched t;
-      ignore (Expand.expand_cst_unsafe c);
+      ignore (Expand.expand_cst_maybe c);
       ()
 
     let expand_uty (uty:ty_uninterpreted_slice): unit =
@@ -3039,7 +3033,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       ()
 
     and expand_dep = function
-      | Dep_cst c -> ignore (Expand.expand_cst_unsafe c)
+      | Dep_cst c -> ignore (Expand.expand_cst_maybe c)
       | Dep_uty uty -> expand_uty uty
       | Dep_proxy p -> expand_proxy p
 
@@ -3163,8 +3157,8 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           (* ensure we expand the blocking atoms *)
           Sequence.iter
             (function
-              | Dep_cst c -> ignore (Expand.expand_cst_unsafe c)
-              | Dep_proxy p -> expand_proxy p
+              | Dep_cst c -> ignore (Expand.expand_cst_maybe c)
+              | Dep_proxy p -> expand_proxy p (* TODO: only if not too deep *)
               | Dep_uty _uty -> assert false (* TODO: expand only if not too deep *)
             )
             (Unif.res_deps res);
