@@ -192,6 +192,8 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
   (* unification problem: conjunction of equalities *)
   and unif_set = {
     unif_set_eqns: unif_eqn list;
+    unif_set_solved: (lit * explanation) list;
+    (* solved part, of the form [?x=cstor] *)
     unif_set_expl: explanation; (* accumulated so far *)
   }
   and unif_eqn = term * term * explanation
@@ -1798,6 +1800,15 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       cst * ty_uninterpreted_slice * Clause.t list
 
     val expand_cases : cst -> Ty.t -> cst_info -> term list * Clause.t list
+
+    val expand_cst_unsafe : cst -> term list
+    (** expand the given constant so that, later, it will be
+        assigned a value by the SAT solver
+        @return its list of cases
+        @raise Assert_failure if the cst is too deep *)
+
+    val expand_cst_maybe : cst -> term list option
+    (** expand [c] iff it is not too deep; return its list of cases *)
   end = struct
     (* make a fresh constant, with a unique name *)
     let new_cst_ =
@@ -2116,6 +2127,45 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       (* build clauses *)
       let case_clauses = clauses_of_cases cst by_ty info.cst_depth in
       by_ty, List.rev_append other_clauses case_clauses
+
+    (* expand the given constant so that, later, it will be
+       assigned a value by the SAT solver
+       @return its list of cases *)
+    let expand_cst_unsafe (c:cst): term list =
+      let ty, info = match c.cst_kind with
+        | Cst_undef (ty,i,_) -> ty,i
+        | Cst_defined _ | Cst_cstor _ | Cst_uninterpreted_dom_elt _ ->
+          assert false
+      in
+      (* we should never have to expand a meta that is too deep *)
+      let depth = info.cst_depth in
+      assert (depth <= (Iterative_deepening.current_depth() :> int));
+      (* check whether [c] is expanded *)
+      begin match info.cst_cases with
+        | Lazy_none ->
+          (* [c] is blocking, not too deep, but not expanded *)
+          let l, clauses = expand_cases c ty info in
+          Log.debugf 2
+            (fun k->k "(@[<1>expand_cst@ @[%a@]@ :into (@[%a@])@ :depth %d@])"
+                Typed_cst.pp c (Utils.pp_list Term.pp) l depth);
+          info.cst_cases <- Lazy_some l;
+          incr stat_num_cst_expanded;
+          Clause.push_new_l clauses;
+          l
+        | Lazy_some l -> l
+      end
+
+    (* expand [c] iff it is not too deep; return its list of cases *)
+    let expand_cst_maybe (c:cst): term list option =
+      let info = match c.cst_kind with
+        | Cst_undef (_,i,_) -> i
+        | Cst_defined _ | Cst_cstor _ | Cst_uninterpreted_dom_elt _ ->
+          assert false
+      in
+      let depth = info.cst_depth in
+      if depth <= (Iterative_deepening.current_depth() :> int)
+      then Some (expand_cst_unsafe c)
+      else None
   end
 
   (** {2 Current (partial) model} *)
@@ -2620,6 +2670,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
 
     let reduce set = set (* TODO *)
 
+    (* a view on a unification atom [a=b] *)
     type unif_pair =
       | UP_none
       | UP_cstor of cst * cst (* cstor *) * term list
@@ -2641,6 +2692,11 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         | UP_none -> match_pair b a
         | res -> res
       end
+
+    let mk_unif_set (l:unif_eqn list)(e:explanation): unif_set =
+      let l, solved =
+        CCList.partition_map
+          (fun e -> match 
 
     type update_nf =
       | U_true of explanation
@@ -2691,10 +2747,6 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
 
     exception Yield_false of explanation
 
-    let get_cases (cst:cst): term list lazily_expanded = match cst.cst_kind with
-      | Cst_undef (_, i, _) -> i.cst_cases
-      | _ -> assert false
-
     type update_state = {
       mutable new_expl: explanation;
       mutable new_eqns: unif_eqn list;
@@ -2719,8 +2771,9 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
        the other a WHNF value *)
     let try_unif_direct st ((a,b,e_ab) as eqn): unit = match as_unif_pair a b with
       | UP_cstor (c, cstor, args) ->
-        begin match get_cases c with
-          | Lazy_some cases ->
+        (* try to expand [c], and select the proper choice in the list of cases *)
+        begin match Expand.expand_cst_maybe c with
+          | Some cases ->
             (* which case corresponds to [cstor]? *)
             let case,sub_metas =
               CCList.find_map
@@ -2740,11 +2793,11 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
             (* keep it as equation, as it might not be satisfied *)
             add_eqn st eqn;
             incr stat_num_unif;
-          | Lazy_none ->
+          | None ->
             (* not expanded, must wait *)
             add_eqn st eqn;
         end
-      | UP_uty (c, uty, dom_elt) ->
+      | UP_uty (_c, _uty, _dom_elt) ->
         (* [c=dom_elt] depends on [uty] *)
         (* TODO:
            - assert [uty] is unfolded deep enough to contain dom_elt
@@ -2891,48 +2944,6 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       let c2 = a :: Lit.neg b :: guard |> Clause.make in
       [ c1; c2 ]
 
-    (* expand the given constant so that, later, it will be
-       assigned a value by the SAT solver
-       @return its list of cases *)
-    let expand_cst_ (c:cst): term list =
-      let ty, info = match c.cst_kind with
-        | Cst_undef (ty,i,_) -> ty,i
-        | Cst_defined _ | Cst_cstor _ | Cst_uninterpreted_dom_elt _ ->
-          assert false
-      in
-      (* we should never have to expand a meta that is too deep *)
-      let depth = info.cst_depth in
-      assert (depth <= (Iterative_deepening.current_depth() :> int));
-      (* check whether [c] is expanded *)
-      begin match info.cst_cases with
-        | Lazy_none ->
-          (* [c] is blocking, not too deep, but not expanded *)
-          let l, clauses = Expand.expand_cases c ty info in
-          Log.debugf 2
-            (fun k->k "(@[<1>expand_cst@ @[%a@]@ :into (@[%a@])@ :depth %d@])"
-                Typed_cst.pp c (Utils.pp_list Term.pp) l depth);
-          info.cst_cases <- Lazy_some l;
-          incr stat_num_cst_expanded;
-          Clause.push_new_l clauses;
-          l
-        | Lazy_some l -> l
-      end
-
-    let expand_cst (c:cst) : unit = ignore (expand_cst_ c)
-
-    (* if [c] is not too deep, expand it and return [Some l] where [l] is
-       its list of cases. *)
-    let expand_cst_maybe (c:cst): term list option =
-      let info = match c.cst_kind with
-        | Cst_undef (_,i,_) -> i
-        | Cst_defined _ | Cst_cstor _ | Cst_uninterpreted_dom_elt _ ->
-          assert false
-      in
-      let depth = info.cst_depth in
-      if depth <= (Iterative_deepening.current_depth() :> int)
-      then Some (expand_cst_ c)
-      else None
-
     (* add [t] to the list of literals that watch the constant [c] *)
     let watch_cst_ (t:t)(c:cst) : unit =
       Log.debugf 2
@@ -2943,7 +2954,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           assert false
       in
       Poly_set.add info.cst_watched t;
-      expand_cst c;
+      ignore (Expand.expand_cst_unsafe c);
       ()
 
     let expand_uty (uty:ty_uninterpreted_slice): unit =
@@ -3056,7 +3067,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       ()
 
     and expand_dep = function
-      | Dep_cst c -> expand_cst c
+      | Dep_cst c -> ignore (Expand.expand_cst_unsafe c)
       | Dep_uty uty -> expand_uty uty
       | Dep_proxy p -> expand_proxy p
 
@@ -3167,25 +3178,18 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         | NF_false ->
           let res = Unif.update !set in
           (* propagate some literals that must be true for [p] to be
-             true, under some explanations (subset of current model) *)
-          (* FIXME: depends a lot on sign (do it for True, but
-          for false only if there is exactly one lit (and negate it) *)
-          let cs =
-            List.map
-              (fun (e,lit) ->
-                 let lits =
-                   Lit.assert_proxy ~sign:false p :: lit :: clause_guard_of_exp_ e
-                 in
-                 Clause.make lits)
-              res.Unif.update_propagate
-          in
-          Clause.push_new_l cs;
+             true/false, under some explanations (subset of current model) *)
+          begin match decided with
+            | NF_true -> propagate_unif_true p res
+            | NF_false -> propagate_unif_false p res
+            | _ -> assert false
+          end;
           (* ensure we expand the blocking atoms *)
           List.iter
             (function
-              | Dep_cst c -> expand_cst_maybe c |> ignore
+              | Dep_cst c -> ignore (Expand.expand_cst_unsafe c)
               | Dep_proxy p -> expand_proxy p
-              | Dep_uty uty -> assert false (* TODO: expand only if not too deep *)
+              | Dep_uty _uty -> assert false (* TODO: expand only if not too deep *)
             )
             res.Unif.update_deps;
           (* ... and that we update the proxies *)
@@ -3213,6 +3217,47 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           () (* not decided *)
         | NF_term _ -> assert false
       end
+
+    (* [p] is a unif proxy, reducing to [res], and assigned to [true].
+       Do full propagation *)
+    and propagate_unif_true p res =
+      let cs =
+        List.map
+          (fun (e,lit) ->
+             let lits =
+               Lit.assert_proxy ~sign:false p :: lit :: clause_guard_of_exp_ e
+             in
+             Clause.make lits)
+          res.Unif.update_propagate
+      in
+      Clause.push_new_l cs;
+      ()
+
+    and propagate_unif_false p res =
+      (* remove duplicates *)
+      let props =
+        res.Unif.update_propagate
+        |> CCList.sort_uniq ~cmp:(fun (_,l1)(_,l2) -> Lit.compare l1 l2)
+      in
+      begin match props with
+        | []
+        | _::_::_ -> ()
+        | [e, lit] ->
+          (* this literal must be false *)
+      end
+      (* FIXME: depends a lot on sign (do it for True, but
+          for false only if there is exactly one lit (and negate it) *)
+      let cs =
+        List.map
+          (fun (e,lit) ->
+             let lits =
+               Lit.assert_proxy ~sign:false p :: lit :: clause_guard_of_exp_ e
+             in
+             Clause.make lits)
+          res.Unif.update_propagate
+      in
+      Clause.push_new_l cs;
+      ()
   end
 
   (** {2 Toplevel goals}
