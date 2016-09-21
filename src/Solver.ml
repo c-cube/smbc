@@ -1567,7 +1567,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       && List.for_all (mem la) lb
 
     let pp out e =
-      Format.fprintf out "(@[%a@])"
+      Format.fprintf out "(@[<hv>%a@])"
         (Utils.pp_list Lit.pp) (to_list_uniq e)
   end
 
@@ -2637,6 +2637,8 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
   end = struct
     type eqn = term * term
 
+    let cmp_eqn = CCOrd.pair Term.compare Term.compare
+
     let simplify (a,b) = Term.simplify a, Term.simplify b
 
     (* a view on a unification atom [a=b] *)
@@ -2735,54 +2737,22 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     let add_proxies st = List.iter (add_proxy st)
     let push_new_eqn st e = Queue.push e st.to_process
 
-    (* TODO: also, in case [cstor args = (match t with …)] where
-       - all branch start with a constructor
-       - at most one branch has the proper cstor
-       reduce to [cstor args = the branch, t = the pattern] *)
+    (* main entry point for unification: try to make [a=b] true *)
+    let rec try_solve_eqn (st:update_state) (a,b,e_ab): unit =
+      if Term.equal a b (* check physical eq before reducing *)
+      then add_expl st e_ab
+      else (
+        let res_a, a = Reduce.compute_nf_term_rec_non_bool a in
+        let res_b, b = Reduce.compute_nf_term_rec_non_bool b in
+        let e_ab =
+          Explanation.append res_a.expl (Explanation.append res_b.expl e_ab)
+        in
+        add_proxies st res_a.proxies;
+        add_proxies st res_b.proxies;
+        try_solve_eqn_reduced st (a,b,e_ab)
+      )
 
-    (* try to unify [a,b] directly, if one of them is a meta and
-       the other a WHNF value *)
-    let propagate_or_delay st a b: unit = match as_unif_pair a b with
-      | UP_cstor (c, cstor, args) ->
-        (* try to expand [c], and select the proper choice in the list of cases *)
-        begin match Expand.expand_cst_maybe c with
-          | Some cases ->
-            (* which case corresponds to [cstor]? *)
-            let case,sub_metas =
-              CCList.find_map
-                (fun t -> match Term.as_cstor_app t with
-                   | Some (cstor', _, sub_metas) ->
-                     if Typed_cst.equal cstor cstor'
-                     then Some (t,sub_metas)
-                     else None
-                   | None -> assert false)
-                cases
-              |> (function | Some x->x | None -> assert false (* wrong cstor?! *))
-            in
-            assert (List.length sub_metas = List.length args);
-            (* propagate [cst := case] *)
-            let lit_case = Lit.cst_choice c case in
-            add_propagate st lit_case;
-          | None ->
-            (* not expanded, must wait *)
-            add_eqn st (a,b);
-        end
-      | UP_uty (_c, _uty, _dom_elt) ->
-        (* [c=dom_elt] depends on [uty] *)
-        (* TODO:
-           - assert [uty] is unfolded deep enough to contain dom_elt
-           - assert [c=dom_elt] *)
-        assert false
-      | UP_none -> add_eqn st (a,b) (* must delay *)
-
-    let try_solve_eqn (st:update_state) (a,b,e_ab): unit =
-      let res_a, a = Reduce.compute_nf_term_rec_non_bool a in
-      let res_b, b = Reduce.compute_nf_term_rec_non_bool b in
-      let e_ab =
-        Explanation.append res_a.expl (Explanation.append res_b.expl e_ab)
-      in
-      add_proxies st res_a.proxies;
-      add_proxies st res_b.proxies;
+    and try_solve_eqn_reduced st (a,b,e_ab): unit =
       (* check now *)
       if Term.equal a b
       then
@@ -2791,13 +2761,15 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       else begin match Term.as_cstor_app a, Term.as_cstor_app b with
         | Some (c1,_,l1), Some (c2,_,l2) ->
           if not (Typed_cst.equal c1 c2)
-          then
+          then (
             (* [c1 ... = c2 ...] --> false, as distinct constructors
                can never be equal *)
             raise (Yield_false e_ab)
-          else (
+          ) else (
             assert (Typed_cst.equal c1 c2);
             assert (List.length l1 = List.length l2); (* typing *)
+            (* remember how we got there *)
+            add_expl st e_ab;
             (* same constructor -> injectivity:
                we unify the arguments pairwise.
                Even if all arguments are not provided,
@@ -2819,10 +2791,58 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
               then add_expl st e_ab
               else raise (Yield_false e_ab)
             | _ ->
+              add_expl st e_ab;
               (* try with meta variables *)
-              propagate_or_delay st a b
+              propagate_or_delay st (a,b,e_ab)
           end
       end
+
+    (* TODO: also, in case [cstor args = (match t with …)] where
+       - all branch start with a constructor
+       - at most one branch has the proper cstor
+       reduce to [cstor args = the branch, t = the pattern] *)
+
+    (* try to unify [a,b] directly, if one of them is a meta and
+       the other a WHNF value *)
+    and propagate_or_delay st (a,b,e_ab): unit = match as_unif_pair a b with
+      | UP_cstor (c, cstor, args) ->
+        (* try to expand [c], and select the proper choice in the list of cases *)
+        begin match Expand.expand_cst_maybe c with
+          | Some cases ->
+            (* which case corresponds to [cstor]? *)
+            let case,sub_metas =
+              CCList.find_map
+                (fun t -> match Term.as_cstor_app t with
+                   | Some (cstor', _, sub_metas) ->
+                     if Typed_cst.equal cstor cstor'
+                     then Some (t,sub_metas)
+                     else None
+                   | None -> assert false)
+                cases
+              |> (function | Some x->x | None -> assert false (* wrong cstor?! *))
+            in
+            assert (List.length sub_metas = List.length args);
+            (* propagate [cst := case] *)
+            let lit_case = Lit.cst_choice c case in
+            add_propagate st lit_case;
+            (* unify arguments pairwise *)
+            List.iter2
+              (fun sub_meta arg ->
+                 let e_sub = Explanation.cons lit_case e_ab in
+                 push_new_eqn st (sub_meta,arg,e_sub))
+              sub_metas args;
+          | None ->
+            (* not expanded, must wait *)
+            add_eqn st (a,b);
+        end
+      | UP_uty (_c, _uty, _dom_elt) ->
+        (* [c=dom_elt] depends on [uty] *)
+        (* TODO:
+           - assert [uty] is unfolded deep enough to contain dom_elt
+           - assert [c=dom_elt] *)
+        assert false
+      | UP_none ->
+        add_eqn st (a,b) (* must delay *)
 
     (* update set of constraints to a new set *)
     let update_ (a,b): update_res =
@@ -2845,8 +2865,10 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         begin match state.new_eqns, state.l_propagate with
           | [], [] -> U_true state.new_expl
           | _ ->
+            let eqns = CCList.sort_uniq ~cmp:cmp_eqn state.new_eqns in
+            let propagate = CCList.sort_uniq ~cmp:Lit.compare state.l_propagate in
             let res = {
-              nf=(state.new_eqns, state.l_propagate);
+              nf=(eqns, propagate);
               expl=state.new_expl;
               proxies=state.l_proxies;
             } in
@@ -2967,13 +2989,13 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
                 [a; neg_ b; neg_ t];
                 [neg_ a; b; neg_ t]]
               |> expand_builtin_clauses p
-          | Builtin (B_eq (a,b)) ->
-            expand_unif p a b;
-          | _ ->
-            p.proxy_expansion <- Proxy_eval;
-            (* expand [t]'s dependencies *)
-            List.iter expand_dep t.term_deps;
-            ()
+            | Builtin (B_eq (a,b)) ->
+              expand_unif p a b;
+            | _ ->
+              p.proxy_expansion <- Proxy_eval;
+              (* expand [t]'s dependencies *)
+              List.iter expand_dep t.term_deps;
+              ()
           end;
       end;
       (* in the case of a non-connective, the dependencies might be
@@ -3172,23 +3194,26 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           | [], [lit] ->
             assert_equiv (Lit.assert_proxy p) lit expl;
           | _ ->
-            (* [p <=> conjunction] *)
+            (* [expl => (p <=> conjunction)] *)
             let lit_p = Lit.assert_proxy p in
             let all_lits = List.map (fun (a,b) -> Lit.eq a b) eqns @ lits in
+            let guard = clause_guard_of_exp_ expl in
             (* implication *)
             let c_indirect =
-              lit_p :: List.map Lit.neg all_lits |> Clause.make
+              lit_p :: List.map Lit.neg all_lits @ guard |> Clause.make
             and cs_direct =
               List.map
-                (fun sub_lit -> [Lit.neg lit_p; sub_lit] |> Clause.make)
+                (fun sub_lit ->
+                   Lit.neg lit_p :: sub_lit :: guard |> Clause.make)
                 all_lits
             in
             let clauses = c_indirect :: cs_direct in
             Log.debugf 5
               (fun k->k
-                  "(@[propagate_unif_and@ %a@ (@[<hv>%a@])@ clauses: (@[%a@])@])"
+                  "(@[propagate_unif_and@ %a@ eqns: (@[<hv>%a@])@ \
+                   clauses: (@[%a@])@ expl: %a@])"
                   Lit.pp lit_p (Utils.pp_list Lit.pp) all_lits
-                  (Utils.pp_list Clause.pp) clauses);
+                  (Utils.pp_list Clause.pp) clauses Explanation.pp expl);
             Clause.push_new_l clauses;
         end
   end
