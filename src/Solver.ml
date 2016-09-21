@@ -2576,11 +2576,11 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         | Some (e,false) -> return ~e NF_false
   end
 
+  let pp_unif_eqn out (a,b,_) =
+    Format.fprintf out "(@[<hv1>=?=@ %a@ %a@])" Term.pp a Term.pp b
+
   let pp_unif out (set:unif_set) =
-    let pp_eqn out (a,b,_) =
-      Format.fprintf out "(@[<hv1>=?=@ %a@ %a@])" Term.pp a Term.pp b
-    in
-    Format.fprintf out "(@[%a@])" (Utils.pp_list pp_eqn) set.unif_set_eqns
+    Format.fprintf out "(@[%a@])" (Utils.pp_list pp_unif_eqn) set.unif_set_eqns
 
   (** {2 Unification} *)
   module Unif : sig
@@ -2654,6 +2654,19 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       update_nf: update_nf;
     }
 
+    let pp_nf out = function
+      | U_true e -> Format.fprintf out "true (expl %a)" Explanation.pp e
+      | U_false e -> Format.fprintf out "false (expl %a)" Explanation.pp e
+      | U_set set -> pp_unif out set
+
+    let pp_res out (res:update_res) =
+      Format.fprintf out
+        "(@[<hv>nf: %a@ deps: (@[%a@])@ proxies: (@[%a@])@ propagate: (@[%a@])@])"
+        pp_nf res.update_nf
+        (Utils.pp_list pp_dep) res.update_deps
+        (Utils.pp_list pp_proxy_) res.update_proxies
+        (Utils.pp_list (CCFormat.pair Explanation.pp Lit.pp)) res.update_propagate
+
     let cycle_check_tbl : unit Term.Tbl.t = Term.Tbl.create 32
 
     (* [cycle_check sub into] checks whether [sub] occurs in [into] under
@@ -2695,7 +2708,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     let add_propagate st p = st.l_propagate <- p :: st.l_propagate
     let add_proxy st p = st.l_proxies <- p :: st.l_proxies
     let add_proxies st = List.iter (add_proxy st)
-    let push_eqn st e = Queue.push e st.to_process
+    let push_new_eqn st e = Queue.push e st.to_process
 
     (* TODO: also, in case [cstor args = (match t with …)] where
        - all branch start with a constructor
@@ -2718,21 +2731,14 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
                      else None
                    | None -> assert false)
                 cases
-              |> (function
-                | Some x->x
-                | None -> assert false (* wrong cstor?! *)
-              )
+              |> (function | Some x->x | None -> assert false (* wrong cstor?! *))
             in
             assert (List.length sub_metas = List.length args);
             (* propagate [cst := case] *)
             let lit_case = Lit.cst_choice c case in
             add_propagate st (e_ab,lit_case);
-            (* deal with sub-problems recursively *)
-            List.iter2
-              (fun sub_meta arg ->
-                 let eqn = sub_meta, arg, Explanation.return lit_case in
-                 push_eqn st eqn)
-              sub_metas args;
+            (* keep it as equation, as it might not be satisfied *)
+            add_eqn st eqn;
             incr stat_num_unif;
           | Lazy_none ->
             (* not expanded, must wait *)
@@ -2744,9 +2750,9 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
            - assert [uty] is unfolded deep enough to contain dom_elt
            - assert [c=dom_elt] *)
         assert false
-      | UP_none -> push_eqn st eqn (* must delay *)
+      | UP_none -> add_eqn st eqn (* must delay *)
 
-    let try_solve_eqn (st:update_state) ((a,b,e_ab) as eqn): unit =
+    let try_solve_eqn (st:update_state) (a,b,e_ab): unit =
       let res_a, a = Reduce.compute_nf_term_rec_non_bool a in
       let res_b, b = Reduce.compute_nf_term_rec_non_bool b in
       let e_ab =
@@ -2774,7 +2780,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
                Even if all arguments are not provided,
                we can use extensionality *)
             List.iter2
-              (fun a1 b1 -> push_eqn st (a1,b1,e_ab))
+              (fun a1 b1 -> push_new_eqn st (a1,b1,e_ab))
               l1 l2
           )
         | Some (_, _, l), None when cycle_check_l ~sub:b l ->
@@ -2791,12 +2797,12 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
               else raise (Yield_false e_ab)
             | _ ->
               (* try with meta variables *)
-              try_unif_direct st eqn
+              try_unif_direct st (a,b,e_ab)
           end
       end
 
     (* update set of constraints to a new set *)
-    let update set =
+    let update_inner (set:unif_set): update_res =
       let state = {
         new_expl=set.unif_set_expl;
         new_eqns=[];
@@ -2842,6 +2848,13 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           update_proxies=state.l_proxies;
           update_deps=[];
         }
+
+    let update set =
+      let res = update_inner set in
+      Log.debugf 5
+        (fun k->k
+            "(@[<hv1>unif_update@ %a@ res: %a@])" pp_unif set pp_res res);
+      res
   end
 
   (** {2 Consistency Checking}
@@ -3155,6 +3168,8 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           let res = Unif.update !set in
           (* propagate some literals that must be true for [p] to be
              true, under some explanations (subset of current model) *)
+          (* FIXME: depends a lot on sign (do it for True, but
+          for false only if there is exactly one lit (and negate it) *)
           let cs =
             List.map
               (fun (e,lit) ->
@@ -3186,6 +3201,12 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
             | Unif.U_set set' ->
               Backtrack.push_unif_set p;
               set := set';
+              (* watch the dependencies that block the current set of eqns *)
+              List.iter
+                (fun (a,b,_) ->
+                   List.iter (watch_dep p) a.term_deps;
+                   List.iter (watch_dep p) b.term_deps)
+                set'.unif_set_eqns;
           end;
         | NF_proxy (p',_) ->
           assert (eq_proxy_ p p');
