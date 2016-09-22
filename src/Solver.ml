@@ -923,6 +923,27 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         | Const ({cst_kind=Cst_uninterpreted_dom_elt ty; _} as c) -> Some (c,ty)
         | _ -> None
 
+    (* typical view for unification/equality *)
+    type unif_form =
+      | Unif_cst of cst * Ty.t * cst_info * ty_uninterpreted_slice option
+      | Unif_cstor of cst * Ty.t * term list
+      | Unif_dom_elt  of cst * Ty.t
+      | Unif_none
+
+    let as_unif (t:term): unif_form = match t.term_cell with
+      | Const ({cst_kind=Cst_uninterpreted_dom_elt ty; _} as c) ->
+        Unif_dom_elt (c,ty)
+      | Const ({cst_kind=Cst_undef (ty,info,slice); _} as c) ->
+        Unif_cst (c,ty,info,slice)
+      | Const ({cst_kind=Cst_cstor ty; _} as c) -> Unif_cstor (c,ty,[])
+      | App (f, l) ->
+        begin match f.term_cell with
+          | Const ({cst_kind=Cst_cstor ty; _} as c) -> Unif_cstor  (c,ty,l)
+          | _ -> Unif_none
+        end
+      | _ -> Unif_none
+
+
     let fpf = Format.fprintf
 
     let pp_top ~ids out t =
@@ -2119,8 +2140,8 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         in
         if Term.equal a' b'
         then e_ab, Term.true_ (* syntactic *)
-        else begin match Term.as_cstor_app a', Term.as_cstor_app b' with
-          | Some (c1,ty1,l1), Some (c2,_,l2) ->
+        else begin match Term.as_unif a', Term.as_unif b' with
+          | Term.Unif_cstor (c1,ty1,l1), Term.Unif_cstor (c2,_,l2) ->
             if not (Typed_cst.equal c1 c2)
             then
               (* [c1 ... = c2 ...] --> false, as distinct constructors
@@ -2139,21 +2160,18 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
               |> compute_nf_add e_ab
             )
             else e_ab, default()
-          | Some (_, _, l), None when cycle_check_l ~sub:b' l ->
+          | Term.Unif_cstor (_, _, l), _ when cycle_check_l ~sub:b' l ->
             (* acyclicity rule *)
             e_ab, Term.false_
-          | None, Some (_, _, l) when cycle_check_l ~sub:a' l ->
+          | _, Term.Unif_cstor (_, _, l) when cycle_check_l ~sub:a' l ->
             e_ab, Term.false_
-          | _ ->
-            begin match Term.as_domain_elt a', Term.as_domain_elt b' with
-              | Some (c1,ty1), Some (c2,ty2) ->
-                (* domain elements: they are all distinct *)
-                assert (Ty.equal ty1 ty2);
-                if Typed_cst.equal c1 c2
-                then e_ab, Term.true_
-                else e_ab, Term.false_
-              | _ -> e_ab, default()
-            end
+          | Term.Unif_dom_elt (c1,ty1), Term.Unif_dom_elt (c2,ty2) ->
+            (* domain elements: they are all distinct *)
+            assert (Ty.equal ty1 ty2);
+            if Typed_cst.equal c1 c2
+            then e_ab, Term.true_
+            else e_ab, Term.false_
+          | _ -> e_ab, default()
         end
 
     let compute_nf_lit (lit:lit): explanation * lit =
