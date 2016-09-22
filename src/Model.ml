@@ -19,6 +19,14 @@ type t = {
 }
 
 let make ~env ~consts ~domains =
+  (* also add domains to [env] *)
+  let env =
+    A.Ty.Map.to_seq domains
+    |> Sequence.flat_map_l (fun (ty,l) -> List.map (CCPair.make ty) l)
+    |> Sequence.fold
+      (fun env (_,cst) -> A.env_add_def env cst A.E_uninterpreted_cst)
+      env
+  in
   {env; consts; domains}
 
 type entry =
