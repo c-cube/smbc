@@ -43,6 +43,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
   let stat_num_clause_push = ref 0
   let stat_num_clause_tautology = ref 0
   let stat_num_propagations = ref 0
+  let stat_num_unif = ref 0
 
   (* for objects that are expanded on demand only *)
   type 'a lazily_expanded =
@@ -2274,6 +2275,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
                 let check_subs =
                   List.map2 Term.eq sub_metas args |> Term.and_l
                 in
+                incr stat_num_unif;
                 (* eager "and", as a "if" *)
                 compute_nf_add e_ab
                   (Term.if_ check_case check_subs Term.false_)
@@ -2289,12 +2291,13 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
                 Expand.expand_cst c;
                 let check_uty = Term.check_empty_uty uty |> Term.not_ in
                 if Typed_cst.equal dom_elt dom_elt'
-                then
+                then (
+                  incr stat_num_unif;
                   (* check assignment *)
                   Term.and_eager check_uty
                     (Term.check_assign c (Term.const dom_elt))
                   |> compute_nf_add e_c
-                else (
+                ) else (
                   begin match c.cst_kind with
                     | Cst_undef (_, {cst_cases=Lazy_some cases; _}, _) ->
                       (* [c=dom_elt' OR c=c'] *)
@@ -3100,6 +3103,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
        :num_clause_tautology %d@ \
        :num_lits %d@ \
        :num_propagations %d@ \
+       :num_unif %d@ \
        @])"
       !stat_num_cst_expanded
       !stat_num_uty_expanded
@@ -3107,6 +3111,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       !stat_num_clause_tautology
       (Watched_lit.size())
       !stat_num_propagations
+      !stat_num_unif
 
   let do_on_exit ~on_exit =
     List.iter (fun f->f()) on_exit;
