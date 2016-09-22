@@ -77,7 +77,6 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       (* quantification on finite types *)
     | Builtin of builtin
     | Check_assign of cst * term (* check a literal *)
-  (* TODO: check assign for domain elements *)
 
   and db = int * ty_h
 
@@ -813,10 +812,10 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     let and_par a b c d =
       builtin_ ~deps:(Term_dep_sub2 (c,d)) (B_and (a,b,c,d))
 
-    let and_l = function
+    let rec and_l = function
       | [] -> true_
       | [t] -> t
-      | a :: l -> List.fold_left and_ a l
+      | a :: l -> and_ a (and_l l)
 
     let or_l = function
       | [] -> false_
@@ -1740,6 +1739,50 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       (* build clauses *)
       let case_clauses = clauses_of_cases cst by_ty info.cst_depth in
       by_ty, List.rev_append other_clauses case_clauses
+
+    (* expand the given constant so that, later, it will be
+       assigned a value by the SAT solver *)
+    let expand_cst (c:cst): unit =
+      let ty, info = match c.cst_kind with
+        | Cst_undef (ty,i,_) -> ty,i
+        | Cst_defined _ | Cst_cstor _ | Cst_uninterpreted_dom_elt _ ->
+          assert false
+      in
+      (* we should never have to expand a meta that is too deep *)
+      let depth = info.cst_depth in
+      if depth <= (Iterative_deepening.current_depth() :> int)
+      (* check whether [c] is expanded *)
+      then begin match info.cst_cases with
+        | Lazy_none ->
+          (* [c] is blocking, not too deep, but not expanded *)
+          let l, clauses = expand_cases c ty info in
+          Log.debugf 2
+            (fun k->k "(@[<1>expand_cst@ @[%a@]@ :into (@[%a@])@ :depth %d@])"
+                Typed_cst.pp c (Utils.pp_list Term.pp) l depth);
+          info.cst_cases <- Lazy_some l;
+          incr stat_num_cst_expanded;
+          Clause.push_new_l clauses
+        | Lazy_some _ -> ()
+      end
+
+    let expand_uty (uty:ty_uninterpreted_slice): unit =
+      (* we should never have to expand a type slice that is too deep *)
+      let depth = uty.uty_offset in
+      if depth <= (Iterative_deepening.current_depth() :> int)
+      (* check whether [c] is expanded *)
+      then begin match uty.uty_pair with
+        | Lazy_none ->
+          (* [uty] is blocking, not too deep, but not expanded *)
+          let c_head, uty_tail, clauses = expand_uninterpreted_slice uty in
+          Log.debugf 2
+            (fun k->k
+                "(@[<1>expand_uty@ @[%a@]@ :into (@[%a ++@ %a@])@ :depth %d@])"
+                pp_uty uty Typed_cst.pp c_head pp_uty uty_tail depth);
+          uty.uty_pair <- Lazy_some (c_head, uty_tail);
+          incr stat_num_uty_expanded;
+          Clause.push_new_l clauses
+        | Lazy_some _ -> ()
+      end
   end
 
   let pp_dep_full out = function
@@ -2023,16 +2066,20 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           let e = Explanation.append e_reduce e_f in
           set_nf_ t new_t e;
           e, new_t
-        | Check_assign (c, t) ->
+        | Check_assign (c, case) ->
           begin match c.cst_kind with
             | Cst_undef (_, {cst_cur_case=None;_}, _) ->
               Explanation.empty, t
-            | Cst_undef (_, ({cst_cur_case=Some (e,case);_} as info), _) ->
+            | Cst_undef (_, ({cst_cur_case=Some (_,case');_} as info), _) ->
               assert (match info.cst_cases with
-                | Lazy_some l -> List.memq t l | Lazy_none -> false);
-              if Term.equal t case
-              then e, Term.true_
-              else e, Term.false_
+                | Lazy_some l -> List.memq case l | Lazy_none -> false);
+              (* NOTE: instead of saying [c=c10 --> false] because [c:=c1],
+                 or because [c:=c2], etc. we can cut more search space by
+                 explaining it by [not (c=c10)]  *)
+              let lit = Lit.cst_choice c case in
+              if Term.equal case case'
+              then Explanation.return lit, Term.true_
+              else Explanation.return (Lit.neg lit), Term.false_
             | Cst_uninterpreted_dom_elt _
             | Cst_cstor _ | Cst_defined _ ->
               assert false
@@ -2171,6 +2218,38 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
             if Typed_cst.equal c1 c2
             then e_ab, Term.true_
             else e_ab, Term.false_
+          | Term.Unif_cstor (cstor, _, args), Term.Unif_cst (c, _, info, _)
+          | Term.Unif_cst (c, _, info, _), Term.Unif_cstor (cstor, _, args) ->
+            (* try to expand right now, so we can get a list of cases *)
+            Expand.expand_cst c;
+            begin match info.cst_cases with
+              | Lazy_none -> e_ab, default()
+              | Lazy_some cases ->
+                assert info.cst_complete;
+                (* unification: use the literal [c := case] for
+                   the [case in cases] that matches [cstor].
+                   Reduce to [:= c case & case.i=args.i] *)
+                let case,sub_metas =
+                  CCList.find_map
+                    (fun t -> match Term.as_cstor_app t with
+                       | Some (cstor', _, sub_metas) ->
+                         if Typed_cst.equal cstor cstor'
+                         then Some (t,sub_metas)
+                         else None
+                       | None -> assert false)
+                    cases
+                  |> (function | Some x->x | None -> assert false)
+                in
+                assert (List.length sub_metas = List.length args);
+                let check_case = Term.check_assign c case in
+                let check_subs =
+                  List.map2 Term.eq sub_metas args |> Term.and_l
+                in
+                (* eager "and", as a "if" *)
+                compute_nf_add e_ab
+                  (Term.if_ check_case check_subs Term.false_)
+            end
+            (* TODO: case meta/dom_elt, also as unification *)
           | _ -> e_ab, default()
         end
 
@@ -2225,50 +2304,6 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       Clause.push_new c;
       ()
 
-    (* expand the given constant so that, later, it will be
-       assigned a value by the SAT solver *)
-    let expand_cst (c:cst): unit =
-      let ty, info = match c.cst_kind with
-        | Cst_undef (ty,i,_) -> ty,i
-        | Cst_defined _ | Cst_cstor _ | Cst_uninterpreted_dom_elt _ ->
-          assert false
-      in
-      (* we should never have to expand a meta that is too deep *)
-      let depth = info.cst_depth in
-      assert (depth <= (Iterative_deepening.current_depth() :> int));
-      (* check whether [c] is expanded *)
-      begin match info.cst_cases with
-        | Lazy_none ->
-          (* [c] is blocking, not too deep, but not expanded *)
-          let l, clauses = Expand.expand_cases c ty info in
-          Log.debugf 2
-            (fun k->k "(@[<1>expand_cst@ @[%a@]@ :into (@[%a@])@ :depth %d@])"
-                Typed_cst.pp c (Utils.pp_list Term.pp) l depth);
-          info.cst_cases <- Lazy_some l;
-          incr stat_num_cst_expanded;
-          Clause.push_new_l clauses
-        | Lazy_some _ -> ()
-      end
-
-    let expand_uty (uty:ty_uninterpreted_slice): unit =
-      (* we should never have to expand a type slice that is too deep *)
-      let depth = uty.uty_offset in
-      assert (depth <= (Iterative_deepening.current_depth() :> int));
-      (* check whether [c] is expanded *)
-      begin match uty.uty_pair with
-        | Lazy_none ->
-          (* [uty] is blocking, not too deep, but not expanded *)
-          let c_head, uty_tail, clauses = Expand.expand_uninterpreted_slice uty in
-          Log.debugf 2
-            (fun k->k
-                "(@[<1>expand_uty@ @[%a@]@ :into (@[%a ++@ %a@])@ :depth %d@])"
-                pp_uty uty Typed_cst.pp c_head pp_uty uty_tail depth);
-          uty.uty_pair <- Lazy_some (c_head, uty_tail);
-          incr stat_num_uty_expanded;
-          Clause.push_new_l clauses
-        | Lazy_some _ -> ()
-      end
-
     (* add [t] to the list of literals that watch the constant [c] *)
     let watch_cst_ (t:t)(c:cst) : unit =
       assert (Ty.is_prop t.term_ty);
@@ -2280,7 +2315,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           assert false
       in
       Poly_set.add info.cst_watched t;
-      expand_cst c;
+      Expand.expand_cst c;
       ()
 
     (* add [t] to the list of literals that watch this slice *)
@@ -2289,7 +2324,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       Log.debugf 2
         (fun k->k "(@[<1>watch_uty@ %a@ %a@])" pp_uty uty Term.pp t);
       Poly_set.add uty.uty_watched t;
-      expand_uty uty;
+      Expand.expand_uty uty;
       ()
 
     let watch_dep (t:t) (d:term_dep) : unit = match d with
@@ -2986,7 +3021,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
        :num_uty_expanded %d@ \
        :num_clause_push %d@ \
        :num_clause_tautology %d@ \
-       :num_lits %d\
+       :num_lits %d@ \
        :num_propagations %d@ \
        @])"
       !stat_num_cst_expanded
