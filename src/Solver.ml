@@ -364,11 +364,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     let make_undef ?parent ?exist_if ?slice id ty =
       let info =
         let cst_depth = match parent with
-          | Some {cst_kind=Cst_undef (ty, i, _); _} ->
-            begin match Ty.view ty with
-              | Arrow _ -> i.cst_depth
-              | Atomic _ | Prop -> i.cst_depth + 1
-            end
+          | Some {cst_kind=Cst_undef (_, i, _); _} -> i.cst_depth + 1
           | Some _ ->
             invalid_arg "make_const: parent should be a constant"
           | None -> 0
@@ -1702,11 +1698,12 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           [case1; case2], c_not_empty :: cs
         | Arrow (ty_arg, ty_ret) ->
           (* synthesize a function [fun x:ty_arg. body]
-             where [body] will destruct [x] depending on its type *)
+             where [body] will destruct [x] depending on its type,
+             or [fun _:ty_arg. constant] *)
           let the_param = Term.db (DB.make 0 ty_arg) in
           let rec body = lazy (
             (* only one parent in any case *)
-            let exist_if = ref [lazy (Lit.cst_choice cst (Lazy.force fun_))] in
+            let exist_if = ref [lazy (Lit.cst_choice cst (Lazy.force fun_destruct))] in
             match Ty.view ty_arg with
             | Prop ->
               (* make a test on [the_param] *)
@@ -1759,10 +1756,19 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
             | Arrow _ ->
               assert false (* TODO: support HO? *)
           )
-          and fun_ =
+          and fun_destruct =
             lazy (Term.fun_ ty_arg (Lazy.force body))
+          (* constant function that does not look at input *)
+          and body_const = lazy (
+            let exist_if = ref [lazy (Lit.cst_choice cst (Lazy.force fun_const))] in
+            (* only one parent in any case *)
+            let c' = mk_sub_cst ty_ret ~parent:cst ~exist_if in
+            Term.const c'
+          )
+          and fun_const =
+            lazy (Term.fun_ ty_arg (Lazy.force body_const))
           in
-          [Lazy.force fun_], []
+          [Lazy.force fun_destruct; Lazy.force fun_const], []
         | Prop ->
           (* simply try true/false *)
           [Term.true_; Term.false_], []
