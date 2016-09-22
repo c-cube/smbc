@@ -385,6 +385,10 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       in
       make id (Cst_undef (ty, info, slice))
 
+    let depth (c:t): int = match c.cst_kind with
+      | Cst_undef (_, i, _) -> i.cst_depth
+      | _ -> assert false
+
     let as_undefined (c:t)
       : (t * Ty.t * cst_info * ty_uninterpreted_slice option) option =
       match c.cst_kind with
@@ -1348,6 +1352,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     val reset : unit -> unit
     val current : unit -> state
     val current_depth : unit -> t
+    val current_lit : unit -> Lit.t
     val next : unit -> state
     val lit_of_depth : int -> Lit.t option
     val pp: t CCFormat.printer
@@ -1408,6 +1413,10 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     let current_depth () = match !cur_ with
       | Exhausted -> max_depth
       | At (d,_) -> d
+
+    let current_lit () = match !cur_ with
+      | Exhausted -> assert false
+      | At (_,lit) -> lit
 
     (* next state *)
     let next () = match !cur_ with
@@ -1770,11 +1779,9 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         | Cst_defined _ | Cst_cstor _ | Cst_uninterpreted_dom_elt _ ->
           assert false
       in
-      (* we should never have to expand a meta that is too deep *)
       let depth = info.cst_depth in
-      if depth <= (Iterative_deepening.current_depth() :> int)
       (* check whether [c] is expanded *)
-      then begin match info.cst_cases with
+      begin match info.cst_cases with
         | Lazy_none ->
           (* [c] is blocking, not too deep, but not expanded *)
           let l, clauses = expand_cases c ty info in
@@ -1788,11 +1795,9 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       end
 
     let expand_uty (uty:ty_uninterpreted_slice): unit =
-      (* we should never have to expand a type slice that is too deep *)
       let depth = uty.uty_offset in
-      if depth <= (Iterative_deepening.current_depth() :> int)
       (* check whether [c] is expanded *)
-      then begin match uty.uty_pair with
+      begin match uty.uty_pair with
         | Lazy_none ->
           (* [uty] is blocking, not too deep, but not expanded *)
           let c_head, uty_tail, clauses = expand_uninterpreted_slice uty in
@@ -2250,10 +2255,10 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
             else e_ab, Term.false_
           | Term.Unif_cstor (cstor, _, args), Term.Unif_cst (c, _, info, _)
           | Term.Unif_cst (c, _, info, _), Term.Unif_cstor (cstor, _, args) ->
-            (* try to expand right now, so we can get a list of cases *)
+            (* expand right now, so we can get a list of cases *)
             Expand.expand_cst c;
             begin match info.cst_cases with
-              | Lazy_none -> e_ab, default()
+              | Lazy_none -> assert false
               | Lazy_some cases ->
                 assert info.cst_complete;
                 (* unification: use the literal [c := case] for
