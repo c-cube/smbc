@@ -1,8 +1,6 @@
 #!/usr/bin/env bash
 
-BIN=./smbc.native
-
-perf record --call-graph=dwarf "$BIN" $@
+perf record --call-graph=dwarf $@
 
 perf script \
   | stackcollapse-perf --kernel \
