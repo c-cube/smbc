@@ -77,6 +77,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       (* quantification on finite types *)
     | Builtin of builtin
     | Check_assign of cst * term (* check a literal *)
+    | Check_empty_uty of ty_uninterpreted_slice (* check it's empty *)
 
   and db = int * ty_h
 
@@ -555,6 +556,8 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
             Hash.combine4 32 (Hash.poly q) (hash_uty ty) (sub_hash bod)
           | Check_assign (c,t) ->
             Hash.combine3 33 (Typed_cst.hash c) (sub_hash t)
+          | Check_empty_uty uty ->
+            Hash.combine2 34 (hash_uty uty)
 
         (* equality that relies on physical equality of subterms *)
         let equal t1 t2 : bool = match t1.term_cell, t2.term_cell with
@@ -595,6 +598,8 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
             q1=q2 && equal_uty ty1 ty2 && bod1==bod2
           | Check_assign (c1,t1), Check_assign (c2,t2) ->
             Typed_cst.equal c1 c2 && term_equal_ t1 t2
+          | Check_empty_uty u1, Check_empty_uty u2 ->
+            equal_uty u1 u2
           | True, _
           | False, _
           | DB _, _
@@ -608,6 +613,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           | Switch _, _
           | Quant _, _
           | Check_assign _, _
+          | Check_empty_uty _, _
             -> false
 
         let set_id t i = t.term_id <- i
@@ -771,7 +777,12 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       t
 
     let check_assign c t : term =
-      mk_term_ ~deps:(Term_dep_cst c) ~ty:(DTy_direct Ty.prop) (Check_assign (c, t))
+      mk_term_ (Check_assign (c, t))
+        ~deps:(Term_dep_cst c) ~ty:(DTy_direct Ty.prop)
+
+    let check_empty_uty (uty:ty_uninterpreted_slice): term =
+      mk_term_ (Check_empty_uty uty)
+        ~deps:(Term_dep_uty uty) ~ty:(DTy_direct Ty.prop)
 
     let builtin b =
       let deps = match b with
@@ -811,6 +822,9 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
 
     let and_par a b c d =
       builtin_ ~deps:(Term_dep_sub2 (c,d)) (B_and (a,b,c,d))
+
+    (* "eager" and, evaluating [a] first *)
+    let and_eager a b = if_ a b false_
 
     let rec and_l = function
       | [] -> true_
@@ -893,7 +907,8 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           | Quant (_, _, body)
           | Mu body
           | Fun (_, body) -> aux body
-          | Check_assign _ -> ()
+          | Check_assign _
+          | Check_empty_uty _ -> ()
       in
       aux t
 
@@ -926,12 +941,15 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     type unif_form =
       | Unif_cst of cst * Ty.t * cst_info * ty_uninterpreted_slice option
       | Unif_cstor of cst * Ty.t * term list
-      | Unif_dom_elt  of cst * Ty.t
+      | Unif_dom_elt  of cst * Ty.t * ty_uninterpreted_slice
       | Unif_none
 
     let as_unif (t:term): unif_form = match t.term_cell with
       | Const ({cst_kind=Cst_uninterpreted_dom_elt ty; _} as c) ->
-        Unif_dom_elt (c,ty)
+        let uty = match ty.ty_cell
+          with Atomic (_, Uninterpreted uty) -> uty | _ -> assert false
+        in
+        Unif_dom_elt (c,ty,uty)
       | Const ({cst_kind=Cst_undef (ty,info,slice); _} as c) ->
         Unif_cst (c,ty,info,slice)
       | Const ({cst_kind=Cst_cstor ty; _} as c) -> Unif_cstor (c,ty,[])
@@ -995,6 +1013,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           fpf out "(@[<hv1>=@ %a@ %a@])" pp a pp b
         | Check_assign (c,t) ->
           fpf out "(@[<hv1>:=@ %a@ %a@])" Typed_cst.pp c pp t
+        | Check_empty_uty uty -> fpf out "(@[check_empty %a@])" pp_uty uty
       in
       pp out t
 
@@ -1021,7 +1040,8 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
                | Match (u,m) ->
                  Sequence.cons u (ID.Map.values m |> Sequence.map snd)
                | Switch (u,_) -> Sequence.singleton u
-               | Check_assign _ -> Sequence.empty
+               | Check_assign _
+               | Check_empty_uty _ -> Sequence.empty
              end
              |> Sequence.mapi (fun i t' -> GE_sub i, t')
            and watched =
@@ -1063,6 +1083,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
               | B_or _ -> "or" | B_imply _ -> "=>" | B_eq _ -> "="
             end
         | Check_assign _ -> CCFormat.string out ":="
+        | Check_empty_uty _ -> ()
       in
       let attrs_v t =
         [`Label (CCFormat.to_string pp_node t); `Shape "box"]
@@ -1869,7 +1890,9 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
             let l' = aux_l env l in
             if f==f' && CCList.equal (==) l l' then t else Term.app f' l'
           | Builtin b -> Term.builtin (Term.map_builtin (aux env) b)
-          | Check_assign _ -> t (* closed *)
+          | Check_assign _
+          | Check_empty_uty _
+            -> t (* closed *)
         and aux_l env l =
           List.map (aux env) l
         in
@@ -2084,6 +2107,12 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
             | Cst_cstor _ | Cst_defined _ ->
               assert false
           end
+        | Check_empty_uty uty ->
+          begin match uty.uty_status with
+            | None -> Explanation.empty, t
+            | Some (e, Uty_empty) -> e, Term.true_
+            | Some (e, Uty_nonempty) -> e, Term.false_
+          end
 
     (* apply [f] to [l], until no beta-redex is found *)
     and compute_nf_app env e f l = match f.term_cell, l with
@@ -2212,7 +2241,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
             e_ab, Term.false_
           | _, Term.Unif_cstor (_, _, l) when cycle_check_l ~sub:a' l ->
             e_ab, Term.false_
-          | Term.Unif_dom_elt (c1,ty1), Term.Unif_dom_elt (c2,ty2) ->
+          | Term.Unif_dom_elt (c1,ty1,_), Term.Unif_dom_elt (c2,ty2,_) ->
             (* domain elements: they are all distinct *)
             assert (Ty.equal ty1 ty2);
             if Typed_cst.equal c1 c2
@@ -2249,7 +2278,52 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
                 compute_nf_add e_ab
                   (Term.if_ check_case check_subs Term.false_)
             end
-            (* TODO: case meta/dom_elt, also as unification *)
+          | Term.Unif_dom_elt (dom_elt,_, uty_root), Term.Unif_cst (c, _, _, _)
+          | Term.Unif_cst (c, _, _, _), Term.Unif_dom_elt (dom_elt,_,uty_root) ->
+            (* we know that [uty] is expanded deep enough that [dom_elt]
+               exists, so we can simply reduce [?c = dom_elt_n] into
+               [¬empty(uty[0:]) & .. & ¬empty(uty[:n]) & ?c := dom_elt_n] *)
+            let traverse e_c c uty = match uty.uty_pair with
+              | Lazy_none -> assert false (* should have met [dom_elt] *)
+              | Lazy_some (dom_elt', _) ->
+                Expand.expand_cst c;
+                let check_uty = Term.check_empty_uty uty |> Term.not_ in
+                if Typed_cst.equal dom_elt dom_elt'
+                then
+                  (* check assignment *)
+                  Term.and_eager check_uty
+                    (Term.check_assign c (Term.const dom_elt))
+                  |> compute_nf_add e_c
+                else (
+                  begin match c.cst_kind with
+                    | Cst_undef (_, {cst_cases=Lazy_some cases; _}, _) ->
+                      (* [c=dom_elt' OR c=c'] *)
+                      let c' = match cases with
+                        | [a;b] ->
+                          begin match Term.as_cst_undef a, Term.as_cst_undef b with
+                            | Some (c',_,_,_), _ | _, Some (c',_,_,_) -> c'
+                            | _ -> assert false
+                          end
+                        | _ -> assert false
+                      in
+                      assert (c != c');
+                      Term.and_eager
+                        check_uty
+                        (Term.and_
+                           (Term.check_assign c (Term.const c'))
+                           (Term.eq (Term.const c') (Term.const dom_elt)))
+                      |> compute_nf_add e_c
+                    | Cst_undef (_, {cst_cases=Lazy_none; _}, _) ->
+                      (* blocked: could not expand *)
+                      e_c, Term.eq (Term.const c) (Term.const dom_elt)
+                    | _ -> assert false
+                  end
+                )
+            in
+            let uty = match c.cst_kind with
+              | Cst_undef (_, _, Some uty) -> uty | _ -> uty_root
+            in
+            traverse e_ab c uty
           | _ -> e_ab, default()
         end
 
@@ -2890,6 +2964,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           end
         | Check_assign (c,t) ->
           aux env (Term.eq (Term.const c) t) (* becomes a mere equality *)
+        | Check_empty_uty _ -> assert false
       in aux DB_env.empty t
   end
 
@@ -2947,7 +3022,9 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         | Fun (ty,body) -> Term.fun_ ty (aux body)
         | Mu body -> Term.mu (aux body)
         | Builtin b -> Term.builtin (Term.map_builtin aux b)
-        | Check_assign _ -> assert false
+        | Check_assign _
+        | Check_empty_uty _
+          -> assert false
     in
     aux t
 
