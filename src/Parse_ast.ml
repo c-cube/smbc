@@ -75,6 +75,8 @@ let or_ l = Or l
 let not_ t = Not t
 let forall x t = Forall (x,t)
 let exists x t = Exists (x,t)
+let forall_l = List.fold_right forall
+let exists_l = List.fold_right exists
 
 let _mk ?loc stmt = { loc; stmt }
 
@@ -170,6 +172,7 @@ module Tip = struct
       ty_arrow_l (List.map conv_ty args) (conv_ty ret)
 
   let conv_typed_var (v,ty) = v, conv_ty ty
+  let conv_typed_vars = List.map conv_typed_var
 
   let conv_term (t:A.term): term =
     let rec aux t = match t with
@@ -200,6 +203,8 @@ module Tip = struct
         List.fold_right
           (fun (v,t) rhs -> let_ v (aux t) rhs)
           l (aux rhs)
+      | A.Forall (vars,body) -> forall_l (conv_typed_vars vars) (aux body)
+      | A.Exists (vars,body) -> exists_l (conv_typed_vars vars) (aux body)
     in
     aux t
 
@@ -214,6 +219,12 @@ module Tip = struct
         (conv_ty f.A.fun_ret)
     in
     f.A.fun_name, ty, fun_l args (conv_term body)
+
+  let rec open_forall (t:term): typed_var list * term = match t with
+    | Forall (v, t') ->
+      let vars, body = open_forall t' in
+      v :: vars, body
+    | _ -> [], t
 
   let conv_stmt (st:A.statement): statement option =
     let loc = A.loc st in
@@ -249,11 +260,11 @@ module Tip = struct
         then tip_errorf ?loc "declarations and bodies should have same length";
         let l = List.map2 (conv_fun ?loc) decls bodies in
         def ?loc l |> CCOpt.return
-      | A.Stmt_assert_not ([], vars, t) ->
-        let vars = List.map conv_typed_var vars in
-        let g = not_ (conv_term t) in (* negate *)
+      | A.Stmt_assert_not ([], t) ->
+        let vars, t = open_forall (conv_term t) in
+        let g = not_ t in (* negate *)
         goal ?loc vars g |> CCOpt.return
-      | A.Stmt_assert_not (_::_, _, _) ->
+      | A.Stmt_assert_not (_::_, _) ->
         tip_errorf ?loc "cannot convert polymorphic goal@ `@[%a@]`"
           A.pp_stmt st
       | A.Stmt_check_sat -> None
