@@ -208,10 +208,18 @@ module Tip = struct
     in
     aux t
 
-  (* convert this function *)
-  let conv_fun ?loc f body =
+  let conv_fun_decl ?loc f =
     if f.A.fun_ty_vars <> []
-    then tip_errorf ?loc "cannot convert polymorphic function@ %a" A.pp_fun_decl f;
+    then tip_errorf ?loc "cannot convert polymorphic function@ %a"
+        (A.pp_fun_decl A.pp_ty) f;
+    let args = List.map conv_ty f.A.fun_args in
+    let ty = ty_arrow_l args (conv_ty f.A.fun_ret) in
+    f.A.fun_name, ty
+
+  let conv_fun_def ?loc f body =
+    if f.A.fun_ty_vars <> []
+    then tip_errorf ?loc "cannot convert polymorphic function@ %a"
+        (A.pp_fun_decl A.pp_typed_var) f;
     let args = List.map conv_typed_var f.A.fun_args in
     let ty =
       ty_arrow_l
@@ -233,8 +241,9 @@ module Tip = struct
         ty_decl ?loc s |> CCOpt.return
       | A.Stmt_decl_sort (_, _) ->
         tip_errorf ?loc "cannot handle polymorphic type@ %a" A.pp_stmt st
-      | A.Stmt_decl (s, ty) ->
-        decl ?loc s (conv_ty ty) |> CCOpt.return
+      | A.Stmt_decl fr ->
+        let f, ty = conv_fun_decl ?loc fr in
+        decl ?loc f ty |> CCOpt.return
       | A.Stmt_assert t ->
         assert_ ?loc (conv_term t) |> CCOpt.return
       | A.Stmt_data ([], l) ->
@@ -251,14 +260,15 @@ module Tip = struct
         data ?loc l |> CCOpt.return
       | A.Stmt_data (_::_, _) ->
         tip_errorf ?loc "cannot convert polymorphic data@ `@[%a@]`" A.pp_stmt st
+      | A.Stmt_fun_def f
       | A.Stmt_fun_rec f ->
-        let id, ty, t = conv_fun ?loc f.A.fr_decl f.A.fr_body in
+        let id, ty, t = conv_fun_def ?loc f.A.fr_decl f.A.fr_body in
         def ?loc [id, ty, t] |> CCOpt.return
       | A.Stmt_funs_rec fsr ->
         let {A.fsr_decls=decls; fsr_bodies=bodies} = fsr in
         if List.length decls <> List.length bodies
         then tip_errorf ?loc "declarations and bodies should have same length";
-        let l = List.map2 (conv_fun ?loc) decls bodies in
+        let l = List.map2 (conv_fun_def ?loc) decls bodies in
         def ?loc l |> CCOpt.return
       | A.Stmt_assert_not ([], t) ->
         let vars, t = open_forall (conv_term t) in
