@@ -1,6 +1,7 @@
 
 OCAMLBUILD=ocamlbuild -use-ocamlfind -tag debug
 TARGETS=src/smbc.native src/smbc.byte
+BINDIR ?= /usr/bin/
 
 all: build
 
@@ -9,6 +10,9 @@ build:
 
 clean:
 	$(OCAMLBUILD) -clean
+
+install: build
+	cp smbc.native $(BINDIR)/smbc
 
 test: build
 	frogtest run -c test.toml

@@ -5,7 +5,9 @@ homepage: "https://github.com/c-cube/smbc"
 build: [
     [make]
 ]
-install: [make "install"]
+install: [
+  make "BINDIR=%{bin}%" "install"
+]
 remove: [
     ["rm" "%{bin}%/smbc"]
 ]
