@@ -169,6 +169,9 @@ val string_of_syntax : syntax -> string
 val parse : include_dir:string -> file:string -> syntax -> statement list or_error
 (** Parse the given file, type-check, etc.  *)
 
+val parse_stdin : syntax -> statement list or_error
+(** Parse stdin, type-check, etc. *)
+
 (** {2 Environment} *)
 
 type env_entry =

@@ -11,10 +11,17 @@ type config = {
   check: bool;
 }
 
-let parse_file (syn:Ast.syntax) (file:string) : Ast.statement list =
+let parse_file (syn:Ast.syntax) (file:string) : Ast.statement list Ast.or_error =
   Log.debugf 2 (fun k->k "(@[parse_file@ %S@])" file);
   let dir = Filename.dirname file in
-  let res = Ast.parse ~include_dir:dir ~file syn in
+  Ast.parse ~include_dir:dir ~file syn
+
+let parse syn input: Ast.statement list =
+  let res = match input with
+    | `None -> failwith "provide one file or use --stdin"
+    | `Stdin -> Ast.parse_stdin syn
+    | `File f -> parse_file syn f
+  in
   match res with
     | Result.Error msg -> print_endline msg; exit 1
     | Result.Ok l -> l
@@ -69,10 +76,17 @@ let check_ = ref false
 let timeout_ = ref ~-1
 let syntax_ = ref Ast.Auto
 
-let file = ref ""
-let set_file s =
-  if !file = "" then file := s
-  else failwith "provide at most one file"
+let file = ref `None
+
+let set_file s = match !file with
+  | `None -> file := `File s
+  | `Stdin -> raise (Arg.Bad "cannot combine --stdin and file")
+  | `File _ -> raise (Arg.Bad "provide at most one file")
+
+let set_stdin () = match !file with
+  | `Stdin -> ()
+  | `None -> file := `Stdin; syntax_ := Ast.Tip
+  | `File _ -> raise (Arg.Bad "cannot combine --stdin and file")
 
 let set_syntax_ s =
   syntax_ :=
@@ -97,6 +111,7 @@ let options =
     "-nc", Arg.Clear color_, " do not use colors";
     "-p", Arg.Set progress_, " progress bar";
     "--input", Arg.String set_syntax_, " input format";
+    "--stdin", Arg.Unit set_stdin, " parse on stdin (forces --input tip)";
     "-i", Arg.String set_syntax_, " alias to --input";
     "--pp-hashcons", Arg.Set pp_hashcons_, " print hashconsing IDs";
     "--debug", Arg.Int set_debug_, " set debug level";
@@ -122,13 +137,15 @@ let setup_gc () =
   Gc.set g
 
 let () =
-  Arg.parse options set_file "experimental SMT solver";
-  if !file = "" then failwith "provide one file";
+  Arg.parse options set_file
+    "experimental SMT solver for datatypes and recursive functions.\n\
+    \n\
+    Usage: smbc [options] (file | --stdin).\n";
   CCFormat.set_color_default !color_;
   if !timeout_ >= 1 then setup_timeout_ !timeout_;
   setup_gc ();
   (* parse *)
-  let ast = parse_file !syntax_ !file in
+  let ast = parse !syntax_ !file in
   if !print_input_
   then
     Format.printf "@[parsed:@ @[<v>%a@]@]@."

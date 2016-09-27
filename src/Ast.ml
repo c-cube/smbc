@@ -762,6 +762,18 @@ let parse ~include_dir ~file syn =
   try Result.Ok (parse_file_exn ctx ~file syn)
   with e -> Result.Error (Printexc.to_string e)
 
+let parse_stdin syn = match syn with
+  | Auto -> errorf "impossible to guess input format with <stdin>"
+  | Smbc -> errorf "impossible to parse <stdin> with sbmc format"
+  | Tip ->
+    let ctx = Ctx.create ~include_dir:"." () in
+    try
+      Tip_util.parse_chan_exn ~filename:"<stdin>" stdin
+      |> CCList.filter_map A.Tip.conv_stmt
+      |> CCList.flat_map (conv_statement ctx syn)
+      |> CCResult.return
+    with e -> Result.Error (Printexc.to_string e)
+
 (** {2 Environment} *)
 
 type env_entry =
