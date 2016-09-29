@@ -15,7 +15,7 @@ install: build
 	cp smbc.native $(BINDIR)/smbc
 
 test: build
-	frogtest run -c test.toml
+	frogtest run -c test.toml --meta `git rev-parse HEAD`
 
 watch:
 	while find src/ -print0 | xargs -0 inotifywait -e delete_self -e modify ; do \
@@ -25,6 +25,6 @@ watch:
 	done
 
 benchs:
-	frogtest run -c benchmarks/smbc.toml --save snapshots/tip-`git rev-parse HEAD`
+	frogtest run -c benchmarks/smbc.toml --meta `git rev-parse HEAD`
 
 .PHONY: watch benchs clean build test
