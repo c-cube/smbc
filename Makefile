@@ -24,7 +24,7 @@ watch:
 		make all; \
 	done
 
-benchs:
+benchs: build
 	frogtest run -c benchmarks/smbc.toml --meta `git rev-parse HEAD`
 
 .PHONY: watch benchs clean build test
