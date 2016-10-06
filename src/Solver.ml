@@ -166,15 +166,6 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
        a subset? Affects completeness *)
     mutable cst_cur_case: (explanation * term) option;
     (* current choice of normal form *)
-    cst_watched: term Poly_set.t;
-    (* set of literals (rather, boolean terms) that depend on this constant
-       for evaluation.
-
-       A literal [lit] can watch several typed constants. If
-       [lit.nf = t], and [t]'s evaluation is blocked by [c1,...,ck],
-       then [lit] will watch [c1,...,ck].
-
-       Watch list only grow, they never shrink. *)
   }
 
   (* this is a disjunction of sufficient conditions for the existence of
@@ -227,9 +218,6 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
        Expanded on demand. *)
     mutable uty_status: (explanation * ty_uninterpreted_status) option;
     (* current status in the model *)
-    uty_watched: term Poly_set.t;
-    (* set of terms whose evaluation is blocked by this uty.
-       See {!info.cst_watched} for more details *)
   }
 
   let pp_quant out = function
@@ -375,8 +363,6 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           cst_cases=Lazy_none;
           cst_complete=false;
           cst_cur_case=None;
-          cst_watched=
-            Poly_set.create ~eq:term_equal_ 16;
         }
       in
       make id (Cst_undef (ty, info, slice))
@@ -1121,7 +1107,6 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     if l.lit_sign then pp_lit_view out l.lit_view
     else Format.fprintf out "(@[@<1>¬@ %a@])" pp_lit_view l.lit_view
 
-  (* FIXME: make a specific data structure *)
   (** {2 Literals} *)
   module Lit : sig
     type t = lit
@@ -1512,7 +1497,6 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
             uty_pair=Lazy_none;
             uty_offset=n+1;
             uty_status=None;
-            uty_watched=Poly_set.create 16 ~eq:term_equal_;
           } in
           Log.debugf 5
             (fun k->k "expand slice %a@ into (@[%a,@ %a@])"
@@ -2397,12 +2381,6 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       assert (Ty.is_prop t.term_ty);
       Log.debugf 2
         (fun k->k "(@[<1>watch_cst@ %a@ %a@])" Typed_cst.pp c Term.pp t);
-      let _, info = match c.cst_kind with
-        | Cst_undef (ty,i,_) -> ty,i
-        | Cst_defined _ | Cst_cstor _ | Cst_uninterpreted_dom_elt _ ->
-          assert false
-      in
-      Poly_set.add info.cst_watched t;
       Expand.expand_cst c;
       ()
 
@@ -2411,7 +2389,6 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       assert (Ty.is_prop t.term_ty);
       Log.debugf 2
         (fun k->k "(@[<1>watch_uty@ %a@ %a@])" pp_uty uty Term.pp t);
-      Poly_set.add uty.uty_watched t;
       Expand.expand_uty uty;
       ()
 
@@ -2494,142 +2471,6 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
   let flush_progress (): unit =
     Printf.printf "\r%-80d\r%!" 0
 
-  (* the "theory" part: propagations *)
-  module M_th :
-    Msat.Theory_intf.S
-    with type formula = M_expr.t
-     and type proof = M_expr.proof
-  = struct
-    type formula = M_expr.t
-    type proof = M_expr.proof
-
-    type level = Backtrack.level
-
-    let dummy = Backtrack.dummy_level
-
-    (* increment and return level *)
-    let current_level () =
-      Backtrack.push_level ();
-      Backtrack.cur_level ()
-
-    let backtrack = Backtrack.backtrack
-
-    exception Conflict of Clause.t
-
-    (* push clauses from {!lemma_queue} into the slice *)
-    let flush_new_clauses_into_slice slice =
-      if Queue.is_empty Clause.conflicts then
-        while not (Queue.is_empty Clause.lemma_queue) do
-          let c = Queue.pop Clause.lemma_queue in
-          Log.debugf 5 (fun k->k "(@[<2>push_lemma@ %a@])" Clause.pp c);
-          let lits = Clause.lits c in
-          slice.TI.push lits ();
-        done
-      else (
-        let c = Queue.pop Clause.conflicts in
-        Queue.clear Clause.conflicts;
-        raise (Conflict c)
-      )
-
-    (* assert [c := new_t], or conflict *)
-    let assert_choice (c:cst)(new_t:term) : unit =
-      let _, _, info, _ = Typed_cst.as_undefined_exn c in
-      begin match info.cst_cur_case with
-        | None ->
-          let e = Explanation.return (Lit.cst_choice c new_t) in
-          Backtrack.push_set_cst_case_ info;
-          info.cst_cur_case <- Some (e, new_t);
-          (* TODO: only update if the current NF is blocked by [uty] *)
-          Poly_set.iter Watched_lit.update_watches_of_term info.cst_watched
-        | Some (_,new_t') ->
-          Log.debugf 1
-            (fun k->k "(@[<hv1>assert_choice %a@ :to %a@ :cur %a@])"
-                Typed_cst.pp c Term.pp new_t Term.pp new_t');
-          assert (Term.equal new_t new_t');
-      end
-
-    let assert_uty
-        (uty:ty_uninterpreted_slice)
-        (status:ty_uninterpreted_status)
-      : unit =
-      Log.debugf 2
-        (fun k->k "(@[<1>@{<green>assume_uty@}@ @[%a@] %a@])"
-        pp_uty uty pp_uty_status status);
-      begin match uty.uty_status with
-        | None ->
-          let e = Explanation.return (Lit.uty_choice_status uty status) in
-          Backtrack.push_uty_status uty;
-          uty.uty_status <- Some (e, status);
-          (* TODO: only update if the current NF is blocked by [c] *)
-          Poly_set.iter Watched_lit.update_watches_of_term uty.uty_watched
-        | Some (_, ((Uty_empty | Uty_nonempty) as s)) ->
-          Log.debugf 1
-            (fun k->k "(@[<hv1>assert_uty %a@ :to %a@ :cur %a@])"
-                pp_uty uty pp_uty_status status pp_uty_status s);
-          assert (s = status)
-      end
-
-    (* handle a literal assumed by the SAT solver *)
-    let assume_lit (lit:Lit.t) : unit =
-      Log.debugf 2
-        (fun k->k "(@[<1>@{<green>assume_lit@}@ @[%a@]@])" Lit.pp lit);
-      (* check consistency first *)
-      let e, lit' = Reduce.compute_nf_lit lit in
-      begin match Lit.view lit' with
-        | Lit_fresh _ -> ()
-        | Lit_atom {term_cell=True; _} -> ()
-        | Lit_atom {term_cell=False; _} ->
-          (* conflict! *)
-          let c = Lit.neg lit :: clause_guard_of_exp_ e |> Clause.make in
-          Clause.push_conflict c
-        | Lit_atom _ -> ()
-        | Lit_assign(c, t) ->
-          if Lit.sign lit then assert_choice c t
-        | Lit_uty_empty uty ->
-          let status = if Lit.sign lit then Uty_empty else Uty_nonempty in
-          assert_uty uty status
-      end
-
-    (* propagation from the bool solver *)
-    let assume slice =
-      let start = slice.TI.start in
-      assert (slice.TI.length > 0);
-      (* do the propagations in a local frame *)
-      if Config.progress then print_progress();
-      try
-        (* first, empty the tautology queue *)
-        flush_new_clauses_into_slice slice;
-        for i = start to start + slice.TI.length - 1 do
-          let lit = slice.TI.get i in
-          assume_lit lit;
-        done;
-        flush_new_clauses_into_slice slice;
-        TI.Sat
-      with Conflict conflict_clause ->
-        Log.debugf 3
-          (fun k->k "(@[<1>raise_inconsistent@ %a@])"
-              Clause.pp conflict_clause);
-        TI.Unsat (Clause.lits conflict_clause, ())
-
-    (* TODO: move checking code from Main_loop here? *)
-    let if_sat _slice = ()
-  end
-
-  module M = Msat.Solver.Make(M_expr)(M_th)(struct end)
-
-  (* push one clause into [M], in the current level (not a lemma but
-     an axiom) *)
-  let push_clause (c:Clause.t): unit =
-    Log.debugf 2 (fun k->k "(@[<1>push_clause@ @[%a@]@])" Clause.pp c);
-    (* reduce to normal form the literals, ensure they
-         are added to the proper constant watchlist(s) *)
-    Clause.to_seq c
-      |> Sequence.filter_map Lit.as_atom
-      |> Sequence.map fst
-      |> Sequence.iter Watched_lit.watch_term;
-    incr stat_num_clause_push;
-    M.assume [Clause.lits c]
-
   (** {2 Toplevel Goals}
 
       List of toplevel goals to satisfy
@@ -2690,6 +2531,157 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         assert false;
       )
   end
+
+  (* the "theory" part: propagations *)
+  module M_th :
+    Msat.Theory_intf.S
+    with type formula = M_expr.t
+     and type proof = M_expr.proof
+  = struct
+    type formula = M_expr.t
+    type proof = M_expr.proof
+
+    type level = Backtrack.level
+
+    let dummy = Backtrack.dummy_level
+
+    (* increment and return level *)
+    let current_level () =
+      Backtrack.push_level ();
+      Backtrack.cur_level ()
+
+    let backtrack = Backtrack.backtrack
+
+    exception Conflict of Clause.t
+
+    (* push clauses from {!lemma_queue} into the slice *)
+    let flush_new_clauses_into_slice slice =
+      if Queue.is_empty Clause.conflicts then
+        while not (Queue.is_empty Clause.lemma_queue) do
+          let c = Queue.pop Clause.lemma_queue in
+          Log.debugf 5 (fun k->k "(@[<2>push_lemma@ %a@])" Clause.pp c);
+          let lits = Clause.lits c in
+          slice.TI.push lits ();
+        done
+      else (
+        let c = Queue.pop Clause.conflicts in
+        Queue.clear Clause.conflicts;
+        raise (Conflict c)
+      )
+
+    (* assert [c := new_t], or conflict *)
+    let assert_choice (c:cst)(new_t:term) : unit =
+      let _, _, info, _ = Typed_cst.as_undefined_exn c in
+      begin match info.cst_cur_case with
+        | None ->
+          let e = Explanation.return (Lit.cst_choice c new_t) in
+          Backtrack.push_set_cst_case_ info;
+          info.cst_cur_case <- Some (e, new_t);
+        | Some (_,new_t') ->
+          Log.debugf 1
+            (fun k->k "(@[<hv1>assert_choice %a@ :to %a@ :cur %a@])"
+                Typed_cst.pp c Term.pp new_t Term.pp new_t');
+          assert (Term.equal new_t new_t');
+      end
+
+    let assert_uty
+        (uty:ty_uninterpreted_slice)
+        (status:ty_uninterpreted_status)
+      : unit =
+      Log.debugf 2
+        (fun k->k "(@[<1>@{<green>assume_uty@}@ @[%a@] %a@])"
+        pp_uty uty pp_uty_status status);
+      begin match uty.uty_status with
+        | None ->
+          let e = Explanation.return (Lit.uty_choice_status uty status) in
+          Backtrack.push_uty_status uty;
+          uty.uty_status <- Some (e, status);
+        | Some (_, ((Uty_empty | Uty_nonempty) as s)) ->
+          Log.debugf 1
+            (fun k->k "(@[<hv1>assert_uty %a@ :to %a@ :cur %a@])"
+                pp_uty uty pp_uty_status status pp_uty_status s);
+          assert (s = status)
+      end
+
+    (* handle a literal assumed by the SAT solver *)
+    let assume_lit (lit:Lit.t) : unit =
+      Log.debugf 2
+        (fun k->k "(@[<1>@{<green>assume_lit@}@ @[%a@]@])" Lit.pp lit);
+      (* check consistency first *)
+      let e, lit' = Reduce.compute_nf_lit lit in
+      begin match Lit.view lit' with
+        | Lit_fresh _ -> ()
+        | Lit_atom {term_cell=True; _} -> ()
+        | Lit_atom {term_cell=False; _} ->
+          (* conflict! *)
+          let c = Lit.neg lit :: clause_guard_of_exp_ e |> Clause.make in
+          Clause.push_conflict c
+        | Lit_atom _ -> ()
+        | Lit_assign(c, t) ->
+          if Lit.sign lit then assert_choice c t
+        | Lit_uty_empty uty ->
+          let status = if Lit.sign lit then Uty_empty else Uty_nonempty in
+          assert_uty uty status
+      end
+
+    (* is the dependency updated, i.e. decided by the SAT solver? *)
+    let dep_updated (d:term_dep): bool = match d with
+      | Dep_cst {cst_kind=Cst_undef (_, i, _); _} ->
+        CCOpt.is_some i.cst_cur_case
+      | Dep_cst _ -> assert false
+      | Dep_uty uty ->
+        CCOpt.is_some uty.uty_status
+
+    (* for each term in [terms], update its watches, iff one of its dependencies
+       is set *)
+    let update_terms (terms:term Sequence.t): unit =
+      Sequence.iter
+        (fun t ->
+           let _, nf = Reduce.get_nf t in
+           if List.exists dep_updated nf.term_deps
+           then Watched_lit.update_watches_of_term t)
+        terms
+
+    (* propagation from the bool solver *)
+    let assume slice =
+      let start = slice.TI.start in
+      assert (slice.TI.length > 0);
+      (* do the propagations in a local frame *)
+      if Config.progress then print_progress();
+      try
+        (* first, empty the tautology queue *)
+        flush_new_clauses_into_slice slice;
+        for i = start to start + slice.TI.length - 1 do
+          let lit = slice.TI.get i in
+          assume_lit lit;
+        done;
+        update_terms Top_goals.to_seq;
+        flush_new_clauses_into_slice slice;
+        TI.Sat
+      with Conflict conflict_clause ->
+        Log.debugf 3
+          (fun k->k "(@[<1>raise_inconsistent@ %a@])"
+              Clause.pp conflict_clause);
+        TI.Unsat (Clause.lits conflict_clause, ())
+
+    (* TODO: move checking code from Main_loop here? *)
+    let if_sat _slice = ()
+  end
+
+  module M = Msat.Solver.Make(M_expr)(M_th)(struct end)
+
+  (* push one clause into [M], in the current level (not a lemma but
+     an axiom) *)
+  let push_clause (c:Clause.t): unit =
+    Log.debugf 2 (fun k->k "(@[<1>push_clause@ @[%a@]@])" Clause.pp c);
+    (* reduce to normal form the literals, ensure they
+         are added to the proper constant watchlist(s) *)
+    Clause.to_seq c
+      |> Sequence.filter_map Lit.as_atom
+      |> Sequence.map fst
+      |> Sequence.iter Watched_lit.watch_term;
+    incr stat_num_clause_push;
+    M.assume [Clause.lits c]
 
   (** {2 Conversion} *)
 
@@ -2841,7 +2833,6 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
               uty_offset=0; (* root *)
               uty_pair=Lazy_none;
               uty_status=None;
-              uty_watched=Poly_set.create 16 ~eq:term_equal_;
             } in
             Ty.atomic id (Uninterpreted ty0)
           ) in
