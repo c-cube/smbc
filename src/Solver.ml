@@ -128,6 +128,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     | E_empty
     | E_leaf of lit
     | E_append of explanation * explanation
+    | E_or of explanation * explanation (* disjunction! *)
 
   (* boolean literal *)
   and lit = {
@@ -1193,6 +1194,10 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     type t = explanation
     let empty : t = E_empty
     let return e = E_leaf e
+    let or_ a b = match a, b with
+      | E_empty, _ -> b
+      | _, E_empty -> a
+      | _ -> E_or (a,b)
     let append s1 s2 = match s1, s2 with
       | E_empty, _ -> s2
       | _, E_empty -> s1
@@ -1201,39 +1206,41 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
 
     let is_empty = function
       | E_empty -> true
-      | E_leaf _
-      | E_append _ -> false (* by smart cstor *)
+      | E_leaf _ | E_or _ | E_append _ -> false (* by smart cstor *)
 
-    let rec to_seq e yield = match e with
-      | E_empty -> ()
-      | E_leaf x -> yield x
-      | E_append (a,b) -> to_seq a yield; to_seq b yield
-
-    let to_list e =
+    let to_lists e: lit list Sequence.t =
+      let open Sequence.Infix in
       let rec aux acc = function
-        | E_empty -> acc
-        | E_leaf x -> x::acc
-        | E_append (a,b) -> aux (aux acc a) b
+        | E_empty -> Sequence.return acc
+        | E_leaf x -> Sequence.return (x::acc)
+        | E_append (a,b) ->
+          aux acc a >>= fun acc ->
+          aux acc b
+        | E_or (a,b) ->
+          Sequence.append (aux acc a)(aux acc b)
       in
       aux [] e
 
-    let to_list_uniq e =
-      to_seq e
-      |> Sequence.to_rev_list
-      |> Lit.Set.of_list
-      |> Lit.Set.to_list
+    let to_lists_l e: lit list list = to_lists e |> Sequence.to_rev_list
 
-    let equal a b =
-      let la = to_list a in
-      let lb = to_list b in
-      (* double inclusion *)
-      let mem l x = List.exists (fun y -> Lit.equal x y) l in
-      List.for_all (mem lb) la
-      && List.for_all (mem la) lb
+    let to_lists_uniq e =
+      let f l = Lit.Set.of_list l |> Lit.Set.to_list in
+      to_lists e |> Sequence.map f
+
+    let to_lists_uniq_l e =
+      to_lists_uniq e |> Sequence.to_rev_list
 
     let pp out e =
-      Format.fprintf out "(@[%a@])"
-        (Utils.pp_list Lit.pp) (to_list_uniq e)
+      let pp1 out l =
+        Format.fprintf out "(@[%a@])"
+          (Utils.pp_list Lit.pp) l
+      in
+      match to_lists_uniq_l e with
+        | [] -> assert false
+        | [e] -> pp1 out e
+        | l ->
+          Format.fprintf out "(@[<hv2>or@ %a@])"
+            (Utils.pp_list pp1) l
   end
 
   (** {2 Clauses} *)
@@ -1823,13 +1830,16 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         "(@[%a@ :expanded %B@])"
         pp_uty uty (uty.uty_pair<>Lazy_none)
 
-  (* from explanation [e1, e2, ..., en] build the guard
+  (* for each explanation [e1, e2, ..., en] build the guard
          [e1 & e2 & ... & en => …], that is, the clause
          [not e1 | not e2 | ... | not en] *)
-  let clause_guard_of_exp_ (e:explanation): Lit.t list =
-    Explanation.to_list e
-    |> List.map Lit.neg (* this is a guard! *)
-    |> CCList.sort_uniq ~cmp:Lit.compare
+  let clause_guard_of_exp_ (e:explanation): Lit.t list Sequence.t =
+    let l = Explanation.to_lists e in
+    Sequence.map
+      (fun e ->
+         List.map Lit.neg e (* this is a guard! *)
+         |> CCList.sort_uniq ~cmp:Lit.compare)
+      l
 
   (** {2 Reduction to Normal Form} *)
   module Reduce = struct
@@ -2179,28 +2189,26 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         end
       | B_and (a,b,c,d) ->
         (* evaluate [c] and [d], but only provide some explanation
-           once their conjunction reduces to [true] or [false].
-
-           We first compute only [c], in case it is [False]. *)
+           once their conjunction reduces to [true] or [false]. *)
         let e_a, c' = compute_nf a in
-        begin match c'.term_cell with
-          | False ->
+        let e_b, d' = compute_nf b in
+        begin match c'.term_cell, d'.term_cell with
+          | False, False ->
+            (* combine explanations here *)
+            Explanation.or_ e_a e_b, Term.false_
+          | False, _ ->
             e_a, Term.false_
+          | _, False ->
+            e_b, Term.false_
+          | True, True ->
+            let e_ab = Explanation.append e_a e_b in
+            e_ab, Term.true_
           | _ ->
-            let e_b, d' = compute_nf b in
-            begin match c'.term_cell, d'.term_cell with
-              | _, False ->
-                e_b, Term.false_
-              | True, True ->
-                let e_ab = Explanation.append e_a e_b in
-                e_ab, Term.true_
-              | _ ->
-                let t' =
-                  if c==c' && d==d' then old else Term.and_par a b c' d'
-                in
-                (* keep the explanations for when the value is true/false *)
-                Explanation.empty, t'
-            end
+            let t' =
+              if c==c' && d==d' then old else Term.and_par a b c' d'
+            in
+            (* keep the explanations for when the value is true/false *)
+            Explanation.empty, t'
         end
       | B_eq (a,b) ->
         assert (not (Ty.is_prop a.term_ty));
@@ -2361,19 +2369,20 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     let to_lit = Lit.atom ~sign:true
     let pp = Term.pp
 
-    (* clause for [e => l] *)
-    let clause_imply (l:lit) (e:explanation): Clause.t =
-      let c = l :: clause_guard_of_exp_ e |> Clause.make in
-      c
+    (* clauses for [e => l] *)
+    let clause_imply (l:lit) (e:explanation): Clause.t Sequence.t =
+      clause_guard_of_exp_ e
+      |> Sequence.map
+        (fun guard -> l :: guard |> Clause.make)
 
     let propagate_lit_ (l:t) (e:explanation): unit =
-      let c = clause_imply (to_lit l) e in
+      let cs = clause_imply (to_lit l) e |> Sequence.to_rev_list in
       Log.debugf 4
         (fun k->k
-            "(@[<hv1>@{<green>propagate_lit@}@ %a@ nf: %a@ clause: %a@])"
-            pp l pp (snd (Reduce.compute_nf l)) Clause.pp c);
+            "(@[<hv1>@{<green>propagate_lit@}@ %a@ nf: %a@ clauses: (@[%a@])@])"
+            pp l pp (snd (Reduce.compute_nf l)) (Utils.pp_list Clause.pp) cs);
       incr stat_num_propagations;
-      Clause.push_new c;
+      Clause.push_new_l cs;
       ()
 
     (* add [t] to the list of literals that watch the constant [c] *)
@@ -2614,8 +2623,12 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         | Lit_atom {term_cell=True; _} -> ()
         | Lit_atom {term_cell=False; _} ->
           (* conflict! *)
-          let c = Lit.neg lit :: clause_guard_of_exp_ e |> Clause.make in
-          Clause.push_conflict c
+          let cs =
+            clause_guard_of_exp_ e
+            |> Sequence.map
+              (fun guard -> Lit.neg lit :: guard |> Clause.make)
+          in
+          Sequence.iter Clause.push_new cs
         | Lit_atom _ -> ()
         | Lit_assign(c, t) ->
           if Lit.sign lit then assert_choice c t
