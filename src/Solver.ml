@@ -150,7 +150,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
   and cst_kind =
     | Cst_undef of ty_h * cst_info * ty_uninterpreted_slice option
     | Cst_cstor of ty_h
-    | Cst_uninterpreted_dom_elt of ty_h (* uninterpreted domain constant *)
+    | Cst_uninterpreted_dom_elt of ty_h * ty_uninterpreted (* uninterpreted domain constant *)
     | Cst_defined of ty_h * term lazy_t
 
   and cst_info = {
@@ -337,7 +337,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     let ty_of_kind = function
       | Cst_defined (ty, _)
       | Cst_undef (ty, _, _)
-      | Cst_uninterpreted_dom_elt ty
+      | Cst_uninterpreted_dom_elt (ty,_)
       | Cst_cstor ty -> ty
 
     let ty t = ty_of_kind t.cst_kind
@@ -348,7 +348,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       assert (Ty.is_data ret);
       make id (Cst_cstor ty)
     let make_defined id ty t = make id (Cst_defined (ty, t))
-    let make_uty_dom_elt id ty = make id (Cst_uninterpreted_dom_elt ty)
+    let make_uty_dom_elt id ty uty = make id (Cst_uninterpreted_dom_elt (ty,uty))
 
     let make_undef ?parent ?exist_if ?slice id ty =
       let info =
@@ -920,9 +920,10 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           end
         | _ -> None
 
-    let as_domain_elt (t:term): (cst * Ty.t) option =
+    let as_domain_elt (t:term): (cst * Ty.t * ty_uninterpreted_slice) option =
       match t.term_cell with
-        | Const ({cst_kind=Cst_uninterpreted_dom_elt ty; _} as c) -> Some (c,ty)
+        | Const ({cst_kind=Cst_uninterpreted_dom_elt (ty,uty); _} as c) ->
+          Some (c,ty,uty)
         | _ -> None
 
     (* typical view for unification/equality *)
@@ -933,10 +934,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       | Unif_none
 
     let as_unif (t:term): unif_form = match t.term_cell with
-      | Const ({cst_kind=Cst_uninterpreted_dom_elt ty; _} as c) ->
-        let uty = match ty.ty_cell
-          with Atomic (_, Uninterpreted uty) -> uty | _ -> assert false
-        in
+      | Const ({cst_kind=Cst_uninterpreted_dom_elt (ty,uty); _} as c) ->
         Unif_dom_elt (c,ty,uty)
       | Const ({cst_kind=Cst_undef (ty,info,slice); _} as c) ->
         Unif_cst (c,ty,info,slice)
@@ -947,7 +945,6 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           | _ -> Unif_none
         end
       | _ -> Unif_none
-
 
     let fpf = Format.fprintf
 
@@ -1496,7 +1493,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
             in
             ID.makef "$%a_%d" ID.pp_name ty_id n
           in
-          let c_head = Typed_cst.make_uty_dom_elt c_id ty in
+          let c_head = Typed_cst.make_uty_dom_elt c_id ty uty in
           (* create the next slice *)
           let uty_tail = {
             uty_self=uty.uty_self;
@@ -2283,13 +2280,20 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
                 compute_nf_add e_ab
                   (Term.if_ check_case check_subs Term.false_)
             end
-          | Term.Unif_dom_elt (dom_elt,_, uty_root), Term.Unif_cst (c, _, _, _)
-          | Term.Unif_cst (c, _, _, _), Term.Unif_dom_elt (dom_elt,_,uty_root) ->
+          | Term.Unif_dom_elt (dom_elt,_, uty_dom_elt), Term.Unif_cst (c, _, _, _)
+          | Term.Unif_cst (c, _, _, _), Term.Unif_dom_elt (dom_elt,_,uty_dom_elt) ->
+            let dom_elt_offset = uty_dom_elt.uty_offset in
             (* we know that [uty] is expanded deep enough that [dom_elt]
                exists, so we can simply reduce [?c = dom_elt_n] into
                [¬empty(uty[0:]) & .. & ¬empty(uty[:n]) & ?c := dom_elt_n] *)
             let traverse e_c c uty = match uty.uty_pair with
-              | Lazy_none -> assert false (* should have met [dom_elt] *)
+              | Lazy_none ->
+                (* we are too deep in [uty], cannot hold *)
+                assert (dom_elt_offset < uty.uty_offset);
+                Explanation.empty, Term.false_
+              | Lazy_some _ when dom_elt_offset < uty.uty_offset ->
+                (* we are too deep in [uty], cannot hold *)
+                Explanation.empty, Term.false_
               | Lazy_some (dom_elt', _) ->
                 Expand.expand_cst c;
                 let check_uty = Term.check_empty_uty uty |> Term.not_ in
@@ -2326,10 +2330,12 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
                   end
                 )
             in
-            let uty = match c.cst_kind with
-              | Cst_undef (_, _, Some uty) -> uty | _ -> uty_root
+            let uty_root = match c.cst_kind, uty_dom_elt.uty_self with
+              | Cst_undef (_, _, Some uty), _ -> uty
+              | _, lazy {ty_cell=Atomic (_, Uninterpreted uty); _} -> uty
+              | _ -> assert false
             in
-            traverse e_ab c uty
+            traverse e_ab c uty_root
           | _ -> e_ab, default()
         end
 
