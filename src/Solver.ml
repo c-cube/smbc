@@ -68,10 +68,10 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     mutable term_ty: ty_h;
     term_cell: term_cell;
     mutable term_bits: Term_bits.t; (* bitfield for various properties *)
-    mutable term_parents: term list; (* parent terms *)
+    mutable term_parents: term Bag.t; (* parent terms of the whole equiv class *)
     mutable term_root: term; (* representative of congruence class *)
-    mutable term_class: term Bag.t; (* equivalence class *)
-    mutable term_expl: (term * explanation) option; (* the rooted forest for explanations *)
+    mutable term_expl: (term * explanation) option;
+    (* the rooted forest for explanations *)
     mutable term_nf: term_nf option; (* normal form? *)
   }
 
@@ -85,17 +85,8 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     | Fun of ty_h * term
     | Mu of term
     | If of term * term * term
-    | Match of term * (ty_h list * term) ID.Map.t
-    | Switch of term * switch_cell (* function table *)
-    | Quant of quant * ty_uninterpreted_slice * term
-      (* quantification on finite types *)
+    | Case of term * term ID.Map.t (* check head constructor *)
     | Builtin of builtin
-    | Check_assign of cst * term (* check a literal *)
-    | Check_empty_uty of ty_uninterpreted_slice (* check it's empty *)
-
-  and quant =
-    | Forall
-    | Exists
 
   and builtin =
     | B_not of term
@@ -149,7 +140,6 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     | Lit_fresh of ID.t (* fresh literals *)
     | Lit_atom of term
     | Lit_assign of cst * term
-    | Lit_uty_empty of ty_uninterpreted_slice
 
   and cst = {
     cst_id: ID.t;
@@ -157,10 +147,9 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
   }
 
   and cst_kind =
-    | Cst_undef of ty_h * cst_info * ty_uninterpreted_slice option
+    | Cst_undef of ty_h * cst_info
     | Cst_cstor of data_cstor
     | Cst_proj of ty_h * data_cstor * int (* [cstor, argument position] *)
-    | Cst_uninterpreted_dom_elt of ty_h * ty_uninterpreted (* uninterpreted domain constant *)
     | Cst_defined of ty_h * term lazy_t
 
   and cst_info = {
@@ -195,7 +184,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
   }
 
   and ty_def =
-    | Uninterpreted of ty_uninterpreted (* uninterpreted type, with its domain *)
+    | Uninterpreted
     | Data of datatype (* set of constructors *)
 
   and datatype = {
@@ -215,38 +204,6 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     | Prop
     | Atomic of ID.t * ty_def
     | Arrow of ty_h * ty_h
-
-  and ty_uninterpreted = ty_uninterpreted_slice
-
-  (* current status of this slice of uninterpreted type in the model *)
-  and ty_uninterpreted_status =
-    | Uty_empty
-    | Uty_nonempty
-
-  (* A slice of an uninterpreted type's the domain.
-     For instance, if [u] is uninterpreted, it might be defined as
-     [(u0 | (u1 | (empty)))] where [empty] will be expanded into [(u2 | empty)]
-     if needed. We write [u[3:]] to designate the slice of [u]'s domain
-     that skips the first 3 elements. *)
-  and ty_uninterpreted_slice = {
-    uty_self: ty_h lazy_t;
-    (* pointer to the root type *)
-    uty_offset: int;
-    (* length of path from root [Uninterpreted]; in other words, the
-       number of elements that have been skipped. *)
-    uty_parent: ty_uninterpreted_slice option;
-    (* if [offset>0], the previous slice *)
-    mutable uty_pair: (cst * ty_uninterpreted_slice) lazily_expanded;
-    (* the domain constant, must be Cst_uninterpreted_dom_elt,
-       and the next slice.
-       Expanded on demand. *)
-    mutable uty_status: (explanation * ty_uninterpreted_status) option;
-    (* current status in the model *)
-  }
-
-  let pp_quant out = function
-    | Forall -> CCFormat.string out "forall"
-    | Exists -> CCFormat.string out "exists"
 
   module Ty : sig
     type t = ty_h
@@ -384,16 +341,14 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     val ty : t -> Ty.t
     val make_cstor : ID.t -> data_cstor -> t
     val make_defined : ID.t -> Ty.t -> term lazy_t -> t
-    val make_uty_dom_elt : ID.t -> Ty.t -> ty_uninterpreted_slice -> t
     val make_undef :
-      ?parent:cst -> ?exist_if:cst_exist_conds -> ?slice:ty_uninterpreted_slice ->
-      ID.t -> Ty.t -> t
+      ?parent:cst -> ?exist_if:cst_exist_conds -> ID.t -> Ty.t -> t
     val depth : t -> int
     val equal : t -> t -> bool
     val compare : t -> t -> int
     val hash : t -> int
-    val as_undefined : t -> (t * Ty.t * cst_info * ty_uninterpreted_slice option) option
-    val as_undefined_exn : t -> t * Ty.t * cst_info * ty_uninterpreted_slice option
+    val as_undefined : t -> (t * Ty.t * cst_info) option
+    val as_undefined_exn : t -> t * Ty.t * cst_info
     val pp : t CCFormat.printer
     module Map : CCMap.S with type key = t
   end = struct
@@ -403,8 +358,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
 
     let ty_of_kind = function
       | Cst_defined (ty, _)
-      | Cst_undef (ty, _, _)
-      | Cst_uninterpreted_dom_elt (ty,_)
+      | Cst_undef (ty, _)
       | Cst_proj (ty, _, _) -> ty
       | Cst_cstor cstor -> ~!(cstor.cstor_ty)
 
@@ -416,12 +370,11 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       assert (Ty.is_data ret);
       make id (Cst_cstor cstor)
     let make_defined id ty t = make id (Cst_defined (ty, t))
-    let make_uty_dom_elt id ty uty = make id (Cst_uninterpreted_dom_elt (ty,uty))
 
-    let make_undef ?parent ?exist_if ?slice id ty =
+    let make_undef ?parent ?exist_if id ty =
       let info =
         let cst_depth = match parent with
-          | Some {cst_kind=Cst_undef (_, i, _); _} -> i.cst_depth + 1
+          | Some {cst_kind=Cst_undef (_, i); _} -> i.cst_depth + 1
           | Some _ ->
             invalid_arg "make_const: parent should be a constant"
           | None -> 0
@@ -434,18 +387,18 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           cst_cur_case=None;
         }
       in
-      make id (Cst_undef (ty, info, slice))
+      make id (Cst_undef (ty, info))
 
     let depth (c:t): int = match c.cst_kind with
-      | Cst_undef (_, i, _) -> i.cst_depth
+      | Cst_undef (_, i) -> i.cst_depth
       | _ -> assert false
 
     let as_undefined (c:t) = match c.cst_kind with
-      | Cst_undef (ty,i,slice) -> Some (c,ty,i,slice)
-      | Cst_defined _ | Cst_cstor _ | Cst_uninterpreted_dom_elt _ | Cst_proj _
+      | Cst_undef (ty,i) -> Some (c,ty,i)
+      | Cst_defined _ | Cst_cstor _ | Cst_proj _
         -> None
 
-    let as_undefined_exn (c:t): t * Ty.t * cst_info * ty_uninterpreted_slice option=
+    let as_undefined_exn (c:t): t * Ty.t * cst_info =
       match as_undefined c with
         | Some tup -> tup
         | None -> assert false
@@ -461,16 +414,6 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       end)
   end
 
-  let cmp_uty a b =
-    let c = Ty.compare (Lazy.force a.uty_self) (Lazy.force b.uty_self) in
-    if c<>0 then c
-    else CCOrd.int_ a.uty_offset b.uty_offset
-
-  let equal_uty a b = cmp_uty a b = 0
-
-  let hash_uty uty =
-    Hash.combine3 104 (Ty.hash (Lazy.force uty.uty_self)) uty.uty_offset
-
   let cmp_lit a b =
     let c = CCOrd.bool_ a.lit_sign b.lit_sign in
     if c<>0 then c
@@ -479,19 +422,16 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         | Lit_fresh _ -> 0
         | Lit_atom _ -> 1
         | Lit_assign _ -> 2
-        | Lit_uty_empty _ -> 3
       in
       match a.lit_view, b.lit_view with
         | Lit_fresh i1, Lit_fresh i2 -> ID.compare i1 i2
         | Lit_atom t1, Lit_atom t2 -> term_cmp_ t1 t2
         | Lit_assign (c1,t1), Lit_assign (c2,t2) ->
           CCOrd.(Typed_cst.compare c1 c2 <?> (term_cmp_, t1, t2))
-        | Lit_uty_empty u1, Lit_uty_empty u2 -> cmp_uty u1 u2
         | Lit_fresh _, _
         | Lit_atom _, _
         | Lit_assign _, _
-        | Lit_uty_empty _, _ ->
-          CCOrd.int_ (int_of_cell_ a.lit_view) (int_of_cell_ b.lit_view)
+          -> CCOrd.int_ (int_of_cell_ a.lit_view) (int_of_cell_ b.lit_view)
 
   let hash_lit a =
     let sign = a.lit_sign in
@@ -500,18 +440,6 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       | Lit_atom t -> Hash.combine3 2 (Hash.bool sign) (term_hash_ t)
       | Lit_assign (c,t) ->
         Hash.combine4 3 (Hash.bool sign) (Typed_cst.hash c) (term_hash_ t)
-      | Lit_uty_empty uty -> Hash.combine3 4 (Hash.bool sign) (hash_uty uty)
-
-  let pp_uty out uty =
-    let n = uty.uty_offset in
-    let lazy ty = uty.uty_self in
-    if n=0
-    then Format.fprintf out "%a[:]" Ty.pp ty
-    else Format.fprintf out "%a[%d:]" Ty.pp ty n
-
-  let pp_uty_status out = function
-    | Uty_empty -> CCFormat.string out "empty"
-    | Uty_nonempty -> CCFormat.string out "non_empty"
 
   module Backtrack : sig
     val dummy_level : level
@@ -569,13 +497,9 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     val app : term -> term list -> t
     val fun_ : Ty.t -> term -> t
     val mu : term -> t
-    val match_ : term -> (Ty.t list * term) ID.Map.t -> t
-    val switch : term -> switch_cell -> t
+    val case : term -> term ID.Map.t -> t
     val if_ : term -> term -> term -> t
     val builtin : builtin -> t
-    val quant : quant -> ty_uninterpreted_slice -> term -> t
-    val forall : ty_uninterpreted_slice -> term -> t
-    val exists : ty_uninterpreted_slice -> term -> t
     val and_ : term -> term -> t
     val or_ : term -> term -> t
     val not_ : term -> t
@@ -600,12 +524,9 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         Hash.combine3 5 f.term_id (Hash.list sub_hash l)
       | Fun (ty, f) -> Hash.combine3 6 (Ty.hash ty) f.term_id
       | If (a,b,c) -> Hash.combine4 7 a.term_id b.term_id c.term_id
-      | Match (u,m) ->
-        let hash_case (tys,rhs) =
-          Hash.combine2 (Hash.list Ty.hash tys) rhs.term_id
-        in
+      | Case (u,m) ->
         let hash_m =
-          Hash.seq (Hash.pair ID.hash hash_case) (ID.Map.to_seq m)
+          Hash.seq (Hash.pair ID.hash sub_hash) (ID.Map.to_seq m)
         in
         Hash.combine3 8 u.term_id hash_m
       | Builtin (B_not a) -> Hash.combine2 20 a.term_id
@@ -614,14 +535,6 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       | Builtin (B_imply (t1,t2)) -> Hash.combine3 23 t1.term_id t2.term_id
       | Builtin (B_eq (t1,t2)) -> Hash.combine3 24 t1.term_id t2.term_id
       | Mu sub -> Hash.combine sub_hash 30 sub
-      | Switch (t, tbl) ->
-        Hash.combine3 31 (sub_hash t) tbl.switch_id
-      | Quant (q,ty,bod) ->
-        Hash.combine4 32 (Hash.poly q) (hash_uty ty) (sub_hash bod)
-      | Check_assign (c,t) ->
-        Hash.combine3 33 (Typed_cst.hash c) (sub_hash t)
-      | Check_empty_uty uty ->
-        Hash.combine2 34 (hash_uty uty)
 
     (* equality that relies on physical equality of subterms *)
     let equal a b = match a, b with
@@ -635,17 +548,15 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       | Fun (ty1,f1), Fun (ty2,f2) -> Ty.equal ty1 ty2 && f1 == f2
       | If (a1,b1,c1), If (a2,b2,c2) ->
         a1 == a2 && b1 == b2 && c1 == c2
-      | Match (u1, m1), Match (u2, m2) ->
+      | Case (u1, m1), Case (u2, m2) ->
         u1 == u2 &&
         ID.Map.for_all
-          (fun k1 (_,rhs1) ->
-             try rhs1 == snd (ID.Map.find k1 m2)
+          (fun k1 rhs1 ->
+             try rhs1 == ID.Map.find k1 m2
              with Not_found -> false)
           m1
         &&
         ID.Map.for_all (fun k2 _ -> ID.Map.mem k2 m1) m2
-      | Switch (t1,m1), Switch (t2,m2) ->
-        t1==t2 && m1.switch_id = m2.switch_id
       | Builtin b1, Builtin b2 ->
         begin match b1, b2 with
           | B_not a1, B_not a2 -> a1 == a2
@@ -657,12 +568,6 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           | B_or _, _ | B_imply _, _ -> false
         end
       | Mu t1, Mu t2 -> t1==t2
-      | Quant (q1,ty1,bod1), Quant (q2,ty2,bod2) ->
-        q1=q2 && equal_uty ty1 ty2 && bod1==bod2
-      | Check_assign (c1,t1), Check_assign (c2,t2) ->
-        Typed_cst.equal c1 c2 && term_equal_ t1 t2
-      | Check_empty_uty u1, Check_empty_uty u2 ->
-        equal_uty u1 u2
       | True, _
       | False, _
       | DB _, _
@@ -670,13 +575,9 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       | App _, _
       | Fun _, _
       | If _, _
-      | Match _, _
+      | Case _, _
       | Builtin _, _
       | Mu _, _
-      | Switch _, _
-      | Quant _, _
-      | Check_assign _, _
-      | Check_empty_uty _, _
         -> false
 
     let true_ = True
@@ -696,8 +597,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
 
     let fun_ ty body = Fun (ty, body)
     let mu t = Mu t
-    let match_ u m = Match (u,m)
-    let switch u m = Switch (u,m)
+    let case u m = Case (u,m)
     let if_ a b c =
       assert (Ty.equal b.term_ty c.term_ty);
       If (a,b,c)
@@ -711,14 +611,6 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         | _ -> b
       in
       Builtin b
-
-    let quant q uty body =
-      assert (Ty.is_prop body.term_ty);
-      (* evaluation is blocked by the uninterpreted type *)
-      Quant (q,uty,body)
-
-    let forall = quant Forall
-    let exists = quant Exists
 
     let not_ t = match t.term_cell with
       | True -> False
@@ -746,13 +638,9 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       | Const c -> Typed_cst.ty c
       | App (f, l) -> app_ty_ f.term_ty l
       | If (_,b,_) -> b.term_ty
-      | Match (_,m) ->
-        let _, (_,rhs) = ID.Map.choose m in
+      | Case (_,m) ->
+        let _, rhs = ID.Map.choose m in
         rhs.term_ty
-      | Switch (_, m) -> m.switch_ty_ret
-      | Check_assign _
-      | Check_empty_uty _
-      | Quant _
       | Builtin _ -> Ty.prop
       | Mu t -> t.term_ty
       | Fun (ty,body) -> Ty.arrow ty body.term_ty
@@ -768,6 +656,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     type t = term
 
     module Field_in_cc : Term_bits.FIELD with type value = bool
+    module Field_expanded : Term_bits.FIELD with type value = bool
 
     val id : t -> int
     val ty : t -> Ty.t
@@ -789,11 +678,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     val fun_ : Ty.t -> t -> t
     val fun_l : Ty.t list -> t -> t
     val mu : t -> t
-    val match_ : t -> (Ty.t list * t) ID.Map.t -> t
-    val switch : t -> switch_cell -> t
-    val quant : quant -> ty_uninterpreted_slice -> t -> t
-    val forall : ty_uninterpreted_slice -> t -> t
-    val exists : ty_uninterpreted_slice -> t -> t
+    val case : t -> t ID.Map.t -> t
     val and_ : t -> t -> t
     val or_ : t -> t -> t
     val not_ : t -> t
@@ -819,18 +704,14 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     val is_const : t -> bool
 
     (* return [Some] iff the term is an undefined constant *)
-    val as_cst_undef :
-      t -> (cst * Ty.t * cst_info * ty_uninterpreted_slice option) option
+    val as_cst_undef : t -> (cst * Ty.t * cst_info) option
 
     val as_cstor_app : t -> (cst * data_cstor * t list) option
 
-    val as_domain_elt : t -> (cst * Ty.t * ty_uninterpreted_slice) option
-
     (* typical view for unification/equality *)
     type unif_form =
-      | Unif_cst of cst * Ty.t * cst_info * ty_uninterpreted_slice option
+      | Unif_cst of cst * Ty.t * cst_info
       | Unif_cstor of cst * data_cstor * term list
-      | Unif_dom_elt  of cst * Ty.t * ty_uninterpreted_slice
       | Unif_none
 
     val as_unif : t -> unif_form
@@ -843,6 +724,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     type t = term
 
     module Field_in_cc = (val (Term_bits.bool ~name:"in_cc" ()))
+    module Field_expanded = (val (Term_bits.bool ~name:"expanded" ()))
     let () = Term_bits.freeze()
 
     let id t = t.term_id
@@ -864,9 +746,8 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           let rec t = {
             term_id= !n;
             term_ty;
-            term_parents=[];
+            term_parents=Bag.empty;
             term_bits=Term_bits.empty;
-            term_class=Bag.return t;
             term_root=t;
             term_expl=None;
             term_cell=c;
@@ -897,18 +778,11 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
 
     let mu t = make (Term_cell.mu t)
 
-    let match_ u m = make (Term_cell.match_ u m)
-
-    let switch u m = make (Term_cell.switch u m)
+    let case u m = make (Term_cell.case u m)
 
     let if_ a b c = make (Term_cell.if_ a b c)
 
     let not_ t = make (Term_cell.not_ t)
-
-    let quant q uty body = make (Term_cell.quant q uty body)
-
-    let forall = quant Forall
-    let exists = quant Exists
 
     let and_ a b = make (Term_cell.and_ a b)
     let or_ a b = make (Term_cell.or_ a b)
@@ -991,23 +865,17 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           | DB _ | Const _ | True | False -> ()
           | App (f,l) -> aux f; List.iter aux l
           | If (a,b,c) -> aux a; aux b; aux c
-          | Match (t, m) ->
+          | Case (t, m) ->
             aux t;
-            ID.Map.iter (fun _ (_,rhs) -> aux rhs) m
-          | Switch (u,_) -> aux u (* ignore the table *)
+            ID.Map.iter (fun _ rhs -> aux rhs) m
           | Builtin b -> builtin_to_seq b aux
-          | Quant (_, _, body)
           | Mu body
           | Fun (_, body) -> aux body
-          | Check_assign _
-          | Check_empty_uty _ -> ()
       in
       aux t
 
     (* return [Some] iff the term is an undefined constant *)
-    let as_cst_undef (t:term):
-      (cst * Ty.t * cst_info * ty_uninterpreted_slice option) option
-      =
+    let as_cst_undef (t:term): (cst * Ty.t * cst_info) option =
       match t.term_cell with
         | Const c -> Typed_cst.as_undefined c
         | _ -> None
@@ -1024,24 +892,15 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           end
         | _ -> None
 
-    let as_domain_elt (t:term): (cst * Ty.t * ty_uninterpreted_slice) option =
-      match t.term_cell with
-        | Const ({cst_kind=Cst_uninterpreted_dom_elt (ty,uty); _} as c) ->
-          Some (c,ty,uty)
-        | _ -> None
-
     (* typical view for unification/equality *)
     type unif_form =
-      | Unif_cst of cst * Ty.t * cst_info * ty_uninterpreted_slice option
+      | Unif_cst of cst * Ty.t * cst_info
       | Unif_cstor of cst * data_cstor * term list
-      | Unif_dom_elt  of cst * Ty.t * ty_uninterpreted_slice
       | Unif_none
 
     let as_unif (t:term): unif_form = match t.term_cell with
-      | Const ({cst_kind=Cst_uninterpreted_dom_elt (ty,uty); _} as c) ->
-        Unif_dom_elt (c,ty,uty)
-      | Const ({cst_kind=Cst_undef (ty,info,slice); _} as c) ->
-        Unif_cst (c,ty,info,slice)
+      | Const ({cst_kind=Cst_undef (ty,info); _} as c) ->
+        Unif_cst (c,ty,info)
       | Const ({cst_kind=Cst_cstor cstor; _} as c) -> Unif_cstor (c,cstor,[])
       | App (f, l) ->
         begin match f.term_cell with
@@ -1068,29 +927,18 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           fpf out "(@[<1>%a@ %a@])" pp f (Utils.pp_list pp) l
         | Fun (ty,f) ->
           fpf out "(@[fun %a@ %a@])" Ty.pp ty pp f
-        | Quant (q,uty,f) ->
-          fpf out "(@[%a %a@ %a@])" pp_quant q pp_uty uty pp f
         | Mu sub -> fpf out "(@[mu@ %a@])" pp sub
         | If (a, b, c) ->
           fpf out "(@[if %a@ %a@ %a@])" pp a pp b pp c
-        | Match (t,m) ->
-          let pp_bind out (id,(_tys,rhs)) =
-            fpf out "(@[<1>%a@ %a@])" ID.pp id pp rhs
+        | Case (t,m) ->
+          let pp_bind out (id,rhs) =
+            fpf out "(@[<1>case %a@ %a@])" ID.pp id pp rhs
           in
           let print_map =
             CCFormat.seq ~start:"" ~stop:"" ~sep:" " pp_bind
           in
           fpf out "(@[match %a@ (@[<hv>%a@])@])"
             pp t print_map (ID.Map.to_seq m)
-        | Switch (t, m) ->
-          let pp_case out (lhs,rhs) =
-            fpf out "(@[<1>case@ %a@ %a@])" ID.pp lhs pp rhs
-          in
-          let print_map =
-            CCFormat.seq ~start:"" ~stop:"" ~sep:" " pp_case
-          in
-          fpf out "(@[switch %a@ (@[<hv>%a@])@])"
-            pp t print_map (ID.Tbl.to_seq m.switch_tbl)
         | Builtin (B_not t) -> fpf out "(@[<hv1>not@ %a@])" pp t
         | Builtin (B_and (a,b)) ->
           fpf out "(@[<hv1>and@ %a@ %a@])" pp a pp b
@@ -1100,9 +948,6 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           fpf out "(@[<hv1>=>@ %a@ %a@])" pp a pp b
         | Builtin (B_eq (a,b)) ->
           fpf out "(@[<hv1>=@ %a@ %a@])" pp a pp b
-        | Check_assign (c,t) ->
-          fpf out "(@[<hv1>:=@ %a@ %a@])" Typed_cst.pp c pp t
-        | Check_empty_uty uty -> fpf out "(@[check_empty %a@])" pp_uty uty
       in
       pp out t
 
@@ -1115,7 +960,6 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       | Lit_atom t -> Term.pp out t
       | Lit_assign (c,t) ->
         Format.fprintf out "(@[:= %a@ %a@])" Typed_cst.pp c Term.pp t
-      | Lit_uty_empty u -> Format.fprintf out "(empty %a)" pp_uty u
     in
     if l.lit_sign then pp_lit_view out l.lit_view
     else Format.fprintf out "(@[@<1>¬@ %a@])" pp_lit_view l.lit_view
@@ -1135,9 +979,6 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     val eq : term -> term -> t
     val neq : term -> term -> t
     val cst_choice : cst -> term -> t
-    val uty_choice_empty : ty_uninterpreted_slice -> t
-    val uty_choice_nonempty : ty_uninterpreted_slice -> t
-    val uty_choice_status : ty_uninterpreted_slice -> ty_uninterpreted_status -> t
     val hash : t -> int
     val compare : t -> t -> int
     val equal : t -> t -> bool
@@ -1179,11 +1020,6 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     let eq a b = atom ~sign:true (Term.eq a b)
     let neq a b = atom ~sign:false (Term.eq a b)
     let cst_choice c t = make ~sign:true (Lit_assign (c, t))
-    let uty_choice_empty uty = make ~sign:true (Lit_uty_empty uty)
-    let uty_choice_nonempty uty : t = make ~sign:false (Lit_uty_empty uty)
-    let uty_choice_status uty s : t = match s with
-      | Uty_empty -> uty_choice_empty uty
-      | Uty_nonempty -> uty_choice_nonempty uty
 
     let as_atom (lit:t) : (term * bool) option = match lit.lit_view with
       | Lit_atom t -> Some (t, lit.lit_sign)
@@ -1310,6 +1146,9 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
 
   (** {2 Iterative Deepening} *)
 
+  (* TODO: remove, replace with "blocking atoms" (that block function
+     calls that lead to recursive calls) *)
+
   module Iterative_deepening : sig
     type t = private int
     val max_depth : t
@@ -1422,14 +1261,11 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     val find : term -> repr
     (** Current representative *)
 
-    val class_seq : repr -> term Sequence.t (* terms in the same class *)
+    type update_res =
+      | Sat
+      | Unsat of repr * repr (* must merge those, but they are incompatible *)
 
-    type union_res =
-      | Union_ok
-      | Union_unsat of repr * repr
-      (* must merge those, but they are incompatible *)
-
-    val union : repr -> repr -> Explanation.t -> union_res
+    val union : repr -> repr -> Explanation.t -> update_res
     (** Merge the two equivalence classes *)
 
     val eval : repr -> term_nf option
@@ -1442,6 +1278,16 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     val explain : term -> term -> Explanation.t
     (** [explain t1 t2] returns a small explanation of why [t1=t2].
         precond: the terms have the same representative, ie [find t1 = find t2] *)
+
+    val in_cc : term -> bool
+    (** Is the term properly added to the congruence closure? *)
+
+    val add_cc : term -> unit
+    (** Add the term to the congruence closure.
+        @raise Error if the current level is not 0 *)
+
+    val add_cc_seq : term Sequence.t -> unit
+    (** Add a sequence of terms to the congruence closure *)
   end = struct
     type repr = term
 
@@ -1449,11 +1295,11 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
 
     let is_root_ t = t.term_root == t
     let same_class_ (r1:repr)(r2:repr): bool = equal r1 r2
-    let size_ (r:repr) = assert (is_root_ r); Bag.size r.term_class
+    let size_ (r:repr) = assert (is_root_ r); Bag.size r.term_parents
 
-    let class_seq t =
-      assert (is_root_ t);
-      Bag.to_seq t.term_class
+    (* check if [t] is in the congruence closure.
+       Invariant: [in_cc t => in_cc u, forall u subterm t] *)
+    let in_cc (t:term): bool = Term.Field_in_cc.get t.term_bits
 
     let signatures_tbl : repr Term_cell.Tbl.t = Term_cell.Tbl.create 2048
     (* map a signature to the corresponding equivalence class.
@@ -1462,27 +1308,6 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
        is normalized (i.e. is its own representative).
        The critical property is that all members of an equivalence class
        that have the same "shape" (including head symbol) have the same signature *)
-
-    let in_cc_ (t:repr): bool = Term.Field_in_cc.get t.term_bits
-
-    (* TODO:
-       - do it
-       - when should it be used? *)
-    let add_to_cc (t:repr): unit =
-      if not (in_cc_ t) then (
-        assert (is_root_ t);
-        t.term_bits <- Term.Field_in_cc.set true t.term_bits;
-        assert false
-        (* TODO:
-           - add children to CC
-           - register to relevant children in [term.term_parents]
-           - add to [pending] for processing:
-             (check if signature exist, if yes, merge).
-             XXX problem: what about backtracking? this merge should happen
-             at toplevel, maybe, or at least at some level below…
-             (at the lowest level where all subterms of [t] are congruent
-              to the signature entry) *)
-      )
 
     (* find representative *)
     let rec find t : repr =
@@ -1503,12 +1328,8 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         -> None
       | App (f, l) -> App (find f, List.map find l) |> CCOpt.return
       | If (a,b,c) -> If (find a, b, c) |> CCOpt.return
-      | Match (t, m) -> Match (find t, m) |> CCOpt.return
-      | Switch (t, m) -> Switch (find t, m) |> CCOpt.return
+      | Case (t, m) -> Case (find t, m) |> CCOpt.return
       | Builtin b -> Builtin (Term.map_builtin find b) |> CCOpt.return
-      | Quant _
-      | Check_assign _
-      | Check_empty_uty _ -> assert false (* TODO *)
 
     (* find whether the given (parent) term corresponds to some signature
        in [signatures_] *)
@@ -1534,16 +1355,30 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
 
     (* TODO: check-is-bool? or something like this? *)
 
-    type union_res =
-      | Union_ok
-      | Union_unsat of repr * repr (* must merge those, but they are incompatible *)
+    type update_res =
+      | Sat
+      | Unsat of repr * repr (* must merge those, but they are incompatible *)
 
-    type union_state = {
+    type update_state = {
       pending: term Queue.t;
       (* terms to check, maybe their new signature is in {!signatures_tbl} *)
       combine: (term * term * explanation) Queue.t;
       (* pairs of terms to merge *)
     }
+
+    let st : update_state = {
+      pending=Queue.create();
+      combine=Queue.create();
+    }
+
+    let is_done_state (st:update_state): bool =
+      Queue.is_empty st.pending &&
+      Queue.is_empty st.combine
+
+    let clear_state (st:update_state): unit =
+      Queue.clear st.pending;
+      Queue.clear st.combine;
+      ()
 
     (* TODO:
          - make queues "pending" and "combine"
@@ -1555,7 +1390,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
          - proof forest *)
 
     (* perform the congruence closure main algorithm *)
-    let rec union_rec (st:union_state): union_res =
+    let rec update (st:update_state): update_res =
       (* step 1: merge equivalence classes in [st.combine] *)
       while not (Queue.is_empty st.combine) do
         let a, b, e_ab = Queue.pop st.combine in
@@ -1564,31 +1399,31 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         if not (equal ra rb) then (
           assert (is_root_ ra);
           assert (is_root_ rb);
+          (* TODO: datatype checks, inconsistency detection,
+             injectivity, etc. if at least one of [(ra, rb)] has a non-null
+             normal form *)
           (* invariant: [size ra <= size rb].
-             we merge [ra] into [rb].
-             NOTE this is not perfect, as we should measure the number of
-             parent terms, instead of the number of elements in the class (but
-             it's more costly to compute) *)
+             we merge [ra] into [rb]. *)
           let ra, rb = if size_ ra > size_ rb then rb, ra else ra, rb in
           (* remove [ra.parents] from signature, put them into [st.pending] *)
-          let () =
-            class_seq ra
-            |> Sequence.flat_map_l (fun t_a -> t_a.term_parents)
+          begin
+            Bag.to_seq ra.term_parents
             |> Sequence.iter
               (fun parent ->
                  remove_signature parent.term_cell;
                  Queue.push parent st.pending)
-          in
+          end;
           (* perform [union ra rb] *)
-          Backtrack.push_undo
-            (let rb_class = rb.term_class in
-            fun () -> ra.term_root <- ra; rb.term_class <- rb_class);
-          ra.term_root <- rb;
-          rb.term_class <- Bag.append rb.term_class ra.term_class;
+          begin
+            let rb_old_parents = rb.term_parents in
+            Backtrack.push_undo
+              (fun () ->
+                 ra.term_root <- ra;
+                 rb.term_parents <- rb_old_parents);
+            ra.term_root <- rb;
+            rb.term_parents <- Bag.append rb_old_parents ra.term_parents;
+          end;
           (* TODO: update proof forest (use [e_ab]?) *)
-          (* TODO: datatype checks, inconsistency detection,
-             injectivity, etc. if at least one of [(ra, rb)] has a non-null
-             normal form *)
         )
       done;
       (* step 2 deal with pending (parent) terms whose equiv class
@@ -1597,7 +1432,9 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       while not (Queue.is_empty st.pending) do
         let t = Queue.pop st.pending in
         match find_by_signature t.term_cell with
-          | None -> ()
+          | None ->
+            (* add to the signature table *)
+            add_signature t.term_cell (find t)
           | Some r ->
             (* must combine [t] with [r] *)
             (* TODO: get explanation right, e.g.
@@ -1606,17 +1443,17 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
             Queue.push (t, r, Explanation.empty) st.combine
       done;
       if !is_done
-      then Union_ok
-      else union_rec st (* repeat *)
+      then Sat
+      else update st (* repeat *)
 
-    let union (a:repr) (b:repr) (e:explanation): union_res =
+    let union (a:repr) (b:repr) (e:explanation): update_res =
       assert (is_root_ a);
       assert (is_root_ b);
+      assert (is_done_state st);
       if not (same_class_ a b) then (
-        let st = {pending=Queue.create(); combine=Queue.create()} in
         Queue.push (a,b,e) st.combine; (* start by merging [a=b] *)
-        union_rec st
-      )
+        update st
+      ) else Sat
 
     let eval t =
       assert (is_root_ t);
@@ -1631,13 +1468,60 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       let r = find a in
       assert (find b == r);
       assert false (* TODO *)
+
+    (* TODO: check that level=0, somehow *)
+
+    let add_cc_seq (seq:term Sequence.t): unit =
+      assert (is_done_state st);
+      (* add [t] and the required subterms to the congruence closure *)
+      let rec add_cc_pending (t:term): unit =
+        if not (in_cc t) then (
+          assert (is_root_ t);
+          t.term_bits <- Term.Field_in_cc.set true t.term_bits;
+          let add_sub sub =
+            add_cc_pending sub;
+            sub.term_parents <- t :: sub.term_parents
+          in
+          (* register sub-terms, add [t] to their parent list *)
+          begin match t.term_cell with
+            | True | False | Const _ | DB _ -> ()
+            | App (f, l) ->
+              add_sub f;
+              List.iter add_sub l
+            | Case (t, m) ->
+              add_sub t;
+              ID.Map.iter (fun _ rhs -> add_sub rhs) m
+            | If (a,b,c) ->
+              add_sub a;
+              add_sub b;
+              add_sub c
+            | Mu _
+            | Fun _ -> () (* not expanded yet *)
+            | Builtin b -> Term.builtin_to_seq b add_sub
+          end;
+          Queue.push t st.pending
+        )
+      in
+      seq add_cc_pending;
+      (* now perform an update *)
+      begin match update st with
+        | Sat -> ()
+        | Unsat _ -> assert false
+      end
+
+    let add_cc (t:term): unit = add_cc_seq (Sequence.return t)
   end
 
   (** {2 Case Expansion} *)
 
   let declare_defined_cst _ = ()
 
-  module Expand = struct
+  module Expand : sig
+    val expand_term : term -> unit
+    (** Expand the term by making a case distinction, a boolean CNF,
+        or nothing, depending on its type. Idempotent.
+        precondition: [CC.in_cc t] *)
+  end = struct
     (* make a fresh constant, with a unique name *)
     let new_cst_ =
       let n = ref 0 in
@@ -1658,65 +1542,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         | [] -> [c]
         | l -> List.map (fun f -> Lit.neg f :: c) l
 
-    (* build the list of clauses that enforce the choice between
-       [uty = empty] and [uty = c_head : uty_tail] *)
-    let clauses_of_uty (uty:ty_uninterpreted_slice) : Clause.t list =
-      let n = uty.uty_offset in
-      let guard = Iterative_deepening.lit_of_depth n in
-      let lit_nonempty = Lit.uty_choice_nonempty uty in
-      (* - if we have a parent:
-           nonempty => the previous slice must also be nonempty
-         - if we don't have a parent:
-           must never be empty*)
-      let c_inherit = match uty.uty_parent with
-        | None -> [lit_nonempty] |> Clause.make
-        | Some uty' ->
-          [Lit.neg lit_nonempty; Lit.uty_choice_nonempty uty'] |> Clause.make
-      (* depth limit *)
-      and cs_limit = match guard with
-        | None -> []
-        | Some g ->
-          [[Lit.neg lit_nonempty; Lit.neg g] |> Clause.make]
-      in
-      c_inherit :: cs_limit
-
-    (* expand the given slice, if needed, adding required constraints
-       to {!Clause}, and return its head constant and remaining slice. E.g.,
-       on [τ[4:]], it will return [τ_4, τ[5:]]. *)
-    let expand_uninterpreted_slice (uty:ty_uninterpreted_slice)
-      : cst * ty_uninterpreted_slice * Clause.t list =
-      match uty.uty_pair with
-        | Lazy_none ->
-          (* create a new domain element *)
-          let lazy ty = uty.uty_self in
-          let n = uty.uty_offset in
-          (* find a name for the new domain element *)
-          let c_id =
-            let ty_id = match Ty.view ty with
-              | Atomic (i, _) -> i
-              | _ -> assert false
-            in
-            ID.makef "$%a_%d" ID.pp_name ty_id n
-          in
-          let c_head = Typed_cst.make_uty_dom_elt c_id ty uty in
-          (* create the next slice *)
-          let uty_tail = {
-            uty_self=uty.uty_self;
-            uty_parent=Some uty;
-            uty_pair=Lazy_none;
-            uty_offset=n+1;
-            uty_status=None;
-          } in
-          Log.debugf 5
-            (fun k->k "expand slice %a@ into (@[%a,@ %a@])"
-                pp_uty uty Typed_cst.pp c_head pp_uty uty_tail);
-          (* memoize *)
-          uty.uty_pair <- Lazy_some (c_head, uty_tail);
-          (* emit clauses *)
-          let clauses = clauses_of_uty uty in
-          c_head, uty_tail, clauses
-        | Lazy_some (hd,tl) ->
-          hd, tl, [] (* already expanded *)
+    (* TODO: revise the whole mechanism of depth guards *)
 
     (* build clause(s) that explains that [c] must be one of its
        cases *)
@@ -1748,11 +1574,6 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
                     | Const {cst_kind=Cst_undef (_,info,_); _} ->
                       (* is [sub] a constant deeper than [d]? *)
                       info.cst_depth > depth
-                    | Switch (_,{switch_cst={cst_kind=Cst_undef (_,info,_); _}; _}) ->
-                      (* in this case, the map will contain metas of depth
-                         [info.cst_depth+1], even though they might not
-                         exist already *)
-                      info.cst_depth >= depth
                     | _ -> false)
              in
              lit, needs_guard)
@@ -1836,11 +1657,12 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       in
       (* expand constant depending on its type *)
       let by_ty, other_clauses = match Ty.view ty with
-        | Atomic (_, Data cstors) ->
+        | Atomic (_, Data data) ->
           (* datatype: refine by picking the head constructor *)
           info.cst_complete <- true;
           List.map
-            (fun (lazy c) ->
+            (fun (lazy cstor)  ->
+               let c = cstor.cstor_cst in
                let rec case = lazy (
                  let ty_args, _ = Typed_cst.ty c |> Ty.unfold in
                  (* elements of [memo] already used when generating the
@@ -1861,34 +1683,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
                  Term.app_cst c args
                ) in
                Lazy.force case)
-            cstors, []
-        | Atomic (_, Uninterpreted uty_root) ->
-          assert (Ty.equal ty (Lazy.force uty_root.uty_self));
-          (* find the proper uninterpreted slice *)
-          let uty = match cst.cst_kind with
-            | Cst_undef (_, _, Some u) -> u
-            | Cst_undef ({ty_cell=Atomic (_,Uninterpreted uty); _}, _, _) -> uty
-            | _ -> assert false
-          in
-          (* first, expand slice if required *)
-          let c_head, uty_tail, cs = expand_uninterpreted_slice uty in
-          (* two cases: either [c_head], or some new, deeper constant somewhere
-             in the slice [uty_tail] *)
-          info.cst_complete <- false;
-          let case1 = Term.const c_head in
-          let case2 =
-            let cond = lazy (Lit.uty_choice_nonempty uty) in
-            let plist = ref [cond] in
-            (* [cst = cst'], but [cst'] is deeper and belongs to the next slice *)
-            let cst' = mk_sub_cst ty ~slice:uty_tail ~exist_if:plist ~parent:cst in
-            Term.const cst'
-          in
-          (* additional clause to specify that [is_empty uty_tail => cst = case1] *)
-          let c_not_empty =
-            [Lit.neg (Lit.uty_choice_empty uty_tail); Lit.cst_choice cst case1]
-            |> Clause.make
-          in
-          [case1; case2], c_not_empty :: cs
+            data.data_cstors, []
         | Arrow (ty_arg, ty_ret) ->
           (* synthesize a function [fun x:ty_arg. body]
              where [body] will destruct [x] depending on its type,
