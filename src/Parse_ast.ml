@@ -46,7 +46,7 @@ and stmt =
   | Stmt_include of string
   | Stmt_ty_decl of string
   | Stmt_decl of string * ty
-  | Stmt_def of (string * ty * term) list
+  | Stmt_def of [`Rec | `Non_rec] * (string * ty * term) list
   | Stmt_data of (string * cstor list) list
   | Stmt_assert of term
   | Stmt_goal of typed_var list * term (* satisfy this *)
@@ -88,7 +88,9 @@ let _mk ?loc stmt = { loc; stmt }
 let include_ ?loc s = _mk ?loc (Stmt_include s)
 let ty_decl ?loc s = _mk ?loc (Stmt_ty_decl s)
 let decl ?loc f ty = _mk ?loc (Stmt_decl (f, ty))
-let def ?loc l = _mk ?loc (Stmt_def l)
+let def ?loc ~rec_ l =
+  let kind = if rec_ then `Rec else `Non_rec in
+  _mk ?loc (Stmt_def (kind,l))
 let data ?loc l = _mk ?loc (Stmt_data l)
 let assert_ ?loc t = _mk ?loc (Stmt_assert t)
 let goal ?loc vars t = _mk ?loc (Stmt_goal (vars, t))
@@ -143,11 +145,13 @@ let pp_stmt out (st:statement) = match view st with
     fpf out "(@[ty-decl@ %s@])" s
   | Stmt_decl (s, ty) ->
     fpf out "(@[decl@ %s@ %a@])" s pp_ty ty
-  | Stmt_def l ->
+  | Stmt_def (k,l) ->
     let pp_def out (s,ty,rhs) =
       fpf out "(@[<1>%s@ %a@ %a@])" s pp_ty ty pp_term rhs
+    and pp_kind out k =
+      CCFormat.string out (match k with `Rec -> "rec" | `Non_rec -> "non_rec")
     in
-    fpf out "(@[<hv1>define@ %a@])" (Utils.pp_list pp_def) l
+    fpf out "(@[<hv1>define %a@ %a@])" pp_kind k (Utils.pp_list pp_def) l
   | Stmt_data l ->
     let pp_cstor out c =
       if c.cstor_args =[] then CCFormat.string out c.cstor_name
@@ -270,16 +274,18 @@ module Tip = struct
         data ?loc l |> CCOpt.return
       | A.Stmt_data (_::_, _) ->
         tip_errorf ?loc "cannot convert polymorphic data@ `@[%a@]`" A.pp_stmt st
-      | A.Stmt_fun_def f
+      | A.Stmt_fun_def f ->
+        let id, ty, t = conv_fun_def ?loc f.A.fr_decl f.A.fr_body in
+        def ?loc ~rec_:false [id, ty, t] |> CCOpt.return
       | A.Stmt_fun_rec f ->
         let id, ty, t = conv_fun_def ?loc f.A.fr_decl f.A.fr_body in
-        def ?loc [id, ty, t] |> CCOpt.return
+        def ?loc ~rec_:true [id, ty, t] |> CCOpt.return
       | A.Stmt_funs_rec fsr ->
         let {A.fsr_decls=decls; fsr_bodies=bodies} = fsr in
         if List.length decls <> List.length bodies
         then tip_errorf ?loc "declarations and bodies should have same length";
         let l = List.map2 (conv_fun_def ?loc) decls bodies in
-        def ?loc l |> CCOpt.return
+        def ?loc ~rec_:true l |> CCOpt.return
       | A.Stmt_assert_not ([], t) ->
         let vars, t = open_forall (conv_term t) in
         let g = not_ t in (* negate *)

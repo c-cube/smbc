@@ -163,11 +163,13 @@ and term_cell =
 
 type definition = ID.t * Ty.t * term
 
+type rec_marker = Recursive | Non_recursive
+
 type statement =
   | Data of Ty.data list
   | TyDecl of ID.t (* new atomic cstor *)
   | Decl of ID.t * Ty.t
-  | Define of definition list
+  | Define of rec_marker * definition list
   | Assert of term
   | Goal of var list * term
 
@@ -232,7 +234,7 @@ let statement_to_sexp st = match st with
     S.of_list [S.atom "type"; ID.to_sexp id]
   | Decl (id,ty) ->
     S.of_list [S.atom "decl"; ID.to_sexp id; Ty.to_sexp ty]
-  | Define defs ->
+  | Define (_,defs) ->
     let def_to_sexp (id,ty,t) =
       S.of_list [ID.to_sexp id; Ty.to_sexp ty; term_to_sexp t]
     in
@@ -734,7 +736,7 @@ and conv_statement_aux ctx syn (t:A.statement) : statement list = match A.view t
         l
     in
     [Data l]
-  | A.Stmt_def defs ->
+  | A.Stmt_def (k, defs) ->
     (* parse id,ty and declare them before parsing the function bodies *)
     let preparse (name, ty, rhs) =
       let ty, _ = conv_ty ctx ty in
@@ -748,8 +750,11 @@ and conv_statement_aux ctx syn (t:A.statement) : statement list = match A.view t
            let rhs = conv_term ctx rhs in
            id,ty,rhs)
         defs
+    and kind = match k with
+      | `Rec -> Recursive
+      | `Non_rec -> Non_recursive
     in
-    [Define defs]
+    [Define (kind, defs)]
   | A.Stmt_assert t ->
     let t = conv_term ctx t in
     check_prop_ t;
@@ -840,7 +845,7 @@ let env_add_statement env st =
         env l
     | TyDecl id -> add_def id E_uninterpreted_ty env
     | Decl (id,ty) -> add_def id (E_const ty) env
-    | Define l ->
+    | Define (_,l) ->
       List.fold_left
         (fun map (id,ty,def) -> add_def id (E_defined (ty,def)) map)
         env l

@@ -107,11 +107,13 @@ and term_cell =
 
 type definition = ID.t * Ty.t * term
 
+type rec_marker = Recursive | Non_recursive
+
 type statement =
   | Data of Ty.data list
   | TyDecl of ID.t (* new atomic cstor *)
   | Decl of ID.t * Ty.t
-  | Define of definition list
+  | Define of rec_marker * definition list
   | Assert of term
   | Goal of var list * term
 

@@ -112,7 +112,7 @@ stmt:
     RIGHT_PAREN
     {
       let loc = Loc.mk_pos $startpos $endpos in
-      A.def ~loc l
+      A.def ~loc ~rec_:true l
     }
   | error
     {
