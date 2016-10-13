@@ -72,7 +72,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       (* the rooted forest for explanations *)
     mutable term_cases_set: term_cases_set;
       (* abstract set of values this term can take *)
-    mutable term_nf: term_nf option; (* normal form? *)
+    mutable term_nf: term_nf option; (* normal form, if any? *)
   }
 
   (* term shallow structure *)
@@ -110,7 +110,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     | CC_lit of lit (* because of this literal *)
     | CC_congruence of term * term (* same shape *)
     | CC_injectivity of term * term (* arguments of those constructors *)
-  (* TODO: some explanations for datatypes *)
+    | CC_reduce_because of term * term_nf (* reduce because this has a normal form *)
 
   (* boolean literal *)
   and lit = {
@@ -391,6 +391,16 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         | Lit_expanded _, _
           -> CCOrd.int_ (int_of_cell_ a.lit_view) (int_of_cell_ b.lit_view)
 
+  let cmp_nf a b =
+    let toint = function NF_bool _ -> 0 | NF_cstor _ -> 1 in
+    match a, b with
+      | NF_bool b1, NF_bool b2 -> CCOrd.bool_ b1 b2
+      | NF_cstor (c1,args1), NF_cstor (c2,args2) ->
+        CCOrd.(Cst.compare c1.cstor_cst c2.cstor_cst
+          <?> (IArray.compare term_cmp_, args1, args2))
+      | NF_bool _, _
+      | NF_cstor _, _ -> CCOrd.int_ (toint a)(toint b)
+
   let hash_lit a =
     let sign = a.lit_sign in
     match a.lit_view with
@@ -402,7 +412,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
   let cmp_cc_expl a b =
     let toint = function
       | CC_congruence _ -> 0 | CC_lit _ -> 1
-      | CC_reduction -> 2 | CC_injectivity _ -> 3
+      | CC_reduction -> 2 | CC_injectivity _ -> 3 | CC_reduce_because _ -> 4
     in
     match a, b with
       | CC_congruence (t1,t2), CC_congruence (u1,u2) ->
@@ -411,7 +421,10 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       | CC_lit l1, CC_lit l2 -> cmp_lit l1 l2
       | CC_injectivity (t1,t2), CC_injectivity (u1,u2) ->
         CCOrd.(term_cmp_ t1 u1 <?> (term_cmp_, t2, u2))
-      | CC_congruence _, _ | CC_lit _, _ | CC_reduction, _ | CC_injectivity _, _
+      | CC_reduce_because (t1, nf1), CC_reduce_because (t2,nf2) ->
+        CCOrd.(term_cmp_ t1 t2 <?> (cmp_nf, nf1, nf2))
+      | CC_congruence _, _ | CC_lit _, _ | CC_reduction, _
+      | CC_injectivity _, _ | CC_reduce_because _, _
         -> CCOrd.int_ (toint a)(toint b)
 
   module CC_expl_set = CCSet.Make(struct
@@ -426,9 +439,6 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     val backtrack : level -> unit
     val push_undo : (unit -> unit) -> unit
   end = struct
-    type _level = level
-    type level = _level
-
     let dummy_level = -1
 
     type stack_cell = unit -> unit (* "undo" operation *)
@@ -1057,6 +1067,8 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       Format.fprintf out "(@[<hv1>congruence@ %a@ %a@])" Term.pp a Term.pp b
     | CC_injectivity (a,b) ->
       Format.fprintf out "(@[<hv1>injectivity@ %a@ %a@])" Term.pp a Term.pp b
+    | CC_reduce_because (t, nf) ->
+      Format.fprintf out "(@[<hv1>reduce_because@ %a@ nf: %a@])" Term.pp t pp_term_nf nf
 
   (** {2 Literals} *)
   module Lit : sig
@@ -1277,7 +1289,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
             let g = Lit.Set.to_list guard |> List.map Lit.neg in
             Clause.make (Lit.expanded t :: g)
           in
-          Log.debugf 3 
+          Log.debugf 3
             (fun k->k "(@[delay_expand %a@ guard: %a@])" Term.pp t Clause.pp c);
           A.add_clause c
         )
@@ -1678,7 +1690,34 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         (* expand term *)
         if not (Term.Field_expanded.get t.term_bits) then (
           E.expand_term ~mode:E.Safe t
-        )
+        );
+        (* evaluation rules: if, case... *)
+        begin match t.term_cell with
+          | If (a, b, c) ->
+            let ra = find a in
+            begin match ra.term_nf with
+              | Some (NF_bool true as nf) ->
+                push_combine t b (CC_reduce_because (a, nf))
+              | Some (NF_bool false as nf) ->
+                push_combine t c (CC_reduce_because (a, nf))
+              | Some (NF_cstor _) -> assert false
+              | None -> ()
+            end
+          | Case (u, m) ->
+            let r_u = find u in
+            begin match r_u.term_nf with
+              | Some (NF_cstor (c, _) as nf) ->
+                (* reduce to the proper branch *)
+                let rhs =
+                  try ID.Map.find c.cstor_cst.cst_id m
+                  with Not_found -> assert false
+                in
+                push_combine t rhs (CC_reduce_because (u, nf));
+              | Some (NF_bool _) -> assert false
+              | None -> ()
+            end
+          | _ -> ()
+        end
       done;
       if is_done_state ()
       then Sat
@@ -1720,7 +1759,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
                   if Cst.equal c1.cstor_cst c2.cstor_cst then (
                     (* unify arguments recursively, by injectivity *)
                     assert (IArray.length args1 = IArray.length args2);
-                    IArray.iter2 
+                    IArray.iter2
                       (fun sub1 sub2 ->
                          push_combine sub1 sub2 (CC_injectivity (ra, rb)))
                       args1 args2
@@ -1909,50 +1948,53 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
             | None -> assert false
             | Some (next_a, e_a_b) ->
               proof := CC_expl_set.add e_a_b !proof;
-              begin match e_a_b with
-                | CC_reduction
-                | CC_lit _ -> ()
-                | CC_congruence (t1,t2) ->
-                  begin match t1.term_cell, t2.term_cell with
-                    | True, _ | False, _ | DB _, _ 
-                    | Mu _, _ | Fun _, _ -> assert false (* no congruence here *)
-                    | App_cst (f1, a1), App_cst (f2, a2) ->
-                      assert (Cst.equal f1 f2);
-                      assert (IArray.length a1 = IArray.length a2);
-                      IArray.iter2 add_obligation a1 a2
-                    | App_ho (f1, l1), App_ho (f2, l2) ->
-                      assert (List.length l1 = List.length l2);
-                      add_obligation f1 f2;
-                      List.iter2 add_obligation l1 l2
-                    | Case (t1, m1), Case (t2, m2) ->
-                      add_obligation t1 t2;
-                      ID.Map.iter
-                        (fun id rhs1 ->
-                           let rhs2 = ID.Map.find id m2 in
-                           add_obligation rhs1 rhs2)
-                        m1;
-                    | If (a1,b1,c1), If (a2,b2,c2) ->
-                      add_obligation a1 a2;
-                      add_obligation b1 b2;
-                      add_obligation c1 c2;
-                    | Builtin (B_not u1), Builtin (B_not u2) ->
-                      add_obligation u1 u2
-                    | Builtin (B_and (a1,b1)), Builtin (B_and (a2,b2))
-                    | Builtin (B_or (a1,b1)), Builtin (B_or (a2,b2))
-                    | Builtin (B_imply (a1,b1)), Builtin (B_imply (a2,b2))
-                    | Builtin (B_eq (a1,b1)), Builtin (B_eq (a2,b2)) ->
-                      add_obligation a1 a2;
-                      add_obligation b1 b2;
-                    | App_cst _, _
-                    | App_ho _, _
-                    | Case _, _
-                    | If _, _
-                    | Builtin _, _ -> assert false
-                  end;
-              end;
+              decompose_explain e_a_b;
               (* now prove [next_a = parent_a] *)
               explain_along_path next_a parent_a
         )
+      and decompose_explain e: unit = match e with
+        | CC_reduction
+        | CC_lit _ -> ()
+        | CC_reduce_because (_t, _nf) ->
+          assert false (* TODO: explain why t==nf *)
+        | CC_injectivity (t1,t2)
+        | CC_congruence (t1,t2) ->
+          begin match t1.term_cell, t2.term_cell with
+            | True, _ | False, _ | DB _, _
+            | Mu _, _ | Fun _, _ -> assert false (* no congruence here *)
+            | App_cst (f1, a1), App_cst (f2, a2) ->
+              assert (Cst.equal f1 f2);
+              assert (IArray.length a1 = IArray.length a2);
+              IArray.iter2 add_obligation a1 a2
+            | App_ho (f1, l1), App_ho (f2, l2) ->
+              assert (List.length l1 = List.length l2);
+              add_obligation f1 f2;
+              List.iter2 add_obligation l1 l2
+            | Case (t1, m1), Case (t2, m2) ->
+              add_obligation t1 t2;
+              ID.Map.iter
+                (fun id rhs1 ->
+                   let rhs2 = ID.Map.find id m2 in
+                   add_obligation rhs1 rhs2)
+                m1;
+            | If (a1,b1,c1), If (a2,b2,c2) ->
+              add_obligation a1 a2;
+              add_obligation b1 b2;
+              add_obligation c1 c2;
+            | Builtin (B_not u1), Builtin (B_not u2) ->
+              add_obligation u1 u2
+            | Builtin (B_and (a1,b1)), Builtin (B_and (a2,b2))
+            | Builtin (B_or (a1,b1)), Builtin (B_or (a2,b2))
+            | Builtin (B_imply (a1,b1)), Builtin (B_imply (a2,b2))
+            | Builtin (B_eq (a1,b1)), Builtin (B_eq (a2,b2)) ->
+              add_obligation a1 a2;
+              add_obligation b1 b2;
+            | App_cst _, _
+            | App_ho _, _
+            | Case _, _
+            | If _, _
+            | Builtin _, _ -> assert false
+          end
       in
       Queue.push (a,b) to_prove;
       while not (Queue.is_empty to_prove) do
@@ -1974,6 +2016,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       (function
         | CC_reduction
         | CC_injectivity _
+        | CC_reduce_because _
         | CC_congruence _ -> None
         | CC_lit lit -> Some lit)
     |> Sequence.map Lit.neg (* this is a guard *)
@@ -2003,7 +2046,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
 
   (** {2 Toplevel Goals}
 
-      List of toplevel goals to satisfy
+      List of toplevel goals to satisfy. Mainly used for checking purpose
   *)
 
   module Top_goals: sig
@@ -2053,7 +2096,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     type formula = M_expr.t
     type proof = M_expr.proof
 
-    type level = Backtrack.level
+    type level = level
 
     let dummy = Backtrack.dummy_level
 
