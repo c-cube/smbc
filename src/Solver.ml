@@ -10,8 +10,6 @@ module FI = Msat.Formula_intf
 module TI = Msat.Theory_intf
 module SI = Msat.Solver_intf
 
-let (~!) = Lazy.force
-
 (** {1 Solver} *)
 
 module type CONFIG = sig
@@ -130,9 +128,9 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
 
   and cst_kind =
     | Cst_undef of ty_h (* simple undefined constant *)
-    | Cst_cstor of data_cstor
-    | Cst_proj of ty_h * data_cstor * int (* [cstor, argument position] *)
-    | Cst_test of ty_h * data_cstor (* test if [cstor] *)
+    | Cst_cstor of data_cstor lazy_t
+    | Cst_proj of ty_h * data_cstor lazy_t * int (* [cstor, argument position] *)
+    | Cst_test of ty_h * data_cstor lazy_t (* test if [cstor] *)
     | Cst_defined of ty_h * term lazy_t * cst_defined_info
 
   (* what kind of constant is that? *)
@@ -319,11 +317,12 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     type t = cst
     val id : t -> ID.t
     val ty : t -> Ty.t
-    val make_cstor : ID.t -> data_cstor -> t
-    val make_proj : ID.t -> Ty.t -> data_cstor -> int -> t
-    val make_tester : ID.t -> Ty.t -> data_cstor -> t
+    val make_cstor : ID.t -> Ty.t -> data_cstor lazy_t -> t
+    val make_proj : ID.t -> Ty.t -> data_cstor lazy_t -> int -> t
+    val make_tester : ID.t -> Ty.t -> data_cstor lazy_t -> t
     val make_defined : ID.t -> Ty.t -> term lazy_t -> cst_defined_info -> t
     val make_undef : ID.t -> Ty.t -> t
+    val arity : t -> int (* number of args *)
     val equal : t -> t -> bool
     val compare : t -> t -> int
     val hash : t -> int
@@ -341,13 +340,15 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       | Cst_undef ty
       | Cst_test (ty, _)
       | Cst_proj (ty, _, _) -> ty
-      | Cst_cstor cstor -> cstor.cstor_ty
+      | Cst_cstor (lazy cstor) -> cstor.cstor_ty
 
     let ty t = ty_of_kind t.cst_kind
 
+    let arity t = fst (Ty.unfold_n (ty t))
+
     let make cst_id cst_kind = {cst_id; cst_kind}
-    let make_cstor id cstor =
-      let _, ret = Ty.unfold cstor.cstor_ty in
+    let make_cstor id ty cstor =
+      let _, ret = Ty.unfold ty in
       assert (Ty.is_data ret);
       make id (Cst_cstor cstor)
     let make_proj id ty cstor i =
@@ -581,6 +582,9 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       | [] -> f.term_cell
       | _ ->
         begin match f.term_cell with
+          | App_cst (f, a) when IArray.length a + List.length l = Cst.arity f ->
+            (* [f] becomes fully applied *)
+            App_cst (f, IArray.append a (IArray.of_list l))
           | App_ho (f1, l1) ->
             let l' = l1 @ l in
             App_ho (f1, l')
@@ -598,10 +602,10 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       If (a,b,c)
 
     let cstor_test cstor t =
-      app_cst ~!(cstor.cstor_test) (IArray.singleton t)
+      app_cst (Lazy.force cstor.cstor_test) (IArray.singleton t)
 
     let cstor_proj cstor i t =
-      let p = IArray.get ~!(cstor.cstor_proj) i in
+      let p = IArray.get (Lazy.force cstor.cstor_proj) i in
       app_cst p (IArray.singleton t)
 
     let builtin b =
@@ -770,7 +774,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           (* set of possibilities *)
           let term_cases_set = match Ty.view term_ty with
             | Atomic (_, Data data) ->
-              TC_cstors ~!(data.data_cstors)
+              TC_cstors (Lazy.force data.data_cstors)
             | _ -> TC_none
           in
           let rec t = {
@@ -809,9 +813,9 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       let cell = Term_cell.app_cst f a in
       let t = make cell in
       (* update some fields *)
-      if t.term_cell == cell then (
+      if t.term_cell == cell && IArray.length a = Cst.arity f then (
         begin match f.cst_kind with
-          | Cst_cstor cstor when t.term_cell == cell ->
+          | Cst_cstor (lazy cstor) when t.term_cell == cell ->
             (* by definition, a constructor term has itself as a normal form *)
             assert (t.term_nf = None);
             t.term_nf <- Some (NF_cstor (cstor, a));
@@ -942,7 +946,8 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
        applied to some arguments *)
     let as_cstor_app (t:term): (cst * data_cstor * term IArray.t) option =
       match t.term_cell with
-        | App_cst ({cst_kind=Cst_cstor cstor; _} as c, a) -> Some (c,cstor,a)
+        | App_cst ({cst_kind=Cst_cstor (lazy cstor); _} as c, a) ->
+          Some (c,cstor,a)
         | _ -> None
 
     (* typical view for unification/equality *)
@@ -954,7 +959,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     let as_unif (t:term): unif_form = match t.term_cell with
       | App_cst ({cst_kind=Cst_undef ty; _} as c, a) when IArray.is_empty a ->
         Unif_cst (c,ty)
-      | App_cst ({cst_kind=Cst_cstor cstor; _} as c, a) ->
+      | App_cst ({cst_kind=Cst_cstor (lazy cstor); _} as c, a) ->
         Unif_cstor (c,cstor,a)
       | _ -> Unif_none
 
@@ -1355,7 +1360,8 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           ID.Map.iter
             (fun c rhs ->
                let cstor =
-                 try ID.Map.find c ~!(data.data_cstors) with Not_found -> assert false
+                 try ID.Map.find c (Lazy.force data.data_cstors)
+                 with Not_found -> assert false
                in
                let g_c = Lit.cstor_test cstor t in
                expand_term_safe ~guard:(Lit.Set.add g_c guard) rhs)
@@ -2297,9 +2303,22 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
             errorf "could not find constant `%a`" ID.pp id
         end
       | Ast.App (f, l) ->
-        let f = conv_term env f in
-        let l = List.map (conv_term env) l in
-        Term.app f l
+        begin match Ast.term_view f with
+          | Ast.Const id ->
+            let f =
+              try ID.Tbl.find decl_ty_ id |> Lazy.force
+              with Not_found ->
+                errorf "could not find constant `%a`" ID.pp id
+            in
+            let l = List.map (conv_term env) l in
+            if List.length l = fst (Ty.unfold_n (Cst.ty f))
+            then Term.app_cst f (IArray.of_list l) (* fully applied *)
+            else Term.app (Term.const f) l
+          | _ ->
+            let f = conv_term env f in
+            let l = List.map (conv_term env) l in
+            Term.app f l
+        end
       | Ast.Var v ->
         begin match
             CCList.find_idx (fun (v',_) -> Ast.Var.equal v v') env
@@ -2330,7 +2349,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           ID.Map.mapi
             (fun c_id (vars,rhs) ->
                let cstor =
-                 try ID.Map.find c_id ~!(data.data_cstors)
+                 try ID.Map.find c_id (Lazy.force data.data_cstors)
                  with Not_found -> errorf "invalid constructor %a" ID.pp c_id
                in
                (* replace the variables of the pattern-matching with
@@ -2411,10 +2430,10 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
                    |> ID.Map.map
                      (fun c ->
                         let c_id = c.Ast.Ty.cstor_id in
+                        let ty_c = conv_ty c.Ast.Ty.cstor_ty in
                         let rec cst = lazy (
-                          Cst.make_cstor c_id (Lazy.force cstor)
+                          Cst.make_cstor c_id ty_c cstor
                         ) and cstor = lazy (
-                          let ty_c = conv_ty c.Ast.Ty.cstor_ty in
                           let ty_args, ty_ret = Ty.unfold ty_c in
                           let cstor_proj = lazy (
                             let n = ref 0 in
@@ -2423,15 +2442,15 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
                                  let ty_proj = Ty.arrow ty_ret ty_arg in
                                  let i = !n in
                                  incr n;
-                                 Cst.make_proj id ty_proj ~!cstor i)
+                                 Cst.make_proj id ty_proj cstor i)
                               c.Ast.Ty.cstor_proj ty_args
                             |> IArray.of_list
                           ) in
                           let cstor_test = lazy (
                             let ty_test = Ty.arrow ty_ret Ty.prop in
-                            Cst.make_tester c.Ast.Ty.cstor_test ty_test ~!cstor
+                            Cst.make_tester c.Ast.Ty.cstor_test ty_test cstor
                           ) in
-                          { cstor_ty=ty_c; cstor_cst= ~! cst;
+                          { cstor_ty=ty_c; cstor_cst=Lazy.force cst;
                             cstor_args=IArray.of_list ty_args;
                             cstor_proj; cstor_test }
                         ) in
