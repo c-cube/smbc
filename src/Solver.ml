@@ -70,6 +70,8 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     mutable term_root: term; (* representative of congruence class *)
     mutable term_expl: (term * cc_explanation) option;
       (* the rooted forest for explanations *)
+    mutable term_cases_set: term_cases_set;
+      (* abstract set of values this term can take *)
     mutable term_nf: term_nf option; (* normal form? *)
   }
 
@@ -98,11 +100,16 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     | NF_cstor of data_cstor * term IArray.t
     | NF_bool of bool
 
+  and term_cases_set =
+    | TC_none
+    | TC_cstors of data_cstor ID.Map.t (* set of possible constructors *)
+
   (* atomic explanation in the congruence closure *)
   and cc_explanation =
     | CC_reduction (* by pure reduction, tautologically equal *)
     | CC_lit of lit (* because of this literal *)
     | CC_congruence of term * term (* same shape *)
+    | CC_injectivity of term * term (* arguments of those constructors *)
   (* TODO: some explanations for datatypes *)
 
   (* boolean literal *)
@@ -154,7 +161,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
 
   and datatype = {
     data_ty: ty_h; (* the type itself *)
-    data_cstors: data_cstor lazy_t ID.Map.t;
+    data_cstors: data_cstor ID.Map.t lazy_t;
   }
 
   (* a constructor *)
@@ -394,14 +401,17 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
 
   let cmp_cc_expl a b =
     let toint = function
-      | CC_congruence _ -> 0 | CC_lit _ -> 1 | CC_reduction -> 2
+      | CC_congruence _ -> 0 | CC_lit _ -> 1
+      | CC_reduction -> 2 | CC_injectivity _ -> 3
     in
     match a, b with
       | CC_congruence (t1,t2), CC_congruence (u1,u2) ->
         CCOrd.(term_cmp_ t1 u1 <?> (term_cmp_, t2, u2))
       | CC_reduction, CC_reduction -> 0
       | CC_lit l1, CC_lit l2 -> cmp_lit l1 l2
-      | CC_congruence _, _ | CC_lit _, _ | CC_reduction, _
+      | CC_injectivity (t1,t2), CC_injectivity (u1,u2) ->
+        CCOrd.(term_cmp_ t1 u1 <?> (term_cmp_, t2, u2))
+      | CC_congruence _, _ | CC_lit _, _ | CC_reduction, _ | CC_injectivity _, _
         -> CCOrd.int_ (toint a)(toint b)
 
   module CC_expl_set = CCSet.Make(struct
@@ -739,6 +749,12 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         try Term_cell.Tbl.find tbl c
         with Not_found ->
           let term_ty = Term_cell.ty c in
+          (* set of possibilities *)
+          let term_cases_set = match Ty.view term_ty with
+            | Atomic (_, Data data) ->
+              TC_cstors ~!(data.data_cstors)
+            | _ -> TC_none
+          in
           let rec t = {
             term_id= !n;
             term_ty;
@@ -747,6 +763,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
             term_root=t;
             term_expl=None;
             term_cell=c;
+            term_cases_set;
             term_nf=None;
           } in
           incr n;
@@ -766,8 +783,6 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
 
     let db d = make (DB d)
 
-    let const c = make (Term_cell.const c)
-
     let app f l = match l with
       | [] -> f
       | _ -> make (Term_cell.app f l)
@@ -775,14 +790,21 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     let app_cst f a =
       let cell = Term_cell.app_cst f a in
       let t = make cell in
-      begin match f.cst_kind with
-        | Cst_cstor cstor when t.term_cell == cell ->
-          (* by definition, a constructor term has itself as a normal form *)
-          assert (t.term_nf = None);
-          t.term_nf <- Some (NF_cstor (cstor, a));
-        | _ -> ()
-      end;
+      (* update some fields *)
+      if t.term_cell == cell then (
+        begin match f.cst_kind with
+          | Cst_cstor cstor when t.term_cell == cell ->
+            (* by definition, a constructor term has itself as a normal form *)
+            assert (t.term_nf = None);
+            t.term_nf <- Some (NF_cstor (cstor, a));
+            assert (t.term_cases_set <> TC_none);
+            t.term_cases_set <- TC_cstors (ID.Map.singleton f.cst_id cstor);
+          | _ -> ()
+        end;
+      );
       t
+
+    let const c = app_cst c IArray.empty
 
     let fun_ ty body = make (Term_cell.fun_ ty body)
 
@@ -1013,6 +1035,12 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       )
   end
 
+  let pp_term_nf out (nf:term_nf) = match nf with
+    | NF_bool b -> Format.fprintf out "%B" b
+    | NF_cstor (cstor, args) ->
+      Format.fprintf out "(@[<hv2>%a @%a@])"
+        Cst.pp cstor.cstor_cst (Utils.pp_iarray Term.pp) args
+
   let pp_lit out l =
     let pp_lit_view out = function
       | Lit_fresh i -> Format.fprintf out "#%a" ID.pp i
@@ -1027,6 +1055,8 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     | CC_lit lit -> pp_lit out lit
     | CC_congruence (a,b) ->
       Format.fprintf out "(@[<hv1>congruence@ %a@ %a@])" Term.pp a Term.pp b
+    | CC_injectivity (a,b) ->
+      Format.fprintf out "(@[<hv1>injectivity@ %a@ %a@])" Term.pp a Term.pp b
 
   (** {2 Literals} *)
   module Lit : sig
@@ -1296,8 +1326,8 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           in
           ID.Map.iter
             (fun c rhs ->
-               let lazy cstor =
-                 try ID.Map.find c data.data_cstors with Not_found -> assert false
+               let cstor =
+                 try ID.Map.find c ~!(data.data_cstors) with Not_found -> assert false
                in
                let g_c = Lit.cstor_test cstor t in
                expand_term_safe ~guard:(Lit.Set.add g_c guard) rhs)
@@ -1477,7 +1507,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
        that have the same "shape" (including head symbol)
        have the same signature *)
 
-    (* find representative, recursively *)
+    (* find representative, recursively, and perform path compression *)
     let rec find_rec t : repr =
       if t==t.term_root then t
       else (
@@ -1621,6 +1651,13 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         let delay_expansion = Terms_to_expand.add
       end)
 
+    exception Exn_unsat of repr * repr
+    (* exception during merge of those two classes *)
+    (* TODO: add a CC_expl_set.t in there? *)
+
+    let push_combine t u e = Queue.push (t,u,e) st.combine
+    let push_pending t = Queue.push t st.pending
+
     (* main CC algo: add terms from [pending] to the signature table,
        check for collisions *)
     let rec update_pending (): update_res =
@@ -1636,7 +1673,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
             add_signature t.term_cell (find t)
           | Some r ->
             (* must combine [t] with [r] *)
-            Queue.push (t, r, CC_congruence (t,r)) st.combine
+            push_combine t r (CC_congruence (t,r))
         end;
         (* expand term *)
         if not (Term.Field_expanded.get t.term_bits) then (
@@ -1647,7 +1684,8 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       then Sat
       else update_combine st (* repeat *)
 
-    (* main CC algo: merge equivalence classes in [st.combine] *)
+    (* main CC algo: merge equivalence classes in [st.combine].
+       @raise Exn_unsat if merge fails *)
     and update_combine st =
       while not (Queue.is_empty st.combine) do
         let a, b, e_ab = Queue.pop st.combine in
@@ -1656,19 +1694,50 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         if not (equal ra rb) then (
           assert (is_root_ ra);
           assert (is_root_ rb);
-          (* TODO: datatype checks, inconsistency detection,
-             injectivity, etc. if at least one of [(ra, rb)] has a non-null
-             normal form *)
+          (* TODO: update set of possible constructors if datatypes *)
           (* invariant: [size ra <= size rb].
              we merge [ra] into [rb]. *)
           let ra, rb = if size_ ra > size_ rb then rb, ra else ra, rb in
+          (* check normal form(s) for consistency, merge them *)
+          begin match ra.term_nf, rb.term_nf with
+            | None, None -> ()
+            | None, Some _ -> ()
+            | Some nf, (None as old_nf_b) ->
+              (* update [rb]'s normal form *)
+              if not !at_level_0 then (
+                Backtrack.push_undo (fun () -> rb.term_nf <- old_nf_b);
+              );
+              rb.term_nf <- Some nf;
+              (* TODO: notify parents? like, a parent if/then/else? *)
+            | Some nf_a, Some nf_b ->
+              (* check consistency of normal forms *)
+              begin match nf_a, nf_b with
+                | NF_bool v_a, NF_bool v_b ->
+                  if v_a <> v_b then (
+                    raise (Exn_unsat (ra, rb)); (* incompatible *)
+                  )
+                | NF_cstor (c1, args1), NF_cstor (c2, args2) ->
+                  if Cst.equal c1.cstor_cst c2.cstor_cst then (
+                    (* unify arguments recursively, by injectivity *)
+                    assert (IArray.length args1 = IArray.length args2);
+                    IArray.iter2 
+                      (fun sub1 sub2 ->
+                         push_combine sub1 sub2 (CC_injectivity (ra, rb)))
+                      args1 args2
+                  ) else (
+                    raise (Exn_unsat (ra, rb)); (* incompatible *)
+                  )
+                | NF_bool _, _
+                | NF_cstor _, _ -> assert false (* ill typed *)
+              end
+          end;
           (* remove [ra.parents] from signature, put them into [st.pending] *)
           begin
             Bag.to_seq ra.term_parents
             |> Sequence.iter
               (fun parent ->
                  remove_signature parent.term_cell;
-                 Queue.push parent st.pending)
+                 push_pending parent)
           end;
           (* perform [union ra rb] *)
           begin
@@ -1747,7 +1816,8 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           | Fun _ -> () (* not expanded yet *)
           | Builtin b -> Term.builtin_to_seq b add_sub
         end;
-        Queue.push t st.pending
+        (* will have to find [t]'s congruence class *)
+        push_pending t;
       )
 
     (* add [t=u] to the congruence closure, unconditionally (reduction relation)  *)
@@ -1766,7 +1836,10 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       (* NOTE: add terms after adding equations, because some
          equations might have pushed terms in [st.terms_to_add] *)
       update_add_cc_terms ();
-      update_pending ()
+      try
+        update_pending ()
+      with Exn_unsat (a,b) ->
+        Unsat (a,b)
 
     let union (a:repr) (b:repr) (e:cc_explanation): update_res =
       assert (is_root_ a);
@@ -1900,6 +1973,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     |> Sequence.filter_map
       (function
         | CC_reduction
+        | CC_injectivity _
         | CC_congruence _ -> None
         | CC_lit lit -> Some lit)
     |> Sequence.map Lit.neg (* this is a guard *)
@@ -1959,8 +2033,13 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         if Config.progress then flush_progress();
         Log.debugf 1
           (fun k->
+             let pp_lit out t =
+               let nf = CC.normal_form t in
+               Format.fprintf out "(@[term: %a@ nf: %a@])"
+                 Term.pp t (CCFormat.opt pp_term_nf) nf
+             in
              k "(@[<hv1>Top_goals.check@ (@[<v>%a@])@])"
-               (Utils.pp_list Term.pp) !toplevel_goals_);
+               (Utils.pp_list pp_lit) !toplevel_goals_);
         assert false;
       )
   end
