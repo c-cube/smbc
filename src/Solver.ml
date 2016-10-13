@@ -1694,19 +1694,21 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       | Lit_atom t ->
         assert (Ty.is_prop t.term_ty);
         let sign = Lit.sign lit in
+        (* equate t and true/false *)
+        let rhs = if sign then Term.true_ else Term.false_ in
+        add_cc t;
+        push_combine t rhs (CC_lit lit);
+        (* perform additional operations, if needed *)
         begin match t.term_cell with
           | False | Builtin (B_not _) -> assert false
           | App_cst ({cst_kind=Cst_test (_, _cstor); _}, args) ->
             assert (IArray.length args = 1);
             assert false (* TODO: update set of possible cstors for [args.(0)] *)
-          | Builtin (B_eq (_a, _b)) ->
-            assert false (* TODO: merge a,b if sign; check a!=b otherwise *)
-          | _ ->
-            (* equate t and true/false *)
-            let rhs =
-              if sign then Term.true_ else Term.false_
-            in
-            push_combine t rhs (CC_lit lit)
+          | Builtin (B_eq (a, b)) ->
+            if sign then (
+              push_combine a b (CC_lit lit);
+            )
+          | _ -> ()
         end
 
     (* re-root the explanation tree of the equivalence class of [r]
@@ -1806,6 +1808,10 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
               | Some (NF_bool _) -> assert false
               | None -> ()
             end
+          | Builtin (B_eq (a,b)) ->
+            assert false (* TODO: if [find a=find b], set to true *)
+          | App_cst ({cst_kind=Cst_test(_,lazy cstor)}, a) when IArray.length a=1 ->
+            assert false (* TODO: if [a.(0)] has a cstor normal form, set to true/false *)
           | _ -> ()
         end
       done;
@@ -1837,7 +1843,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
                 Backtrack.push_undo (fun () -> rb.term_nf <- old_nf_b);
               );
               rb.term_nf <- Some nf;
-              (* TODO: notify parents? like, a parent if/then/else? *)
+              (* TODO: notify parents of [rb]? like, a parent if/then/else? *)
             | Some nf_a, Some nf_b ->
               (* check consistency of normal forms *)
               begin match nf_a, nf_b with
@@ -1854,7 +1860,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
                          push_combine sub1 sub2 (CC_injectivity (ra, rb)))
                       args1 args2
                   ) else (
-                    raise (Exn_unsat (ra, rb)); (* incompatible *)
+                    raise (Exn_unsat (ra, rb)); (* incompatible *) (* TODO: is this the good exn? *)
                   )
                 | NF_bool _, _
                 | NF_cstor _, _ -> assert false (* ill typed *)
