@@ -22,8 +22,6 @@ module Make(C:CONFIG)(Dummy : sig end) : sig
   type cst
   type ty_h (** types *)
 
-  type cst_info
-
   type ty_def
 
   type ty_cell =
@@ -66,7 +64,7 @@ module Make(C:CONFIG)(Dummy : sig end) : sig
   end
 
   (** {2 Typed Constant} *)
-  module Typed_cst : sig
+  module Cst : sig
     type t = cst
 
     val id : t -> ID.t
@@ -90,7 +88,6 @@ module Make(C:CONFIG)(Dummy : sig end) : sig
     val app : t -> t list -> t
     val fun_ : Ty.t -> t -> t
     val mu : t -> t
-    val match_ : t -> (Ty.t list * t) ID.Map.t -> t
     val if_ : t -> t -> t -> t
     val true_ : t
     val false_ : t
@@ -106,8 +103,6 @@ module Make(C:CONFIG)(Dummy : sig end) : sig
     include Intf.ORD with type t := t
     include Intf.HASH with type t := t
     include Intf.PRINT with type t := t
-
-    val pp_dot : t Sequence.t CCFormat.printer
   end
 
   (** {2 Literals} *)
