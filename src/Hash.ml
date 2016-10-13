@@ -29,6 +29,8 @@ let opt f = function
   | Some x -> combine2 43 (f x)
 
 let list f l = List.fold_left (combine f) 0x42 l
+let array f = Array.fold_left (combine f) 0x43
+let iarray f = IArray.fold (combine f) 0x44
 let seq f seq =
   let h = ref 0x43 in
   seq (fun x -> h := combine f !h x);

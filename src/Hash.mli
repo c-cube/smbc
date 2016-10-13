@@ -12,6 +12,8 @@ val pair : 'a t -> 'b t -> ('a * 'b) t
 
 val opt : 'a t -> 'a option t
 val list : 'a t -> 'a list t
+val array : 'a t -> 'a array t
+val iarray : 'a t -> 'a IArray.t t
 val seq : 'a t -> 'a Sequence.t t
 
 val combine2 : int -> int -> int
