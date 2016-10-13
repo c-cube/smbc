@@ -47,9 +47,14 @@ and stmt =
   | Stmt_ty_decl of string
   | Stmt_decl of string * ty
   | Stmt_def of (string * ty * term) list
-  | Stmt_data of (string * (string * ty list) list) list
+  | Stmt_data of (string * cstor list) list
   | Stmt_assert of term
   | Stmt_goal of typed_var list * term (* satisfy this *)
+
+and cstor = {
+  cstor_name: string;
+  cstor_args: (string option * ty) list;
+}
 
 let ty_prop = Ty_bool
 let ty_const s = Ty_const s
@@ -144,9 +149,10 @@ let pp_stmt out (st:statement) = match view st with
     in
     fpf out "(@[<hv1>define@ %a@])" (Utils.pp_list pp_def) l
   | Stmt_data l ->
-    let pp_cstor out (s,ty_args) =
-      if ty_args=[] then CCFormat.string out s
-      else fpf out "(@[<1>%s@ %a@])" s (Utils.pp_list pp_ty) ty_args
+    let pp_cstor out c =
+      if c.cstor_args =[] then CCFormat.string out c.cstor_name
+      else fpf out "(@[<1>%s@ %a@])" c.cstor_name
+          (Utils.pp_list pp_ty) (List.map snd c.cstor_args)
     in
     let pp_data out (s,cstors) =
       fpf out "(@[<hv1>%s@ (@[<v>%a@]@])" s (Utils.pp_list pp_cstor) cstors
@@ -251,7 +257,11 @@ module Tip = struct
           let cstors =
             List.map
               (fun c ->
-                 c.A.cstor_name, List.map (fun (_,ty) -> conv_ty ty) c.A.cstor_args)
+                 let cstor_name = c.A.cstor_name in
+                 let cstor_args =
+                   List.map (fun (s,ty) -> Some s, conv_ty ty) c.A.cstor_args
+                 in
+                 {cstor_name; cstor_args})
               cstors
           in
           s, cstors
@@ -278,7 +288,6 @@ module Tip = struct
         tip_errorf ?loc "cannot convert polymorphic goal@ `@[%a@]`"
           A.pp_stmt st
       | A.Stmt_check_sat -> None
-
 end
 
 (** {2 Errors} *)

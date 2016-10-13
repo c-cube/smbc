@@ -52,10 +52,17 @@ module Ty : sig
 
   (** {2 Datatypes} *)
 
+  type data_cstor = {
+    cstor_id: ID.t;
+    cstor_ty: t;
+    cstor_proj: ID.t list;
+    cstor_test: ID.t;
+  }
+
   (** Mutually recursive datatypes *)
   type data = {
     data_id: ID.t;
-    data_cstors: t ID.Map.t;
+    data_cstors: data_cstor ID.Map.t;
   }
 
   val data_to_sexp : data -> sexp
@@ -178,8 +185,8 @@ type env_entry =
   | E_uninterpreted_ty
   | E_uninterpreted_cst (* domain element *)
   | E_const of Ty.t
-  | E_data of Ty.t ID.Map.t (* list of cstors *)
-  | E_cstor of Ty.t
+  | E_data of Ty.data_cstor ID.Map.t (* list of cstors *)
+  | E_cstor of Ty.data_cstor (* datatype it belongs to *)
   | E_defined of Ty.t * term (* if defined *)
 
 type env = {

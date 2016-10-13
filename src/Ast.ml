@@ -92,16 +92,25 @@ module Ty = struct
 
   (** {2 Datatypes} *)
 
+  type data_cstor = {
+    cstor_id: ID.t;
+    cstor_ty: t;
+    cstor_proj: ID.t list;
+    cstor_test: ID.t;
+  }
+
+  (** Mutually recursive datatypes *)
   type data = {
     data_id: ID.t;
-    data_cstors: t ID.Map.t;
+    data_cstors: data_cstor ID.Map.t;
   }
 
   let data_to_sexp d =
     let cstors =
       ID.Map.fold
-        (fun c ty acc ->
-           let ty_args, _ = unfold ty in
+        (fun _ cstor acc ->
+           let c = cstor.cstor_id in
+           let ty_args, _ = unfold cstor.cstor_ty in
            let c_sexp = match ty_args with
              | [] -> ID.to_sexp c
              | _::_ -> S.of_list (ID.to_sexp c :: List.map to_sexp ty_args)
@@ -396,7 +405,7 @@ module Ctx = struct
   type t = {
     names: ID.t StrTbl.t;
     kinds: kind ID.Tbl.t;
-    data: (ID.t * Ty.t) list ID.Tbl.t; (* data -> cstors *)
+    data: Ty.data_cstor ID.Map.t ID.Tbl.t; (* data -> cstors *)
     included: unit StrTbl.t; (* included paths *)
     include_dir: string; (* where to look for includes *)
     mutable loc: A.Loc.t option; (* current loc *)
@@ -442,7 +451,7 @@ module Ctx = struct
     try ID.Tbl.find t.kinds id
     with Not_found -> errorf "did not find kind of ID `%a`" ID.pp id
 
-  let as_data t (ty:Ty.t) : (ID.t * Ty.t) list = match ty with
+  let as_data t (ty:Ty.t) : Ty.data_cstor ID.Map.t = match ty with
     | Ty.Const id ->
       begin match ID.Tbl.get t.data id with
         | Some l -> l
@@ -617,8 +626,9 @@ and conv_term_aux ctx t = match t with
         (* check exhaustiveness *)
         let missing =
           all_cstors
-          |> List.filter (fun (cstor,_) -> not (ID.Map.mem cstor cases))
-          |> List.map fst
+          |> ID.Map.filter (fun c _ -> not (ID.Map.mem c cases))
+          |> ID.Map.keys
+          |> Sequence.to_list
         in
         if missing<>[]
         then errorf_ctx ctx
@@ -626,15 +636,16 @@ and conv_term_aux ctx t = match t with
             A.pp_term t (Utils.pp_list ID.pp) missing;
         cases
       | Some def_rhs ->
-        List.fold_left
-          (fun cases (cstor,ty_cstor) ->
-             if ID.Map.mem cstor cases then cases
+        ID.Map.values all_cstors
+        |> Sequence.fold
+          (fun cases cstor ->
+             if ID.Map.mem cstor.Ty.cstor_id cases then cases
              else (
-               let args, _ = Ty.unfold ty_cstor in
+               let args, _ = Ty.unfold cstor.Ty.cstor_ty in
                let vars = List.mapi (fun i ty -> Var.makef ~ty "_%d" i) args in
-               ID.Map.add cstor (vars, def_rhs) cases
+               ID.Map.add cstor.Ty.cstor_id (vars, def_rhs) cases
              ))
-          cases all_cstors
+          cases
     in
     match_ lhs cases
   | A.App (f, args) ->
@@ -688,16 +699,38 @@ and conv_statement_aux ctx syn (t:A.statement) : statement list = match A.view t
       List.map
         (fun (data_id, cstors) ->
            let data_ty = Ty.const data_id in
-           let parse_case (c, ty_args) =
-             let ty_args = List.map (conv_ty_fst ctx) ty_args in
+           let parse_case {A.cstor_name; cstor_args} =
+             let cstor_proj, ty_args =
+               cstor_args
+               |> List.mapi
+                 (fun i (s,ty_arg) ->
+                    let ty_arg = conv_ty_fst ctx ty_arg in
+                    let name = match s with
+                      | Some s -> s
+                      | None -> Printf.sprintf "select-%s-%d" cstor_name i
+                    in
+                    let id =
+                      Ctx.add_id ctx name (Ctx.K_fun (Ty.arrow data_ty ty_arg))
+                    in
+                    id, ty_arg)
+               |> List.split
+             in
              let ty_c = Ty.arrow_l ty_args data_ty in
-             let id = Ctx.add_id ctx c (Ctx.K_cstor ty_c) in
-             id, ty_c
+             let id = Ctx.add_id ctx cstor_name (Ctx.K_cstor ty_c) in
+             let cstor_test =
+               Ctx.add_id ctx ("is-" ^ cstor_name)
+                 (Ctx.K_fun (Ty.arrow data_ty Ty.prop))
+             in
+             {Ty.cstor_id=id; cstor_ty=ty_c; cstor_proj; cstor_test;}
            in
-           let cstors = List.map parse_case cstors in
+           let cstors =
+             List.map parse_case cstors
+             |> List.map (fun c->c.Ty.cstor_id,c)
+             |> ID.Map.of_list
+           in
            (* update info on [data] *)
            Ctx.add_data ctx data_id cstors;
-           {Ty.data_id; data_cstors=ID.Map.of_list cstors})
+           {Ty.data_id; data_cstors=cstors })
         l
     in
     [Data l]
@@ -780,8 +813,8 @@ type env_entry =
   | E_uninterpreted_ty
   | E_uninterpreted_cst (* domain element *)
   | E_const of Ty.t
-  | E_data of Ty.t ID.Map.t (* list of cstors *)
-  | E_cstor of Ty.t (* datatype it belongs to *)
+  | E_data of Ty.data_cstor ID.Map.t (* list of cstors *)
+  | E_cstor of Ty.data_cstor (* datatype it belongs to *)
   | E_defined of Ty.t * term (* if defined *)
 
 type env = {
@@ -802,7 +835,7 @@ let env_add_statement env st =
         (fun env {Ty.data_id; data_cstors} ->
            let map = add_def data_id (E_data data_cstors) env in
            ID.Map.fold
-             (fun c_id c_ty map -> add_def c_id (E_cstor c_ty) map)
+             (fun c_id cstor map -> add_def c_id (E_cstor cstor) map)
              data_cstors map)
         env l
     | TyDecl id -> add_def id E_uninterpreted_ty env

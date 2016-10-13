@@ -53,8 +53,11 @@ parse_list: l=stmt* EOI {l}
 parse: t=stmt EOI { t }
 
 cstor:
-  | c=IDENT { c, [] }
-  | LEFT_PAREN c=IDENT l=ty+ RIGHT_PAREN { c, l }
+  | c=IDENT { {cstor_name=c; cstor_args=[]} }
+  | LEFT_PAREN c=IDENT l=ty+ RIGHT_PAREN
+    { {cstor_name=c;
+       cstor_args=List.map (fun ty->None,ty) l;}
+    }
 
 data:
   | LEFT_PAREN
