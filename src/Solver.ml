@@ -108,7 +108,8 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     | CC_lit of lit (* because of this literal *)
     | CC_congruence of term * term (* same shape *)
     | CC_injectivity of term * term (* arguments of those constructors *)
-    | CC_reduce_because of term * term_nf (* reduce because this has a normal form *)
+    | CC_reduce_nf of term * term_nf (* reduce because this has a normal form *)
+    | CC_reduce_eq of term * term (* reduce because those are equal *)
 
   (* boolean literal *)
   and lit = {
@@ -419,7 +420,8 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
   let cmp_cc_expl a b =
     let toint = function
       | CC_congruence _ -> 0 | CC_lit _ -> 1
-      | CC_reduction -> 2 | CC_injectivity _ -> 3 | CC_reduce_because _ -> 4
+      | CC_reduction -> 2 | CC_injectivity _ -> 3
+      | CC_reduce_nf _ -> 4 | CC_reduce_eq _ -> 5
     in
     match a, b with
       | CC_congruence (t1,t2), CC_congruence (u1,u2) ->
@@ -428,10 +430,12 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       | CC_lit l1, CC_lit l2 -> cmp_lit l1 l2
       | CC_injectivity (t1,t2), CC_injectivity (u1,u2) ->
         CCOrd.(term_cmp_ t1 u1 <?> (term_cmp_, t2, u2))
-      | CC_reduce_because (t1, nf1), CC_reduce_because (t2,nf2) ->
+      | CC_reduce_nf (t1, nf1), CC_reduce_nf (t2,nf2) ->
         CCOrd.(term_cmp_ t1 t2 <?> (cmp_nf, nf1, nf2))
+      | CC_reduce_eq (t1, u1), CC_reduce_eq (t2,u2) ->
+        CCOrd.(term_cmp_ t1 t2 <?> (term_cmp_, u1, u2))
       | CC_congruence _, _ | CC_lit _, _ | CC_reduction, _
-      | CC_injectivity _, _ | CC_reduce_because _, _
+      | CC_injectivity _, _ | CC_reduce_nf _, _ | CC_reduce_eq _, _
         -> CCOrd.int_ (toint a)(toint b)
 
   module CC_expl_set = CCSet.Make(struct
@@ -978,7 +982,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         | App_cst (c, a) when IArray.is_empty a ->
           if ids then Cst.pp out c else ID.pp_name out c.cst_id
         | App_cst (f,l) ->
-          fpf out "(@[<1>@@ %a@ %a@])" Cst.pp f (Utils.pp_iarray pp) l
+          fpf out "(@[<1>%a@ %a@])" Cst.pp f (Utils.pp_iarray pp) l
         | App_ho (f,l) ->
           fpf out "(@[<1>@@ %a@ %a@])" pp f (Utils.pp_list pp) l
         | Fun (ty,f) ->
@@ -1094,8 +1098,10 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       Format.fprintf out "(@[<hv1>congruence@ %a@ %a@])" Term.pp a Term.pp b
     | CC_injectivity (a,b) ->
       Format.fprintf out "(@[<hv1>injectivity@ %a@ %a@])" Term.pp a Term.pp b
-    | CC_reduce_because (t, nf) ->
-      Format.fprintf out "(@[<hv1>reduce_because@ %a@ nf: %a@])" Term.pp t pp_term_nf nf
+    | CC_reduce_nf (t, nf) ->
+      Format.fprintf out "(@[<hv1>reduce_nf@ %a@ nf: %a@])" Term.pp t pp_term_nf nf
+    | CC_reduce_eq (t, u) ->
+      Format.fprintf out "(@[<hv1>reduce_eq@ %a@ %a@])" Term.pp t Term.pp u
 
   (** {2 Literals} *)
   module Lit : sig
@@ -1762,6 +1768,15 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       | Sat
       | Unsat of term * term (* must merge those, but they are incompatible *)
 
+    (* does [t] have some (direct) evaluation semantics? *)
+    let is_evaluable (t:term): bool = match t.term_cell with
+      | If _
+      | Case _
+      | Builtin (B_eq _ | B_not _) -> true
+      | Builtin (B_and _ | B_or _ | B_imply _)
+      | App_cst _ | App_ho _ | Mu _ | Fun _ | DB _ | True | False
+        -> false
+
     (* main CC algo: add terms from [pending] to the signature table,
        check for collisions *)
     let rec update_pending (): result =
@@ -1789,9 +1804,9 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
             let ra = find a in
             begin match ra.term_nf with
               | Some (NF_bool true as nf) ->
-                push_combine t b (CC_reduce_because (a, nf))
+                push_combine t b (CC_reduce_nf (a, nf))
               | Some (NF_bool false as nf) ->
-                push_combine t c (CC_reduce_because (a, nf))
+                push_combine t c (CC_reduce_nf (a, nf))
               | Some (NF_cstor _) -> assert false
               | None -> ()
             end
@@ -1804,14 +1819,43 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
                   try ID.Map.find c.cstor_cst.cst_id m
                   with Not_found -> assert false
                 in
-                push_combine t rhs (CC_reduce_because (u, nf));
+                push_combine t rhs (CC_reduce_nf (u, nf));
               | Some (NF_bool _) -> assert false
               | None -> ()
             end
           | Builtin (B_eq (a,b)) ->
-            assert false (* TODO: if [find a=find b], set to true *)
-          | App_cst ({cst_kind=Cst_test(_,lazy cstor)}, a) when IArray.length a=1 ->
-            assert false (* TODO: if [a.(0)] has a cstor normal form, set to true/false *)
+            (* check if [find a = find b] *)
+            let ra = find a in
+            let rb = find b in
+            if equal ra rb then (
+              push_combine t Term.true_ (CC_reduce_eq (a, b))
+            )
+          | Builtin (B_not a) ->
+            (* check if [a == true/false] *)
+            let ra = find a in
+            begin match ra.term_nf with
+              | Some (NF_bool true as nf) ->
+                push_combine t Term.false_ (CC_reduce_nf (a, nf))
+              | Some (NF_bool false as nf) ->
+                push_combine t Term.true_ (CC_reduce_nf (a, nf))
+              | Some _ -> assert false
+              | None -> ()
+            end
+          | App_cst ({cst_kind=Cst_test(_,lazy cstor); _}, a) when IArray.length a=1 ->
+            (* check if [a.(0)] has a constructor *)
+            let arg = IArray.get a 0 in
+            let r_a = find arg in
+            begin match r_a.term_nf with
+              | None -> ()
+              | Some (NF_cstor (cstor', _) as nf) ->
+                (* reduce to true/false depending on whether [cstor=cstor'] *)
+                if Cst.equal cstor.cstor_cst cstor'.cstor_cst then (
+                  push_combine t Term.true_ (CC_reduce_nf (arg, nf))
+                ) else (
+                  push_combine t Term.true_ (CC_reduce_nf (arg, nf))
+                )
+              | Some (NF_bool _) -> assert false
+            end
           | _ -> ()
         end
       done;
@@ -1843,7 +1887,16 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
                 Backtrack.push_undo (fun () -> rb.term_nf <- old_nf_b);
               );
               rb.term_nf <- Some nf;
-              (* TODO: notify parents of [rb]? like, a parent if/then/else? *)
+              (* notify parents of [rb] that can be evaluated, because the
+                 new normal form of [rb] might trigger such an evaluation *)
+              begin
+                Bag.to_seq rb.term_parents
+                |> Sequence.filter is_evaluable
+                |> Sequence.iter
+                  (fun parent ->
+                     remove_signature parent.term_cell;
+                     push_pending parent)
+              end;
             | Some nf_a, Some nf_b ->
               (* check consistency of normal forms *)
               begin match nf_a, nf_b with
@@ -2023,9 +2076,12 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       and decompose_explain e: unit = match e with
         | CC_reduction
         | CC_lit _ -> ()
-        | CC_reduce_because (_t, _nf) ->
+        | CC_reduce_nf (_t, _nf) ->
           assert false (* TODO: explain why t==nf *)
+        | CC_reduce_eq (a, b) ->
+          add_obligation a b
         | CC_injectivity (t1,t2)
+        (* FIXME: should this be different from CC_congruence? just explain why t1==t2? *)
         | CC_congruence (t1,t2) ->
           begin match t1.term_cell, t2.term_cell with
             | True, _ | False, _ | DB _, _
@@ -2064,7 +2120,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
             | Builtin _, _ -> assert false
           end
       in
-      Queue.push (a,b) to_prove;
+      add_obligation a b;
       while not (Queue.is_empty to_prove) do
         let a, b = Queue.pop to_prove in
         assert (find a == find b);
@@ -2095,7 +2151,8 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       (function
         | CC_reduction
         | CC_injectivity _
-        | CC_reduce_because _
+        | CC_reduce_nf _
+        | CC_reduce_eq _
         | CC_congruence _ -> None
         | CC_lit lit -> Some lit)
     |> Sequence.map Lit.neg (* this is a guard *)
@@ -2204,12 +2261,13 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       Log.debugf 2
         (fun k->k "(@[<1>@{<green>assume_lit@}@ @[%a@]@])" Lit.pp lit);
       (* check consistency first *)
+      let sign = Lit.sign lit in
       begin match Lit.view lit with
         | Lit_fresh _ -> ()
         | Lit_atom {term_cell=True; _} -> ()
         | Lit_atom {term_cell=False; _} -> assert false
         | Lit_expanded t ->
-          assert (Term.Field_expanded.get t.term_bits);
+          assert (not sign || Term.Field_expanded.get t.term_bits);
           Terms_to_expand.remove t;
         | Lit_atom _ ->
           (* let the CC do the job *)
@@ -2736,6 +2794,9 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         |> Sequence.map (fun {Terms_to_expand.lit; _} -> Lit.neg lit)
         |> Sequence.to_rev_list
       in
+      Log.debugf 5
+        (fun k->k "(@[<1>solve@ :with-assumptions (@[%a@])@])"
+            (Utils.pp_list Lit.pp) assumptions);
       begin match M.solve ~assumptions () with
         | M.Sat _ ->
           Log.debugf 1 (fun k->k "@{<Yellow>** found SAT@}");
