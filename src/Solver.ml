@@ -1015,6 +1015,12 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
 
     type eval_env = term DB_env.t
 
+    (* TODO: perform some additional simplifications:
+       - if true a b --> a
+       - if false a b --> b
+       - match (cstor args) m --> m[cstor]
+      *)
+
     let eval_db (env:eval_env) (t:term) : term =
       let rec aux env t : term = match t.term_cell with
         | DB d ->
@@ -1308,7 +1314,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
             let g = Lit.Set.to_list guard |> List.map Lit.neg in
             Clause.make (Lit.expanded t :: g)
           in
-          Log.debugf 3
+          Log.debugf 5
             (fun k->k "(@[delay_expand %a@ guard: %a@])" Term.pp t Clause.pp c);
           A.add_clause c
         )
@@ -1788,66 +1794,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         if not (Term.Field_expanded.get t.term_bits) then (
           E.expand_term ~mode:E.Safe t
         );
-        (* evaluation rules: if, case... *)
-        begin match t.term_cell with
-          | If (a, b, c) ->
-            let ra = find a in
-            begin match ra.term_nf with
-              | Some (NF_bool true as nf) ->
-                push_combine t b (CC_reduce_nf (a, nf))
-              | Some (NF_bool false as nf) ->
-                push_combine t c (CC_reduce_nf (a, nf))
-              | Some (NF_cstor _) -> assert false
-              | None -> ()
-            end
-          | Case (u, m) ->
-            let r_u = find u in
-            begin match r_u.term_nf with
-              | Some (NF_cstor (c, _) as nf) ->
-                (* reduce to the proper branch *)
-                let rhs =
-                  try ID.Map.find c.cstor_cst.cst_id m
-                  with Not_found -> assert false
-                in
-                push_combine t rhs (CC_reduce_nf (u, nf));
-              | Some (NF_bool _) -> assert false
-              | None -> ()
-            end
-          | Builtin (B_eq (a,b)) ->
-            (* check if [find a = find b] *)
-            let ra = find a in
-            let rb = find b in
-            if equal ra rb then (
-              push_combine t Term.true_ (CC_reduce_eq (a, b))
-            )
-          | Builtin (B_not a) ->
-            (* check if [a == true/false] *)
-            let ra = find a in
-            begin match ra.term_nf with
-              | Some (NF_bool true as nf) ->
-                push_combine t Term.false_ (CC_reduce_nf (a, nf))
-              | Some (NF_bool false as nf) ->
-                push_combine t Term.true_ (CC_reduce_nf (a, nf))
-              | Some _ -> assert false
-              | None -> ()
-            end
-          | App_cst ({cst_kind=Cst_test(_,lazy cstor); _}, a) when IArray.length a=1 ->
-            (* check if [a.(0)] has a constructor *)
-            let arg = IArray.get a 0 in
-            let r_a = find arg in
-            begin match r_a.term_nf with
-              | None -> ()
-              | Some (NF_cstor (cstor', _) as nf) ->
-                (* reduce to true/false depending on whether [cstor=cstor'] *)
-                if Cst.equal cstor.cstor_cst cstor'.cstor_cst then (
-                  push_combine t Term.true_ (CC_reduce_nf (arg, nf))
-                ) else (
-                  push_combine t Term.true_ (CC_reduce_nf (arg, nf))
-                )
-              | Some (NF_bool _) -> assert false
-            end
-          | _ -> ()
-        end
+        eval_pending t;
       done;
       if is_done_state ()
       then Sat
@@ -1940,6 +1887,81 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       done;
       (* now update pending terms again *)
       update_pending ()
+
+    (* evaluation rules: if, case... *)
+    and eval_pending (t:term): unit =
+      begin match t.term_cell with
+        | If (a, b, c) ->
+          let ra = find a in
+          begin match ra.term_nf with
+            | Some (NF_bool true as nf) ->
+              push_combine t b (CC_reduce_nf (a, nf))
+            | Some (NF_bool false as nf) ->
+              push_combine t c (CC_reduce_nf (a, nf))
+            | Some (NF_cstor _) -> assert false
+            | None -> ()
+          end
+        | Case (u, m) ->
+          let r_u = find u in
+          begin match r_u.term_nf with
+            | Some (NF_cstor (c, _) as nf) ->
+              (* reduce to the proper branch *)
+              let rhs =
+                try ID.Map.find c.cstor_cst.cst_id m
+                with Not_found -> assert false
+              in
+              push_combine t rhs (CC_reduce_nf (u, nf));
+            | Some (NF_bool _) -> assert false
+            | None -> ()
+          end
+        | Builtin (B_eq (a,b)) ->
+          (* check if [find a = find b] *)
+          let ra = find a in
+          let rb = find b in
+          if equal ra rb then (
+            push_combine t Term.true_ (CC_reduce_eq (a, b))
+          )
+        | Builtin (B_not a) ->
+          (* check if [a == true/false] *)
+          let ra = find a in
+          begin match ra.term_nf with
+            | Some (NF_bool true as nf) ->
+              push_combine t Term.false_ (CC_reduce_nf (a, nf))
+            | Some (NF_bool false as nf) ->
+              push_combine t Term.true_ (CC_reduce_nf (a, nf))
+            | Some _ -> assert false
+            | None -> ()
+          end
+        | App_cst ({cst_kind=Cst_test(_,lazy cstor); _}, a) when IArray.length a=1 ->
+          (* check if [a.(0)] has a constructor *)
+          let arg = IArray.get a 0 in
+          let r_a = find arg in
+          begin match r_a.term_nf with
+            | None -> ()
+            | Some (NF_cstor (cstor', _) as nf) ->
+              (* reduce to true/false depending on whether [cstor=cstor'] *)
+              if Cst.equal cstor.cstor_cst cstor'.cstor_cst then (
+                push_combine t Term.true_ (CC_reduce_nf (arg, nf))
+              ) else (
+                push_combine t Term.true_ (CC_reduce_nf (arg, nf))
+              )
+            | Some (NF_bool _) -> assert false
+          end
+        | App_cst ({cst_kind=Cst_proj(_,lazy cstor,i); _}, a) when IArray.length a=1 ->
+          (* reduce if [a.(0)] has the proper constructor *)
+          let arg = IArray.get a 0 in
+          let r_a = find arg in
+          begin match r_a.term_nf with
+            | None -> ()
+            | Some (NF_cstor (cstor', nf_cstor_args) as nf) ->
+              (* [proj-C-3 (C t1...tn) = t3] *)
+              if Cst.equal cstor.cstor_cst cstor'.cstor_cst then (
+                push_combine t (IArray.get nf_cstor_args i) (CC_reduce_nf (arg, nf))
+              )
+            | Some (NF_bool _) -> assert false
+          end
+        | _ -> ()
+      end
 
     (* main CC algo: add missing terms to the congruence class *)
     and update_add_cc_terms () =
