@@ -2804,8 +2804,8 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         |> Sequence.map (fun {Terms_to_expand.lit; _} -> Lit.neg lit)
         |> Sequence.to_rev_list
       in
-      Log.debugf 5
-        (fun k->k "(@[<1>solve@ :with-assumptions (@[%a@])@])"
+      Log.debugf 2
+        (fun k->k "(@[<1>@{<Yellow>solve@}@ @[:with-assumptions@ (@[%a@])]@])"
             (Utils.pp_list Lit.pp) assumptions);
       begin match M.solve ~assumptions () with
         | M.Sat _ ->
@@ -2831,6 +2831,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           Log.debugf 2 (fun k->k "(@[<1>@{<green>expand_next@}@ :term %a@])" Term.pp t);
           CC.expand_term t;
           Terms_to_expand.remove t;
+          Clause.push_new (Clause.make [to_expand.Terms_to_expand.lit]);
           check_cc () (* recurse *)
       end
     in
