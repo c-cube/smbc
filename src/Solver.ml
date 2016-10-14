@@ -1015,8 +1015,6 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
 
     type eval_env = term DB_env.t
 
-    (* TODO: add a cache to {!eval_db}? *)
-
     let eval_db (env:eval_env) (t:term) : term =
       let rec aux env t : term = match t.term_cell with
         | DB d ->
@@ -1028,7 +1026,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         | False -> t
         | App_cst (f, a) ->
           let a' = IArray.map (aux env) a in
-          if IArray.for_all2 (==) a a' then t else app_cst f a
+          if IArray.for_all2 (==) a a' then t else app_cst f a'
         | Fun (ty, body) ->
           let body' = aux (DB_env.push_none env) body in
           if body==body' then t else fun_ ty body'
