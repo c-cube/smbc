@@ -262,7 +262,7 @@ let rec app_ty_ ty l : Ty.t = match ty, l with
     else Ty.ill_typed "expected `@[%a@]`,@ got `@[%a : %a@]`"
         Ty.pp ty_a pp_term a Ty.pp a.ty
   | (Ty.Prop | Ty.Const _), a::_ ->
-    Ty.ill_typed "cannot apply ty `@[%a@]`@ to `@[%a@]`" Ty.pp ty pp_term a
+    Ty.ill_typed "@[<2>cannot apply ty `@[%a@]`@ to `@[%a@]`@]" Ty.pp ty pp_term a
 
 let mk_ term ty = {term; ty}
 
