@@ -1017,63 +1017,57 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
 
     (* TODO: add a cache to {!eval_db}? *)
 
-    (* just evaluate the De Bruijn indices, and return
-       the explanations used to evaluate subterms *)
     let eval_db (env:eval_env) (t:term) : term =
-      if DB_env.size env = 0
-      then t (* trivial *)
-      else (
-        let rec aux env t : term = match t.term_cell with
-          | DB d ->
-            begin match DB_env.get d env with
-              | None -> t
-              | Some t' -> t'
-            end
-          | True
-          | False -> t
-          | App_cst (f, a) ->
-            let a' = IArray.map (aux env) a in
-            if IArray.for_all2 (==) a a' then t else app_cst f a
-          | Fun (ty, body) ->
-            let body' = aux (DB_env.push_none env) body in
-            if body==body' then t else fun_ ty body'
-          | Mu body ->
-            let body' = aux (DB_env.push_none env) body in
-            if body==body' then t else mu body'
-          | Case (u, m) ->
-            let u = aux env u in
-            let m = ID.Map.map (aux env) m in
-            case u m
-          | If (a,b,c) ->
-            let a' = aux env a in
-            let b' = aux env b in
-            let c' = aux env c in
-            if a==a' && b==b' && c==c' then t else if_ a' b' c'
-          | App_ho (_,[]) -> assert false
-          | App_ho (f, l) ->
-            let f' = aux env f in
-            let l' = aux_l env l in
-            beta_reduce DB_env.empty f' l'
-          | Builtin b -> builtin (map_builtin (aux env) b)
-        and aux_l env l =
-          List.map (aux env) l
-        and beta_reduce env f l = match f.term_cell, l with
-          | Fun (ty_arg, body), arg :: tail ->
-            assert (Ty.equal ty_arg arg.term_ty);
-            (* beta-reduction *)
-            let new_env = DB_env.push arg env in
-            beta_reduce new_env body tail
-          | _ ->
-            let f' = aux env f in
-            if equal f f' then (
-              app f' l (* done *)
-            ) else (
-              (* try to reduce again *)
-              beta_reduce DB_env.empty f' l
-            )
-        in
-        aux env t
-      )
+      let rec aux env t : term = match t.term_cell with
+        | DB d ->
+          begin match DB_env.get d env with
+            | None -> t
+            | Some t' -> t'
+          end
+        | True
+        | False -> t
+        | App_cst (f, a) ->
+          let a' = IArray.map (aux env) a in
+          if IArray.for_all2 (==) a a' then t else app_cst f a
+        | Fun (ty, body) ->
+          let body' = aux (DB_env.push_none env) body in
+          if body==body' then t else fun_ ty body'
+        | Mu body ->
+          let body' = aux (DB_env.push_none env) body in
+          if body==body' then t else mu body'
+        | Case (u, m) ->
+          let u = aux env u in
+          let m = ID.Map.map (aux env) m in
+          case u m
+        | If (a,b,c) ->
+          let a' = aux env a in
+          let b' = aux env b in
+          let c' = aux env c in
+          if a==a' && b==b' && c==c' then t else if_ a' b' c'
+        | App_ho (_,[]) -> assert false
+        | App_ho (f, l) ->
+          let f' = aux env f in
+          let l' = aux_l env l in
+          beta_reduce DB_env.empty f' l'
+        | Builtin b -> builtin (map_builtin (aux env) b)
+      and aux_l env l =
+        List.map (aux env) l
+      and beta_reduce env f l = match f.term_cell, l with
+        | Fun (ty_arg, body), arg :: tail ->
+          assert (Ty.equal ty_arg arg.term_ty);
+          (* beta-reduction *)
+          let new_env = DB_env.push arg env in
+          beta_reduce new_env body tail
+        | _ ->
+          let f' = aux env f in
+          if equal f f' then (
+            app f' l (* done *)
+          ) else (
+            (* try to reduce again *)
+            beta_reduce DB_env.empty f' l
+          )
+      in
+      aux env t
   end
 
   let pp_term_nf out (nf:term_nf) = match nf with
@@ -1335,8 +1329,9 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
               true
             | _, Cst_non_recursive
             | Force, _ ->
-              let env = DB_env.push_l (IArray.to_list a) DB_env.empty in
-              let body = Term.eval_db env rhs in
+              let body =
+                Term.eval_db DB_env.empty (Term.app rhs (IArray.to_list a))
+              in
               expand_term_safe ~guard body;
               (* [t = body] is now a reduction axiom *)
               A.add_eqn t body;
@@ -1485,15 +1480,6 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
 
   (** {2 Congruence Closure} *)
 
-  (* TODO: replace by rules about datatypes and CNF.
-     Maybe the rules should be added to a list of rules to be applied in CC...
-     or maybe this should just go before CC and be called by it ([expand t]
-     would be generic and idempotent) *)
-
-  (* TODO: datatypes: need a set of possible constructors for each congruence
-     class, + projectors, + testers (that interoperate with the set of possible
-     constructors) *)
-
   module CC : sig
     type repr = private term
 
@@ -1638,8 +1624,6 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       | None -> None
       | Some (NF_cstor _) -> assert false
 
-    (* TODO: check-is-bool? or something like this? *)
-
     type merge_op = term * term * cc_explanation
     (* a merge operation to perform *)
 
@@ -1675,14 +1659,22 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       Queue.is_empty st.pending &&
       Queue.is_empty st.combine
 
-    let push_combine t u e = Queue.push (t,u,e) st.combine
-    let push_pending t = Queue.push t st.pending
+    let push_combine t u e =
+      Log.debugf 5
+        (fun k->k "(@[<hv1>push_combine@ %a@ %a@ expl: %a@])"
+          Term.pp t Term.pp u pp_cc_explanation e);
+      Queue.push (t,u,e) st.combine
+
+    let push_pending t =
+      Log.debugf 5 (fun k->k "(@[<hv1>push_pending@ %a@])" Term.pp t);
+      Queue.push t st.pending
 
     let add_cc (t:term): unit = Queue.push t st.terms_to_add
 
     let add_cc_seq (seq:term Sequence.t): unit = Sequence.iter add_cc seq
 
     let add_toplevel_eq (t:term) (u:term): unit =
+      Log.debugf 5 (fun k->k "(@[<hv1>push_toplevel_eq@ %a@ %a@])" Term.pp t Term.pp u);
       Queue.push (t, u, CC_reduction) st.eqns_to_add
 
     let union (a:repr) (b:repr) (e:cc_explanation): unit =
@@ -1755,7 +1747,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
 
     let expand_term t: unit =
       if not (Term.Field_expanded.get t.term_bits) then (
-        Log.debugf 3 (fun k->k "(@[CC.expand@ %a@]" Term.pp t);
+        Log.debugf 3 (fun k->k "(@[CC.expand@ %a@])" Term.pp t);
         E.expand_term ~mode:E.Force t;
         assert (Term.Field_expanded.get t.term_bits);
       )
@@ -2014,10 +2006,10 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       if not !at_level_0 then (
         Backtrack.push_undo (fun () -> Queue.push eqn st.eqns_to_add);
       );
-      let t, u, _ = eqn in
+      let t, u, expl = eqn in
       Queue.push t st.terms_to_add;
       Queue.push u st.terms_to_add;
-      Queue.push eqn st.combine
+      push_combine t u expl
 
     (* distance from [t] to its root in the proof forest *)
     let rec distance_to_root (t:term): int = match t.term_expl with
@@ -2120,6 +2112,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
             | Builtin _, _ -> assert false
           end
       in
+      Log.debugf 5 (fun k->k "(@[explain@ %a@ %a@])" Term.pp a Term.pp b);
       add_obligation a b;
       while not (Queue.is_empty to_prove) do
         let a, b = Queue.pop to_prove in
@@ -2261,14 +2254,11 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       Log.debugf 2
         (fun k->k "(@[<1>@{<green>assume_lit@}@ @[%a@]@])" Lit.pp lit);
       (* check consistency first *)
-      let sign = Lit.sign lit in
       begin match Lit.view lit with
         | Lit_fresh _ -> ()
+        | Lit_expanded _
         | Lit_atom {term_cell=True; _} -> ()
         | Lit_atom {term_cell=False; _} -> assert false
-        | Lit_expanded t ->
-          assert (not sign || Term.Field_expanded.get t.term_bits);
-          Terms_to_expand.remove t;
         | Lit_atom _ ->
           (* let the CC do the job *)
           CC.assert_lit lit
@@ -2818,6 +2808,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         | None -> Unsat (* TODO proof *)
         | Some to_expand ->
           let t = to_expand.Terms_to_expand.term in
+          Log.debugf 2 (fun k->k "(@[<1>@{<green>expand_next@}@ :term %a@])" Term.pp t);
           CC.expand_term t;
           Terms_to_expand.remove t;
           check_cc () (* recurse *)
