@@ -2791,6 +2791,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
 
   let solve ?(on_exit=[]) ?(check=true) () =
     let rec check_cc (): res =
+      assert (!at_level_0);
       begin match CC.check () with
         | CC.Unsat _ -> Unsat (* TODO proof *)
         | CC.Sat ->
@@ -2807,7 +2808,10 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       Log.debugf 2
         (fun k->k "(@[<1>@{<Yellow>solve@}@ @[:with-assumptions@ (@[%a@])]@])"
             (Utils.pp_list Lit.pp) assumptions);
-      begin match M.solve ~assumptions () with
+      at_level_0 := false;
+      let res = M.solve ~assumptions() in
+      at_level_0 := true;
+      begin match res with
         | M.Sat _ ->
           Log.debugf 1 (fun k->k "@{<Yellow>** found SAT@}");
           do_on_exit ~on_exit;
