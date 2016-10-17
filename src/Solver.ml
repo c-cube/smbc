@@ -1260,7 +1260,9 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
 
     let push_new (c:t): unit =
       begin match c.lits with
+        (* FIXME: maybe a special method to add such clauses, e.g. for "IF"
         | [a;b] when Lit.equal (Lit.neg a) b -> () (* trivial *)
+           *)
         | _ when Tbl.mem all_lemmas_ c -> () (* already asserted *)
         | _ ->
           Log.debugf 3
@@ -1366,6 +1368,8 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         | Fun _ -> true
         | If (a,b,c) ->
           let g_a = Lit.atom a in
+          (* force SAT solver to choose value of [g_a] *)
+          A.add_clause ([g_a; Lit.neg g_a] |> Clause.make);
           (* expand subterms, with guard [a] or [not a] for the branches *)
           expand_term_safe ~guard a;
           expand_term_safe ~guard:(Lit.Set.add g_a guard) b;
@@ -1782,10 +1786,6 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
             (* must combine [t] with [r] *)
             push_combine t u (CC_congruence (t,u))
         end;
-        (* expand term *)
-        if not (Term.Field_expanded.get t.term_bits) then (
-          E.expand_term ~mode:E.Safe t
-        );
         eval_pending t;
       done;
       if is_done_state ()
@@ -1992,6 +1992,10 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
             )
         );
         t.term_bits <- Term.Field_in_cc.set true t.term_bits;
+        (* expand term *)
+        if not (Term.Field_expanded.get t.term_bits) then (
+          E.expand_term ~mode:E.Safe t
+        );
         let add_sub sub =
           let old_parents = sub.term_parents in
           sub.term_parents <- Bag.cons t sub.term_parents;
