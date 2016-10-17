@@ -450,6 +450,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     val cur_level : unit -> level
     val push_level : unit -> unit
     val backtrack : level -> unit
+    val backtrack_to_level_0 : unit -> unit
     val at_level_0 : unit -> bool
     val not_at_level_0 : unit -> bool
     val push_undo : (unit -> unit) -> unit
@@ -481,15 +482,27 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     let at_level_0 () = !at_level_0_
     let not_at_level_0 () = not !at_level_0_
 
+    let level_0_ : level option ref = ref None
+
     let push_level () : unit =
       let l = cur_level() in
       Log.debugf 2 (fun k->k "@{<Yellow>** now at level %d (push)@}" l);
       if !at_level_0_ then (
+        assert (!level_0_ = None);
         Log.debug 5 "not at level 0 anymore";
-        push_undo (fun () -> Log.debug 5 "back to level 0"; at_level_0_ := true);
+        push_undo
+          (fun () ->
+             Log.debug 5 "back to level 0";
+             at_level_0_ := true;
+             level_0_ := None);
         at_level_0_ := false;
+        level_0_ := Some l;
       );
       ()
+
+    let backtrack_to_level_0 () = match !level_0_ with
+      | None -> ()
+      | Some l -> backtrack l
   end
 
   (* TODO: normalization of {!term_cell} for use in signatures? *)
@@ -2848,6 +2861,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           CC.expand_term t;
           Terms_to_expand.remove t;
           Clause.push_new (Clause.make [to_expand.Terms_to_expand.lit]);
+          Backtrack.backtrack_to_level_0 ();
           check_cc () (* recurse *)
       end
     in
