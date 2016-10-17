@@ -1842,7 +1842,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
               begin match nf_a, nf_b with
                 | NF_bool v_a, NF_bool v_b ->
                   if v_a <> v_b then (
-                    let l = [e_ab; CC_reduce_nf ra; CC_reduce_nf rb] in
+                    let l = [e_ab; CC_reduce_nf a; CC_reduce_nf b] in
                     raise (Exn_unsat l); (* incompatible *)
                   )
                 | NF_cstor (c1, args1), NF_cstor (c2, args2) ->
@@ -1854,7 +1854,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
                          push_combine sub1 sub2 (CC_injectivity (ra, rb)))
                       args1 args2
                   ) else (
-                    let l = [e_ab; CC_reduce_nf ra; CC_reduce_nf rb] in
+                    let l = [e_ab; CC_reduce_nf a; CC_reduce_nf b] in
                     raise (Exn_unsat l); (* incompatible *)
                   )
                 | NF_bool _, _
