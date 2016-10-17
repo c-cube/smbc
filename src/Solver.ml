@@ -70,7 +70,9 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       (* the rooted forest for explanations *)
     mutable term_cases_set: term_cases_set;
       (* abstract set of values this term can take *)
-    mutable term_nf: term_nf option; (* normal form, if any? *)
+    mutable term_nf: (term_nf * term) option;
+    (* normal form, if any? [Some (nf,t)] means that [repr = nf]
+       because [repr = t], for explanation purpose *)
   }
 
   (* term shallow structure *)
@@ -108,7 +110,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     | CC_lit of lit (* because of this literal *)
     | CC_congruence of term * term (* same shape *)
     | CC_injectivity of term * term (* arguments of those constructors *)
-    | CC_reduce_nf of term * term_nf (* reduce because this has a normal form *)
+    | CC_reduce_nf of term (* reduce because this has a normal form *)
     | CC_reduce_eq of term * term (* reduce because those are equal *)
 
   (* boolean literal *)
@@ -430,8 +432,8 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       | CC_lit l1, CC_lit l2 -> cmp_lit l1 l2
       | CC_injectivity (t1,t2), CC_injectivity (u1,u2) ->
         CCOrd.(term_cmp_ t1 u1 <?> (term_cmp_, t2, u2))
-      | CC_reduce_nf (t1, nf1), CC_reduce_nf (t2,nf2) ->
-        CCOrd.(term_cmp_ t1 t2 <?> (cmp_nf, nf1, nf2))
+      | CC_reduce_nf t1, CC_reduce_nf t2 ->
+        term_cmp_ t1 t2
       | CC_reduce_eq (t1, u1), CC_reduce_eq (t2,u2) ->
         CCOrd.(term_cmp_ t1 t2 <?> (term_cmp_, u1, u2))
       | CC_congruence _, _ | CC_lit _, _ | CC_reduction, _
@@ -805,7 +807,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     (* boolean are special: we know already what normal form they have *)
     let mk_bool_ b =
       let t = make (if b then True else False) in
-      t.term_nf <- Some (NF_bool b);
+      t.term_nf <- Some (NF_bool b, t);
       t
 
     let true_ = mk_bool_ true
@@ -826,7 +828,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           | Cst_cstor (lazy cstor) when t.term_cell == cell ->
             (* by definition, a constructor term has itself as a normal form *)
             assert (t.term_nf = None);
-            t.term_nf <- Some (NF_cstor (cstor, a));
+            t.term_nf <- Some (NF_cstor (cstor, a), t);
             assert (t.term_cases_set <> TC_none);
             t.term_cases_set <- TC_cstors (ID.Map.singleton f.cst_id cstor);
           | _ -> ()
@@ -1102,8 +1104,8 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       Format.fprintf out "(@[<hv1>congruence@ %a@ %a@])" Term.pp a Term.pp b
     | CC_injectivity (a,b) ->
       Format.fprintf out "(@[<hv1>injectivity@ %a@ %a@])" Term.pp a Term.pp b
-    | CC_reduce_nf (t, nf) ->
-      Format.fprintf out "(@[<hv1>reduce_nf@ %a@ nf: %a@])" Term.pp t pp_term_nf nf
+    | CC_reduce_nf t ->
+      Format.fprintf out "(@[<hv1>reduce_nf@ %a@])" Term.pp t
     | CC_reduce_eq (t, u) ->
       Format.fprintf out "(@[<hv1>reduce_eq@ %a@ %a@])" Term.pp t Term.pp u
 
@@ -1506,17 +1508,6 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     (** Given a literal, assume it in the congruence closure and propagate
         its consequences *)
 
-    val eval : repr -> term_nf option
-    (** a WHNF, if any *)
-
-    val eval_bool : repr -> bool option
-    (** specialize {!eval} for propositions
-        precond: the term is a boolean *)
-
-    val explain : term -> term -> CC_expl_set.t
-    (** [explain t1 t2] returns a small explanation of why [t1=t2].
-        precond: the terms have the same representative, ie [find t1 = find t2] *)
-
     val normal_form : term -> term_nf option
     (** Normal form of the term's congruence closure, if any *)
 
@@ -1538,11 +1529,14 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
 
     type result =
       | Sat
-      | Unsat of term * term (* must merge those, but they are incompatible *)
-    (* TODO: think of what Unsat should contain. A lazy CC_expl_set.t
-       by calling [explain]? *)
+      | Unsat of cc_explanation list
+      (* list of direct explanations to the conflict. *)
 
     val check : unit -> result
+
+    val explain_conflict: cc_explanation list -> Lit.Set.t
+    (** Explain the conflict by returning a complete set of
+        literals explaining it *)
   end = struct
     type repr = term
 
@@ -1588,7 +1582,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
 
     let normal_form t =
       let r = find t in
-      r.term_nf
+      CCOpt.map fst r.term_nf
 
     let signature (t:term_cell): term_cell option = match t with
       | True | False | DB _ | Fun _ | Mu _
@@ -1624,15 +1618,6 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
             Term_cell.Tbl.add signatures_tbl t' r;
           | Some r' -> assert (equal r r');
         end
-
-    let eval t =
-      assert (is_root_ t);
-      t.term_nf
-
-    let eval_bool t = match eval t with
-      | Some (NF_bool b) -> Some b
-      | None -> None
-      | Some (NF_cstor _) -> assert false
 
     type merge_op = term * term * cc_explanation
     (* a merge operation to perform *)
@@ -1694,6 +1679,10 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       if not (same_class_ a b) then (
         push_combine a b e; (* start by merging [a=b] *)
       )
+
+    (* TODO: replace logic of assert_lit by mere [combine t true],
+       and move the logic to main CC loop (so that propagating, say, [(= a b)]
+       because [(= (= a b) (= c d))] will also [combine a b] and recursively *)
 
     (* assert that this boolean literal holds *)
     let assert_lit lit : unit = match Lit.view lit with
@@ -1762,13 +1751,12 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         assert (Term.Field_expanded.get t.term_bits);
       )
 
-    exception Exn_unsat of repr * repr
-    (* exception during merge of those two classes *)
-    (* TODO: add a CC_expl_set.t in there? *)
+    exception Exn_unsat of cc_explanation list
 
     type result =
       | Sat
-      | Unsat of term * term (* must merge those, but they are incompatible *)
+      | Unsat of cc_explanation list
+      (* list of direct explanations to the conflict. *)
 
     (* does [t] have some (direct) evaluation semantics? *)
     let is_evaluable (t:term): bool = match t.term_cell with
@@ -1840,12 +1828,13 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
                      remove_signature parent.term_cell;
                      push_pending parent)
               end;
-            | Some nf_a, Some nf_b ->
+            | Some (nf_a,_), Some (nf_b,_) ->
               (* check consistency of normal forms *)
               begin match nf_a, nf_b with
                 | NF_bool v_a, NF_bool v_b ->
                   if v_a <> v_b then (
-                    raise (Exn_unsat (ra, rb)); (* incompatible *)
+                    let l = [e_ab; CC_reduce_nf ra; CC_reduce_nf rb] in
+                    raise (Exn_unsat l); (* incompatible *)
                   )
                 | NF_cstor (c1, args1), NF_cstor (c2, args2) ->
                   if Cst.equal c1.cstor_cst c2.cstor_cst then (
@@ -1856,7 +1845,8 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
                          push_combine sub1 sub2 (CC_injectivity (ra, rb)))
                       args1 args2
                   ) else (
-                    raise (Exn_unsat (ra, rb)); (* incompatible *) (* TODO: is this the good exn? *)
+                    let l = [e_ab; CC_reduce_nf ra; CC_reduce_nf rb] in
+                    raise (Exn_unsat l); (* incompatible *)
                   )
                 | NF_bool _, _
                 | NF_cstor _, _ -> assert false (* ill typed *)
@@ -1900,24 +1890,24 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         | If (a, b, c) ->
           let ra = find a in
           begin match ra.term_nf with
-            | Some (NF_bool true as nf) ->
-              push_combine t b (CC_reduce_nf (a, nf))
-            | Some (NF_bool false as nf) ->
-              push_combine t c (CC_reduce_nf (a, nf))
-            | Some (NF_cstor _) -> assert false
+            | Some (NF_bool true, _) ->
+              push_combine t b (CC_reduce_nf a)
+            | Some (NF_bool false, _) ->
+              push_combine t c (CC_reduce_nf a)
+            | Some (NF_cstor _, _) -> assert false
             | None -> ()
           end
         | Case (u, m) ->
           let r_u = find u in
           begin match r_u.term_nf with
-            | Some (NF_cstor (c, _) as nf) ->
+            | Some (NF_cstor (c, _), _) ->
               (* reduce to the proper branch *)
               let rhs =
                 try ID.Map.find c.cstor_cst.cst_id m
                 with Not_found -> assert false
               in
-              push_combine t rhs (CC_reduce_nf (u, nf));
-            | Some (NF_bool _) -> assert false
+              push_combine t rhs (CC_reduce_nf u);
+            | Some (NF_bool _, _) -> assert false
             | None -> ()
           end
         | Builtin (B_eq (a,b)) ->
@@ -1931,10 +1921,10 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           (* check if [a == true/false] *)
           let ra = find a in
           begin match ra.term_nf with
-            | Some (NF_bool true as nf) ->
-              push_combine t Term.false_ (CC_reduce_nf (a, nf))
-            | Some (NF_bool false as nf) ->
-              push_combine t Term.true_ (CC_reduce_nf (a, nf))
+            | Some (NF_bool true, _) ->
+              push_combine t Term.false_ (CC_reduce_nf a)
+            | Some (NF_bool false, _) ->
+              push_combine t Term.true_ (CC_reduce_nf a)
             | Some _ -> assert false
             | None -> ()
           end
@@ -1944,14 +1934,14 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           let r_a = find arg in
           begin match r_a.term_nf with
             | None -> ()
-            | Some (NF_cstor (cstor', _) as nf) ->
+            | Some (NF_cstor (cstor', _), _) ->
               (* reduce to true/false depending on whether [cstor=cstor'] *)
               if Cst.equal cstor.cstor_cst cstor'.cstor_cst then (
-                push_combine t Term.true_ (CC_reduce_nf (arg, nf))
+                push_combine t Term.true_ (CC_reduce_nf arg)
               ) else (
-                push_combine t Term.true_ (CC_reduce_nf (arg, nf))
+                push_combine t Term.true_ (CC_reduce_nf arg)
               )
-            | Some (NF_bool _) -> assert false
+            | Some (NF_bool _, _) -> assert false
           end
         | App_cst ({cst_kind=Cst_proj(_,lazy cstor,i); _}, a) when IArray.length a=1 ->
           (* reduce if [a.(0)] has the proper constructor *)
@@ -1959,12 +1949,12 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           let r_a = find arg in
           begin match r_a.term_nf with
             | None -> ()
-            | Some (NF_cstor (cstor', nf_cstor_args) as nf) ->
+            | Some (NF_cstor (cstor', nf_cstor_args), _) ->
               (* [proj-C-3 (C t1...tn) = t3] *)
               if Cst.equal cstor.cstor_cst cstor'.cstor_cst then (
-                push_combine t (IArray.get nf_cstor_args i) (CC_reduce_nf (arg, nf))
+                push_combine t (IArray.get nf_cstor_args i) (CC_reduce_nf arg)
               )
-            | Some (NF_bool _) -> assert false
+            | Some (NF_bool _, _) -> assert false
           end
         | _ -> ()
       end
@@ -2068,36 +2058,42 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       in
       aux_same_dist a b
 
-    (* return an explanation of why [a=b] holds.
-       precondition: [find a == find b] *)
-    let explain a b : CC_expl_set.t =
-      (* TODO: an additional union-find to keep track, for each term,
-         of the terms they are known to be equal to, according
-         to the current explanation. That allows not to prove some equality
-         several times.
-         See "fast congruence closure and extensions", Nieuwenhis&al, page 14 *)
-      let proof : CC_expl_set.t ref = ref CC_expl_set.empty in
-      let to_prove: (term*term) Queue.t = Queue.create () in
-      let add_obligation a b = Queue.push (a,b) to_prove in
-      (* explain why [a = parent_a], where [a -> ... -> parent_a] in the
-         proof forest *)
-      let rec explain_along_path a parent_a =
-        if a!=parent_a then (
-          match a.term_expl with
-            | None -> assert false
-            | Some (next_a, e_a_b) ->
-              proof := CC_expl_set.add e_a_b !proof;
-              decompose_explain e_a_b;
-              (* now prove [next_a = parent_a] *)
-              explain_along_path next_a parent_a
-        )
-      and decompose_explain e: unit = match e with
+    type proof_state = {
+      mutable ps_lits: Lit.Set.t;
+      ps_queue: (term*term) Queue.t;
+    }
+
+    let create_proof_state() = {
+      ps_lits=Lit.Set.empty;
+      ps_queue=Queue.create();
+    }
+    (* TODO: an additional union-find to keep track, for each term,
+       of the terms they are known to be equal to, according
+       to the current explanation. That allows not to prove some equality
+       several times.
+       See "fast congruence closure and extensions", Nieuwenhis&al, page 14 *)
+
+    let ps_add_obligation ps a b = Queue.push (a,b) ps.ps_queue
+    let ps_add_lit ps l = ps.ps_lits <- Lit.Set.add l ps.ps_lits
+    let ps_add_expl ps e = match e with
+      | CC_lit lit -> ps_add_lit ps lit
+      | CC_reduce_nf _ | CC_reduce_eq _ | CC_congruence _
+      | CC_injectivity _ | CC_reduction
+        -> ()
+
+    let decompose_explain ps (e:cc_explanation): unit =
+      Log.debugf 5 (fun k->k "(@[decompose_expl@ %a@])" pp_cc_explanation e);
+      begin match e with
         | CC_reduction
         | CC_lit _ -> ()
-        | CC_reduce_nf (_t, _nf) ->
-          assert false (* TODO: explain why t==nf *)
+        | CC_reduce_nf t ->
+          let r = find t in
+          begin match r.term_nf with
+            | None -> assert false
+            | Some (_, t_nf) -> ps_add_obligation ps t t_nf
+          end
         | CC_reduce_eq (a, b) ->
-          add_obligation a b
+          ps_add_obligation ps a b;
         | CC_injectivity (t1,t2)
         (* FIXME: should this be different from CC_congruence? just explain why t1==t2? *)
         | CC_congruence (t1,t2) ->
@@ -2107,74 +2103,82 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
             | App_cst (f1, a1), App_cst (f2, a2) ->
               assert (Cst.equal f1 f2);
               assert (IArray.length a1 = IArray.length a2);
-              IArray.iter2 add_obligation a1 a2
+              IArray.iter2 (ps_add_obligation ps) a1 a2
             | App_ho (f1, l1), App_ho (f2, l2) ->
               assert (List.length l1 = List.length l2);
-              add_obligation f1 f2;
-              List.iter2 add_obligation l1 l2
+              ps_add_obligation ps f1 f2;
+              List.iter2 (ps_add_obligation ps) l1 l2
             | Case (t1, m1), Case (t2, m2) ->
-              add_obligation t1 t2;
+              ps_add_obligation ps t1 t2;
               ID.Map.iter
                 (fun id rhs1 ->
                    let rhs2 = ID.Map.find id m2 in
-                   add_obligation rhs1 rhs2)
+                   ps_add_obligation ps rhs1 rhs2)
                 m1;
             | If (a1,b1,c1), If (a2,b2,c2) ->
-              add_obligation a1 a2;
-              add_obligation b1 b2;
-              add_obligation c1 c2;
+              ps_add_obligation ps a1 a2;
+              ps_add_obligation ps b1 b2;
+              ps_add_obligation ps c1 c2;
             | Builtin (B_not u1), Builtin (B_not u2) ->
-              add_obligation u1 u2
+              ps_add_obligation ps u1 u2
             | Builtin (B_and (a1,b1)), Builtin (B_and (a2,b2))
             | Builtin (B_or (a1,b1)), Builtin (B_or (a2,b2))
             | Builtin (B_imply (a1,b1)), Builtin (B_imply (a2,b2))
             | Builtin (B_eq (a1,b1)), Builtin (B_eq (a2,b2)) ->
-              add_obligation a1 a2;
-              add_obligation b1 b2;
+              ps_add_obligation ps a1 a2;
+              ps_add_obligation ps b1 b2;
             | App_cst _, _
             | App_ho _, _
             | Case _, _
             | If _, _
             | Builtin _, _ -> assert false
           end
-      in
-      Log.debugf 5 (fun k->k "(@[explain@ %a@ %a@])" Term.pp a Term.pp b);
-      add_obligation a b;
-      while not (Queue.is_empty to_prove) do
-        let a, b = Queue.pop to_prove in
+      end
+
+    (* explain why [a = parent_a], where [a -> ... -> parent_a] in the
+       proof forest *)
+    let rec explain_along_path ps a parent_a =
+      if a!=parent_a then (
+        match a.term_expl with
+          | None -> assert false
+          | Some (next_a, e_a_b) ->
+            ps_add_expl ps e_a_b;
+            decompose_explain ps e_a_b;
+            (* now prove [next_a = parent_a] *)
+            explain_along_path ps next_a parent_a
+      )
+
+    let explain_loop ps: Lit.Set.t =
+      while not (Queue.is_empty ps.ps_queue) do
+        let a, b = Queue.pop ps.ps_queue in
+        Log.debugf 5 (fun k->k "(@[explain_loop at@ %a@ %a@])" Term.pp a Term.pp b);
         assert (find a == find b);
         let c = find_common_ancestor a b in
-        explain_along_path a c;
-        explain_along_path b c;
+        explain_along_path ps a c;
+        explain_along_path ps b c;
       done;
-      !proof
+      ps.ps_lits
+
+    let explain_conflict (l:cc_explanation list): Lit.Set.t =
+      Log.debugf 5
+        (fun k->k "(@[explain_confict@ (@[<hv>%a@])@])"
+            (Utils.pp_list pp_cc_explanation) l);
+      let ps = create_proof_state () in
+      List.iter (decompose_explain ps) l;
+      explain_loop ps
 
     (* check satisfiability, update congruence closure *)
     let check (): result =
+      Log.debug 5 "(CC.check)";
       update_add_cc_eqns ();
       (* NOTE: add terms after adding equations, because some
          equations might have pushed terms in [st.terms_to_add] *)
       update_add_cc_terms ();
       try
         update_pending ()
-      with Exn_unsat (a,b) ->
-        Unsat (a,b)
+      with Exn_unsat e ->
+        Unsat e
   end
-
-  (* for each explanation [e1, e2, ..., en] build the guard
-         [e1 & e2 & ... & en => …], that is, the clause
-         [not e1 | not e2 | ... | not en] *)
-  let clause_guard_of_exp_ (e:CC_expl_set.t): Lit.t Sequence.t =
-    CC_expl_set.to_seq e
-    |> Sequence.filter_map
-      (function
-        | CC_reduction
-        | CC_injectivity _
-        | CC_reduce_nf _
-        | CC_reduce_eq _
-        | CC_congruence _ -> None
-        | CC_lit lit -> Some lit)
-    |> Sequence.map Lit.neg (* this is a guard *)
 
   (** {2 Sat Solver} *)
 
@@ -2307,11 +2311,11 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       flush_new_clauses_into_slice slice;
       begin match res with
         | CC.Sat -> TI.Sat
-        | CC.Unsat (a,b) ->
-          let expl_set = CC.explain a b in
+        | CC.Unsat expls ->
+          let lit_set = CC.explain_conflict expls in
           let conflict_clause =
-            clause_guard_of_exp_ expl_set
-            |> Sequence.to_list
+            Lit.Set.to_list lit_set
+            |> List.map Lit.neg
             |> Clause.make
           in
           Log.debugf 3
