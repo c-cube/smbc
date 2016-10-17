@@ -648,8 +648,12 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       | App_ho (f, l) -> app_ty_ f.term_ty l
       | App_cst (f, a) ->
         let n_args, ret = Cst.ty f |> Ty.unfold_n in
-        assert (n_args = IArray.length a);
-        ret
+        if n_args = IArray.length a
+        then ret (* fully applied *)
+        else (
+          assert (IArray.length a < n_args);
+          app_ty_ (Cst.ty f) (IArray.to_list a)
+        )
       | If (_,b,_) -> b.term_ty
       | Case (_,m) ->
         let _, rhs = ID.Map.choose m in
