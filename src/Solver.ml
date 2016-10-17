@@ -1559,8 +1559,9 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
        Invariant: [in_cc t => in_cc u, forall u subterm t] *)
     let in_cc (t:term): bool = Term.Field_in_cc.get t.term_bits
 
-    let signatures_tbl : repr Term_cell.Tbl.t = Term_cell.Tbl.create 2048
-    (* map a signature to the corresponding equivalence class.
+    let signatures_tbl : term Term_cell.Tbl.t
+      = Term_cell.Tbl.create 2048
+    (* map a signature to the corresponding term in some equivalence class.
        A signature is a [term_cell] in which every immediate subterm
        that participates in the congruence/evaluation relation
        is normalized (i.e. is its own representative).
@@ -1604,7 +1605,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
 
     (* find whether the given (parent) term corresponds to some signature
        in [signatures_] *)
-    let find_by_signature (t:term_cell): repr option = match signature t with
+    let find_by_signature (t:term_cell): term option = match signature t with
       | None -> None
       | Some t' -> Term_cell.Tbl.get signatures_tbl t'
 
@@ -1613,9 +1614,10 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       | Some t' ->
         Term_cell.Tbl.remove signatures_tbl t'
 
-    let add_signature (t:term_cell)(r:repr): unit = match signature t with
+    let add_signature (t:term_cell)(r:term): unit = match signature t with
       | None -> ()
       | Some t' ->
+        assert (CCOpt.map_or ~default:false (Term_cell.equal t') (signature r.term_cell));
         (* add, but only if not present already *)
         begin match Term_cell.Tbl.get signatures_tbl t' with
           | None ->
@@ -1624,7 +1626,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
                 (fun () -> Term_cell.Tbl.remove signatures_tbl t');
             );
             Term_cell.Tbl.add signatures_tbl t' r;
-          | Some r' -> assert (equal r r');
+          | Some r' -> assert (Term.equal r r');
         end
 
     type merge_op = term * term * cc_explanation
@@ -1716,32 +1718,20 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           | _ -> ()
         end
 
-    (* re-root the explanation tree of the equivalence class of [r]
-       so that it points to [r].
-       postcondition: [r.term_expl = None] *)
-    let reroot_expl (r:repr): unit =
-      (* reverse [prev -> t] into [t -> prev], and recurse into [t]'s expl *)
-      let rec aux prev t e_t_prev =
-        let old_expl = t.term_expl in
-        (* make [t] point to [prev] *)
-        if Backtrack.not_at_level_0 () then (
-          Backtrack.push_undo (fun () -> t.term_expl <- old_expl);
-        );
-        t.term_expl <- Some (prev, e_t_prev);
-        (* now recurse *)
-        match old_expl with
-          | None -> ()
-          | Some (u, e_t_u) ->
-            aux t u e_t_u
-      in
-      begin match r.term_expl with
+    (* re-root the explanation tree of the equivalence class of [t]
+       so that it points to [t].
+       postcondition: [t.term_expl = None] *)
+    let rec reroot_expl (t:term): unit =
+      let old_expl_t = t.term_expl in
+      if Backtrack.not_at_level_0 () then (
+        Backtrack.push_undo (fun () -> t.term_expl <- old_expl_t);
+      );
+      begin match old_expl_t with
         | None -> () (* already root *)
-        | Some (t, e_t_r) as old_expl_r ->
-          if Backtrack.not_at_level_0 () then (
-            Backtrack.push_undo (fun () -> r.term_expl <- old_expl_r);
-          );
-          r.term_expl <- None;
-          aux r t e_t_r
+        | Some (u, e_t_u) ->
+          reroot_expl u;
+          u.term_expl <- Some (t, e_t_u);
+          t.term_expl <- None;
       end
 
     (* instantiate expansion of terms *)
@@ -1787,10 +1777,10 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         begin match find_by_signature t.term_cell with
           | None ->
             (* add to the signature table *)
-            add_signature t.term_cell (find t)
-          | Some r ->
+            add_signature t.term_cell t
+          | Some u ->
             (* must combine [t] with [r] *)
-            push_combine t r (CC_congruence (t,r))
+            push_combine t u (CC_congruence (t,u))
         end;
         (* expand term *)
         if not (Term.Field_expanded.get t.term_bits) then (
@@ -1817,54 +1807,19 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
              we merge [ra] into [rb]. *)
           let ra, rb = if size_ ra > size_ rb then rb, ra else ra, rb in
           (* check normal form(s) for consistency, merge them *)
-          begin match ra.term_nf, rb.term_nf with
-            | None, None -> ()
-            | None, Some _ -> ()
-            | Some nf, (None as old_nf_b) ->
-              (* update [rb]'s normal form *)
-              if Backtrack.not_at_level_0 () then (
-                Backtrack.push_undo (fun () -> rb.term_nf <- old_nf_b);
-              );
-              rb.term_nf <- Some nf;
-              (* notify parents of [rb] that can be evaluated, because the
-                 new normal form of [rb] might trigger such an evaluation *)
-              begin
-                Bag.to_seq rb.term_parents
-                |> Sequence.filter is_evaluable
-                |> Sequence.iter
-                  (fun parent ->
-                     remove_signature parent.term_cell;
-                     push_pending parent)
-              end;
-            | Some (nf_a,_), Some (nf_b,_) ->
-              (* check consistency of normal forms *)
-              begin match nf_a, nf_b with
-                | NF_bool v_a, NF_bool v_b ->
-                  if v_a <> v_b then (
-                    let l = [e_ab; CC_reduce_nf a; CC_reduce_nf b] in
-                    raise (Exn_unsat l); (* incompatible *)
-                  )
-                | NF_cstor (c1, args1), NF_cstor (c2, args2) ->
-                  if Cst.equal c1.cstor_cst c2.cstor_cst then (
-                    (* unify arguments recursively, by injectivity *)
-                    assert (IArray.length args1 = IArray.length args2);
-                    IArray.iter2
-                      (fun sub1 sub2 ->
-                         push_combine sub1 sub2 (CC_injectivity (ra, rb)))
-                      args1 args2
-                  ) else (
-                    let l = [e_ab; CC_reduce_nf a; CC_reduce_nf b] in
-                    raise (Exn_unsat l); (* incompatible *)
-                  )
-                | NF_bool _, _
-                | NF_cstor _, _ -> assert false (* ill typed *)
-              end
-          end;
+          let merge_ok = check_normal_forms ra rb in
+          if not merge_ok then (
+            let l = [e_ab; CC_reduce_nf a; CC_reduce_nf b] in
+            raise (Exn_unsat l); (* incompatible *)
+          );
           (* remove [ra.parents] from signature, put them into [st.pending] *)
           begin
             Bag.to_seq ra.term_parents
             |> Sequence.iter
               (fun parent ->
+                 (* FIXME: with OCaml's hashtable, we should be able
+                    to keep this entry (and have it become relevant later
+                    once the signature of [parent] is backtracked) *)
                  remove_signature parent.term_cell;
                  push_pending parent)
           end;
@@ -1878,19 +1833,64 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
             ra.term_root <- rb;
             rb.term_parents <- Bag.append rb_old_parents ra.term_parents;
           end;
-          (* update explanations (ra -> rb) *)
+          (* update explanations (a -> b) *)
           begin
-            reroot_expl ra;
-            assert (ra.term_expl = None);
+            reroot_expl a;
+            assert (a.term_expl = None);
             if Backtrack.not_at_level_0 () then (
-              Backtrack.push_undo (fun () -> ra.term_expl <- None);
+              Backtrack.push_undo (fun () -> a.term_expl <- None);
             );
-            ra.term_expl <- Some (rb, e_ab);
+            a.term_expl <- Some (b, e_ab);
           end;
         )
       done;
       (* now update pending terms again *)
       update_pending ()
+
+    (* returns [true] if [ra] and [rb] have compatible normal forms.
+       Side effect: also pushes sub-tasks *)
+    and check_normal_forms (ra:repr)(rb:repr): bool =
+      assert (is_root_ ra);
+      assert (is_root_ rb);
+      begin match ra.term_nf, rb.term_nf with
+        | None, None -> true
+        | None, Some _ -> true
+        | Some nf, (None as old_nf_b) ->
+          (* update [rb]'s normal form *)
+          if Backtrack.not_at_level_0 () then (
+            Backtrack.push_undo (fun () -> rb.term_nf <- old_nf_b);
+          );
+          rb.term_nf <- Some nf;
+          (* notify parents of [rb] that can be evaluated, because the
+             new normal form of [rb] might trigger such an evaluation *)
+          begin
+            Bag.to_seq rb.term_parents
+            |> Sequence.filter is_evaluable
+            |> Sequence.iter
+              (fun parent ->
+                 remove_signature parent.term_cell;
+                 push_pending parent)
+          end;
+          true
+        | Some (nf_a,_), Some (nf_b,_) ->
+          (* check consistency of normal forms *)
+          begin match nf_a, nf_b with
+            | NF_bool v_a, NF_bool v_b ->
+              v_a = v_b
+            | NF_cstor (c1, args1), NF_cstor (c2, args2) ->
+              if Cst.equal c1.cstor_cst c2.cstor_cst then (
+                (* unify arguments recursively, by injectivity *)
+                assert (IArray.length args1 = IArray.length args2);
+                IArray.iter2
+                  (fun sub1 sub2 ->
+                     push_combine sub1 sub2 (CC_injectivity (ra, rb)))
+                  args1 args2;
+                true
+              ) else false
+            | NF_bool _, _
+            | NF_cstor _, _ -> assert false (* ill typed *)
+          end
+      end
 
     (* evaluation rules: if, case... *)
     and eval_pending (t:term): unit =
