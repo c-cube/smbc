@@ -1226,8 +1226,8 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       | [] -> CCFormat.string out "false"
       | [lit] -> Lit.pp out lit
       | _ ->
-        Format.fprintf out "(@[<hv1>or@ %a@ id: %d@])"
-          (Utils.pp_list Lit.pp) c.lits c.id
+        Format.fprintf out "[@[<hv>%a@]]/%d"
+          (Utils.pp_list ~sep:"; " Lit.pp) c.lits c.id
 
     (* canonical form: sorted list *)
     let make =
