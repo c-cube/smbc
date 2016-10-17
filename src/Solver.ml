@@ -984,9 +984,9 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         | False -> CCFormat.string out "false"
         | DB d -> DB.pp out d
         | App_cst (c, a) when IArray.is_empty a ->
-          if ids then Cst.pp out c else ID.pp_name out c.cst_id
+          pp_id out (Cst.id c)
         | App_cst (f,l) ->
-          fpf out "(@[<1>%a@ %a@])" Cst.pp f (Utils.pp_iarray pp) l
+          fpf out "(@[<1>%a@ %a@])" pp_id (Cst.id f) (Utils.pp_iarray pp) l
         | App_ho (f,l) ->
           fpf out "(@[<1>@@ %a@ %a@])" pp f (Utils.pp_list pp) l
         | Fun (ty,f) ->
@@ -996,7 +996,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           fpf out "(@[if %a@ %a@ %a@])" pp a pp b pp c
         | Case (t,m) ->
           let pp_bind out (id,rhs) =
-            fpf out "(@[<1>case %a@ %a@])" ID.pp id pp rhs
+            fpf out "(@[<1>case %a@ %a@])" pp_id id pp rhs
           in
           let print_map =
             CCFormat.seq ~start:"" ~stop:"" ~sep:" " pp_bind
@@ -1012,10 +1012,12 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           fpf out "(@[<hv1>=>@ %a@ %a@])" pp a pp b
         | Builtin (B_eq (a,b)) ->
           fpf out "(@[<hv1>=@ %a@ %a@])" pp a pp b
+      and pp_id =
+        if ids then ID.pp else ID.pp_name
       in
       pp out t
 
-    let pp = pp_top ~ids:true
+    let pp = pp_top ~ids:false
 
     type eval_env = term DB_env.t
 
