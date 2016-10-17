@@ -450,6 +450,8 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     val cur_level : unit -> level
     val push_level : unit -> unit
     val backtrack : level -> unit
+    val at_level_0 : unit -> bool
+    val not_at_level_0 : unit -> bool
     val push_undo : (unit -> unit) -> unit
   end = struct
     let dummy_level = -1
@@ -471,12 +473,23 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
 
     let cur_level () = CCVector.length st_
 
+    let push_undo f = CCVector.push st_ f
+
+    (* Are we current at level 0, or in the search tree?
+       This helps because some operations are much cheaper to do at level 0 *)
+    let at_level_0_ : bool ref = ref true
+    let at_level_0 () = !at_level_0_
+    let not_at_level_0 () = not !at_level_0_
+
     let push_level () : unit =
       let l = cur_level() in
       Log.debugf 2 (fun k->k "@{<Yellow>** now at level %d (push)@}" l);
+      if !at_level_0_ then (
+        Log.debug 5 "not at level 0 anymore";
+        push_undo (fun () -> Log.debug 5 "back to level 0"; at_level_0_ := true);
+        at_level_0_ := false;
+      );
       ()
-
-    let push_undo f = CCVector.push st_ f
   end
 
   (* TODO: normalization of {!term_cell} for use in signatures? *)
@@ -1264,10 +1277,6 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     let to_seq c = Sequence.of_list c.lits
   end
 
-  let at_level_0 : bool ref = ref true
-  (** Are we current at level 0, or in the search tree?
-      This helps because some operations are much cheaper to do at level 0 *)
-
   (** {2 Term Expansion}
 
       Some terms reduce to other terms (e.g., defined functions and constants);
@@ -1567,7 +1576,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         let root = find_rec old_root in
         (* path compression *)
         if root != old_root then (
-          if not !at_level_0 then (
+          if Backtrack.not_at_level_0 () then (
             Backtrack.push_undo (fun () -> t.term_root <- old_root);
           );
           t.term_root <- root;
@@ -1611,7 +1620,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         (* add, but only if not present already *)
         begin match Term_cell.Tbl.get signatures_tbl t' with
           | None ->
-            if not !at_level_0 then (
+            if Backtrack.not_at_level_0 () then (
               Backtrack.push_undo
                 (fun () -> Term_cell.Tbl.remove signatures_tbl t');
             );
@@ -1716,7 +1725,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       let rec aux prev t e_t_prev =
         let old_expl = t.term_expl in
         (* make [t] point to [prev] *)
-        if not !at_level_0 then (
+        if Backtrack.not_at_level_0 () then (
           Backtrack.push_undo (fun () -> t.term_expl <- old_expl);
         );
         t.term_expl <- Some (prev, e_t_prev);
@@ -1729,7 +1738,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       begin match r.term_expl with
         | None -> () (* already root *)
         | Some (t, e_t_r) as old_expl_r ->
-          if not !at_level_0 then (
+          if Backtrack.not_at_level_0 () then (
             Backtrack.push_undo (fun () -> r.term_expl <- old_expl_r);
           );
           r.term_expl <- None;
@@ -1814,7 +1823,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
             | None, Some _ -> ()
             | Some nf, (None as old_nf_b) ->
               (* update [rb]'s normal form *)
-              if not !at_level_0 then (
+              if Backtrack.not_at_level_0 () then (
                 Backtrack.push_undo (fun () -> rb.term_nf <- old_nf_b);
               );
               rb.term_nf <- Some nf;
@@ -1874,7 +1883,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           begin
             reroot_expl ra;
             assert (ra.term_expl = None);
-            if not !at_level_0 then (
+            if Backtrack.not_at_level_0 () then (
               Backtrack.push_undo (fun () -> ra.term_expl <- None);
             );
             ra.term_expl <- Some (rb, e_ab);
@@ -1976,7 +1985,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     and add_cc_pending (t:term): unit =
       if not (in_cc t) then (
         (* on backtrack: add [t] again later *)
-        if not !at_level_0 then (
+        if Backtrack.not_at_level_0 () then (
           Backtrack.push_undo
             (fun () ->
                t.term_bits <- Term.Field_in_cc.set false t.term_bits;
@@ -1990,7 +1999,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           (* NOTE: add to CC after updating parents, so that [t] is merged
              properly too *)
           add_cc_pending sub;
-          if not !at_level_0 then (
+          if Backtrack.not_at_level_0 () then (
             Backtrack.push_undo (fun () -> sub.term_parents <- old_parents);
           )
         in
@@ -2019,7 +2028,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     (* add [t=u] to the congruence closure, unconditionally (reduction relation)  *)
     and add_cc_eqn (st:update_state) (eqn:merge_op): unit =
       (* on backtrack: remember to add [t=u] again *)
-      if not !at_level_0 then (
+      if Backtrack.not_at_level_0 () then (
         Backtrack.push_undo (fun () -> Queue.push eqn st.eqns_to_add);
       );
       let t, u, expl = eqn in
@@ -2801,7 +2810,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
 
   let solve ?(on_exit=[]) ?(check=true) () =
     let rec check_cc (): res =
-      assert (!at_level_0);
+      assert (Backtrack.at_level_0 ());
       begin match CC.check () with
         | CC.Unsat _ -> Unsat (* TODO proof *)
         | CC.Sat ->
@@ -2818,10 +2827,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       Log.debugf 2
         (fun k->k "(@[<1>@{<Yellow>solve@}@ @[:with-assumptions@ (@[%a@])]@])"
             (Utils.pp_list Lit.pp) assumptions);
-      at_level_0 := false;
-      let res = M.solve ~assumptions() in
-      at_level_0 := true;
-      begin match res with
+      begin match M.solve ~assumptions() with
         | M.Sat _ ->
           Log.debugf 1 (fun k->k "@{<Yellow>** found SAT@}");
           do_on_exit ~on_exit;
