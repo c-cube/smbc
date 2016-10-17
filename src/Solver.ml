@@ -2091,6 +2091,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
 
     let decompose_explain ps (e:cc_explanation): unit =
       Log.debugf 5 (fun k->k "(@[decompose_expl@ %a@])" pp_cc_explanation e);
+      ps_add_expl ps e;
       begin match e with
         | CC_reduction
         | CC_lit _ -> ()
@@ -2127,19 +2128,12 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
               ps_add_obligation ps a1 a2;
               ps_add_obligation ps b1 b2;
               ps_add_obligation ps c1 c2;
-            | Builtin (B_not u1), Builtin (B_not u2) ->
-              ps_add_obligation ps u1 u2
-            | Builtin (B_and (a1,b1)), Builtin (B_and (a2,b2))
-            | Builtin (B_or (a1,b1)), Builtin (B_or (a2,b2))
-            | Builtin (B_imply (a1,b1)), Builtin (B_imply (a2,b2))
-            | Builtin (B_eq (a1,b1)), Builtin (B_eq (a2,b2)) ->
-              ps_add_obligation ps a1 a2;
-              ps_add_obligation ps b1 b2;
+            | Builtin _, _ -> assert false
             | App_cst _, _
             | App_ho _, _
             | Case _, _
             | If _, _
-            | Builtin _, _ -> assert false
+              -> assert false
           end
       end
 
@@ -2150,7 +2144,6 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         match a.term_expl with
           | None -> assert false
           | Some (next_a, e_a_b) ->
-            ps_add_expl ps e_a_b;
             decompose_explain ps e_a_b;
             (* now prove [next_a = parent_a] *)
             explain_along_path ps next_a parent_a
