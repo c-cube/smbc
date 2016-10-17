@@ -1594,14 +1594,13 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       CCOpt.map fst r.term_nf
 
     let signature (t:term_cell): term_cell option = match t with
-      | True | False | DB _ | Fun _ | Mu _
+      | True | False | DB _ | Fun _ | Mu _ | Builtin _
         -> None
       | App_cst (_, a) when IArray.is_empty a -> None
       | App_cst (f, a) -> App_cst (f, IArray.map find a) |> CCOpt.return
       | App_ho (f, l) -> App_ho (find f, List.map find l) |> CCOpt.return
       | If (a,b,c) -> If (find a, b, c) |> CCOpt.return
       | Case (t, m) -> Case (find t, m) |> CCOpt.return
-      | Builtin b -> Builtin (Term.map_builtin find b) |> CCOpt.return
 
     (* find whether the given (parent) term corresponds to some signature
        in [signatures_] *)
