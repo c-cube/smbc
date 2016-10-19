@@ -3054,8 +3054,8 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
 
   let rec find_domain_ (uty:ty_uninterpreted_slice): cst list =
     match uty.uty_status, uty.uty_pair with
-      | None, _
-      | _, Lazy_none -> assert false
+      | None, _ -> assert false
+      | _, Lazy_none -> [] (* we did not need this slice *)
       | Some (_, Uty_empty), _ -> []
       | Some (_, Uty_nonempty), Lazy_some (c_head, uty_tail) ->
         c_head :: find_domain_ uty_tail
