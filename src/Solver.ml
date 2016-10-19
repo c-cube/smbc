@@ -2630,7 +2630,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         | App_cst (f, args) when IArray.is_empty args ->
           A.const f.cst_id (ty_to_ast t.term_ty)
         | App_cst (f, args) ->
-          let f = A.const f.cst_id (ty_to_ast t.term_ty) in
+          let f = A.const f.cst_id (ty_to_ast (Cst.ty f)) in
           let args = IArray.map (aux env) args in
           A.app f (IArray.to_list args)
         | App_ho (f,l) -> A.app (aux env f) (List.map (aux env) l)
