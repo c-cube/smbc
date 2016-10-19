@@ -292,8 +292,11 @@ let match_ t m =
   mk_ (Match (t,m)) rhs1.ty
 
 let switch u m =
-  let _, t1 = ID.Map.choose m in
-  mk_ (Switch (u,m)) t1.ty
+  try
+    let _, t1 = ID.Map.choose m in
+    mk_ (Switch (u,m)) t1.ty
+  with Not_found ->
+    invalid_arg "Ast.switch: empty list of cases"
 
 let let_ v t u =
   if not (Ty.equal (Var.ty v) t.ty)
