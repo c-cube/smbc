@@ -33,15 +33,17 @@ type entry =
   | E_ty of ty * domain
   | E_const of ID.t * term
 
-let pp out (m:t) =
+let pp_syn (syn:A.syntax) out (m:t) =
   let pp_cst_name out c = ID.pp_name out c in
+  let pp_ty = match syn with A.Auto | A.Tip -> A.pp_ty_tip | A.Smbc -> A.Ty.pp in
+  let pp_term = match syn with A.Auto | A.Tip -> A.pp_term_tip | A.Smbc -> A.pp_term in
   let pp_entry out = function
     | E_ty (ty,l) ->
       Format.fprintf out "(@[<1>type@ %a@ (@[<hv>%a@])@])"
-        A.Ty.pp ty (Utils.pp_list pp_cst_name) l
+        pp_ty ty (Utils.pp_list pp_cst_name) l
     | E_const (c,t) ->
       Format.fprintf out "(@[<1>val@ %a@ %a@])"
-        ID.pp_name c A.pp_term t
+        ID.pp_name c pp_term t
   in
   let es =
     CCList.append
@@ -49,6 +51,9 @@ let pp out (m:t) =
       (ID.Map.to_list m.consts |> List.map (fun (c,t) -> E_const (c,t)))
   in
   Format.fprintf out "(@[<v>%a@])" (Utils.pp_list pp_entry) es
+
+let pp = pp_syn A.Smbc
+let pp_tip = pp_syn A.Tip
 
 exception Bad_model of t * term * term
 exception Error of string

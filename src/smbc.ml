@@ -2,6 +2,7 @@
 (* This file is free software. See file "license" for more details. *)
 
 type config = {
+  syntax: Ast.syntax;
   max_depth: int;
   print_stat: bool;
   dot_term_graph: string option;
@@ -56,7 +57,8 @@ let solve ~config (ast:Ast.statement list) : unit =
   if config.print_stat then Format.printf "%a@." S.pp_stats ();
   match res with
     | S.Sat m ->
-      Format.printf "(@[<1>result @{<Green>SAT@}@ :model @[%a@]@])@." Model.pp m;
+      Format.printf "(@[<1>result @{<Green>SAT@}@ :model @[%a@]@])@."
+        (Model.pp_syn config.syntax) m;
     | S.Unsat ->
       Format.printf "(result @{<Yellow>UNSAT@})@."
     | S.Unknown _ ->
@@ -153,6 +155,7 @@ let () =
   (* solve *)
   let config = {
     max_depth = !max_depth_;
+    syntax= !syntax_;
     print_stat = !stats_;
     progress = !progress_;
     pp_hashcons = !pp_hashcons_;

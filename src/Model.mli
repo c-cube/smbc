@@ -25,6 +25,8 @@ val make :
   t
 
 val pp : t CCFormat.printer
+val pp_tip : t CCFormat.printer
+val pp_syn : A.syntax -> t CCFormat.printer
 
 val eval : t -> term -> term
 

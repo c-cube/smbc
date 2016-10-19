@@ -9,6 +9,7 @@ type 'a to_sexp = 'a -> sexp
 
 (** {2 Types} *)
 
+exception Error of string
 exception Ill_typed of string
 
 module Var : sig
@@ -145,6 +146,9 @@ val statement_to_sexp : statement to_sexp
 val pp_term : term CCFormat.printer
 val pp_statement : statement CCFormat.printer
 
+val pp_term_tip : term CCFormat.printer
+val pp_ty_tip : Ty.t CCFormat.printer
+
 (** {2 Parsing and Typing} *)
 
 module Ctx : sig
@@ -167,10 +171,14 @@ type syntax =
 val string_of_syntax : syntax -> string
 
 val parse : include_dir:string -> file:string -> syntax -> statement list or_error
-(** Parse the given file, type-check, etc.  *)
+(** Parse the given file, type-check, etc.
+    @raise Error in case the input is ill formed
+    @raise Ill_typed if the input is ill typed *)
 
 val parse_stdin : syntax -> statement list or_error
-(** Parse stdin, type-check, etc. *)
+(** Parse stdin, type-check, etc.
+    @raise Error in case the input is ill formed
+    @raise Ill_typed if the input is ill typed *)
 
 (** {2 Environment} *)
 

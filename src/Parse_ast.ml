@@ -120,7 +120,7 @@ let rec pp_term out (t:term) = match t with
   | Fun (v,body) -> fpf out "(@[<1>fun@ (%a)@ %a@])" pp_typed_var v pp_term body
   | Forall (v,body) -> fpf out "(@[<1>forall@ (%a)@ %a@])" pp_typed_var v pp_term body
   | Exists (v,body) -> fpf out "(@[<1>exists@ (%a)@ %a@])" pp_typed_var v pp_term body
-  | Mu (v,body) -> fpf out "(@[<1>fun@ (%a)@ %a@])" pp_typed_var v pp_term body
+  | Mu (v,body) -> fpf out "(@[<1>mu@ (%a)@ %a@])" pp_typed_var v pp_term body
   | Eq (a,b) -> fpf out "(@[=@ %a@ %a@])" pp_term a pp_term b
   | Imply (a,b) -> fpf out "(@[=>@ %a@ %a@])" pp_term a pp_term b
   | And l -> fpf out "(@[<hv>and@ %a@])" (Utils.pp_list pp_term) l

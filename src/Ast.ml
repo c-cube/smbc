@@ -10,7 +10,6 @@ type 'a to_sexp = 'a -> sexp
 module S = CCSexp
 
 exception Error of string
-
 exception Ill_typed of string
 
 let () = Printexc.register_printer
@@ -773,6 +772,77 @@ let parse_stdin syn = match syn with
       |> CCList.flat_map (conv_statement ctx syn)
       |> CCResult.return
     with e -> Result.Error (Printexc.to_string e)
+
+(** {2 To TIP} *)
+
+module TA = Tip_ast
+
+let rec ty_to_tip ty: TA.ty = match ty with
+  | Ty.Prop -> TA.ty_bool
+  | Ty.Const id -> TA.ty_const (ID.to_string id)
+  | Ty.Arrow (a,b) -> TA.ty_arrow (ty_to_tip a)(ty_to_tip b)
+
+let var_to_tip v : TA.var = ID.to_string (Var.id v)
+let typed_var_to_tip v = var_to_tip v, ty_to_tip (Var.ty v)
+
+let rec term_to_tip (t:term): TA.term = match t.term with
+  | Var v -> TA.const (var_to_tip v)
+  | Const c -> TA.const (ID.to_string c)
+  | App (f,l) ->
+    let f = term_to_tip f in
+    let l = List.map term_to_tip l in
+    begin match f with
+      | TA.Const f_id -> TA.app f_id l
+      | _ -> List.fold_left TA.ho_app f l
+    end
+  | If (a,b,c) -> TA.if_ (term_to_tip a)(term_to_tip b)(term_to_tip c)
+  | Match (t,m) ->
+    let m =
+      ID.Map.to_list m
+       |> List.map
+         (fun (c,(vars,rhs)) ->
+            TA.Match_case (
+              ID.to_string c,
+              List.map var_to_tip vars,
+              term_to_tip rhs))
+    in
+    TA.match_ (term_to_tip t) m
+  | Switch (t,m) ->
+    let t = term_to_tip t in
+    begin match ID.Map.to_list m with
+      | [] -> assert false
+      | (_, last_rhs) :: tail ->
+        List.fold_left
+          (fun else_ (c, rhs) ->
+             let test = TA.eq t (TA.const (ID.to_string c)) in
+             TA.if_ test (term_to_tip rhs) else_)
+          (term_to_tip last_rhs) tail
+    end
+  | True -> TA.true_
+  | False -> TA.false_
+  | Let (v,t,u) ->
+    TA.let_ [var_to_tip v, term_to_tip t] (term_to_tip u)
+  | Fun (v,t) ->
+    TA.fun_ (typed_var_to_tip v) (term_to_tip t)
+  | Forall (v,t) ->
+    TA.forall [typed_var_to_tip v] (term_to_tip t)
+  | Exists (v,t) ->
+    TA.exists [typed_var_to_tip v] (term_to_tip t)
+  | Not t -> TA.not_ (term_to_tip t)
+  | Binop (op,a,b) ->
+    let a = term_to_tip a in
+    let b = term_to_tip b in
+    begin match op with
+      | And -> TA.and_ [a;b]
+      | Or -> TA.or_ [a;b]
+      | Imply -> TA.imply a b
+      | Eq -> TA.eq a b
+    end
+  | Mu (_,_) -> assert false (* TODO? *)
+
+let pp_term_tip out t = TA.pp_term out (term_to_tip t)
+
+let pp_ty_tip out ty = TA.pp_ty out (ty_to_tip ty)
 
 (** {2 Environment} *)
 
