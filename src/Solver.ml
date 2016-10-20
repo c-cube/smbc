@@ -154,7 +154,12 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
   and ty_h = {
     mutable ty_id: int;
     ty_cell: ty_cell;
+    ty_card: ty_card lazy_t;
   }
+
+  and ty_card =
+    | Finite
+    | Infinite
 
   and ty_def =
     | Uninterpreted
@@ -171,12 +176,48 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     cstor_proj: cst IArray.t lazy_t; (* projectors *)
     cstor_test: cst lazy_t; (* tester *)
     cstor_cst: cst; (* the cstor itself *)
+    cstor_card: ty_card; (* cardinality of the constructor('s args) *)
   }
 
   and ty_cell =
     | Prop
     | Atomic of ID.t * ty_def
     | Arrow of ty_h * ty_h
+
+  (** {2 Type Cardinality} *)
+  module Ty_card : sig
+    type t = ty_card
+
+    val (+) : t -> t -> t
+    val ( * ) : t -> t -> t
+    val ( ^ ) : t -> t -> t
+    val finite : t
+    val infinite : t
+
+    val sum : t list -> t
+    val product : t list -> t
+
+    val equal : t -> t -> bool
+    val compare : t -> t -> int
+    val pp : t CCFormat.printer
+  end = struct
+    type t = ty_card
+
+    let (+) a b = match a, b with Finite, Finite -> Finite | _ -> Infinite
+    let ( * ) a b = match a, b with Finite, Finite -> Finite | _ -> Infinite
+    let ( ^ ) a b = match a, b with Finite, Finite -> Finite | _ -> Infinite
+    let finite = Finite
+    let infinite = Infinite
+
+    let sum = List.fold_left (+) Finite
+    let product = List.fold_left ( * ) Finite
+
+    let equal = (=)
+    let compare = Pervasives.compare
+    let pp out = function
+      | Finite -> CCFormat.string out "finite"
+      | Infinite -> CCFormat.string out "infinite"
+  end
 
   module Ty : sig
     type t = ty_h
@@ -186,7 +227,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     val hash : t -> int
 
     val prop : t
-    val atomic : ID.t -> ty_def -> t
+    val atomic : ID.t -> ty_def -> card:ty_card lazy_t -> t
     val arrow : t -> t -> t
     val arrow_l : t list -> t -> t
 
@@ -227,23 +268,26 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       end)
 
     (* build a type *)
-    let make_ : ty_cell -> t =
+    let make_ : ty_cell -> card:ty_card lazy_t -> t =
       let tbl : t Tbl_cell.t = Tbl_cell.create 128 in
       let n = ref 0 in
-      fun c ->
+      fun c ~card ->
         try Tbl_cell.find tbl c
         with Not_found ->
           let ty_id = !n in
           incr n;
-          let ty = {ty_id; ty_cell=c;} in
+          let ty = {ty_id; ty_cell=c; ty_card=card; } in
           Tbl_cell.add tbl c ty;
           ty
 
-    let prop = make_ Prop
+    let prop = make_ Prop ~card:(Lazy.from_val Finite)
 
-    let atomic id def = make_ (Atomic (id,def))
+    let atomic id def ~card = make_ (Atomic (id,def)) ~card
 
-    let arrow a b = make_ (Arrow (a,b))
+    let arrow a b =
+      let card = lazy (Ty_card.(Lazy.force b.ty_card ^ Lazy.force a.ty_card)) in
+      make_ (Arrow (a,b)) ~card
+
     let arrow_l = List.fold_right arrow
 
     let is_prop t =
@@ -2389,7 +2433,12 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
 
   let add_ty_support_ (_ty:Ty.t): unit = ()
 
-  module Conv = struct
+  module Conv : sig
+    val add_statement : Ast.statement -> unit
+    val add_statement_l : Ast.statement list -> unit
+    val ty_to_ast: Ty.t -> Ast.Ty.t
+    val term_to_ast: term -> Ast.term
+  end = struct
     (* for converting Ast.Ty into Ty *)
     let ty_tbl_ : Ty.t lazy_t ID.Tbl.t = ID.Tbl.create 16
 
@@ -2527,7 +2576,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           Top_goals.push t;
           push_clause (Clause.make [Lit.atom t])
         | Ast.TyDecl id ->
-          let ty = Ty.atomic id Uninterpreted in
+          let ty = Ty.atomic id Uninterpreted ~card:(Lazy.from_val Infinite) in
           add_ty_support_ ty;
           ID.Tbl.add ty_tbl_ id (Lazy.from_val ty)
         | Ast.Decl (id, ty) ->
@@ -2537,20 +2586,37 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           add_cst_support_ cst; (* need it in model *)
           ID.Tbl.add decl_ty_ id (Lazy.from_val cst)
         | Ast.Data l ->
+          (* the datatypes in [l]. Used for computing cardinalities *)
+          let in_same_block : ID.Set.t =
+            List.map (fun {Ast.Ty.data_id; _} -> data_id) l |> ID.Set.of_list
+          in
           (* declare the type, and all the constructors *)
           List.iter
             (fun {Ast.Ty.data_id; data_cstors} ->
                let ty = lazy (
+                 let card_ : ty_card ref = ref Finite in
                  let cstors = lazy (
                    data_cstors
                    |> ID.Map.map
                      (fun c ->
                         let c_id = c.Ast.Ty.cstor_id in
                         let ty_c = conv_ty c.Ast.Ty.cstor_ty in
+                        let ty_args, ty_ret = Ty.unfold ty_c in
+                        (* add cardinality of [c] to the cardinality of [data_id].
+                           (product of cardinalities of args) *)
+                        let cstor_card =
+                          ty_args
+                          |> List.map
+                            (fun ty_arg -> match ty_arg.ty_cell with
+                               | Atomic (id, _) when ID.Set.mem id in_same_block ->
+                                 Infinite
+                               | _ -> Lazy.force ty_arg.ty_card)
+                          |> Ty_card.product
+                        in
+                        card_ := Ty_card.( !card_ + cstor_card );
                         let rec cst = lazy (
                           Cst.make_cstor c_id ty_c cstor
                         ) and cstor = lazy (
-                          let ty_args, ty_ret = Ty.unfold ty_c in
                           let cstor_proj = lazy (
                             let n = ref 0 in
                             List.map2
@@ -2568,14 +2634,21 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
                           ) in
                           { cstor_ty=ty_c; cstor_cst=Lazy.force cst;
                             cstor_args=IArray.of_list ty_args;
-                            cstor_proj; cstor_test }
+                            cstor_proj; cstor_test; cstor_card; }
                         ) in
                         ID.Tbl.add decl_ty_ c_id cst; (* declare *)
                         Lazy.force cstor)
                  )
                  in
                  let data = { data_cstors=cstors; } in
-                 Ty.atomic data_id (Data data)
+                 let card = lazy (
+                   ignore (Lazy.force cstors);
+                   let r = !card_ in
+                   Log.debugf 5
+                     (fun k->k "(@[card_of@ %a@ %a@])" ID.pp data_id Ty_card.pp r);
+                   r
+                 ) in
+                 Ty.atomic data_id (Data data) ~card
                ) in
                ID.Tbl.add ty_tbl_ data_id ty;
             )
@@ -2584,6 +2657,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           List.iter
             (fun {Ast.Ty.data_id; _} ->
                let lazy ty = ID.Tbl.find ty_tbl_ data_id in
+               ignore (Lazy.force ty.ty_card);
                begin match ty.ty_cell with
                  | Atomic (_, Data {data_cstors=lazy _; _}) -> ()
                  | _ -> assert false
@@ -2630,11 +2704,6 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       let v = fresh_var ty in
       let env = DB_env.push (A.var v) env in
       f v env
-
-    let with_vars tys env ~f =
-      let vars = List.map fresh_var tys in
-      let env = DB_env.push_l (List.map A.var vars) env in
-      f vars env
 
     let term_to_ast (t:term): Ast.term =
       let rec aux env t = match t.term_cell with

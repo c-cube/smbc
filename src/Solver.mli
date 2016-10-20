@@ -38,7 +38,6 @@ module Make(C:CONFIG)(Dummy : sig end) : sig
     val view : t -> ty_cell
 
     val prop : t
-    val atomic : ID.t -> ty_def -> t
     val arrow : t -> t -> t
     val arrow_l : t list -> t -> t
 
