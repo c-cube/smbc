@@ -103,7 +103,10 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
 
   and term_cases_set =
     | TC_none
-    | TC_cstors of data_cstor ID.Map.t (* set of possible constructors *)
+    | TC_cstors of
+        (* set of possible constructors *)
+        data_cstor ID.Map.t *
+        cc_explanation list
 
   (* atomic explanation in the congruence closure *)
   and cc_explanation =
@@ -169,6 +172,10 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
   and datatype = {
     data_cstors: data_cstor ID.Map.t lazy_t;
   }
+
+  (* TODO: in cstor, add:
+     - for each selector, a special "magic" term for undefined, in
+       case the selector is ill-applied (Collapse 2)  *)
 
   (* a constructor *)
   and data_cstor = {
@@ -384,6 +391,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     val hash : t -> int
     val as_undefined : t -> (t * Ty.t) option
     val as_undefined_exn : t -> t * Ty.t
+    val is_finite_cstor : t -> bool
     val pp : t CCFormat.printer
     module Map : CCMap.S with type key = t
     module Tbl : CCHashtbl.S with type key = t
@@ -425,6 +433,10 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     let as_undefined_exn (c:t) = match as_undefined c with
       | Some tup -> tup
       | None -> assert false
+
+    let is_finite_cstor c = match c.cst_kind with
+      | Cst_cstor (lazy {cstor_card=Finite; _}) -> true
+      | _ -> false
 
     let equal a b = ID.equal a.cst_id b.cst_id
     let compare a b = ID.compare a.cst_id b.cst_id
@@ -772,6 +784,10 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     module Field_is_lit : Term_bits.FIELD with type value = bool
     (** Is this term a boolean literal? *)
 
+    module Field_is_split : Term_bits.FIELD with type value = bool
+    (** Did we perform case split (Split 1) on this term?
+        This is only relevant for terms whose type is a datatype. *)
+
     val id : t -> int
     val ty : t -> Ty.t
     val equal : t -> t -> bool
@@ -816,6 +832,8 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
 
     val to_seq : t -> t Sequence.t
 
+    val all_terms : t Sequence.t
+
     val pp : t CCFormat.printer
 
     (** {6 Views} *)
@@ -852,6 +870,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     module Field_expanded = (val (Term_bits.bool ~name:"expanded" ()))
     module Field_has_expansion_lit = (val (Term_bits.bool ~name:"has_expansion_lit" ()))
     module Field_is_lit = (val (Term_bits.bool ~name:"is_lit" ()))
+    module Field_is_split = (val (Term_bits.bool ~name:"is_split" ()))
     let () = Term_bits.freeze()
 
     let id t = t.term_id
@@ -861,7 +880,8 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     let hash = term_hash_
     let compare a b = CCOrd.int_ a.term_id b.term_id
 
-    let (make, get : (term_cell -> term) * (term_cell -> term option)) =
+    let (make, get, all_terms
+        : (term_cell -> term) * (term_cell -> term option) * term Sequence.t) =
       let tbl : term Term_cell.Tbl.t = Term_cell.Tbl.create 2048 in
       let n = ref 0 in
       let get c =
@@ -873,7 +893,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           (* set of possibilities *)
           let term_cases_set = match Ty.view term_ty with
             | Atomic (_, Data data) ->
-              TC_cstors (Lazy.force data.data_cstors)
+              TC_cstors (Lazy.force data.data_cstors, [])
             | _ -> TC_none
           in
           let rec t = {
@@ -893,8 +913,10 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           t.term_class <- Bag.return t;
           Term_cell.Tbl.add tbl c t;
           t
+      and all_terms yield =
+        Term_cell.Tbl.values tbl yield
       in
-      make, get
+      make, get, all_terms
 
     (* boolean are special: we know already what normal form they have *)
     let mk_bool_ b =
@@ -922,7 +944,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
             assert (t.term_nf = None);
             t.term_nf <- Some (NF_cstor (cstor, a), t);
             assert (t.term_cases_set <> TC_none);
-            t.term_cases_set <- TC_cstors (ID.Map.singleton f.cst_id cstor);
+            t.term_cases_set <- TC_cstors (ID.Map.singleton f.cst_id cstor, []);
           | _ -> ()
         end;
       );
@@ -1586,10 +1608,29 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
   (** {2 Theories} *)
 
   module type THEORY_ACTION = sig
-    val find : term -> term
+    type repr = private term
+
+    val equal_repr : repr -> repr -> bool
+
+    val find : term -> repr
+
+    val all_classes : repr Sequence.t
+    (** Caution, expensive. Traverse every congruence class *)
+
     val add_eqn : term -> term -> cc_explanation -> unit
+    (** Assert [t = u] because [e] *)
+
     val propagate : lit -> cc_explanation list -> unit
+    (** Propagate boolean clause. It must be a theory lemma, that is,
+        a T-tautology *)
+
+    val split : lit list -> cc_explanation list -> unit
+    (** [split lits expl] forces the SAT solver to pick one of [lits],
+        assuming [expl]. That is, [expl => lits] must be a tautology *)
+
     val unsat : cc_explanation list -> unit
+    (** Signal a T-inconsistency using the given tautology that
+        is currently violated *)
   end
 
   (* TODO: move "expand" to THEORY *)
@@ -1642,7 +1683,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
 
     let eval t = match t.term_cell with
       | If (a, b, c) ->
-        let ra = A.find a in
+        let ra = (A.find a:>term) in
         begin match ra.term_nf with
           | Some (NF_bool true, _) ->
             A.add_eqn t b (CC_reduce_nf a)
@@ -1655,12 +1696,12 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         (* check if [find a = find b] *)
         let ra = A.find a in
         let rb = A.find b in
-        if Term.equal ra rb then (
+        if A.equal_repr ra rb then (
           A.add_eqn t Term.true_ (CC_reduce_eq (a, b))
         )
       | Builtin (B_not a) ->
         (* check if [a == true/false] *)
-        let ra = A.find a in
+        let ra = (A.find a:>term) in
         begin match ra.term_nf with
           | Some (NF_bool true, _) ->
             A.add_eqn t Term.false_ (CC_reduce_nf a)
@@ -1676,12 +1717,9 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
 
   (** {2 Theory of Datatypes} *)
 
-  (* TODO acyclicity rule
-     could be done by traversing the set of terms, assigning a "level" to
-     each equiv class. If level clash, find why, return conflict.
-  *)
-
   module Datatype(A : THEORY_ACTION) : THEORY = struct
+    (* merge equiv classes:
+       - injectivity rule on normal forms *)
     let merge_nf ra rb nf_a nf_b: bool =
       begin match nf_a, nf_b with
         | NF_cstor (c1, args1), NF_cstor (c2, args2) ->
@@ -1697,19 +1735,108 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         | _ -> true
       end
 
-    (* TODO *)
-    let set_nf t nf e: unit = match nf, t.term_cell with
-      | NF_bool sign, App_cst ({cst_kind=Cst_test (_, _cstor); _}, args) ->
+    type map_status =
+      | Map_empty
+      | Map_single of data_cstor
+      | Map_other
+
+    type labels = data_cstor ID.Map.t
+
+    (* check if set of cstors is empty or unary *)
+    let map_status (m: labels): map_status =
+      if ID.Map.is_empty m then Map_empty
+      else (
+        let c, cstor = ID.Map.choose m in
+        let m' = ID.Map.remove c m in
+        if ID.Map.is_empty m'
+        then Map_single cstor
+        else Map_other
+      )
+
+    (* propagate [r = cstor], using Instantiation rules *)
+    let propagate_cstor (r:A.repr) (cstor:data_cstor) (expl:cc_explanation list): unit =
+      Log.debugf 5
+        (fun k->k "(@[propagate_cstor@ %a@ %a: expl: (@[%a@])@])"
+            Term.pp (r:>term) Cst.pp cstor.cstor_cst
+            (Utils.pp_list pp_cc_explanation) expl);
+      (* TODO: propagate, add_eqn with cstor term, but only
+         if either:
+         - cstor is finite
+         - or some parent term of [r_u] is a selector.
+
+         We need to create new constants for the arguments *)
+      assert false
+
+    (* perform (Split 2) if all the cstors of [m] (labels of [r]) are finite
+       and (Split 1) was not applied on [r] *)
+    let maybe_split (r:A.repr) (m: labels) (expl:cc_explanation list): unit =
+      assert (ID.Map.cardinal m >= 2);
+      if ID.Map.for_all (fun _ cstor -> Cst.is_finite_cstor cstor.cstor_cst) m
+      && not (Term.Field_is_split.get (r:>term).term_bits)
+      then (
+        Log.debugf 5
+          (fun k->k "(@[split_finite@ %a@ cstors: (@[<hv>%a@])@ expl: (@[%a@])@])"
+              Term.pp (r:>term) (Utils.pp_list Cst.pp)
+              (ID.Map.values m |> Sequence.map (fun c->c.cstor_cst) |> Sequence.to_list)
+              (Utils.pp_list pp_cc_explanation) expl);
+        let lits =
+          ID.Map.values m
+          |>
+          Sequence.map
+            (fun cstor -> Lit.cstor_test cstor (r:>term))
+          |> Sequence.to_list
+        in
+        A.split lits expl
+      )
+
+    let set_nf t nf (e:cc_explanation): unit = match nf, t.term_cell with
+      | NF_bool sign, App_cst ({cst_kind=Cst_test (_, lazy cstor); _}, args) ->
+        (* update set of possible cstors for [A.find args.(0)]
+           if [t = is-cstor args] is true/false *)
         assert (IArray.length args = 1);
-        (* TODO: update set of possible cstors for [A.find args.(0)]
-                  if [t = is-cstor args] *)
-        assert false
+        let u = IArray.get args 1 in
+        let r_u = A.find u in
+        let cstor_set, expl = match (r_u:>term).term_cases_set with
+          | TC_cstors (m,e') -> m,e'
+          | _ -> assert false
+        in
+        let new_expl = e::expl in
+        let cstor_id = cstor.cstor_cst.cst_id in
+        if sign then (
+          if ID.Map.mem cstor_id cstor_set then (
+            (* unit propagate now *)
+            propagate_cstor r_u cstor new_expl
+          ) else (
+            A.unsat new_expl (* conflict: *)
+          )
+        ) else (
+          (* remove [cstor] from the set *)
+          if ID.Map.mem cstor_id cstor_set then (
+            Log.debugf 5
+              (fun k->k "(@[remove_cstor@ %a@ from %a@])" ID.pp cstor_id Term.pp u);
+            let new_set = ID.Map.remove cstor_id cstor_set in
+            begin match map_status new_set with
+              | Map_empty ->
+                A.unsat new_expl (* conflict *)
+              | Map_single cstor' ->
+                propagate_cstor r_u cstor' new_expl;
+              | Map_other ->
+                (* just update set of labels *)
+                if Backtrack.not_at_level_0 () then (
+                  let old_cases = (r_u:>term).term_cases_set in
+                  Backtrack.push_undo (fun () -> (r_u:>term).term_cases_set <- old_cases);
+                );
+                (r_u:>term).term_cases_set <- TC_cstors (new_set, new_expl);
+                maybe_split r_u new_set new_expl
+            end
+          )
+        )
       | _ -> ()
 
     let eval t = match t.term_cell with
       | Case (u, m) ->
         let r_u = A.find u in
-        begin match r_u.term_nf with
+        begin match (r_u:>term).term_nf with
           | Some (NF_cstor (c, _), _) ->
             (* reduce to the proper branch *)
             let rhs =
@@ -1724,7 +1851,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         (* check if [a.(0)] has a constructor *)
         let arg = IArray.get a 0 in
         let r_a = A.find arg in
-        begin match r_a.term_nf with
+        begin match (r_a:>term).term_nf with
           | None -> ()
           | Some (NF_cstor (cstor', _), _) ->
             (* reduce to true/false depending on whether [cstor=cstor'] *)
@@ -1739,7 +1866,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         (* reduce if [a.(0)] has the proper constructor *)
         let arg = IArray.get a 0 in
         let r_a = A.find arg in
-        begin match r_a.term_nf with
+        begin match (r_a:>term).term_nf with
           | None -> ()
           | Some (NF_cstor (cstor', nf_cstor_args), _) ->
             (* [proj-C-i (C t1...tn) = ti] *)
@@ -1757,8 +1884,66 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         IArray.length a=1
       | _ -> false
 
+    (* split every term that is not split yet, and to which some selectors
+       are applied *)
+    let split_rule () =
+      let is_in_proj (r:A.repr): bool =
+        Bag.to_seq (r:>term).term_parents
+        |> Sequence.exists
+          (fun parent -> match parent.term_cell with
+             | App_cst ({cst_kind=Cst_proj _; _}, a) ->
+               let res = IArray.length a = 1 in
+               (* invariant: a.(0) == r should hold *)
+               if res then assert(A.equal_repr r (IArray.get a 1 |> A.find));
+               res
+             | _ -> false)
+      in
+      begin
+        Log.debug 3 "(data.split1)";
+        A.all_classes
+        |> Sequence.filter
+          (fun (r:A.repr) ->
+             (* keep only terms of data-type, never split, with at least
+                two possible cases in their label, and that occur in
+                at least one selector *)
+             Format.printf "check %a@." Term.pp (r:>term);
+             Ty.is_data (r:>term).term_ty
+             &&
+             begin match (r:>term).term_cases_set with
+               | TC_cstors (m, _) -> ID.Map.cardinal m >= 2
+               | _ -> assert false
+             end
+             &&
+             not (Term.Field_is_split.get (r:>term).term_bits)
+             &&
+             is_in_proj r)
+        |> Sequence.iter
+          (fun r ->
+             let r = (r:A.repr:>term) in
+             Log.debugf 5 (fun k->k "(@[split_1@ term: %a@])" Term.pp r);
+             (* unconditional split: consider all cstors *)
+             let cstors = match r.term_ty.ty_cell with
+               | Atomic (_, Data {data_cstors=lazy cstors;_}) -> cstors
+               | _ -> assert false
+             in
+             let lits =
+               ID.Map.values cstors
+               |> Sequence.map (fun cstor -> Lit.cstor_test cstor r)
+               |> Sequence.to_list
+             in
+             r.term_bits <- Term.Field_is_split.set true r.term_bits;
+             A.split lits [])
+      end
+
+    (* TODO acyclicity rule
+       could be done by traversing the set of terms, assigning a "level" to
+       each equiv class. If level clash, find why, return conflict.
+    *)
+
     let final_check (): unit =
-      () (* TODO: acyclicity *)
+      split_rule ();
+      (* TODO: acyclicity *)
+      ()
   end
 
   (** {2 Congruence Closure} *)
@@ -1798,13 +1983,12 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     val add_toplevel_eq : term -> term -> unit
     (** Add [t = u] as a toplevel unconditional equation *)
 
-    type propagation = {
-      propagate_concl: Lit.t;
-      propagate_why: cc_explanation list;
-    }
+    type lemma =
+      | Propagate of Lit.t * cc_explanation list
+      | Split of Lit.t list * cc_explanation list
 
     type result =
-      | Sat of propagation list
+      | Sat of lemma list
       | Unsat of cc_explanation list
       (* list of direct explanations to the conflict. *)
 
@@ -1901,10 +2085,9 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     type merge_op = term * term * cc_explanation
     (* a merge operation to perform *)
 
-    type propagation = {
-      propagate_concl: Lit.t;
-      propagate_why: cc_explanation list;
-    }
+    type lemma =
+      | Propagate of Lit.t * cc_explanation list
+      | Split of Lit.t list * cc_explanation list
 
     type update_state = {
       terms_to_add: term Queue.t;
@@ -1922,9 +2105,8 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       (* terms to check, maybe their new signature is in {!signatures_tbl} *)
       combine: merge_op Queue.t;
       (* pairs of terms to merge *)
-      mutable propagations: propagation list;
-      (* some boolean propagations to make. [lit, expls] means
-         that [expls => lit] is a tautology *)
+      mutable lemmas: lemma list;
+      (* some boolean propagations/splits to make. *)
     }
 
     (* global state for congruence closure *)
@@ -1933,7 +2115,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       eqns_to_add=Queue.create();
       pending=Queue.create();
       combine=Queue.create();
-      propagations=[];
+      lemmas=[];
     }
 
     let is_done_state (): bool =
@@ -1952,12 +2134,19 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       Log.debugf 5 (fun k->k "(@[<hv1>push_pending@ %a@])" Term.pp t);
       Queue.push t st.pending
 
+    let push_split (lits:lit list) (expl:cc_explanation list): unit =
+      Log.debugf 5
+        (fun k->k "(@[<hv1>push_split@ (@[%a@])@ expl: (@[<hv>%a@])@])"
+          (Utils.pp_list Lit.pp) lits (Utils.pp_list pp_cc_explanation) expl);
+      let l = Split (lits, expl) in
+      st.lemmas <- l :: st.lemmas
+
     let push_propagation (lit:lit) (expl:cc_explanation list): unit =
       Log.debugf 5
         (fun k->k "(@[<hv1>push_propagate@ %a@ expl: (@[<hv>%a@])@])"
           Lit.pp lit (Utils.pp_list pp_cc_explanation) expl);
-      let p = { propagate_concl=lit; propagate_why=expl; } in
-      st.propagations <- p :: st.propagations
+      let l = Propagate (lit,expl) in
+      st.lemmas <- l :: st.lemmas
 
     let add_cc (t:term): unit = Queue.push t st.terms_to_add
 
@@ -2024,14 +2213,23 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     let unsat (e:cc_explanation list): _ = raise (Exn_unsat e)
 
     type result =
-      | Sat of propagation list
+      | Sat of lemma list
       | Unsat of cc_explanation list
       (* list of direct explanations to the conflict. *)
 
+    let all_classes : repr Sequence.t = fun yield ->
+      Term.all_terms
+      |> Sequence.filter (fun t -> is_root_ t && Term.Field_in_cc.get t.term_bits)
+      |> Sequence.iter yield
+
     module Theory_actions : THEORY_ACTION = struct
+      type repr = term
+      let equal_repr = Term.equal
+      let all_classes = all_classes
       let find = find
       let add_eqn = push_combine
       let propagate = push_propagation
+      let split = push_split
       let unsat = unsat
     end
 
@@ -2070,9 +2268,9 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       done;
       if is_done_state ()
       then (
-        let propagations = st.propagations in
-        st.propagations <- [];
-        Sat propagations
+        let lemmas = st.lemmas in
+        st.lemmas <- [];
+        Sat lemmas
       )
       else update_combine st (* repeat *)
 
@@ -2495,19 +2693,35 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
   end
 
   (* push those propagations into the SAT solver *)
-  let add_propagations (l:CC.propagation list): unit =
+  let add_cc_lemmas (l:CC.lemma list): unit =
     List.iter
-      (fun {CC.propagate_concl=lit; propagate_why=l} ->
-         let lit_set = CC.explain_unfold l in
-         let c =
-           let guard =
-             Lit.Set.to_list lit_set
-             |> List.map Lit.neg
-           in
-           Clause.make (lit :: guard)
+      (fun l ->
+         let c = match l with
+           | CC.Propagate (lit,l) ->
+             let lit_set = CC.explain_unfold l in
+             let c =
+               let guard =
+                 Lit.Set.to_list lit_set
+                 |> List.map Lit.neg
+               in
+               Clause.make (lit :: guard)
+             in
+             Log.debugf 2
+               (fun k->k "(@[@{<green>propagate@}@ %a@])" Clause.pp c);
+             c
+           | CC.Split (lits,l) ->
+             let lit_set = CC.explain_unfold l in
+             let c =
+               let guard =
+                 Lit.Set.to_list lit_set
+                 |> List.map Lit.neg
+               in
+               Clause.make (lits @ guard)
+             in
+             Log.debugf 2
+               (fun k->k "(@[@{<green>split@}@ %a@])" Clause.pp c);
+             c
          in
-         Log.debugf 2
-           (fun k->k "(@[@{<green>propagate@}@ %a@])" Clause.pp c);
          Clause.push_new c)
       l
 
@@ -2562,8 +2776,8 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     (* convert a result from CC to one that the SAT solver understands *)
     let transform_res slice (res: CC.result): (_,_) TI.res =
       begin match res with
-        | CC.Sat propagations ->
-          add_propagations propagations;
+        | CC.Sat lemmas ->
+          add_cc_lemmas lemmas;
           flush_new_clauses_into_slice slice;
           TI.Sat
         | CC.Unsat expls ->
@@ -3238,8 +3452,8 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       assert (Backtrack.at_level_0 ());
       begin match CC.check () with
         | CC.Unsat _ -> Unsat (* TODO proof *)
-        | CC.Sat propagations  ->
-          add_propagations propagations;
+        | CC.Sat lemmas  ->
+          add_cc_lemmas lemmas;
           check_solver()
       end
 
