@@ -769,6 +769,9 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     (** Upon expansion, does this term have a special literal [Lit_expanded t]
         that should be asserted? *)
 
+    module Field_is_lit : Term_bits.FIELD with type value = bool
+    (** Is this term a boolean literal? *)
+
     val id : t -> int
     val ty : t -> Ty.t
     val equal : t -> t -> bool
@@ -848,6 +851,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     module Field_in_cc = (val (Term_bits.bool ~name:"in_cc" ()))
     module Field_expanded = (val (Term_bits.bool ~name:"expanded" ()))
     module Field_has_expansion_lit = (val (Term_bits.bool ~name:"has_expansion_lit" ()))
+    module Field_is_lit = (val (Term_bits.bool ~name:"is_lit" ()))
     let () = Term_bits.freeze()
 
     let id t = t.term_id
@@ -1248,6 +1252,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
 
     let atom ?(sign=true) (t:term) : t =
       let t, sign' = Term.abs t in
+      t.term_bits <- Term.Field_is_lit.set true t.term_bits;
       let sign = if not sign' then not sign else sign in
       make ~sign (Lit_atom t)
 
@@ -1620,16 +1625,21 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     val add_toplevel_eq : term -> term -> unit
     (** Add [t = u] as a toplevel unconditional equation *)
 
+    type propagation = {
+      propagate_concl: Lit.t;
+      propagate_why: cc_explanation list;
+    }
+
     type result =
-      | Sat
+      | Sat of propagation list
       | Unsat of cc_explanation list
       (* list of direct explanations to the conflict. *)
 
     val check : unit -> result
 
-    val explain_conflict: cc_explanation list -> Lit.Set.t
-    (** Explain the conflict by returning a complete set of
-        literals explaining it *)
+    val explain_unfold: cc_explanation list -> Lit.Set.t
+    (** Unfold those explanations into a complete set of
+        literals implying them *)
   end = struct
     type repr = term
 
@@ -1716,6 +1726,11 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     type merge_op = term * term * cc_explanation
     (* a merge operation to perform *)
 
+    type propagation = {
+      propagate_concl: Lit.t;
+      propagate_why: cc_explanation list;
+    }
+
     type update_state = {
       terms_to_add: term Queue.t;
       (* queue of terms that must be added to the CC first (then to [pending]).
@@ -1732,6 +1747,9 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       (* terms to check, maybe their new signature is in {!signatures_tbl} *)
       combine: merge_op Queue.t;
       (* pairs of terms to merge *)
+      mutable propagations: propagation list;
+      (* some boolean propagations to make. [lit, expls] means
+         that [expls => lit] is a tautology *)
     }
 
     (* global state for congruence closure *)
@@ -1740,6 +1758,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       eqns_to_add=Queue.create();
       pending=Queue.create();
       combine=Queue.create();
+      propagations=[];
     }
 
     let is_done_state (): bool =
@@ -1757,6 +1776,13 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     let push_pending t =
       Log.debugf 5 (fun k->k "(@[<hv1>push_pending@ %a@])" Term.pp t);
       Queue.push t st.pending
+
+    let push_propagation (lit:lit) (expl:cc_explanation list): unit =
+      Log.debugf 5
+        (fun k->k "(@[<hv1>push_propagate@ %a@ expl: (@[<hv>%a@])@])"
+          Lit.pp lit (Utils.pp_list pp_cc_explanation) expl);
+      let p = { propagate_concl=lit; propagate_why=expl; } in
+      st.propagations <- p :: st.propagations
 
     let add_cc (t:term): unit = Queue.push t st.terms_to_add
 
@@ -1821,7 +1847,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     exception Exn_unsat of cc_explanation list
 
     type result =
-      | Sat
+      | Sat of propagation list
       | Unsat of cc_explanation list
       (* list of direct explanations to the conflict. *)
 
@@ -1854,7 +1880,11 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         eval_pending t;
       done;
       if is_done_state ()
-      then Sat
+      then (
+        let propagations = st.propagations in
+        st.propagations <- [];
+        Sat propagations
+      )
       else update_combine st (* repeat *)
 
     (* main CC algo: merge equivalence classes in [st.combine].
@@ -1867,7 +1897,6 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         if not (equal ra rb) then (
           assert (is_root_ ra);
           assert (is_root_ rb);
-          (* TODO: update set of possible constructors if datatypes *)
           (* invariant: [size ra <= size rb].
              we merge [ra] into [rb]. *)
           let ra, rb = if size_ ra > size_ rb then rb, ra else ra, rb in
@@ -1915,14 +1944,12 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       (* now update pending terms again *)
       update_pending ()
 
-    (* TODO: propagate some literals to the SAT solver? *)
-
     (* [r == nf] because [e]; perform propagations to the theories and the
        SAT solver *)
     and update_normal_form (nf:term_nf) (r:repr) (e:cc_explanation): unit =
       (* this term now has this boolean normal form; update in consequence *)
       let assert_bool (t:term) (sign:bool) (e:cc_explanation): unit =
-        match t.term_cell with
+        begin match t.term_cell with
           | App_cst ({cst_kind=Cst_test (_, _cstor); _}, args) ->
             assert (IArray.length args = 1);
             assert false (* TODO: update set of possible cstors for [args.(0)] *)
@@ -1931,6 +1958,12 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
               push_combine a b e;
             )
           | _ -> ()
+        end;
+        (* propagate to the SAT solver *)
+        if t != r && Term.Field_is_lit.get t.term_bits then (
+          let l = [e; CC_reduce_eq (t, r)] in
+          push_propagation (Lit.atom ~sign t) l;
+        );
       in
       (* see whether some boolean propagations are recommended *)
       begin match nf with
@@ -2261,7 +2294,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       done;
       ps.ps_lits
 
-    let explain_conflict (l:cc_explanation list): Lit.Set.t =
+    let explain_unfold (l:cc_explanation list): Lit.Set.t =
       Log.debugf 5
         (fun k->k "(@[explain_confict@ (@[<hv>%a@])@])"
             (Utils.pp_list pp_cc_explanation) l);
@@ -2347,6 +2380,23 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       )
   end
 
+  (* push those propagations into the SAT solver *)
+  let add_propagations (l:CC.propagation list): unit =
+    List.iter
+      (fun {CC.propagate_concl=lit; propagate_why=l} ->
+         let lit_set = CC.explain_unfold l in
+         let c =
+           let guard =
+             Lit.Set.to_list lit_set
+             |> List.map Lit.neg
+           in
+           Clause.make (lit :: guard)
+         in
+         Log.debugf 2
+           (fun k->k "(@[@{<green>propagate@}@ %a@])" Clause.pp c);
+         Clause.push_new c)
+      l
+
   (* the "theory" part: propagations *)
   module M_th :
     Msat.Theory_intf.S
@@ -2411,9 +2461,11 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       let res = CC.check () in
       flush_new_clauses_into_slice slice;
       begin match res with
-        | CC.Sat -> TI.Sat
+        | CC.Sat propagations ->
+          add_propagations propagations;
+          TI.Sat
         | CC.Unsat expls ->
-          let lit_set = CC.explain_conflict expls in
+          let lit_set = CC.explain_unfold expls in
           let conflict_clause =
             Lit.Set.to_list lit_set
             |> List.map Lit.neg
@@ -3062,7 +3114,8 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       assert (Backtrack.at_level_0 ());
       begin match CC.check () with
         | CC.Unsat _ -> Unsat (* TODO proof *)
-        | CC.Sat ->
+        | CC.Sat propagations  ->
+          add_propagations propagations;
           check_solver()
       end
 
