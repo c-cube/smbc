@@ -44,6 +44,8 @@ let rec to_seq t yield = match t with
   | L x -> yield x
   | N (a,b,_) -> to_seq a yield; to_seq b yield
 
+let iter f t = to_seq t f
+
 let equal f a b =
   let rec push x l = match x with
     | E -> l

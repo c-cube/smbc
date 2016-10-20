@@ -25,5 +25,7 @@ val to_seq : 'a t -> 'a Sequence.t
 
 val fold : ('a -> 'b -> 'a) -> 'a -> 'b t -> 'a
 
+val iter : ('a -> unit) -> 'a t -> unit
+
 val equal : ('a -> 'a -> bool) -> 'a t -> 'a t -> bool
 (** Are the two bags equal, element wise? *)

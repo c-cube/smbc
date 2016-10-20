@@ -64,6 +64,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     mutable term_ty: ty_h;
     term_cell: term_cell;
     mutable term_bits: Term_bits.t; (* bitfield for various properties *)
+    mutable term_class: term Bag.t; (* terms in the same equiv class *)
     mutable term_parents: term Bag.t; (* parent terms of the whole equiv class *)
     mutable term_root: term; (* representative of congruence class *)
     mutable term_expl: (term * cc_explanation) option;
@@ -874,6 +875,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           let rec t = {
             term_id= !n;
             term_ty;
+            term_class=Bag.empty;
             term_parents=Bag.empty;
             term_bits=Term_bits.empty;
             term_root=t;
@@ -883,6 +885,8 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
             term_nf=None;
           } in
           incr n;
+          (* set [class(t) = {t}] *)
+          t.term_class <- Bag.return t;
           Term_cell.Tbl.add tbl c t;
           t
       in
@@ -1576,6 +1580,11 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
 
   (** {2 Congruence Closure} *)
 
+  (* TODO acyclicity rule
+     could be done by traversing the set of terms, assigning a "level" to
+     each equiv class. If level clash, find why, return conflict.
+  *)
+
   module CC : sig
     type repr = private term
 
@@ -1765,10 +1774,6 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         push_combine a b e; (* start by merging [a=b] *)
       )
 
-    (* TODO: replace logic of assert_lit by mere [combine t true],
-       and move the logic to main CC loop (so that propagating, say, [(= a b)]
-       because [(= (= a b) (= c d))] will also [combine a b] and recursively *)
-
     (* assert that this boolean literal holds *)
     let assert_lit lit : unit = match Lit.view lit with
       | Lit_fresh _
@@ -1780,18 +1785,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         let rhs = if sign then Term.true_ else Term.false_ in
         add_cc t;
         push_combine t rhs (CC_lit lit);
-        (* perform additional operations, if needed *)
-        begin match t.term_cell with
-          | False | Builtin (B_not _) -> assert false
-          | App_cst ({cst_kind=Cst_test (_, _cstor); _}, args) ->
-            assert (IArray.length args = 1);
-            assert false (* TODO: update set of possible cstors for [args.(0)] *)
-          | Builtin (B_eq (a, b)) ->
-            if sign then (
-              push_combine a b (CC_lit lit);
-            )
-          | _ -> ()
-        end
+        ()
 
     (* re-root the explanation tree of the equivalence class of [t]
        so that it points to [t].
@@ -1878,7 +1872,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
              we merge [ra] into [rb]. *)
           let ra, rb = if size_ ra > size_ rb then rb, ra else ra, rb in
           (* check normal form(s) for consistency, merge them *)
-          let merge_ok = check_normal_forms ra rb in
+          let merge_ok = check_normal_forms ra rb e_ab in
           if not merge_ok then (
             let l = [e_ab; CC_reduce_nf a; CC_reduce_nf b] in
             raise (Exn_unsat l); (* incompatible *)
@@ -1896,12 +1890,15 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           end;
           (* perform [union ra rb] *)
           begin
+            let rb_old_class = rb.term_class in
             let rb_old_parents = rb.term_parents in
             Backtrack.push_undo
               (fun () ->
                  ra.term_root <- ra;
+                 rb.term_class <- rb_old_class;
                  rb.term_parents <- rb_old_parents);
             ra.term_root <- rb;
+            rb.term_class <- Bag.append rb_old_class ra.term_class;
             rb.term_parents <- Bag.append rb_old_parents ra.term_parents;
           end;
           (* update explanations (a -> b) *)
@@ -1918,30 +1915,59 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       (* now update pending terms again *)
       update_pending ()
 
+    (* TODO: propagate some literals to the SAT solver? *)
+
+    (* [r == nf] because [e]; perform propagations to the theories and the
+       SAT solver *)
+    and update_normal_form (nf:term_nf) (r:repr) (e:cc_explanation): unit =
+      (* this term now has this boolean normal form; update in consequence *)
+      let assert_bool (t:term) (sign:bool) (e:cc_explanation): unit =
+        match t.term_cell with
+          | App_cst ({cst_kind=Cst_test (_, _cstor); _}, args) ->
+            assert (IArray.length args = 1);
+            assert false (* TODO: update set of possible cstors for [args.(0)] *)
+          | Builtin (B_eq (a, b)) ->
+            if sign then (
+              push_combine a b e;
+            )
+          | _ -> ()
+      in
+      (* see whether some boolean propagations are recommended *)
+      begin match nf with
+        | NF_bool sign ->
+          Bag.iter (fun t -> assert_bool t sign e) r.term_class;
+        | NF_cstor _ -> ()
+      end;
+      (* update parents that might be evaluable, because the newly
+         acquired normal form of [r] might trigger some eval rule *)
+      begin
+        Bag.to_seq r.term_parents
+        |> Sequence.filter is_evaluable
+        |> Sequence.iter
+          (fun parent ->
+             remove_signature parent.term_cell;
+             push_pending parent)
+      end;
+      ()
+
     (* returns [true] if [ra] and [rb] have compatible normal forms.
        Side effect: also pushes sub-tasks *)
-    and check_normal_forms (ra:repr)(rb:repr): bool =
+    and check_normal_forms (ra:repr)(rb:repr)(e:cc_explanation): bool =
       assert (is_root_ ra);
       assert (is_root_ rb);
       begin match ra.term_nf, rb.term_nf with
         | None, None -> true
-        | None, Some _ -> true
+        | None, Some (nf,_) ->
+          update_normal_form nf ra e;
+          true
         | Some nf, (None as old_nf_b) ->
           (* update [rb]'s normal form *)
           if Backtrack.not_at_level_0 () then (
             Backtrack.push_undo (fun () -> rb.term_nf <- old_nf_b);
           );
           rb.term_nf <- Some nf;
-          (* notify parents of [rb] that can be evaluated, because the
-             new normal form of [rb] might trigger such an evaluation *)
-          begin
-            Bag.to_seq rb.term_parents
-            |> Sequence.filter is_evaluable
-            |> Sequence.iter
-              (fun parent ->
-                 remove_signature parent.term_cell;
-                 push_pending parent)
-          end;
+          (* NOTE: this update must be performed only after [rb.term_nf] is set *)
+          update_normal_form (fst nf) rb e;
           true
         | Some (nf_a,_), Some (nf_b,_) ->
           (* check consistency of normal forms *)
@@ -2275,7 +2301,6 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       !stat_num_clause_push
       !stat_num_clause_tautology
 
-  (* TODO: find the proper code for "kill line" *)
   let flush_progress (): unit =
     Printf.printf "\r%-80d\r%!" 0
 
