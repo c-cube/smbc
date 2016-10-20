@@ -1637,6 +1637,8 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
 
     val check : unit -> result
 
+    val final_check : unit -> result
+
     val explain_unfold: cc_explanation list -> Lit.Set.t
     (** Unfold those explanations into a complete set of
         literals implying them *)
@@ -2313,6 +2315,9 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         update_pending ()
       with Exn_unsat e ->
         Unsat e
+
+    (* TODO: theories final checks *)
+    let final_check (): result = check()
   end
 
   (** {2 Sat Solver} *)
@@ -2445,24 +2450,12 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           CC.assert_lit lit
       end
 
-    (* propagation from the bool solver *)
-    let assume slice =
-      let start = slice.TI.start in
-      assert (slice.TI.length > 0);
-      (* do the propagations in a local frame *)
-      if Config.progress then print_progress();
-      (* first, empty the tautology queue *)
-      flush_new_clauses_into_slice slice;
-      for i = start to start + slice.TI.length - 1 do
-        let lit = slice.TI.get i in
-        assume_lit lit;
-      done;
-      (* now check satisfiability *)
-      let res = CC.check () in
-      flush_new_clauses_into_slice slice;
+    (* convert a result from CC to one that the SAT solver understands *)
+    let transform_res slice (res: CC.result): (_,_) TI.res =
       begin match res with
         | CC.Sat propagations ->
           add_propagations propagations;
+          flush_new_clauses_into_slice slice;
           TI.Sat
         | CC.Unsat expls ->
           let lit_set = CC.explain_unfold expls in
@@ -2478,8 +2471,27 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           TI.Unsat (Clause.lits conflict_clause, ())
       end
 
-    (* TODO: check acyclicity, etc here *)
-    let if_sat _slice = ()
+    (* propagation from the bool solver *)
+    let assume slice =
+      let start = slice.TI.start in
+      assert (slice.TI.length > 0);
+      (* do the propagations in a local frame *)
+      if Config.progress then print_progress();
+      (* first, empty the tautology queue *)
+      flush_new_clauses_into_slice slice;
+      for i = start to start + slice.TI.length - 1 do
+        let lit = slice.TI.get i in
+        assume_lit lit;
+      done;
+      (* now check satisfiability *)
+      let res = CC.check () in
+      flush_new_clauses_into_slice slice;
+      transform_res slice res
+
+    (* perform final check of the model *)
+    let if_sat slice =
+      let res = CC.final_check() in
+      transform_res slice res
   end
 
   module M = Msat.Solver.Make(M_expr)(M_th)(struct end)
