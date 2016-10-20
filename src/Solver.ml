@@ -1583,12 +1583,185 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       Term.Tbl.remove all t
   end
 
-  (** {2 Congruence Closure} *)
+  (** {2 Theories} *)
+
+  module type THEORY_ACTION = sig
+    val find : term -> term
+    val add_eqn : term -> term -> cc_explanation -> unit
+    val propagate : lit -> cc_explanation list -> unit
+    val unsat : cc_explanation list -> unit
+  end
+
+  (* TODO: move "expand" to THEORY *)
+
+  module type THEORY = sig
+    val merge_nf : term -> term -> term_nf -> term_nf -> bool
+    (** [merge_nf ra rb nf_a nf_b] is called when [ra, rb]
+        are merged and [ra.nf = nf_a, rb.nf = nf_b].
+        This function merges the two normal forms and checks if they are
+        compatible, returning [true] if it is the case. *)
+
+    val set_nf : term -> term_nf -> cc_explanation -> unit
+    (** [set_nf t nf e] is called when a term [t] acquires the normal form [nf]
+        because of explanation [e]. The theory can propagate literals,
+        equations, etc. *)
+
+    val is_evaluable : term -> bool
+    (** Is the term (potentially) evaluable in the theory? *)
+
+    val eval : term -> unit
+    (** Evaluate given term *)
+
+    val final_check: unit -> unit
+    (** Check satisfiability of the whole theory, including the expensive
+        tests. This {b MUST} call {!THEORY_ACTION.unsat} if the current model
+        is not T-satisfiable. *)
+  end
+
+  type theory = (module THEORY)
+
+  (** {2 Theory of booleans}
+
+      Evaluation of boolean constructs, etc. *)
+
+  module Bool(A : THEORY_ACTION) : THEORY = struct
+    let merge_nf _ _ nf_a nf_b: bool = match nf_a, nf_b with
+      | NF_bool v_a, NF_bool v_b -> v_a = v_b
+      | _ -> true
+
+    let set_nf t nf e: unit = match nf, t.term_cell with
+      | NF_bool sign, Builtin (B_eq (a,b)) ->
+        if sign then (
+          A.add_eqn a b e;
+        )
+      | _ -> ()
+
+    let is_evaluable t = match t.term_cell with
+      | Builtin (B_not _) | If _ -> true
+      | _ -> false
+
+    let eval t = match t.term_cell with
+      | If (a, b, c) ->
+        let ra = A.find a in
+        begin match ra.term_nf with
+          | Some (NF_bool true, _) ->
+            A.add_eqn t b (CC_reduce_nf a)
+          | Some (NF_bool false, _) ->
+            A.add_eqn t c (CC_reduce_nf a)
+          | Some (NF_cstor _, _) -> assert false
+          | None -> ()
+        end
+      | Builtin (B_eq (a,b)) ->
+        (* check if [find a = find b] *)
+        let ra = A.find a in
+        let rb = A.find b in
+        if Term.equal ra rb then (
+          A.add_eqn t Term.true_ (CC_reduce_eq (a, b))
+        )
+      | Builtin (B_not a) ->
+        (* check if [a == true/false] *)
+        let ra = A.find a in
+        begin match ra.term_nf with
+          | Some (NF_bool true, _) ->
+            A.add_eqn t Term.false_ (CC_reduce_nf a)
+          | Some (NF_bool false, _) ->
+            A.add_eqn t Term.true_ (CC_reduce_nf a)
+          | Some _ -> assert false
+          | None -> ()
+        end
+      | _ -> ()
+
+    let final_check () = ()
+  end
+
+  (** {2 Theory of Datatypes} *)
 
   (* TODO acyclicity rule
      could be done by traversing the set of terms, assigning a "level" to
      each equiv class. If level clash, find why, return conflict.
   *)
+
+  module Datatype(A : THEORY_ACTION) : THEORY = struct
+    let merge_nf ra rb nf_a nf_b: bool =
+      begin match nf_a, nf_b with
+        | NF_cstor (c1, args1), NF_cstor (c2, args2) ->
+          if Cst.equal c1.cstor_cst c2.cstor_cst then (
+            (* unify arguments recursively, by injectivity *)
+            assert (IArray.length args1 = IArray.length args2);
+            IArray.iter2
+              (fun sub1 sub2 ->
+                 A.add_eqn sub1 sub2 (CC_injectivity (ra, rb)))
+              args1 args2;
+            true
+          ) else false
+        | _ -> true
+      end
+
+    (* TODO *)
+    let set_nf t nf e: unit = match nf, t.term_cell with
+      | NF_bool sign, App_cst ({cst_kind=Cst_test (_, _cstor); _}, args) ->
+        assert (IArray.length args = 1);
+        (* TODO: update set of possible cstors for [A.find args.(0)]
+                  if [t = is-cstor args] *)
+        assert false
+      | _ -> ()
+
+    let eval t = match t.term_cell with
+      | Case (u, m) ->
+        let r_u = A.find u in
+        begin match r_u.term_nf with
+          | Some (NF_cstor (c, _), _) ->
+            (* reduce to the proper branch *)
+            let rhs =
+              try ID.Map.find c.cstor_cst.cst_id m
+              with Not_found -> assert false
+            in
+            A.add_eqn t rhs (CC_reduce_nf u);
+          | Some (NF_bool _, _) -> assert false
+          | None -> ()
+        end
+      | App_cst ({cst_kind=Cst_test(_,lazy cstor); _}, a) when IArray.length a=1 ->
+        (* check if [a.(0)] has a constructor *)
+        let arg = IArray.get a 0 in
+        let r_a = A.find arg in
+        begin match r_a.term_nf with
+          | None -> ()
+          | Some (NF_cstor (cstor', _), _) ->
+            (* reduce to true/false depending on whether [cstor=cstor'] *)
+            if Cst.equal cstor.cstor_cst cstor'.cstor_cst then (
+              A.add_eqn t Term.true_ (CC_reduce_nf arg)
+            ) else (
+              A.add_eqn t Term.true_ (CC_reduce_nf arg)
+            )
+          | Some (NF_bool _, _) -> assert false
+        end
+      | App_cst ({cst_kind=Cst_proj(_,lazy cstor,i); _}, a) when IArray.length a=1 ->
+        (* reduce if [a.(0)] has the proper constructor *)
+        let arg = IArray.get a 0 in
+        let r_a = A.find arg in
+        begin match r_a.term_nf with
+          | None -> ()
+          | Some (NF_cstor (cstor', nf_cstor_args), _) ->
+            (* [proj-C-i (C t1...tn) = ti] *)
+            if Cst.equal cstor.cstor_cst cstor'.cstor_cst then (
+              A.add_eqn t (IArray.get nf_cstor_args i) (CC_reduce_nf arg)
+            )
+          | Some (NF_bool _, _) -> assert false
+        end
+      | _ -> ()
+
+    let is_evaluable t = match t.term_cell with
+      | Case _ -> true
+      | App_cst ({cst_kind=Cst_test(_,_); _}, a)
+      | App_cst ({cst_kind=Cst_proj(_,_,_); _}, a) ->
+        IArray.length a=1
+      | _ -> false
+
+    let final_check (): unit =
+      () (* TODO: acyclicity *)
+  end
+
+  (** {2 Congruence Closure} *)
 
   module CC : sig
     type repr = private term
@@ -1848,19 +2021,33 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
 
     exception Exn_unsat of cc_explanation list
 
+    let unsat (e:cc_explanation list): _ = raise (Exn_unsat e)
+
     type result =
       | Sat of propagation list
       | Unsat of cc_explanation list
       (* list of direct explanations to the conflict. *)
 
+    module Theory_actions : THEORY_ACTION = struct
+      let find = find
+      let add_eqn = push_combine
+      let propagate = push_propagation
+      let unsat = unsat
+    end
+
+    module Theory_bool = Bool(Theory_actions)
+    module Theory_data = Datatype(Theory_actions)
+
+    let theories : theory list =
+      [ (module Theory_bool);
+        (module Theory_data)
+      ]
+
     (* does [t] have some (direct) evaluation semantics? *)
-    let is_evaluable (t:term): bool = match t.term_cell with
-      | If _
-      | Case _
-      | Builtin (B_eq _ | B_not _) -> true
-      | Builtin (B_and _ | B_or _ | B_imply _)
-      | App_cst _ | App_ho _ | Mu _ | Fun _ | DB _ | True | False
-        -> false
+    let is_evaluable (t:term): bool =
+      List.exists
+        (fun (module Theory: THEORY) -> Theory.is_evaluable t)
+        theories
 
     (* main CC algo: add terms from [pending] to the signature table,
        check for collisions *)
@@ -1906,7 +2093,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           let merge_ok = check_normal_forms ra rb e_ab in
           if not merge_ok then (
             let l = [e_ab; CC_reduce_nf a; CC_reduce_nf b] in
-            raise (Exn_unsat l); (* incompatible *)
+            unsat l; (* incompatible *)
           );
           (* remove [ra.parents] from signature, put them into [st.pending] *)
           begin
@@ -1948,30 +2135,25 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
 
     (* [r == nf] because [e]; perform propagations to the theories and the
        SAT solver *)
-    and update_normal_form (nf:term_nf) (r:repr) (e:cc_explanation): unit =
-      (* this term now has this boolean normal form; update in consequence *)
-      let assert_bool (t:term) (sign:bool) (e:cc_explanation): unit =
-        begin match t.term_cell with
-          | App_cst ({cst_kind=Cst_test (_, _cstor); _}, args) ->
-            assert (IArray.length args = 1);
-            assert false (* TODO: update set of possible cstors for [args.(0)] *)
-          | Builtin (B_eq (a, b)) ->
-            if sign then (
-              push_combine a b e;
-            )
-          | _ -> ()
-        end;
-        (* propagate to the SAT solver *)
-        if t != r && Term.Field_is_lit.get t.term_bits then (
-          let l = [e; CC_reduce_eq (t, r)] in
-          push_propagation (Lit.atom ~sign t) l;
-        );
-      in
-      (* see whether some boolean propagations are recommended *)
-      begin match nf with
-        | NF_bool sign ->
-          Bag.iter (fun t -> assert_bool t sign e) r.term_class;
-        | NF_cstor _ -> ()
+    and set_nf_of_class (nf:term_nf) (r:repr) (e:cc_explanation): unit =
+      (* traverse the equiv class of [r], check every term for boolean
+         propagations and theory propagations *)
+      begin
+        Bag.to_seq r.term_class
+        |> Sequence.iter
+          (fun t ->
+             begin match nf with
+               | NF_bool sign ->
+                 (* propagate to the SAT solver *)
+                 if t != r && Term.Field_is_lit.get t.term_bits then (
+                   let l = [e; CC_reduce_eq (t, r)] in
+                   push_propagation (Lit.atom ~sign t) l;
+                 );
+               | _ -> ()
+             end;
+             List.iter
+               (fun (module Theory : THEORY) -> Theory.set_nf t nf e)
+               theories)
       end;
       (* update parents that might be evaluable, because the newly
          acquired normal form of [r] might trigger some eval rule *)
@@ -1993,7 +2175,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       begin match ra.term_nf, rb.term_nf with
         | None, None -> true
         | None, Some (nf,_) ->
-          update_normal_form nf ra e;
+          set_nf_of_class nf ra e;
           true
         | Some nf, (None as old_nf_b) ->
           (* update [rb]'s normal form *)
@@ -2002,102 +2184,19 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           );
           rb.term_nf <- Some nf;
           (* NOTE: this update must be performed only after [rb.term_nf] is set *)
-          update_normal_form (fst nf) rb e;
+          set_nf_of_class (fst nf) rb e;
           true
         | Some (nf_a,_), Some (nf_b,_) ->
-          (* check consistency of normal forms *)
-          begin match nf_a, nf_b with
-            | NF_bool v_a, NF_bool v_b ->
-              v_a = v_b
-            | NF_cstor (c1, args1), NF_cstor (c2, args2) ->
-              if Cst.equal c1.cstor_cst c2.cstor_cst then (
-                (* unify arguments recursively, by injectivity *)
-                assert (IArray.length args1 = IArray.length args2);
-                IArray.iter2
-                  (fun sub1 sub2 ->
-                     push_combine sub1 sub2 (CC_injectivity (ra, rb)))
-                  args1 args2;
-                true
-              ) else false
-            | NF_bool _, _
-            | NF_cstor _, _ -> assert false (* ill typed *)
-          end
+          List.for_all
+            (fun (module Theory : THEORY) -> Theory.merge_nf ra rb nf_a nf_b)
+            theories
       end
 
     (* evaluation rules: if, case... *)
     and eval_pending (t:term): unit =
-      begin match t.term_cell with
-        | If (a, b, c) ->
-          let ra = find a in
-          begin match ra.term_nf with
-            | Some (NF_bool true, _) ->
-              push_combine t b (CC_reduce_nf a)
-            | Some (NF_bool false, _) ->
-              push_combine t c (CC_reduce_nf a)
-            | Some (NF_cstor _, _) -> assert false
-            | None -> ()
-          end
-        | Case (u, m) ->
-          let r_u = find u in
-          begin match r_u.term_nf with
-            | Some (NF_cstor (c, _), _) ->
-              (* reduce to the proper branch *)
-              let rhs =
-                try ID.Map.find c.cstor_cst.cst_id m
-                with Not_found -> assert false
-              in
-              push_combine t rhs (CC_reduce_nf u);
-            | Some (NF_bool _, _) -> assert false
-            | None -> ()
-          end
-        | Builtin (B_eq (a,b)) ->
-          (* check if [find a = find b] *)
-          let ra = find a in
-          let rb = find b in
-          if equal ra rb then (
-            push_combine t Term.true_ (CC_reduce_eq (a, b))
-          )
-        | Builtin (B_not a) ->
-          (* check if [a == true/false] *)
-          let ra = find a in
-          begin match ra.term_nf with
-            | Some (NF_bool true, _) ->
-              push_combine t Term.false_ (CC_reduce_nf a)
-            | Some (NF_bool false, _) ->
-              push_combine t Term.true_ (CC_reduce_nf a)
-            | Some _ -> assert false
-            | None -> ()
-          end
-        | App_cst ({cst_kind=Cst_test(_,lazy cstor); _}, a) when IArray.length a=1 ->
-          (* check if [a.(0)] has a constructor *)
-          let arg = IArray.get a 0 in
-          let r_a = find arg in
-          begin match r_a.term_nf with
-            | None -> ()
-            | Some (NF_cstor (cstor', _), _) ->
-              (* reduce to true/false depending on whether [cstor=cstor'] *)
-              if Cst.equal cstor.cstor_cst cstor'.cstor_cst then (
-                push_combine t Term.true_ (CC_reduce_nf arg)
-              ) else (
-                push_combine t Term.true_ (CC_reduce_nf arg)
-              )
-            | Some (NF_bool _, _) -> assert false
-          end
-        | App_cst ({cst_kind=Cst_proj(_,lazy cstor,i); _}, a) when IArray.length a=1 ->
-          (* reduce if [a.(0)] has the proper constructor *)
-          let arg = IArray.get a 0 in
-          let r_a = find arg in
-          begin match r_a.term_nf with
-            | None -> ()
-            | Some (NF_cstor (cstor', nf_cstor_args), _) ->
-              (* [proj-C-3 (C t1...tn) = t3] *)
-              if Cst.equal cstor.cstor_cst cstor'.cstor_cst then (
-                push_combine t (IArray.get nf_cstor_args i) (CC_reduce_nf arg)
-              )
-            | Some (NF_bool _, _) -> assert false
-          end
-        | _ -> ()
-      end
+      List.iter
+        (fun (module Theory : THEORY) -> Theory.eval t)
+        theories
 
     (* main CC algo: add missing terms to the congruence class *)
     and update_add_cc_terms () =
@@ -2304,20 +2403,30 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       List.iter (decompose_explain ps) l;
       explain_loop ps
 
-    (* check satisfiability, update congruence closure *)
-    let check (): result =
-      Log.debug 5 "(CC.check)";
+    let check_prelude_ () =
       update_add_cc_eqns ();
       (* NOTE: add terms after adding equations, because some
          equations might have pushed terms in [st.terms_to_add] *)
       update_add_cc_terms ();
+      ()
+
+    (* check satisfiability, update congruence closure *)
+    let check (): result =
+      Log.debug 5 "(CC.check)";
+      check_prelude_ ();
       try
         update_pending ()
       with Exn_unsat e ->
         Unsat e
 
-    (* TODO: theories final checks *)
-    let final_check (): result = check()
+    let final_check (): result =
+      Log.debug 5 "(CC.final_check)";
+      check_prelude_ ();
+      try
+        Theory_data.final_check();
+        update_pending ()
+      with Exn_unsat e ->
+        Unsat e
   end
 
   (** {2 Sat Solver} *)
@@ -2491,7 +2600,10 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     (* perform final check of the model *)
     let if_sat slice =
       let res = CC.final_check() in
-      transform_res slice res
+      match transform_res slice res with
+        | TI.Sat -> ()
+        | TI.Unsat (c,_) ->
+          push_clause slice (Clause.make c)
   end
 
   module M = Msat.Solver.Make(M_expr)(M_th)(struct end)
