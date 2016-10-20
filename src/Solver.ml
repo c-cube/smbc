@@ -2569,7 +2569,11 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           (* force evaluation *)
           List.iter
             (fun {Ast.Ty.data_id; _} ->
-               ID.Tbl.find ty_tbl_ data_id |> Lazy.force |> ignore)
+               let lazy ty = ID.Tbl.find ty_tbl_ data_id in
+               begin match ty.ty_cell with
+                 | Atomic (_, Data {data_cstors=lazy _; _}) -> ()
+                 | _ -> assert false
+               end)
             l
         | Ast.Define (k,l) ->
           (* declare the mutually recursive functions *)
