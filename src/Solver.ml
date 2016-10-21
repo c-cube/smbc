@@ -1471,6 +1471,10 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
 
     (* unconditional expansion, [mode] notwithstanding *)
     and expand_term_real ~mode ~guard t : bool =
+      (* first, ensure booleans are split on properly *)
+      if Ty.is_prop t.term_ty then (
+        A.add_clause (Clause.make [Lit.atom t; Lit.atom ~sign:false t]);
+      );
       begin match t.term_cell with
         | True | False | DB _ -> true
         | App_cst ({cst_kind=Cst_defined (ty, lazy rhs, kind); _}, a) ->
