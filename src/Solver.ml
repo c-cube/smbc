@@ -3322,6 +3322,10 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       in
       aux t
 
+    (* TODO: maybe we really need a notion of "Undefined" that is
+             also not a domain element (i.e. equality not defined on it)
+             + some syntax for it *)
+
     (* build the model of a function *)
     let model_of_fun (doms:doms) (c:cst): Ast.term =
       let ty_args, ty_ret = Ty.unfold (Cst.ty c) in
@@ -3331,7 +3335,12 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           (fun i ty -> Ast.Var.make (ID.makef "x_%d" i) (Conv.ty_to_ast ty))
           ty_args
       in
-      let default = pick_default ~prefix:"?" doms ty_ret |> Conv.term_to_ast in
+      let default = match ty_ret.ty_cell with
+        | Prop -> Ast.true_ (* should be safe: we would have split it otherwise *)
+        | _ ->
+          (* TODO: what about other finites types? *)
+          pick_default ~prefix:"?" doms ty_ret |> Conv.term_to_ast
+      in
       let cases =
         Cst.Tbl.get_or ~or_:ValueListMap.empty doms.dom_of_fun c
         |> ValueListMap.to_list
