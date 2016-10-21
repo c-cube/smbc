@@ -3248,34 +3248,15 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         dom_traversed=Term.Tbl.create 128;
       }
 
-    (* pick a term belonging to this type *)
-    let pick_default (doms:doms)(ty:Ty.t) : term = match ty.ty_cell with
-      | Prop -> Term.true_
-      | Atomic (_, Uninterpreted) ->
-        begin match Ty.Tbl.get doms.dom_of_ty ty with
-          | Some (cst :: _) -> Term.const (Cst.make_undef cst ty)
-          | Some _ | None ->
-            errorf "cannot find domain element for %a" Ty.pp ty
-        end
-      | Atomic (_, Data {data_cstors=lazy map; _}) ->
-        let res =
-          ID.Map.values map
-          |> Sequence.filter_map
-            (fun cstor ->
-               if IArray.is_empty cstor.cstor_args
-               then Some cstor.cstor_cst
-               else None)
-          |> Sequence.head
-        in
-        begin match res with
-          | Some c -> Term.const c
-          | None ->
-            (* FIXME: possible in valid cases,
-               e.g. for "tree = Node (list tree)" *)
-            errorf "cannot find constant cstor for %a" Ty.pp ty
-        end
-      | Arrow _ ->
-        errorf "cannot find default value for %a" Ty.pp ty
+    let n_ = ref 0
+
+    (* pick a term belonging to this type.
+       we just generate a new constant, as picking true/a constructor might
+       refine the partial model into an unsatisfiable state. *)
+    let pick_default (_:doms)(ty:Ty.t) : term =
+      let cst = ID.makef "?unknown_%s_%d" (Ty.mangle ty) !n_ in
+      incr n_;
+      Term.const (Cst.make_undef cst ty)
 
     (* follow "normal form" pointers deeply in the term *)
     let deref_deep (doms:doms) (t:term) : term =
