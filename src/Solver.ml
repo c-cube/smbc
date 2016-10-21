@@ -2959,8 +2959,6 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
             m
         in
         let res = Term.case u m in
-        Format.printf "@[<2>conv %a@ into: %a@."
-          Ast.pp_term t Term.pp res;
         res
       | Ast.Switch _ ->
         errorf "cannot convert switch %a" Ast.pp_term t
