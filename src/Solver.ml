@@ -58,7 +58,10 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
 
      A term contains its own information about the equivalence class it
      belongs to. An equivalence class is represented by its "root" element,
-     the representative. *)
+     the representative.
+
+     If there is a normal form in the congruence class, then the
+     representative is a normal form *)
   and term = {
     mutable term_id: int; (* unique ID *)
     mutable term_ty: ty_h;
@@ -71,9 +74,6 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       (* the rooted forest for explanations *)
     mutable term_cases_set: term_cases_set;
       (* abstract set of values this term can take *)
-    mutable term_nf: (term_nf * term) option;
-    (* normal form, if any? [Some (nf,t)] means that [repr = nf]
-       because [repr = t], for explanation purpose *)
   }
 
   (* term shallow structure *)
@@ -827,6 +827,15 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
 
     val abs : t -> t * bool
 
+    val is_nf : t -> bool
+    (** Is the term a normal form? *)
+
+    val as_nf : t -> term_nf option
+    (** [as_nf t] returns the normal form of [t], if any *)
+
+    val as_nf_exn : t -> term_nf
+    (** Unsafe version of {!as_nf} *)
+
     val map_builtin : (t -> t) -> builtin -> builtin
     val builtin_to_seq : builtin -> t Sequence.t
 
@@ -906,7 +915,6 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
             term_expl=None;
             term_cell=c;
             term_cases_set;
-            term_nf=None;
           } in
           incr n;
           (* set [class(t) = {t}] *)
@@ -918,11 +926,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       in
       make, get, all_terms
 
-    (* boolean are special: we know already what normal form they have *)
-    let mk_bool_ b =
-      let t = make (if b then True else False) in
-      t.term_nf <- Some (NF_bool b, t);
-      t
+    let mk_bool_ b = make (if b then True else False)
 
     let true_ = mk_bool_ true
     let false_ = mk_bool_ false
@@ -941,8 +945,6 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         begin match f.cst_kind with
           | Cst_cstor (lazy cstor) when t.term_cell == cell ->
             (* by definition, a constructor term has itself as a normal form *)
-            assert (t.term_nf = None);
-            t.term_nf <- Some (NF_cstor (cstor, a), t);
             assert (t.term_cases_set <> TC_none);
             t.term_cases_set <- TC_cstors (ID.Map.singleton f.cst_id cstor, []);
           | _ -> ()
@@ -1016,6 +1018,19 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         | B_imply (a,b) ->
           let acc, a, b = fold_binary acc a b in
           acc, B_imply (a, b)
+
+    let as_nf t = match t.term_cell with
+      | True -> Some (NF_bool true)
+      | False -> Some (NF_bool false)
+      | App_cst ({cst_kind=Cst_cstor (lazy cstor);_},a) ->
+        Some (NF_cstor (cstor, a))
+      | _ -> None
+
+    let is_nf t = CCOpt.is_some (as_nf t)
+
+    let as_nf_exn t = match as_nf t with
+      | Some nf -> nf
+      | None -> assert false
 
     let is_const t = match t.term_cell with
       | App_cst (_, a) -> IArray.is_empty a
@@ -1640,11 +1655,16 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
   (** {2 Theories} *)
 
   module type THEORY_ACTION = sig
-    type repr = private term
+    type repr
 
     val equal_repr : repr -> repr -> bool
 
     val find : term -> repr
+
+    val nf : repr -> term_nf option
+    (** Normal form *)
+
+    val term_of_repr : repr -> term
 
     val all_classes : repr Sequence.t
     (** Caution, expensive. Traverse every congruence class *)
@@ -1668,11 +1688,13 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
   (* TODO: move "expand" to THEORY *)
 
   module type THEORY = sig
-    val merge_nf : term -> term -> term_nf -> term_nf -> bool
-    (** [merge_nf ra rb nf_a nf_b] is called when [ra, rb]
-        are merged and [ra.nf = nf_a, rb.nf = nf_b].
+    module A : THEORY_ACTION
+
+    val merge : A.repr -> A.repr -> cc_explanation list -> unit
+    (** [merge ra rb] is called when [ra, rb] are merged.
         This function merges the two normal forms and checks if they are
-        compatible, returning [true] if it is the case. *)
+        compatible, possibly adding splitting clauses, propagating lemmas,
+        or calling {!A.unsat} if an inconsistency is detected. *)
 
     val set_nf : term -> term_nf -> cc_explanation -> unit
     (** [set_nf t nf e] is called when a term [t] acquires the normal form [nf]
@@ -1691,16 +1713,19 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         is not T-satisfiable. *)
   end
 
-  type theory = (module THEORY)
+  type 'repr theory = (module THEORY with type A.repr = 'repr)
 
   (** {2 Theory of booleans}
 
       Evaluation of boolean constructs, etc. *)
 
-  module Bool(A : THEORY_ACTION) : THEORY = struct
-    let merge_nf _ _ nf_a nf_b: bool = match nf_a, nf_b with
-      | NF_bool v_a, NF_bool v_b -> v_a = v_b
-      | _ -> true
+  module Bool(A : THEORY_ACTION) : THEORY with module A=A = struct
+    module A = A
+
+    let merge ra rb expls = match A.nf ra, A.nf rb with
+      | Some (NF_bool v_a), Some (NF_bool v_b) when v_a <> v_b ->
+        A.unsat expls
+      | _ -> ()
 
     let set_nf t nf e: unit = match nf, t.term_cell with
       | NF_bool sign, Builtin (B_eq (a,b)) ->
@@ -1715,14 +1740,11 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
 
     let eval t = match t.term_cell with
       | If (a, b, c) ->
-        let ra = (A.find a:>term) in
-        begin match ra.term_nf with
-          | Some (NF_bool true, _) ->
-            A.add_eqn t b (CC_reduce_nf a)
-          | Some (NF_bool false, _) ->
-            A.add_eqn t c (CC_reduce_nf a)
-          | Some (NF_cstor _, _) -> assert false
-          | None -> ()
+        let ra = (A.find a |> A.term_of_repr) in
+        begin match ra.term_cell with
+          | True -> A.add_eqn t b (CC_reduce_nf a)
+          | False -> A.add_eqn t c (CC_reduce_nf a)
+          | _ -> ()
         end
       | Builtin (B_eq (a,b)) ->
         (* check if [find a = find b] *)
@@ -1733,14 +1755,11 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         )
       | Builtin (B_not a) ->
         (* check if [a == true/false] *)
-        let ra = (A.find a:>term) in
-        begin match ra.term_nf with
-          | Some (NF_bool true, _) ->
-            A.add_eqn t Term.false_ (CC_reduce_nf a)
-          | Some (NF_bool false, _) ->
-            A.add_eqn t Term.true_ (CC_reduce_nf a)
-          | Some _ -> assert false
-          | None -> ()
+        let ra = (A.find a |> A.term_of_repr) in
+        begin match ra.term_cell with
+          | True -> A.add_eqn t Term.false_ (CC_reduce_nf a)
+          | False -> A.add_eqn t Term.true_ (CC_reduce_nf a)
+          | _ -> ()
         end
       | _ -> ()
 
@@ -1749,23 +1768,32 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
 
   (** {2 Theory of Datatypes} *)
 
-  module Datatype(A : THEORY_ACTION) : THEORY = struct
+  module Datatype(A : THEORY_ACTION) : THEORY with module A=A = struct
+    module A = A
+
     (* merge equiv classes:
-       - injectivity rule on normal forms *)
-    let merge_nf ra rb nf_a nf_b: bool =
-      begin match nf_a, nf_b with
-        | NF_cstor (c1, args1), NF_cstor (c2, args2) ->
+       - injectivity rule on normal forms
+       - check consistency of normal forms
+       - intersection of label sets  *)
+    let merge (ra:A.repr) (rb:A.repr) expls =
+      begin match A.nf ra, A.nf rb with
+        | Some (NF_cstor (c1, args1)), Some (NF_cstor (c2, args2)) ->
           if Cst.equal c1.cstor_cst c2.cstor_cst then (
             (* unify arguments recursively, by injectivity *)
             assert (IArray.length args1 = IArray.length args2);
             IArray.iter2
               (fun sub1 sub2 ->
-                 A.add_eqn sub1 sub2 (CC_injectivity (ra, rb)))
+                 A.add_eqn sub1 sub2
+                   (CC_injectivity (A.term_of_repr ra, A.term_of_repr rb)))
               args1 args2;
-            true
-          ) else false
-        | _ -> true
-      end
+          ) else (
+            A.unsat expls
+          )
+        | _ -> ()
+      end;
+      (* TODO: intersect label sets *)
+      (* TODO: check if Split2 applies *)
+      ()
 
     type map_status =
       | Map_empty
@@ -1789,7 +1817,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     let propagate_cstor (r:A.repr) (cstor:data_cstor) (expl:cc_explanation list): unit =
       Log.debugf 5
         (fun k->k "(@[propagate_cstor@ %a@ %a: expl: (@[%a@])@])"
-            Term.pp (r:>term) Cst.pp cstor.cstor_cst
+            Term.pp (A.term_of_repr r) Cst.pp cstor.cstor_cst
             (Utils.pp_list pp_cc_explanation) expl);
       (* TODO: propagate, add_eqn with cstor term, but only
          if either:
@@ -1804,18 +1832,18 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     let maybe_split (r:A.repr) (m: labels) (expl:cc_explanation list): unit =
       assert (ID.Map.cardinal m >= 2);
       if ID.Map.for_all (fun _ cstor -> Cst.is_finite_cstor cstor.cstor_cst) m
-      && not (Term.Field_is_split.get (r:>term).term_bits)
+      && not (Term.Field_is_split.get (A.term_of_repr r).term_bits)
       then (
         Log.debugf 5
           (fun k->k "(@[split_finite@ %a@ cstors: (@[<hv>%a@])@ expl: (@[%a@])@])"
-              Term.pp (r:>term) (Utils.pp_list Cst.pp)
+              Term.pp (A.term_of_repr r) (Utils.pp_list Cst.pp)
               (ID.Map.values m |> Sequence.map (fun c->c.cstor_cst) |> Sequence.to_list)
               (Utils.pp_list pp_cc_explanation) expl);
         let lits =
           ID.Map.values m
           |>
           Sequence.map
-            (fun cstor -> Lit.cstor_test cstor (r:>term))
+            (fun cstor -> Lit.cstor_test cstor (A.term_of_repr r))
           |> Sequence.to_list
         in
         A.split lits expl
@@ -1828,7 +1856,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         assert (IArray.length args = 1);
         let u = IArray.get args 1 in
         let r_u = A.find u in
-        let cstor_set, expl = match (r_u:>term).term_cases_set with
+        let cstor_set, expl = match (A.term_of_repr r_u).term_cases_set with
           | TC_cstors (m,e') -> m,e'
           | _ -> assert false
         in
@@ -1855,10 +1883,10 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
               | Map_other ->
                 (* just update set of labels *)
                 if Backtrack.not_at_level_0 () then (
-                  let old_cases = (r_u:>term).term_cases_set in
-                  Backtrack.push_undo (fun () -> (r_u:>term).term_cases_set <- old_cases);
+                  let old_cases = (A.term_of_repr r_u).term_cases_set in
+                  Backtrack.push_undo (fun () -> (A.term_of_repr r_u).term_cases_set <- old_cases);
                 );
-                (r_u:>term).term_cases_set <- TC_cstors (new_set, new_expl);
+                (A.term_of_repr r_u).term_cases_set <- TC_cstors (new_set, new_expl);
                 maybe_split r_u new_set new_expl
             end
           )
@@ -1868,44 +1896,44 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     let eval t = match t.term_cell with
       | Case (u, m) ->
         let r_u = A.find u in
-        begin match (r_u:>term).term_nf with
-          | Some (NF_cstor (c, _), _) ->
+        begin match A.nf r_u with
+          | Some (NF_cstor (c, _)) ->
             (* reduce to the proper branch *)
             let rhs =
               try ID.Map.find c.cstor_cst.cst_id m
               with Not_found -> assert false
             in
             A.add_eqn t rhs (CC_reduce_nf u);
-          | Some (NF_bool _, _) -> assert false
+          | Some (NF_bool _) -> assert false
           | None -> ()
         end
       | App_cst ({cst_kind=Cst_test(_,lazy cstor); _}, a) when IArray.length a=1 ->
         (* check if [a.(0)] has a constructor *)
         let arg = IArray.get a 0 in
         let r_a = A.find arg in
-        begin match (r_a:>term).term_nf with
+        begin match A.nf r_a with
           | None -> ()
-          | Some (NF_cstor (cstor', _), _) ->
+          | Some (NF_cstor (cstor', _)) ->
             (* reduce to true/false depending on whether [cstor=cstor'] *)
             if Cst.equal cstor.cstor_cst cstor'.cstor_cst then (
               A.add_eqn t Term.true_ (CC_reduce_nf arg)
             ) else (
               A.add_eqn t Term.true_ (CC_reduce_nf arg)
             )
-          | Some (NF_bool _, _) -> assert false
+          | Some (NF_bool _) -> assert false
         end
       | App_cst ({cst_kind=Cst_proj(_,lazy cstor,i); _}, a) when IArray.length a=1 ->
         (* reduce if [a.(0)] has the proper constructor *)
         let arg = IArray.get a 0 in
         let r_a = A.find arg in
-        begin match (r_a:>term).term_nf with
+        begin match A.nf r_a with
           | None -> ()
-          | Some (NF_cstor (cstor', nf_cstor_args), _) ->
+          | Some (NF_cstor (cstor', nf_cstor_args)) ->
             (* [proj-C-i (C t1...tn) = ti] *)
             if Cst.equal cstor.cstor_cst cstor'.cstor_cst then (
               A.add_eqn t (IArray.get nf_cstor_args i) (CC_reduce_nf arg)
             )
-          | Some (NF_bool _, _) -> assert false
+          | Some (NF_bool _) -> assert false
         end
       | _ -> ()
 
@@ -1920,7 +1948,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
        are applied *)
     let split_rule () =
       let is_in_proj (r:A.repr): bool =
-        Bag.to_seq (r:>term).term_parents
+        Bag.to_seq (A.term_of_repr r).term_parents
         |> Sequence.exists
           (fun parent -> match parent.term_cell with
              | App_cst ({cst_kind=Cst_proj _; _}, a) ->
@@ -1938,20 +1966,20 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
              (* keep only terms of data-type, never split, with at least
                 two possible cases in their label, and that occur in
                 at least one selector *)
-             Format.printf "check %a@." Term.pp (r:>term);
-             Ty.is_data (r:>term).term_ty
+             Format.printf "check %a@." Term.pp (A.term_of_repr r);
+             Ty.is_data (A.term_of_repr r).term_ty
              &&
-             begin match (r:>term).term_cases_set with
+             begin match (A.term_of_repr r).term_cases_set with
                | TC_cstors (m, _) -> ID.Map.cardinal m >= 2
                | _ -> assert false
              end
              &&
-             not (Term.Field_is_split.get (r:>term).term_bits)
+             not (Term.Field_is_split.get (A.term_of_repr r).term_bits)
              &&
              is_in_proj r)
         |> Sequence.iter
           (fun r ->
-             let r = (r:A.repr:>term) in
+             let r = A.term_of_repr r in
              Log.debugf 5 (fun k->k "(@[split_1@ term: %a@])" Term.pp r);
              (* unconditional split: consider all cstors *)
              let cstors = match r.term_ty.ty_cell with
@@ -2077,7 +2105,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
 
     let normal_form t =
       let r = find t in
-      CCOpt.map fst r.term_nf
+      Term.as_nf r
 
     let signature (t:term_cell): term_cell option = match t with
       | True | False | DB _ | Fun _ | Mu _ | Builtin _
@@ -2254,9 +2282,11 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       |> Sequence.filter (fun t -> is_root_ t && Term.Field_in_cc.get t.term_bits)
       |> Sequence.iter yield
 
-    module Theory_actions : THEORY_ACTION = struct
+    module Theory_actions : THEORY_ACTION with type repr = repr = struct
       type repr = term
       let equal_repr = Term.equal
+      let term_of_repr t = t
+      let nf = Term.as_nf
       let all_classes = all_classes
       let find = find
       let add_eqn = push_combine
@@ -2268,7 +2298,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     module Theory_bool = Bool(Theory_actions)
     module Theory_data = Datatype(Theory_actions)
 
-    let theories : theory list =
+    let theories : repr theory list =
       [ (module Theory_bool);
         (module Theory_data)
       ]
@@ -2276,7 +2306,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     (* does [t] have some (direct) evaluation semantics? *)
     let is_evaluable (t:term): bool =
       List.exists
-        (fun (module Theory: THEORY) -> Theory.is_evaluable t)
+        (fun ((module Theory):repr theory) -> Theory.is_evaluable t)
         theories
 
     (* main CC algo: add terms from [pending] to the signature table,
@@ -2316,18 +2346,22 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         if not (equal ra rb) then (
           assert (is_root_ ra);
           assert (is_root_ rb);
-          (* invariant: [size ra <= size rb].
-             we merge [ra] into [rb]. *)
-          let ra, rb = if size_ ra > size_ rb then rb, ra else ra, rb in
-          (* check normal form(s) for consistency, merge them *)
-          let merge_ok = check_normal_forms ra rb e_ab in
-          if not merge_ok then (
-            let l = [e_ab; CC_reduce_nf a; CC_reduce_nf b] in
-            unsat l; (* incompatible *)
-          );
+          (* We will merge [r_from] into [r_into].
+             we try to ensure that [size ra <= size rb] in general, unless
+             it clashes with the invariant that the representative must
+             be a normal form if the class contains a normal form *)
+          let r_from, r_into =
+            if Term.is_nf ra && not (Term.is_nf rb) then rb, ra
+            else if size_ ra > size_ rb && not (Term.is_nf rb && not (Term.is_nf ra))
+            then rb, ra
+            else ra, rb
+          in
+          assert (not (Term.is_nf r_from) || Term.is_nf r_into);
+          (* check if merge is ok *)
+          check_merge r_from ~into:r_into e_ab;
           (* remove [ra.parents] from signature, put them into [st.pending] *)
           begin
-            Bag.to_seq ra.term_parents
+            Bag.to_seq r_from.term_parents
             |> Sequence.iter
               (fun parent ->
                  (* FIXME: with OCaml's hashtable, we should be able
@@ -2338,18 +2372,18 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           end;
           (* perform [union ra rb] *)
           begin
-            let rb_old_class = rb.term_class in
-            let rb_old_parents = rb.term_parents in
+            let rb_old_class = r_into.term_class in
+            let rb_old_parents = r_into.term_parents in
             Backtrack.push_undo
               (fun () ->
-                 ra.term_root <- ra;
-                 rb.term_class <- rb_old_class;
-                 rb.term_parents <- rb_old_parents);
-            ra.term_root <- rb;
-            rb.term_class <- Bag.append rb_old_class ra.term_class;
-            rb.term_parents <- Bag.append rb_old_parents ra.term_parents;
+                 r_from.term_root <- r_from;
+                 r_into.term_class <- rb_old_class;
+                 r_into.term_parents <- rb_old_parents);
+            r_from.term_root <- r_into;
+            r_into.term_class <- Bag.append rb_old_class r_from.term_class;
+            r_into.term_parents <- Bag.append rb_old_parents r_from.term_parents;
           end;
-          (* update explanations (a -> b) *)
+          (* update explanations (a -> b), arbitrarily *)
           begin
             reroot_expl a;
             assert (a.term_expl = None);
@@ -2382,7 +2416,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
                | _ -> ()
              end;
              List.iter
-               (fun (module Theory : THEORY) -> Theory.set_nf t nf e)
+               (fun ((module Theory):repr theory) -> Theory.set_nf t nf e)
                theories)
       end;
       (* update parents that might be evaluable, because the newly
@@ -2397,35 +2431,26 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       end;
       ()
 
-    (* returns [true] if [ra] and [rb] have compatible normal forms.
+    (* Checks if [ra] and [~into] have compatible normal forms and can
+       be merged w.r.t. the theories.
        Side effect: also pushes sub-tasks *)
-    and check_normal_forms (ra:repr)(rb:repr)(e:cc_explanation): bool =
+    and check_merge (ra:repr) ~into:(rb:repr)(e:cc_explanation): unit =
       assert (is_root_ ra);
       assert (is_root_ rb);
-      begin match ra.term_nf, rb.term_nf with
-        | None, None -> true
-        | None, Some (nf,_) ->
-          set_nf_of_class nf ra e;
-          true
-        | Some nf, (None as old_nf_b) ->
-          (* update [rb]'s normal form *)
-          if Backtrack.not_at_level_0 () then (
-            Backtrack.push_undo (fun () -> rb.term_nf <- old_nf_b);
-          );
-          rb.term_nf <- Some nf;
-          (* NOTE: this update must be performed only after [rb.term_nf] is set *)
-          set_nf_of_class (fst nf) rb e;
-          true
-        | Some (nf_a,_), Some (nf_b,_) ->
-          List.for_all
-            (fun (module Theory : THEORY) -> Theory.merge_nf ra rb nf_a nf_b)
-            theories
-      end
+      begin match Term.as_nf ra, Term.as_nf rb with
+        | None, None
+        | Some _, Some _ -> () (* theories will check if compatible *)
+        | None, Some nf -> set_nf_of_class nf ra e;
+        | Some _, None -> assert false (* should not happen *)
+      end;
+      List.iter
+        (fun ((module Theory):repr theory) -> Theory.merge ra rb [e])
+        theories
 
     (* evaluation rules: if, case... *)
     and eval_pending (t:term): unit =
       List.iter
-        (fun (module Theory : THEORY) -> Theory.eval t)
+        (fun ((module Theory):repr theory) -> Theory.eval t)
         theories
 
     (* main CC algo: add missing terms to the congruence class *)
@@ -2562,10 +2587,8 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         | CC_lit _ -> ()
         | CC_reduce_nf t ->
           let r = find t in
-          begin match r.term_nf with
-            | None -> assert false
-            | Some (_, t_nf) -> ps_add_obligation ps t t_nf
-          end
+          assert (Term.is_nf r);
+          ps_add_obligation ps t r
         | CC_reduce_eq (a, b) ->
           ps_add_obligation ps a b;
         | CC_injectivity (t1,t2)
