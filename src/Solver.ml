@@ -1537,9 +1537,9 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
             | B_or (a,b) ->
               expand_term_safe ~guard a;
               expand_term_safe ~guard b;
-              [ [ Lit.atom ~sign:false a; Lit.atom ~sign:false b; Lit.atom t ];
-                [ Lit.atom ~sign:false t; Lit.atom a];
-                [ Lit.atom ~sign:false t; Lit.atom b];
+              [ [ Lit.atom a; Lit.atom b; Lit.atom ~sign:false t ];
+                [ Lit.atom t; Lit.atom ~sign:false a];
+                [ Lit.atom t; Lit.atom ~sign:false b];
               ] |> List.map Clause.make
             | B_imply _ -> assert false (* TODO *)
             | B_eq (a,b) ->
