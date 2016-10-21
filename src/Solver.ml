@@ -1137,12 +1137,6 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
 
     type eval_env = term DB_env.t
 
-    (* TODO: perform some additional simplifications:
-       - if true a b --> a
-       - if false a b --> b
-       - match (cstor args) m --> m[cstor]
-      *)
-
     let eval_db (env:eval_env) (t:term) : term =
       let rec aux env t : term = match t.term_cell with
         | DB d ->
@@ -1152,9 +1146,26 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           end
         | True
         | False -> t
+        | App_cst (_, a) when IArray.is_empty a -> t
         | App_cst (f, a) ->
           let a' = IArray.map (aux env) a in
-          if IArray.for_all2 (==) a a' then t else app_cst f a'
+          let a0 = IArray.get a' 0 in
+          begin match f.cst_kind, a0.term_cell with
+            | Cst_proj (_,lazy cstor,i),
+              App_cst ({cst_kind=Cst_cstor (lazy cstor'); _}, a0_args)
+              when Cst.equal cstor.cstor_cst cstor'.cstor_cst ->
+              (* reduction: [proj-C-i (C t1...tn) --> ti] *)
+              assert (IArray.length a0_args > i);
+              aux env (IArray.get a0_args i)
+            | Cst_test (_,lazy cstor),
+              App_cst ({cst_kind=Cst_cstor (lazy cstor'); _}, _) ->
+              (* reduction: [is-C (D t1...tn) -> C==D] *)
+              if Cst.equal cstor.cstor_cst cstor'.cstor_cst
+              then true_ else false_
+            | _ ->
+                 (* just replace *)
+              if IArray.for_all2 (==) a a' then t else app_cst f a'
+          end
         | Fun (ty, body) ->
           let body' = aux (DB_env.push_none env) body in
           if body==body' then t else fun_ ty body'
@@ -1163,13 +1174,30 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           if body==body' then t else mu body'
         | Case (u, m) ->
           let u' = aux env u in
-          let m' = ID.Map.map (aux env) m in
-          case u' m'
+          begin match u'.term_cell with
+            | App_cst ({cst_kind=Cst_cstor (lazy cstor); _}, _) ->
+              let cstor_id = cstor.cstor_cst.cst_id in
+              begin match ID.Map.get cstor_id m with
+                | None ->
+                  errorf "could not find cstor %a@ in %a" ID.pp cstor_id pp t
+                | Some rhs ->
+                  aux env rhs
+              end
+            | _ ->
+              let m' = ID.Map.map (aux env) m in
+              case u' m'
+          end
         | If (a,b,c) ->
           let a' = aux env a in
-          let b' = aux env b in
-          let c' = aux env c in
-          if a==a' && b==b' && c==c' then t else if_ a' b' c'
+          (* normalize on the fly *)
+          begin match a'.term_cell with
+            | True -> aux env b
+            | False -> aux env c
+            | _ ->
+              let b' = aux env b in
+              let c' = aux env c in
+              if a==a' && b==b' && c==c' then t else if_ a' b' c'
+          end
         | App_ho (_,[]) -> assert false
         | App_ho (f, l) ->
           let f' = aux env f in
