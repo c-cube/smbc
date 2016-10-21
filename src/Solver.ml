@@ -3471,10 +3471,16 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     |> Sequence.max
       ~lt:(fun a b -> a.Terms_to_expand.timestamp < b.Terms_to_expand.timestamp)
 
+  (* TODO: max_depth should actually correspond to the maximum depth
+     of un-expanded terms (expand in body of t --> depth = depth(t)+1),
+     so it corresponds to unfolding call graph to some depth *)
+
   let solve ?(on_exit=[]) ?(check=true) () =
+    let n_iter = ref 0 in
     let rec check_cc (): res =
       assert (Backtrack.at_level_0 ());
-      begin match CC.check () with
+      if !n_iter > Config.max_depth then Unknown U_max_depth (* exceeded limit *)
+      else begin match CC.check () with
         | CC.Unsat _ -> Unsat (* TODO proof *)
         | CC.Sat lemmas  ->
           add_cc_lemmas lemmas;
@@ -3488,9 +3494,11 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         |> Sequence.map (fun {Terms_to_expand.lit; _} -> Lit.neg lit)
         |> Sequence.to_rev_list
       in
+      incr n_iter;
       Log.debugf 2
-        (fun k->k "(@[<1>@{<Yellow>solve@}@ @[:with-assumptions@ (@[%a@])]@])"
-            (Utils.pp_list Lit.pp) assumptions);
+        (fun k->k
+            "(@[<1>@{<Yellow>solve@}@ @[:with-assumptions@ (@[%a@])@ n_iter: %d]@])"
+            (Utils.pp_list Lit.pp) assumptions !n_iter);
       begin match M.solve ~assumptions() with
         | M.Sat _ ->
           Log.debugf 1 (fun k->k "@{<Yellow>** found SAT@}");
