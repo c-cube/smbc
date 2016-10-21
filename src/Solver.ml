@@ -3248,15 +3248,16 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         dom_traversed=Term.Tbl.create 128;
       }
 
-    let n_ = ref 0
-
     (* pick a term belonging to this type.
        we just generate a new constant, as picking true/a constructor might
        refine the partial model into an unsatisfiable state. *)
-    let pick_default (_:doms)(ty:Ty.t) : term =
-      let cst = ID.makef "?unknown_%s_%d" (Ty.mangle ty) !n_ in
-      incr n_;
-      Term.const (Cst.make_undef cst ty)
+    let pick_default ~prefix (doms:doms)(ty:Ty.t) : term =
+      (* introduce a fresh constant for this equivalence class *)
+      let elts = Ty.Tbl.get_or ~or_:[] doms.dom_of_ty ty in
+      let cst = ID.makef "%s%s_%d" prefix (Ty.mangle ty) (List.length elts) in
+      let nf = Term.const (Cst.make_undef cst ty) in
+      Ty.Tbl.replace doms.dom_of_ty ty (cst::elts);
+      nf
 
     (* follow "normal form" pointers deeply in the term *)
     let deref_deep (doms:doms) (t:term) : term =
@@ -3281,15 +3282,11 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
               begin match Term.Tbl.get doms.dom_of_class repr with
                 | Some u -> u
                 | None when Ty.is_uninterpreted t.term_ty ->
-                  (* introduce fresh constant for this equivalence class *)
-                  let elts = Ty.Tbl.get_or ~or_:[] doms.dom_of_ty t.term_ty in
-                  let c = ID.makef "$%s_%d" (Ty.mangle t.term_ty) (List.length elts) in
-                  let nf = Term.const (Cst.make_undef c t.term_ty) in
-                  Ty.Tbl.replace doms.dom_of_ty t.term_ty (c::elts);
+                  let nf = pick_default ~prefix:"$" doms t.term_ty in
                   Term.Tbl.add doms.dom_of_class repr nf;
                   nf
                 | None ->
-                  let nf = pick_default doms t.term_ty in
+                  let nf = pick_default ~prefix:"?" doms t.term_ty in
                   Term.Tbl.add doms.dom_of_class repr nf;
                   nf
               end
@@ -3330,7 +3327,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           (fun i ty -> Ast.Var.make (ID.makef "x_%d" i) (Conv.ty_to_ast ty))
           ty_args
       in
-      let default = pick_default doms ty_ret |> Conv.term_to_ast in
+      let default = pick_default ~prefix:"?" doms ty_ret |> Conv.term_to_ast in
       let cases =
         Cst.Tbl.get_or ~or_:ValueListMap.empty doms.dom_of_fun c
         |> ValueListMap.to_list
@@ -3385,11 +3382,19 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       (* now we can convert domains *)
       let domains =
         Ty.Tbl.to_seq doms.dom_of_ty
-        |> Sequence.map
+        |> Sequence.filter_map
           (fun (ty,dom) ->
-             assert (Ty.is_uninterpreted ty);
-             Conv.ty_to_ast ty, List.rev dom)
+             if Ty.is_uninterpreted ty
+             then Some (Conv.ty_to_ast ty, List.rev dom)
+             else None)
         |> Ast.Ty.Map.of_seq
+      (* and update env: add every domain element to it *)
+      and env =
+        Ty.Tbl.to_seq doms.dom_of_ty
+        |> Sequence.flat_map_l (fun (_,dom) -> dom)
+        |> Sequence.fold
+          (fun env id -> Ast.env_add_def env id Ast.E_uninterpreted_cst)
+          env
       in
       Model.make ~env ~consts ~domains
 
