@@ -1162,9 +1162,9 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           let body' = aux (DB_env.push_none env) body in
           if body==body' then t else mu body'
         | Case (u, m) ->
-          let u = aux env u in
-          let m = ID.Map.map (aux env) m in
-          case u m
+          let u' = aux env u in
+          let m' = ID.Map.map (aux env) m in
+          case u' m'
         | If (a,b,c) ->
           let a' = aux env a in
           let b' = aux env b in
@@ -2860,8 +2860,18 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     (* for converting constants *)
     let decl_ty_ : cst lazy_t ID.Tbl.t = ID.Tbl.create 16
 
+    module AstVarMap = CCMap.Make(struct
+        type t = Ast.var
+        let compare = Ast.Var.compare
+      end)
+
     (* environment for variables *)
-    type conv_env = (Ast.var * term option) list
+    type conv_env = {
+      bound: Ast.var list; (* bound variables, turn into De Bruijn *)
+      subst: term AstVarMap.t; (* variables to substitute *)
+    }
+
+    let empty_env : conv_env = {bound=[]; subst=AstVarMap.empty}
 
     let rec conv_ty (ty:Ast.Ty.t): Ty.t = match ty with
       | Ast.Ty.Prop -> Ty.prop
@@ -2900,24 +2910,27 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
             Term.app f l
         end
       | Ast.Var v ->
-        begin match
-            CCList.find_idx (fun (v',_) -> Ast.Var.equal v v') env
-          with
-            | None -> errorf "could not find var `%a`" Ast.Var.pp v
-            | Some (i,(_, None)) ->
-              let ty = Ast.Var.ty v |> conv_ty in
-              Term.db (DB.make i ty)
-            | Some (_,(_,Some t)) -> t
+        (* look whether [v] must be replaced by some term *)
+        begin match AstVarMap.get v env.subst with
+          | Some t -> t
+          | None ->
+            (* lookup as bound variable *)
+            begin match CCList.find_idx (Ast.Var.equal v) env.bound with
+              | None -> errorf "could not find var `%a`" Ast.Var.pp v
+              | Some (i,_) ->
+                let ty = Ast.Var.ty v |> conv_ty in
+                Term.db (DB.make i ty)
+            end
         end
       | Ast.Fun (v,body) ->
-        let body = conv_term ((v,None)::env) body in
+        let body = conv_term {env with bound=v::env.bound} body in
         let ty = Ast.Var.ty v |> conv_ty in
         Term.fun_ ty body
       | Ast.Forall _
       | Ast.Exists _ ->
         errorf "quantifiers not supported"
       | Ast.Mu (v,body) ->
-        let body = conv_term ((v,None)::env) body in
+        let body = conv_term {env with bound=v::env.bound} body in
         Term.mu body
       | Ast.Match (u,m) ->
         let u = conv_term env u in
@@ -2934,24 +2947,27 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
                in
                (* replace the variables of the pattern-matching with
                   projections of cstor *)
-               let env' =
+               let subst =
                  CCList.Idx.foldi
-                   (fun env i v ->
+                   (fun subst i v ->
                       let arg_i = Term.cstor_proj cstor i u in
-                      let env' = (v,Some arg_i)::env in
-                      env')
-                   env vars
+                      let subst = AstVarMap.add v arg_i subst in
+                      subst)
+                   env.subst vars
                in
-               conv_term env' rhs)
+               conv_term {env with subst} rhs)
             m
         in
-        Term.case u m
+        let res = Term.case u m in
+        Format.printf "@[<2>conv %a@ into: %a@."
+          Ast.pp_term t Term.pp res;
+        res
       | Ast.Switch _ ->
         errorf "cannot convert switch %a" Ast.pp_term t
       | Ast.Let (v,t,u) ->
         (* substitute on the fly *)
         let t = conv_term env t in
-        conv_term ((v, Some t)::env) u
+        conv_term {env with subst=AstVarMap.add v t env.subst} u
       | Ast.If (a,b,c) ->
         Term.if_ (conv_term env a)(conv_term env b) (conv_term env c)
       | Ast.Not t -> Term.not_ (conv_term env t)
@@ -2971,7 +2987,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       model_env_ := Ast.env_add_statement !model_env_ st;
       begin match st with
         | Ast.Assert t ->
-          let t = conv_term [] t in
+          let t = conv_term empty_env t in
           Top_goals.push t;
           push_clause (Clause.make [Lit.atom t])
         | Ast.Goal (vars, t) ->
@@ -2981,8 +2997,8 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
               (fun env v ->
                  let ty = Ast.Var.ty v |> conv_ty in
                  let c = Cst.make_undef (Ast.Var.id v) ty in
-                 (v,Some (Term.const c)) :: env, c)
-              []
+                 {env with subst=AstVarMap.add v (Term.const c) env.subst}, c)
+              empty_env
               vars
           in
           (* model should contain values of [consts] *)
@@ -3083,7 +3099,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           List.iter
             (fun (id,ty,rhs) ->
                let ty = conv_ty ty in
-               let rhs = lazy (conv_term [] rhs) in
+               let rhs = lazy (conv_term empty_env rhs) in
                let k = match k with
                  | Ast.Recursive -> Cst_recursive
                  | Ast.Non_recursive -> Cst_non_recursive
