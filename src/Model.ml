@@ -146,6 +146,7 @@ let eval (m:t) (t:term) =
           | _ ->
             begin match ID.Map.get c m.consts with
               | None -> t
+              | Some {A.term=A.Const c';_} when (ID.equal c c') -> t (* trivial cycle *)
               | Some t' -> aux subst t'
             end
         end
