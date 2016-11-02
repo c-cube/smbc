@@ -3036,12 +3036,23 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
                  else None)
             |> ID.Tbl.of_seq
           in
-          let m =
-            { m with
-                switch_tbl;
-                switch_id=new_switch_id_();
-            } in
-          Term.switch (aux u) m
+          if ID.Tbl.length switch_tbl = 0
+          then (
+            (* make a new unknown constant of the proper type *)
+            let c =
+              Typed_cst.make_undef
+                (ID.makef "?default_%s" (Ty.mangle m.switch_ty_ret))
+                m.switch_ty_ret
+            in
+            Term.const c
+          ) else (
+            let m =
+                 { m with
+                     switch_tbl;
+                     switch_id=new_switch_id_();
+                 } in
+            Term.switch (aux u) m
+          )
         | Quant (q,uty,body) -> Term.quant q uty (aux body)
         | Fun (ty,body) -> Term.fun_ ty (aux body)
         | Mu body -> Term.mu (aux body)
