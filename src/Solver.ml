@@ -2351,21 +2351,20 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
 
   (** {2 A literal asserted to SAT}
 
-      We watch those literals depending on the set of constants
-      that block their current normal form *)
+      A set of terms that must be evaluated (and their value, propagated)
+      in the current partial model. *)
 
-  module Watched_lit : sig
+  module Top_terms : sig
     type t = private term
 
     val to_lit : t -> Lit.t
     val pp : t CCFormat.printer
-    val watch : t -> unit
-    val watch_term : term -> unit
-    val update_watches_of : t -> unit
-    val update_watches_of_term : term -> unit
-    val is_watched : t -> bool
+    val watch : term -> unit
+    val update : t -> unit (** re-check value, maybe propagate *)
+    val is_top_term : term -> bool
     val size : unit -> int
     val to_seq : t Sequence.t
+    val update_all : unit -> unit (** update all top terms *)
   end = struct
     type t = term
     (* actually, the watched lit is [Lit.atom t], but we link
@@ -2391,30 +2390,27 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       Clause.push_new_l cs;
       ()
 
-    (* add [t] to the list of literals that watch the constant [c] *)
-    let watch_cst_ (t:t)(c:cst) : unit =
+    let expand_cst_ (t:t)(c:cst) : unit =
       assert (Ty.is_prop t.term_ty);
       Log.debugf 2
         (fun k->k "(@[<1>watch_cst@ %a@ %a@])" Typed_cst.pp c Term.pp t);
       Expand.expand_cst c;
       ()
 
-    (* add [t] to the list of literals that watch this slice *)
-    let watch_uty (t:t)(uty:ty_uninterpreted_slice) : unit =
+    let expand_uty_ (t:t)(uty:ty_uninterpreted_slice) : unit =
       assert (Ty.is_prop t.term_ty);
       Log.debugf 2
         (fun k->k "(@[<1>watch_uty@ %a@ %a@])" pp_uty uty Term.pp t);
       Expand.expand_uty uty;
       ()
 
-    let watch_dep (t:t) (d:term_dep) : unit = match d with
-      | Dep_cst c -> watch_cst_ t c
-      | Dep_uty uty -> watch_uty t uty
+    let expand_dep (t:t) (d:term_dep) : unit = match d with
+      | Dep_cst c -> expand_cst_ t c
+      | Dep_uty uty -> expand_uty_ t uty
 
-    (* ensure that [t] is on the watchlist of all the
-       constants it depends on;
-       also ensure those constants are expanded *)
-    let update_watches_of (t:t): unit =
+    (* evaluate [t] in current partial model, and expand the constants
+       that block it *)
+    let update (t:t): unit =
       assert (Ty.is_prop t.term_ty);
       let e, new_t = Reduce.compute_nf t in
       (* if [new_t = true/false], propagate literal *)
@@ -2422,43 +2418,58 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         | True -> propagate_lit_ t e
         | False -> propagate_lit_ (Term.not_ t) e
         | _ ->
-          (* partially evaluated literal: add [t] (not its
-             temporary normal form) to the watch list of every
-             blocking constant *)
           Log.debugf 4
             (fun k->k
-                "(@[<1>update_watches@ %a@ @[<1>:normal_form@ %a@]@ \
+                "(@[<1>update@ %a@ @[<1>:normal_form@ %a@]@ \
                  :deps (@[%a@])@ :exp @[<hv>%a@]@])"
                 Term.pp t Term.pp new_t
                 (Utils.pp_list pp_dep) new_t.term_deps
                 Explanation.pp e);
-          List.iter (watch_dep t) new_t.term_deps;
+          List.iter (expand_dep t) new_t.term_deps;
       end;
       ()
 
-    let update_watches_of_term = update_watches_of
+    (* NOTE: we use a list because it's lightweight, fast to iterate
+       on, and we only add elements in it at the beginning *)
+    let top_ : term list ref = ref []
 
-    let watched_ : unit Term.Tbl.t = Term.Tbl.create 256
+    let mem_top_ (t:term): bool =
+      List.exists (Term.equal t) !top_
 
-    let watch (lit:t) =
+    let watch (lit:term) =
       let lit, _ = Term.abs lit in
-      if not (Term.Tbl.mem watched_ lit) then (
+      if not (mem_top_ lit) then (
         Log.debugf 3
           (fun k->k "(@[<1>@{<green>watch_lit@}@ %a@])" pp lit);
-        Term.Tbl.add watched_ lit ();
+        top_ := lit :: !top_;
         (* also ensure it is watched properly *)
-        update_watches_of lit;
+        update lit;
       )
 
-    let watch_term = watch
-
-    let is_watched (lit:t) : bool =
+    let is_top_term (lit:t) : bool =
       let lit, _ = Term.abs lit in
-      Term.Tbl.mem watched_ lit
+      mem_top_ lit
 
-    let to_seq = Term.Tbl.keys watched_
+    let to_seq yield = List.iter yield !top_
 
-    let size () = Term.Tbl.length watched_
+    let size () = List.length !top_
+
+    (* is the dependency updated, i.e. decided by the SAT solver? *)
+    let dep_updated (d:term_dep): bool = match d with
+      | Dep_cst {cst_kind=Cst_undef (_, i, _); _} ->
+        CCOpt.is_some i.cst_cur_case
+      | Dep_cst _ -> assert false
+      | Dep_uty uty ->
+        CCOpt.is_some uty.uty_status
+
+    (* update all top terms (whose dependencies have been changed) *)
+    let update_all () =
+      to_seq
+      |> Sequence.filter
+        (fun t ->
+           let _, nf = Reduce.get_nf t in
+           List.exists dep_updated nf.term_deps)
+      |> Sequence.iter update
   end
 
   (** {2 Sat Solver} *)
@@ -2480,7 +2491,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       !stat_num_cst_expanded
       !stat_num_clause_push
       !stat_num_clause_tautology
-      (Watched_lit.size())
+      (Top_terms.size())
 
   (* TODO: find the proper code for "kill line" *)
   let flush_progress (): unit =
@@ -2643,24 +2654,6 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           assert_uty uty status
       end
 
-    (* is the dependency updated, i.e. decided by the SAT solver? *)
-    let dep_updated (d:term_dep): bool = match d with
-      | Dep_cst {cst_kind=Cst_undef (_, i, _); _} ->
-        CCOpt.is_some i.cst_cur_case
-      | Dep_cst _ -> assert false
-      | Dep_uty uty ->
-        CCOpt.is_some uty.uty_status
-
-    (* for each term in [terms], update its watches, iff one of its dependencies
-       is set *)
-    let update_terms (terms:term Sequence.t): unit =
-      Sequence.iter
-        (fun t ->
-           let _, nf = Reduce.get_nf t in
-           if List.exists dep_updated nf.term_deps
-           then Watched_lit.update_watches_of_term t)
-        terms
-
     (* propagation from the bool solver *)
     let assume slice =
       let start = slice.TI.start in
@@ -2674,7 +2667,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           let lit = slice.TI.get i in
           assume_lit lit;
         done;
-        update_terms Top_goals.to_seq;
+        Top_terms.update_all();
         flush_new_clauses_into_slice slice;
         TI.Sat
       with Conflict conflict_clause ->
@@ -2698,7 +2691,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     Clause.to_seq c
       |> Sequence.filter_map Lit.as_atom
       |> Sequence.map fst
-      |> Sequence.iter Watched_lit.watch_term;
+      |> Sequence.iter Top_terms.watch;
     incr stat_num_clause_push;
     M.assume [Clause.lits c]
 
@@ -3124,7 +3117,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
 
   (* print all terms reachable from watched literals *)
   let pp_term_graph out () =
-    Term.pp_dot out (Watched_lit.to_seq :> term Sequence.t)
+    Term.pp_dot out (Top_terms.to_seq :> term Sequence.t)
 
   let pp_stats out () : unit =
     Format.fprintf out
@@ -3141,7 +3134,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       !stat_num_uty_expanded
       !stat_num_clause_push
       !stat_num_clause_tautology
-      (Watched_lit.size())
+      (Top_terms.size())
       !stat_num_propagations
       !stat_num_unif
 
