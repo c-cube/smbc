@@ -1,3 +1,4 @@
+provers = [ "smbc-1", "smbc-5", "smbc-30" ]
 
 [smbc-1]
 
