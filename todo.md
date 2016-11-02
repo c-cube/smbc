@@ -2,6 +2,13 @@
 
 ## Narrowing
 
+- turn uninterpreted terms into datatypes isomorphic to `nat`
+  * using a special value `card_τ : τ` to limit the range of `∧_τ` and `∨_τ`
+    and compute domains (the domain of `τ` is the set of values `{x:τ | x <
+    card_τ}`)
+  * introduce the special `<` (or `≤`) defined on datatypes, used
+    for symmetry-breaking too?
+
 - conflict generalization
   (e.g. failed equalities with a meta on RHS)
 
@@ -45,7 +52,7 @@
 - start testing on simple examples
 
 
-FIX:
+**FIX**:
 ./smbc.native --backtrace --debug 5 --check examples/uf3.smt2
 (should be unsat)
 
