@@ -1,8 +1,8 @@
 
 ; find `f` where: `map (f plus) [1,2,3] = [2,4,6], f 10=20`,
-; same as map_fun2, but easier
 
-; expect: SAT
+; actual status is SAT, but here it's out of fragment
+; expect: ERROR
 
 (include "nat.lisp")
 (include "list.lisp")
