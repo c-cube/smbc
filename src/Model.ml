@@ -77,7 +77,17 @@ module VarMap = CCMap.Make(struct
     let compare = A.Var.compare
   end)
 
-let empty_subst = VarMap.empty
+(* var -> term in normal form *)
+type subst = A.term lazy_t VarMap.t
+
+let empty_subst : subst = VarMap.empty
+
+let pp_subst out (s:subst) =
+  let pp_pair out (v,lazy t) =
+    Format.fprintf out "@[<2>%a@ @<1>→ %a@]" A.Var.pp v A.pp_term t
+  in
+  Format.fprintf out "[@[%a@]]"
+    (CCFormat.list ~start:"" ~stop:"" ~sep:"," pp_pair) (VarMap.to_list s)
 
 let rec as_cstor_app env t = match A.term_view t with
   | A.Const id ->
@@ -97,9 +107,13 @@ let as_domain_elt env t = match A.term_view t with
     end
   | _ -> None
 
-let apply_subst subst t =
+let apply_subst (subst:subst) t =
   let rec aux subst t = match A.term_view t with
-    | A.Var v -> VarMap.get_or ~or_:t v subst
+    | A.Var v ->
+      begin match VarMap.get v subst with
+        | None -> t
+        | Some (lazy t') -> t'
+      end
     | A.True
     | A.False
     | A.Const _ -> t
@@ -128,173 +142,198 @@ let apply_subst subst t =
     | A.Binop (op,a,b) -> A.binop op (aux subst a)(aux subst b)
   and rename_var v subst =
     let v' = A.Var.copy v in
-    let subst' = VarMap.add v (A.var v') subst in
+    let subst' = VarMap.add v (lazy (A.var v')) subst in
     v', subst'
   in
   aux subst t
 
-(* eval term [t] under model [m] *)
-let eval (m:t) (t:term) =
-  let rec aux (subst:term VarMap.t) (t:term) =
-    match A.term_view t with
-      | A.True
-      | A.False -> t
-      | A.Var v -> VarMap.get_or ~or_:t v subst
-      | A.Const c ->
-        begin match A.env_find_def m.env c with
-          | Some (A.E_defined (_, t')) -> aux empty_subst t'
+(* Weak Head Normal Form *)
+let rec eval_whnf (m:t) (subst:subst) (t:term): term = match A.term_view t with
+  | A.True
+  | A.False -> t
+  | A.Var v ->
+    begin match VarMap.get v subst with
+      | None -> t
+      | Some (lazy t') ->
+        eval_whnf m empty_subst t'
+    end
+  | A.Const c ->
+    begin match A.env_find_def m.env c with
+      | Some (A.E_defined (_, t')) -> eval_whnf m empty_subst t'
+      | _ ->
+        begin match ID.Map.get c m.consts with
+          | None -> t
+          | Some {A.term=A.Const c';_} when (ID.equal c c') -> t (* trivial cycle *)
+          | Some t' -> eval_whnf m subst t'
+        end
+    end
+  | A.App (f,l) -> eval_whnf_app m subst subst f l
+  | A.If (a,b,c) ->
+    let a = eval_whnf m subst a in
+    begin match A.term_view a with
+      | A.True -> eval_whnf m subst b
+      | A.False -> eval_whnf m subst c
+      | _ -> apply_subst subst (A.if_ a b c)
+    end
+  | A.Mu _ -> assert false
+  | A.Let (x,t,u) ->
+    let t = lazy (eval_whnf m subst t) in
+    let subst' = VarMap.add x t subst in
+    eval_whnf m subst' u
+  | A.Fun _ -> apply_subst subst t
+  | A.Forall (v,body)
+  | A.Exists (v,body) ->
+    let ty = A.Var.ty v in
+    let dom =
+      try A.Ty.Map.find ty m.domains
+      with Not_found -> errorf "could not find type %a in model" A.Ty.pp ty
+    in
+    (* expand into and/or over the domain *)
+    let t' =
+      let l =
+        List.map
+          (fun c_dom ->
+             let subst' = VarMap.add v (lazy (A.const c_dom ty)) subst in
+             eval_whnf m subst' body)
+          dom
+      in
+      match A.term_view t with
+        | A.Forall _ -> A.and_l l
+        | A.Exists _ -> A.or_l l
+        | _ -> assert false
+    in
+    eval_whnf m subst t'
+  | A.Match (u, branches) ->
+    let u = eval_whnf m subst u in
+    begin match as_cstor_app m.env u with
+      | None ->
+        let branches =
+          ID.Map.map (fun (vars,rhs) -> vars, apply_subst subst rhs) branches
+        in
+        A.match_ u branches
+      | Some (c, _, cstor_args) ->
+        match ID.Map.get c branches with
+          | None -> assert false
+          | Some (vars, rhs) ->
+            assert (List.length vars = List.length cstor_args);
+            let subst' =
+              List.fold_left2
+                (fun s v arg ->
+                   let arg' = lazy (apply_subst subst arg) in
+                   VarMap.add v arg' s)
+                subst vars cstor_args
+            in
+            eval_whnf m subst' rhs
+    end
+  | A.Switch (u, map) ->
+    let u = eval_whnf m subst u in
+    begin match as_domain_elt m.env u with
+      | None ->
+        let map = ID.Map.map (apply_subst subst) map in
+        A.switch u map
+      | Some cst ->
+        begin match ID.Map.get cst map with
+          | Some rhs -> eval_whnf m subst rhs
+          | None ->
+            let map = ID.Map.map (apply_subst subst) map in
+            A.switch u map
+        end
+    end
+  | A.Not f ->
+    let f = eval_whnf m subst f in
+    begin match A.term_view f with
+      | A.True -> A.false_
+      | A.False -> A.true_
+      | _ -> A.not_ f
+    end
+  | A.Binop (op, a, b) ->
+    let a = eval_whnf m subst a in
+    let b = eval_whnf m subst b in
+    begin match op with
+      | A.And ->
+        begin match A.term_view a, A.term_view b with
+          | A.True, A.True -> A.true_
+          | A.False, _
+          | _, A.False -> A.false_
+          | _ -> A.and_ a b
+        end
+      | A.Or ->
+        begin match A.term_view a, A.term_view b with
+          | A.True, _
+          | _, A.True -> A.true_
+          | A.False, A.False -> A.false_
+          | _ -> A.or_ a b
+        end
+      | A.Imply ->
+        begin match A.term_view a, A.term_view b with
+          | _, A.True
+          | A.False, _  -> A.true_
+          | A.True, A.False -> A.false_
+          | _ -> A.imply a b
+        end
+      | A.Eq ->
+        begin match A.term_view a, A.term_view b with
+          | A.True, A.True
+          | A.False, A.False -> A.true_
+          | A.True, A.False
+          | A.False, A.True -> A.false_
           | _ ->
-            begin match ID.Map.get c m.consts with
-              | None -> t
-              | Some {A.term=A.Const c';_} when (ID.equal c c') -> t (* trivial cycle *)
-              | Some t' -> aux subst t'
-            end
-        end
-      | A.App (f,l) ->
-        (* here, call by value *)
-        let f = aux subst f in
-        let l = List.map (aux subst) l in
-        aux_app subst f l
-      | A.If (a,b,c) ->
-        let a = aux subst a in
-        begin match A.term_view a with
-          | A.True -> aux subst b
-          | A.False -> aux subst c
-          | _ -> A.if_ a b c
-        end
-      | A.Mu _ -> assert false
-      | A.Let (x,t,u) ->
-        let t = aux subst t in
-        let subst' = VarMap.add x t subst in
-        aux subst' u
-      | A.Fun _ -> t
-      | A.Forall (v,body)
-      | A.Exists (v,body) ->
-        let ty = A.Var.ty v in
-        let dom =
-          try A.Ty.Map.find ty m.domains
-          with Not_found -> errorf "could not find type %a in model" A.Ty.pp ty
-        in
-        (* expand into and/or over the domain *)
-        let t' =
-          let l =
-            List.map
-              (fun c_dom ->
-                 let subst' = VarMap.add v (A.const c_dom ty) subst in
-                 aux subst' body)
-              dom
-          in
-          match A.term_view t with
-            | A.Forall _ -> A.and_l l
-            | A.Exists _ -> A.or_l l
-            | _ -> assert false
-        in
-        aux subst t'
-      | A.Match (u, branches) ->
-        let u = aux subst u in
-        begin match as_cstor_app m.env u with
-          | None -> A.match_ u branches
-          | Some (c, _, args) ->
-            match ID.Map.get c branches with
-              | None -> assert false
-              | Some (vars, rhs) ->
-                assert (List.length vars = List.length args);
-                let subst' =
-                  List.fold_left2
-                    (fun s v t -> VarMap.add v t s)
-                    subst vars args
-                in
-                aux subst' rhs
-        end
-      | A.Switch (u, map) ->
-        let u = aux subst u in
-        begin match as_domain_elt m.env u with
-          | None -> A.switch u map
-          | Some cst ->
-            begin match ID.Map.get cst map with
-              | Some rhs -> aux subst rhs
-              | None -> A.switch u map
-            end
-        end
-      | A.Not f ->
-        let f = aux subst f in
-        begin match A.term_view f with
-          | A.True -> A.false_
-          | A.False -> A.true_
-          | _ -> A.not_ f
-        end
-      | A.Binop (op, a, b) ->
-        let a = aux subst a in
-        let b = aux subst b in
-        begin match op with
-          | A.And ->
-            begin match A.term_view a, A.term_view b with
-              | A.True, A.True -> A.true_
-              | A.False, _
-              | _, A.False -> A.false_
-              | _ -> A.and_ a b
-            end
-          | A.Or ->
-            begin match A.term_view a, A.term_view b with
-              | A.True, _
-              | _, A.True -> A.true_
-              | A.False, A.False -> A.false_
-              | _ -> A.or_ a b
-            end
-          | A.Imply ->
-            begin match A.term_view a, A.term_view b with
-              | _, A.True
-              | A.False, _  -> A.true_
-              | A.True, A.False -> A.false_
-              | _ -> A.imply a b
-            end
-          | A.Eq ->
-            begin match A.term_view a, A.term_view b with
-              | A.True, A.True
-              | A.False, A.False -> A.true_
-              | A.True, A.False
-              | A.False, A.True -> A.false_
+            begin match as_cstor_app m.env a, as_cstor_app m.env b with
+              | Some (c1,_,l1), Some (c2,_,l2) ->
+                if ID.equal c1 c2 then (
+                  assert (List.length l1 = List.length l2);
+                  eval_whnf m subst (A.and_l (List.map2 A.eq l1 l2))
+                ) else A.false_
               | _ ->
-                begin match as_cstor_app m.env a, as_cstor_app m.env b with
-                  | Some (c1,_,l1), Some (c2,_,l2) ->
-                    if ID.equal c1 c2 then (
-                      assert (List.length l1 = List.length l2);
-                      aux subst (A.and_l (List.map2 A.eq l1 l2))
-                    ) else A.false_
+                begin match as_domain_elt m.env a, as_domain_elt m.env b with
+                  | Some c1, Some c2 ->
+                    (* domain elements: they are all distinct *)
+                    if ID.equal c1 c2
+                    then A.true_
+                    else A.false_
                   | _ ->
-                    begin match as_domain_elt m.env a, as_domain_elt m.env b with
-                      | Some c1, Some c2 ->
-                        (* domain elements: they are all distinct *)
-                        if ID.equal c1 c2
-                        then A.true_
-                        else A.false_
-                      | _ ->
-                        A.eq a b
-                    end
+                    A.eq a b
                 end
             end
         end
-  and aux_app subst f l = match A.term_view f, l with
-    | A.Const c, _ ->
-      begin match A.env_find_def m.env c with
-        | Some (A.E_defined (_, def_f)) ->
-          aux_app subst def_f l
-        | _ -> aux_app' subst f l
-      end
-    | A.Fun (v, body), arg :: tail ->
-      let subst = VarMap.add v arg subst in
-      aux_app subst body tail
-    | A.Var v, _ ->
-      begin match VarMap.get v subst with
-        | Some f' -> aux_app subst f' l
-        | None -> aux_app' subst f l
-      end
-    | _ -> aux_app' subst f l
-  and aux_app' subst f l =
-    let f' = aux subst f in (* now, evaluate body *)
-    A.app f' l
+    end
+(* beta-reduce [f l] while [f] is a function,constant or variable *)
+and eval_whnf_app m subst_f subst_l f l = match A.term_view f, l with
+  | A.Fun (v, body), arg :: tail ->
+    let subst_f = VarMap.add v (lazy (apply_subst subst_l arg)) subst_f in
+    eval_whnf_app m subst_f subst_l body tail
+  | _ -> eval_whnf_app' m subst_f subst_l f l
+(* evaluate [f] and try to beta-reduce if [eval_whnf m f] is a function *)
+and eval_whnf_app' m subst_f subst_l f l =
+  let f' = eval_whnf m subst_f f in
+  begin match A.term_view f', l with
+    | A.Fun _, _::_ -> eval_whnf_app m subst_f subst_l f' l (* evaluate again *)
+    | _ ->
+      (* blocked *)
+      let l = List.map (apply_subst subst_l) l in
+      A.app f' l
+  end
+
+let eval_snf (m:t) (t:term) =
+  let rec aux t =
+    let t = eval_whnf m empty_subst t in
+    begin match A.term_view t with
+      | A.True | A.False | A.Var _ | A.Const _ -> t
+      | A.Not _ | A.Match _ | A.Switch _ | A.Binop _ -> t (* whnf = snf *)
+      | A.Let _ -> assert false
+      | A.App (f, l) ->
+        A.app f (List.map aux l)
+      | A.Forall (v, t) -> A.forall v (aux t)
+      | A.Exists (v, t) -> A.exists v (aux t)
+      | A.Fun (v, t) -> A.fun_ v (aux t)
+      | A.Mu (v, t) -> A.mu v (aux t)
+      | A.If (a,b,c) -> A.if_ a (aux b)(aux c)
+    end
   in
-  aux empty_subst t
+  aux t
+
+(* eval term [t] under model [m] *)
+let eval (m:t) (t:term) = eval_snf m t
 
 (* check model *)
 let check (m:t) ~goals =
