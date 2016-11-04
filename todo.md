@@ -2,6 +2,37 @@
 
 ## Narrowing
 
+- simultaneous match (make and/or/imply based on that)
+  * also need to convert inputs that perform match on arguments (e.g. `less`)
+    into this simultaneous match, automatically
+  * keep it shallow (no deep patterns)
+  * allow `default` case (to avoid explosion) AND wildcard patterns,
+    which are critical for accurate explanations (implementation similar
+    to current parallel and)
+  * optim: if one matched term only has wildcards, remove it (irrelevant).
+    This can happen as a result of other optimizations.
+  * e.g, `and x y = match x,y with
+     | false, _ -> false | _, false -> false | true, true -> true end`
+
+- optimization of `match t with p1 -> c t1 | … | pn -> c tn`
+  where `c` is the same cstor in every branch, into
+  `c (match t with p1 -> t1 | … | pn -> tn)`. This should be
+  done at preprocessing, same as compilation of simultaneous matches.
+  * no need to worry about duplicate sub-computations, they will be
+   shared anyway
+  * allows for faster failures if this is to be equated with another
+   constructor
+  * nice special case: booleans
+  * optimal in conjunction with simultaneous match. E.g., `less` would
+    become
+    `match x, y with
+      | s x1, s y1 -> less x1 y1  | 0, s _ -> true | _, 0 -> false end`
+    which fails if `y=0` immediately (instead of always having to decompose
+    `x` first).
+  * → even further: factor together the branches of simultaneous matching
+    that return the same constructor, even if there still remains several
+    branches.
+
 - turn uninterpreted terms into datatypes isomorphic to `nat`
   * using a special value `card_τ : τ` to limit the range of `∧_τ` and `∨_τ`
     and compute domains (the domain of `τ` is the set of values `{x:τ | x <
