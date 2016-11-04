@@ -82,12 +82,18 @@ type subst = A.term lazy_t VarMap.t
 
 let empty_subst : subst = VarMap.empty
 
+let rename_var subst v =
+  let v' = A.Var.copy v in
+  VarMap.add v (Lazy.from_val (A.var v')) subst, v
+
+let rename_vars = CCList.fold_map rename_var
+
 let pp_subst out (s:subst) =
   let pp_pair out (v,lazy t) =
     Format.fprintf out "@[<2>%a@ @<1>→ %a@]" A.Var.pp v A.pp_term t
   in
   Format.fprintf out "[@[%a@]]"
-    (CCFormat.list ~start:"" ~stop:"" ~sep:"," pp_pair) (VarMap.to_list s)
+    (CCFormat.list ~start:"" ~stop:"" ~sep:"," pp_pair) (VarMap.to_list s |> List.rev)
 
 let rec as_cstor_app env t = match A.term_view t with
   | A.Const id ->
@@ -120,32 +126,30 @@ let apply_subst (subst:subst) t =
     | A.App (f,l) -> A.app (aux subst f) (List.map (aux subst) l)
     | A.If (a,b,c) -> A.if_ (aux subst a) (aux subst b) (aux subst c)
     | A.Match (u,m) ->
-      (* TODO: rename *)
       A.match_ (aux subst u)
-        (ID.Map.map (fun (vars,rhs) ->  vars, aux subst rhs) m)
+        (ID.Map.map
+           (fun (vars,rhs) ->
+              let subst, vars = rename_vars subst vars in
+              vars, aux subst rhs) m)
     | A.Switch (u,m) ->
       A.switch (aux subst u) (ID.Map.map (aux subst) m)
     | A.Let (x,t,u) ->
-      let x', subst' = rename_var x subst in
+      let subst', x' = rename_var subst x in
       A.let_ x' (aux subst t) (aux subst' u)
     | A.Fun (x,body) ->
-      let x', subst' = rename_var x subst in
+      let subst', x'  = rename_var subst x in
       A.fun_ x' (aux subst' body)
     | A.Forall (x,body) ->
-      let x', subst' = rename_var x subst in
+      let subst', x' = rename_var subst x in
       A.forall x' (aux subst' body)
     | A.Exists (x,body) ->
-      let x', subst' = rename_var x subst in
+      let subst', x' = rename_var subst x in
       A.exists x' (aux subst' body)
     | A.Mu (_,_) -> assert false
     | A.Not f -> A.not_ (aux subst f)
     | A.Binop (op,a,b) -> A.binop op (aux subst a)(aux subst b)
-  and rename_var v subst =
-    let v' = A.Var.copy v in
-    let subst' = VarMap.add v (lazy (A.var v')) subst in
-    v', subst'
   in
-  aux subst t
+  if VarMap.is_empty subst then t else aux subst t
 
 (* Weak Head Normal Form *)
 let rec eval_whnf (m:t) (subst:subst) (t:term): term = match A.term_view t with
@@ -164,7 +168,7 @@ let rec eval_whnf (m:t) (subst:subst) (t:term): term = match A.term_view t with
         begin match ID.Map.get c m.consts with
           | None -> t
           | Some {A.term=A.Const c';_} when (ID.equal c c') -> t (* trivial cycle *)
-          | Some t' -> eval_whnf m subst t'
+          | Some t' -> eval_whnf m empty_subst t'
         end
     end
   | A.App (f,l) -> eval_whnf_app m subst subst f l
@@ -173,9 +177,14 @@ let rec eval_whnf (m:t) (subst:subst) (t:term): term = match A.term_view t with
     begin match A.term_view a with
       | A.True -> eval_whnf m subst b
       | A.False -> eval_whnf m subst c
-      | _ -> apply_subst subst (A.if_ a b c)
+      | _ ->
+        let b = apply_subst subst b in
+        let c = apply_subst subst c in
+        A.if_ a b c
     end
-  | A.Mu _ -> assert false
+  | A.Mu (v,body) ->
+    let subst' = VarMap.add v (lazy t) subst in
+    eval_whnf m subst' body
   | A.Let (x,t,u) ->
     let t = lazy (eval_whnf m subst t) in
     let subst' = VarMap.add x t subst in
@@ -208,7 +217,11 @@ let rec eval_whnf (m:t) (subst:subst) (t:term): term = match A.term_view t with
     begin match as_cstor_app m.env u with
       | None ->
         let branches =
-          ID.Map.map (fun (vars,rhs) -> vars, apply_subst subst rhs) branches
+          ID.Map.map
+            (fun (vars,rhs) ->
+               let subst, vars = rename_vars subst vars in
+               vars, apply_subst subst rhs)
+            branches
         in
         A.match_ u branches
       | Some (c, _, cstor_args) ->
@@ -307,33 +320,16 @@ and eval_whnf_app m subst_f subst_l f l = match A.term_view f, l with
 and eval_whnf_app' m subst_f subst_l f l =
   let f' = eval_whnf m subst_f f in
   begin match A.term_view f', l with
-    | A.Fun _, _::_ -> eval_whnf_app m subst_f subst_l f' l (* evaluate again *)
+    | A.Fun _, _::_ ->
+      eval_whnf_app m subst_l subst_l f' l (* beta-reduce again *)
     | _ ->
       (* blocked *)
       let l = List.map (apply_subst subst_l) l in
       A.app f' l
   end
 
-let eval_snf (m:t) (t:term) =
-  let rec aux t =
-    let t = eval_whnf m empty_subst t in
-    begin match A.term_view t with
-      | A.True | A.False | A.Var _ | A.Const _ -> t
-      | A.Not _ | A.Match _ | A.Switch _ | A.Binop _ -> t (* whnf = snf *)
-      | A.Let _ -> assert false
-      | A.App (f, l) ->
-        A.app f (List.map aux l)
-      | A.Forall (v, t) -> A.forall v (aux t)
-      | A.Exists (v, t) -> A.exists v (aux t)
-      | A.Fun (v, t) -> A.fun_ v (aux t)
-      | A.Mu (v, t) -> A.mu v (aux t)
-      | A.If (a,b,c) -> A.if_ a (aux b)(aux c)
-    end
-  in
-  aux t
-
 (* eval term [t] under model [m] *)
-let eval (m:t) (t:term) = eval_snf m t
+let eval (m:t) (t:term) = eval_whnf m empty_subst t
 
 (* check model *)
 let check (m:t) ~goals =
