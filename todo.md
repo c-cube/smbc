@@ -14,6 +14,12 @@
   * e.g, `and x y = match x,y with
      | false, _ -> false | _, false -> false | true, true -> true end`
 
+- maybe parallel match is better than simultaneous match (more accurate
+  in combination with following optim, as you can have some cases
+  with nested matches and some cases in which the inner match collapses
+  into one cstor; e.g. for `less`, matching on snd argument first
+  will have sub-case collapse to `false` automatically).
+
 - optimization of `match t with p1 -> c t1 | … | pn -> c tn`
   where `c` is the same cstor in every branch, into
   `c (match t with p1 -> t1 | … | pn -> tn)`. This should be
@@ -32,6 +38,12 @@
   * → even further: factor together the branches of simultaneous matching
     that return the same constructor, even if there still remains several
     branches.
+
+- detect and prove (by simple induction), when possible, that some
+  boolean function's argument's depth is smaller than another argument's?
+  e.g. for `find` in `ty_infer`, depth of env must be ≥ depth of index
+  for it to return `some`. A builtin `smaller_depth a b` would be used to
+  prune early?
 
 - turn uninterpreted terms into datatypes isomorphic to `nat`
   * using a special value `card_τ : τ` to limit the range of `∧_τ` and `∨_τ`
