@@ -880,25 +880,27 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     module Map = CCMap.Make(As_key)
     module Tbl = CCHashtbl.Make(As_key)
 
-    let to_seq t yield =
-      let rec aux t =
-        yield t;
+    let to_seq_depth t (yield:t*int ->unit): unit =
+      let rec aux k t =
+        yield (t,k);
         match t.term_cell with
           | DB _ | Const _ | True | False -> ()
-          | App (f,l) -> aux f; List.iter aux l
-          | If (a,b,c) -> aux a; aux b; aux c
+          | App (f,l) -> aux k f; List.iter (aux k) l
+          | If (a,b,c) -> aux k a; aux k b; aux k c
           | Match (t, m) ->
-            aux t;
-            ID.Map.iter (fun _ (_,rhs) -> aux rhs) m
-          | Switch (u,_) -> aux u (* ignore the table *)
-          | Builtin b -> builtin_to_seq b aux
+            aux k t;
+            ID.Map.iter (fun _ (tys,rhs) -> aux (k+List.length tys) rhs) m
+          | Switch (u,_) -> aux k u (* ignore the table *)
+          | Builtin b -> builtin_to_seq b (aux k)
           | Quant (_, _, body)
           | Mu body
-          | Fun (_, body) -> aux body
+          | Fun (_, body) -> aux (k+1) body
           | Check_assign _
           | Check_empty_uty _ -> ()
       in
-      aux t
+      aux 0 t
+
+    let to_seq t : t Sequence.t = to_seq_depth t |> Sequence.map fst
 
     (* return [Some] iff the term is an undefined constant *)
     let as_cst_undef (t:term):
@@ -2729,7 +2731,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         end
       | Ast.Ty.Arrow (a,b) -> Ty.arrow (conv_ty a) (conv_ty b)
 
-    let rec conv_term
+    let rec conv_term_rec
         (env: conv_env)
         (t:Ast.term): term = match Ast.term_view t with
       | Ast.True -> Term.true_
@@ -2741,8 +2743,8 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
             errorf "could not find constant `%a`" ID.pp id
         end
       | Ast.App (f, l) ->
-        let f = conv_term env f in
-        let l = List.map (conv_term env) l in
+        let f = conv_term_rec env f in
+        let l = List.map (conv_term_rec env) l in
         Term.app f l
       | Ast.Var v ->
         begin match
@@ -2755,11 +2757,11 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
             | Some (_,(_,Some t)) -> t
         end
       | Ast.Fun (v,body) ->
-        let body = conv_term ((v,None)::env) body in
+        let body = conv_term_rec ((v,None)::env) body in
         let ty = Ast.Var.ty v |> conv_ty in
         Term.fun_ ty body
       | Ast.Forall (v,body) ->
-        let body = conv_term ((v,None)::env) body in
+        let body = conv_term_rec ((v,None)::env) body in
         let uty =
           let ty = Ast.Var.ty v |> conv_ty in
           match Ty.view ty with
@@ -2768,7 +2770,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         in
         Term.forall uty body
       | Ast.Exists (v,body) ->
-        let body = conv_term ((v,None)::env) body in
+        let body = conv_term_rec ((v,None)::env) body in
         let uty =
           let ty = Ast.Var.ty v |> conv_ty in
           match Ty.view ty with
@@ -2777,34 +2779,67 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         in
         Term.exists uty body
       | Ast.Mu (v,body) ->
-        let body = conv_term ((v,None)::env) body in
+        let body = conv_term_rec ((v,None)::env) body in
         Term.mu body
       | Ast.Match (u,m) ->
-        let u = conv_term env u in
+        let any_rhs_depends_vars = ref false in (* some RHS depends on matched arg? *)
         let m =
           ID.Map.map
             (fun (vars,rhs) ->
+               let n_vars = List.length vars in
                let env', tys =
                  CCList.fold_map
                    (fun env v -> (v,None)::env, Ast.Var.ty v |> conv_ty)
                    env vars
                in
-               tys, conv_term env' rhs)
+               let rhs = conv_term_rec env' rhs in
+               let depends_on_vars =
+                 Term.to_seq_depth rhs
+                 |> Sequence.exists
+                   (fun (t,k) -> match t.term_cell with
+                      | DB db ->
+                        DB.level db < n_vars + k (* [k]: number of intermediate binders *)
+                      | _ -> false)
+               in
+               if depends_on_vars then any_rhs_depends_vars := true;
+               tys, rhs)
             m
         in
-        Term.match_ u m
+        (* optim: check whether all branches return the same term, that
+           does not depend on matched variables *)
+        (* TODO: do the closedness check during conversion, above *)
+        let rhs_l =
+          ID.Map.values m
+          |> Sequence.map snd
+          |> Sequence.sort_uniq ~cmp:Term.compare
+          |> Sequence.to_rev_list
+        in
+        begin match rhs_l with
+          | [x] when not (!any_rhs_depends_vars) ->
+            (* every branch yields the same [x], which does not depend
+               on the argument: remove the match and return [x] instead *)
+            x
+          | _ ->
+            let u = conv_term_rec env u in
+            Term.match_ u m
+        end
       | Ast.Switch _ ->
         errorf "cannot convert switch %a" Ast.pp_term t
       | Ast.Let (v,t,u) ->
         (* substitute on the fly *)
-        let t = conv_term env t in
-        conv_term ((v, Some t)::env) u
+        let t = conv_term_rec env t in
+        conv_term_rec ((v, Some t)::env) u
       | Ast.If (a,b,c) ->
-        Term.if_ (conv_term env a)(conv_term env b) (conv_term env c)
-      | Ast.Not t -> Term.not_ (conv_term env t)
+        let b = conv_term_rec env b in
+        let c = conv_term_rec env c in
+        (* optim: [if _ b b --> b] *)
+        if Term.equal b c
+        then b
+        else Term.if_ (conv_term_rec env a) b c
+      | Ast.Not t -> Term.not_ (conv_term_rec env t)
       | Ast.Binop (op,a,b) ->
-        let a = conv_term env a in
-        let b = conv_term env b in
+        let a = conv_term_rec env a in
+        let b = conv_term_rec env b in
         begin match op with
           | Ast.And -> Term.and_ a b
           | Ast.Or -> Term.or_ a b
@@ -2812,13 +2847,19 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           | Ast.Eq -> Term.eq a b
         end
 
+    let conv_term t =
+      let t' = conv_term_rec [] t in
+      Log.debugf 2
+        (fun k->k "(@[conv_term@ @[%a@]@ yields: %a@])" Ast.pp_term t Term.pp t');
+      t'
+
     let add_statement st =
       Log.debugf 2
         (fun k->k "(@[add_statement@ @[%a@]@])" Ast.pp_statement st);
       model_env_ := Ast.env_add_statement !model_env_ st;
       match st with
         | Ast.Assert t ->
-          let t = conv_term [] t in
+          let t = conv_term t in
           Top_goals.push t;
           push_clause (Clause.make [Lit.atom t])
         | Ast.Goal (vars, t) ->
@@ -2834,7 +2875,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           in
           (* model should contain values of [consts] *)
           List.iter add_cst_support_ consts;
-          let t = conv_term env t in
+          let t = conv_term_rec env t in
           Top_goals.push t;
           push_clause (Clause.make [Lit.atom t])
         | Ast.TyDecl id ->
@@ -2889,7 +2930,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           List.iter
             (fun (id,ty,rhs) ->
                let ty = conv_ty ty in
-               let rhs = lazy (conv_term [] rhs) in
+               let rhs = lazy (conv_term rhs) in
                let cst = lazy (
                  Typed_cst.make_defined id ty rhs
                ) in
