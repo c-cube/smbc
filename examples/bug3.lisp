@@ -1,5 +1,5 @@
 
-; expect: SAT
+; expect: UNSAT
 
 ; variant of long_rev_sum6 that triggers the same bug:
 ; ./smbc.native --check examples/bug3.lisp --dimacs /tmp/foo.cnf --depth-step 4
