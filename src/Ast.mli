@@ -148,6 +148,7 @@ val pp_statement : statement CCFormat.printer
 
 val pp_term_tip : term CCFormat.printer
 val pp_ty_tip : Ty.t CCFormat.printer
+val pp_statement_tip : statement CCFormat.printer
 
 (** {2 Parsing and Typing} *)
 

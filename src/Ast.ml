@@ -309,6 +309,13 @@ let fun_ v t =
   let ty = Ty.arrow (Var.ty v) t.ty in
   mk_ (Fun (v,t)) ty
 
+let unfold_fun t =
+  let rec aux acc t = match t.term with
+    | Fun (v, t') -> aux (v::acc) t'
+    | _ -> List.rev acc, t
+  in
+  aux [] t
+
 let quant_ q v t =
   if not (Ty.equal t.ty Ty.prop)
   then Ty.ill_typed
@@ -780,17 +787,26 @@ let parse_stdin syn = match syn with
 
 module TA = Tip_ast
 
+let id_to_tip (id:ID.t): string =
+  let s = ID.to_string id ^ "_" ^ string_of_int (ID.id id) in
+  CCString.map
+    (function
+      | '\'' -> '_'
+      | '/' -> '_'
+      | c -> c)
+    s
+
 let rec ty_to_tip ty: TA.ty = match ty with
   | Ty.Prop -> TA.ty_bool
-  | Ty.Const id -> TA.ty_const (ID.to_string id)
+  | Ty.Const id -> TA.ty_const (id_to_tip id)
   | Ty.Arrow (a,b) -> TA.ty_arrow (ty_to_tip a)(ty_to_tip b)
 
-let var_to_tip v : TA.var = ID.to_string (Var.id v)
+let var_to_tip v : TA.var = id_to_tip (Var.id v)
 let typed_var_to_tip v = var_to_tip v, ty_to_tip (Var.ty v)
 
 let rec term_to_tip (t:term): TA.term = match t.term with
   | Var v -> TA.const (var_to_tip v)
-  | Const c -> TA.const (ID.to_string c)
+  | Const c -> TA.const (id_to_tip c)
   | App (f,l) ->
     let f = term_to_tip f in
     let l = List.map term_to_tip l in
@@ -805,7 +821,7 @@ let rec term_to_tip (t:term): TA.term = match t.term with
        |> List.map
          (fun (c,(vars,rhs)) ->
             TA.Match_case (
-              ID.to_string c,
+              id_to_tip c,
               List.map var_to_tip vars,
               term_to_tip rhs))
     in
@@ -817,7 +833,7 @@ let rec term_to_tip (t:term): TA.term = match t.term with
       | (_, last_rhs) :: tail ->
         List.fold_left
           (fun else_ (c, rhs) ->
-             let test = TA.eq t (TA.const (ID.to_string c)) in
+             let test = TA.eq t (TA.const (id_to_tip c)) in
              TA.if_ test (term_to_tip rhs) else_)
           (term_to_tip last_rhs) tail
     end
@@ -843,9 +859,73 @@ let rec term_to_tip (t:term): TA.term = match t.term with
     end
   | Mu (_,_) -> assert false (* TODO? *)
 
+let mk_tip_decl id ty =
+  let args, ret = Ty.unfold ty in
+  let args = List.map ty_to_tip args in
+  let ret = ty_to_tip ret in
+  TA.mk_fun_decl ~ty_vars:[] (id_to_tip id) args ret
+
+let mk_tip_def id ty rhs =
+  let args, body = unfold_fun rhs in
+  let ty_args, ty_ret = Ty.unfold ty in
+  assert (List.length ty_args = List.length args);
+  let args = List.map (fun {Var.id=v;ty} -> id_to_tip v, ty_to_tip ty) args in
+  let ty_ret = ty_to_tip ty_ret in
+  let body = term_to_tip body in
+  TA.mk_fun_decl ~ty_vars:[] (id_to_tip id) args ty_ret, body
+
+let statement_to_tip (t:statement) : TA.statement list = match t with
+  | TyDecl id -> [TA.decl_sort (id_to_tip id) ~arity:0]
+  | Decl (id,ty) ->
+    let args, ret = Ty.unfold ty in
+    let args = List.map ty_to_tip args in
+    let ret = ty_to_tip ret in
+    [TA.decl_fun ~tyvars:[] (id_to_tip id) args ret]
+  | Data l ->
+    let l =
+      List.map
+        (fun {Ty.data_id; data_cstors} ->
+           let cstors =
+             ID.Map.to_list data_cstors
+             |> List.map
+               (fun (id, ty) ->
+                  let c = id_to_tip id in
+                  let ty_args, _ = Ty.unfold ty in
+                  let ty_args =
+                    List.mapi
+                      (fun i ty_arg ->
+                         Printf.sprintf "select_%s_%d" c i, ty_to_tip ty_arg)
+                      ty_args
+                  in
+                  TA.mk_cstor c ty_args)
+           in
+           id_to_tip data_id, cstors)
+        l
+    in
+    [TA.data [] l]
+  | Define l ->
+    let l =
+      List.map
+        (fun (id,ty,rhs) -> mk_tip_def id ty rhs)
+        l
+    in
+    let decls, bodies = List.split l in
+    [TA.funs_rec decls bodies]
+  | Assert t ->
+    [TA.assert_ (term_to_tip t)]
+  | Goal (vars,e) ->
+    let vars = List.map typed_var_to_tip vars in
+    let e = term_to_tip e in
+    [TA.assert_not ~ty_vars:[] (TA.forall vars (TA.not_ e));
+     TA.check_sat ();
+    ]
+
 let pp_term_tip out t = TA.pp_term out (term_to_tip t)
 
 let pp_ty_tip out ty = TA.pp_ty out (ty_to_tip ty)
+
+let pp_statement_tip out stmt =
+  List.iter (TA.pp_stmt out) (statement_to_tip stmt)
 
 (** {2 Environment} *)
 
