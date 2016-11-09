@@ -788,7 +788,12 @@ let parse_stdin syn = match syn with
 module TA = Tip_ast
 
 let id_to_tip (id:ID.t): string =
-  let s = ID.to_string id ^ "_" ^ string_of_int (ID.id id) in
+  let name = ID.to_string id in
+  let s =
+    if CCString.for_all (function '-'|'0'..'9'->true | _ -> false) name
+    then "num_" ^ name
+    else name ^ "_" ^ string_of_int (ID.id id)
+  in
   CCString.map
     (function
       | '\'' -> '_'
