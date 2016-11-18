@@ -72,8 +72,8 @@ let dot_term_graph_ = ref ""
 let stats_ = ref false
 let progress_  = ref false
 let pp_hashcons_ = ref false
-let max_depth_ = ref 60
-let depth_step_ = ref 0
+let max_depth_ = ref 1000
+let depth_step_ = ref 1
 let check_ = ref false
 let timeout_ = ref ~-1
 let syntax_ = ref Ast.Auto
@@ -92,7 +92,7 @@ let set_stdin () = match !file with
 
 let set_syntax_ s =
   syntax_ :=
-    begin match String.uncapitalize s with
+    begin match String.uncapitalize_ascii s with
       | "smbc" -> Ast.Smbc
       | "tip" -> Ast.Tip
       | _ -> failwith ("unknown syntax " ^ s) (* TODO list *)
