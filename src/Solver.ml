@@ -2561,17 +2561,22 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
   end
 
   (* the "theory" part: propagations *)
-  module M_th :
-    Msat.Theory_intf.S
-    with type formula = M_expr.t
-     and type proof = M_expr.proof
-  = struct
+  module M_th : sig
+    val set_active: bool -> unit
+    include Msat.Theory_intf.S
+      with type formula = M_expr.t
+       and type proof = M_expr.proof
+  end = struct
     type formula = M_expr.t
     type proof = M_expr.proof
 
     type level = Backtrack.level
 
     let dummy = Backtrack.dummy_level
+
+    (* if true, perform theory propagation; otherwise do nothing *)
+    let active = ref true
+    let set_active b = active := b
 
     (* increment and return level *)
     let current_level () =
@@ -2657,7 +2662,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       end
 
     (* propagation from the bool solver *)
-    let assume slice =
+    let assume_real slice =
       let start = slice.TI.start in
       assert (slice.TI.length > 0);
       (* do the propagations in a local frame *)
@@ -2677,6 +2682,9 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           (fun k->k "(@[<1>raise_inconsistent@ %a@])"
               Clause.pp conflict_clause);
         TI.Unsat (Clause.lits conflict_clause, ())
+
+    let assume slice =
+      if !active then assume_real slice else TI.Sat
 
     (* TODO: move checking code from Main_loop here? *)
     let if_sat _slice = ()
@@ -3219,34 +3227,37 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     | PS_complete -> CCFormat.string out "complete"
     | PS_incomplete -> CCFormat.string out "incomplete"
 
-  (* check dependencies of the unsat-core:
-     - if it depends on depth-limit, not UNSAT
-     - if some constant has been refined incompletely, UNKNOWN
-     - otherwise, truly UNSAT
-  *)
-  let proof_status depth_lit core: proof_status =
-    let s = ref PS_complete in
-    try
-      clauses_of_unsat_core core
-      |> Sequence.flat_map Clause.to_seq
-      |> Sequence.iter
-        (fun lit ->
-           if Lit.equal depth_lit (Lit.abs lit)
-           then (
-             s := PS_depth_limited depth_lit;
-             raise Exit
-           ) else match Lit.view lit with
-             | Lit_assign (c,_) ->
-               begin match c.cst_kind with
-                 | Cst_undef (_, i, _) when not i.cst_complete ->
-                   s := PS_incomplete
-                 | _ -> ()
-               end
-             | _ -> ()
-        );
-      !s
-    with Exit ->
-      !s
+  (* precondition: solving under assumption [depth_lit] returned unsat *)
+  let proof_status depth_lit : proof_status =
+    let sat_res =
+      M_th.set_active false; (* no propagation, just check the boolean formula *)
+      let r = M.solve ~assumptions:[] () in
+      M_th.set_active true;
+      r
+    in
+    begin match sat_res with
+      | M.Sat _ ->
+        (* was unsat because of the assumption *)
+        PS_depth_limited depth_lit
+      | M.Unsat us ->
+        (* really unsat, now we need to know if it involves some
+           incomplete choices *)
+        let p = us.SI.get_proof () in
+        let core = p |> M.unsat_core in
+        let incomplete =
+          clauses_of_unsat_core core
+          |> Sequence.flat_map Clause.to_seq
+          |> Sequence.exists
+            (fun lit -> match Lit.view lit with
+               | Lit_assign (c,_) ->
+                 begin match c.cst_kind with
+                   | Cst_undef (_, i, _) when not i.cst_complete -> true
+                   | _ -> false
+                 end
+               | _ -> false)
+        in
+        if incomplete then PS_incomplete else PS_complete
+    end
 
   let solve ?(on_exit=[]) ?(check=true) () =
     let module ID = Iterative_deepening in
@@ -3273,9 +3284,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
             *)
             let p = us.SI.get_proof () in
             Log.debugf 4 (fun k->k "proof: @[%a@]@." pp_proof p);
-            let core = p |> M.unsat_core in
-            assert (Lit.equal (Lit.abs cur_lit) cur_lit);
-            let status = proof_status cur_lit core in
+            let status = proof_status cur_lit in
             Log.debugf 1
               (fun k->k
                   "@{<Yellow>** found Unsat@} at depth %a;@ \
