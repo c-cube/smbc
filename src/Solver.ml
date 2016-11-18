@@ -2687,7 +2687,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       if !active then assume_real slice else TI.Sat
 
     (* TODO: move checking code from Main_loop here? *)
-    let if_sat _slice = ()
+    let if_sat _slice = TI.Sat
   end
 
   module M = Msat.Solver.Make(M_expr)(M_th)(struct end)
