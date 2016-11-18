@@ -787,19 +787,32 @@ let parse_stdin syn = match syn with
 
 module TA = Tip_ast
 
-let id_to_tip (id:ID.t): string =
-  let name = ID.to_string id in
-  let s =
-    if CCString.for_all (function '-'|'0'..'9'->true | _ -> false) name
-    then "num_" ^ name
-    else name ^ "_" ^ string_of_int (ID.id id)
+let id_to_tip : ID.t -> string =
+  let id_to_tip_tbl = ID.Tbl.create 64 in
+  let str_id : (string, ID.t) Hashtbl.t = Hashtbl.create 32 in
+  let sanitize_name =
+    CCString.map
+      (function '\'' -> '_' | '/' -> '_' | c -> c)
   in
-  CCString.map
-    (function
-      | '\'' -> '_'
-      | '/' -> '_'
-      | c -> c)
-    s
+  fun id ->
+    try ID.Tbl.find id_to_tip_tbl id
+    with Not_found ->
+      let prefix = 
+        let p = ID.to_string id |> sanitize_name in
+        if CCString.for_all (function '-'|'0'..'9'->true | _ -> false) p
+        then "num_" ^ p (* TODO: option to control that, once nunchaku parses it *)
+        else p
+      in
+      let n = ref 0 in
+      let s = ref prefix in
+      while Hashtbl.mem str_id !s do
+        incr n;
+        s := prefix ^ "_" ^ string_of_int !n
+      done;
+      let name = !s in
+      Hashtbl.add str_id name id;
+      ID.Tbl.add id_to_tip_tbl id name;
+      name
 
 let rec ty_to_tip ty: TA.ty = match ty with
   | Ty.Prop -> TA.ty_bool
