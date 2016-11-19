@@ -1251,11 +1251,9 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     }
     val make : Lit.t list -> t
     val lits : t -> Lit.t list
-    val conflicts : t Queue.t
     val lemma_queue : t Queue.t
     val push_new : t -> unit
     val push_new_l : t list -> unit
-    val push_conflict : t -> unit
     val iter : (Lit.t -> unit) -> t -> unit
     val to_seq : t -> Lit.t Sequence.t
     val pp : t CCFormat.printer
@@ -1297,10 +1295,6 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
 
     (* all lemmas generated so far, to avoid duplicates *)
     let all_lemmas_ : unit Tbl.t = Tbl.create 1024
-
-    let conflicts : t Queue.t = Queue.create ()
-
-    let push_conflict c = Queue.push c conflicts
 
     (* list of clauses that have been newly generated, waiting
        to be propagated to Msat.
@@ -2585,22 +2579,14 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
 
     let backtrack = Backtrack.backtrack
 
-    exception Conflict of Clause.t
-
     (* push clauses from {!lemma_queue} into the slice *)
     let flush_new_clauses_into_slice slice =
-      if Queue.is_empty Clause.conflicts then
-        while not (Queue.is_empty Clause.lemma_queue) do
-          let c = Queue.pop Clause.lemma_queue in
-          Log.debugf 5 (fun k->k "(@[<2>push_lemma@ %a@])" Clause.pp c);
-          let lits = Clause.lits c in
-          slice.TI.push lits ();
-        done
-      else (
-        let c = Queue.pop Clause.conflicts in
-        Queue.clear Clause.conflicts;
-        raise (Conflict c)
-      )
+      while not (Queue.is_empty Clause.lemma_queue) do
+        let c = Queue.pop Clause.lemma_queue in
+        Log.debugf 5 (fun k->k "(@[<2>push_lemma@ %a@])" Clause.pp c);
+        let lits = Clause.lits c in
+        slice.TI.push lits ();
+      done
 
     (* assert [c := new_t], or conflict *)
     let assert_choice (c:cst)(new_t:term) : unit =
@@ -2667,21 +2653,15 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       assert (slice.TI.length > 0);
       (* do the propagations in a local frame *)
       if Config.progress then print_progress();
-      try
-        (* first, empty the tautology queue *)
-        flush_new_clauses_into_slice slice;
-        for i = start to start + slice.TI.length - 1 do
-          let lit = slice.TI.get i in
-          assume_lit lit;
-        done;
-        Top_terms.update_all();
-        flush_new_clauses_into_slice slice;
-        TI.Sat
-      with Conflict conflict_clause ->
-        Log.debugf 3
-          (fun k->k "(@[<1>raise_inconsistent@ %a@])"
-              Clause.pp conflict_clause);
-        TI.Unsat (Clause.lits conflict_clause, ())
+      (* first, empty the tautology queue *)
+      flush_new_clauses_into_slice slice;
+      for i = start to start + slice.TI.length - 1 do
+        let lit = slice.TI.get i in
+        assume_lit lit;
+      done;
+      Top_terms.update_all();
+      flush_new_clauses_into_slice slice;
+      TI.Sat
 
     let assume slice =
       if !active then assume_real slice else TI.Sat
