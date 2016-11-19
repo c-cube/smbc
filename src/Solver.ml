@@ -2648,7 +2648,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       end
 
     (* propagation from the bool solver *)
-    let assume_real slice =
+    let assume slice =
       let start = slice.TI.start in
       assert (slice.TI.length > 0);
       (* do the propagations in a local frame *)
@@ -2659,12 +2659,11 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         let lit = slice.TI.get i in
         assume_lit lit;
       done;
-      Top_terms.update_all();
+      if !active then (
+        Top_terms.update_all();
+      );
       flush_new_clauses_into_slice slice;
       TI.Sat
-
-    let assume slice =
-      if !active then assume_real slice else TI.Sat
 
     (* TODO: move checking code from Main_loop here? *)
     let if_sat _slice = TI.Sat
