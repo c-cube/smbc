@@ -3231,9 +3231,9 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
   let proof_status depth_lit : proof_status =
     let sat_res =
       M_th.set_active false; (* no propagation, just check the boolean formula *)
-      let r = M.solve ~assumptions:[] () in
-      M_th.set_active true;
-      r
+      CCFun.finally
+        ~h:(fun () -> M_th.set_active true)
+        ~f:(fun () -> M.solve ~assumptions:[] ())
     in
     begin match sat_res with
       | M.Sat _ ->
