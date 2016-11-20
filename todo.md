@@ -1,24 +1,29 @@
 # TODO and ideas
 
+## Now
+
+- experiment to remove uninterpreted types in core, and replace them
+  with the following (amounts to replacing finite model finding with
+  computational narrowing)
+  * For a type τ, `Conv`-time declarations of:
+    + `τ = 0 | S card_τ` types
+    + a `card_τ` value of type `card_τ` with constraint `card_τ != 0`
+    + two recursive function `forall_τ` and `exists_τ` (taking as param
+      the `card_τ` value… or do closures support that? and some predicate `τ → prop`
+      that will be applied to all elements from `0` to `card-1`)
+    + (maybe) a special builtin pred `<` that can be used on all those types
+      (mostly for symmetry breaking: if `a`, `b` are symmetric, add `a<b`)
+  * a translation of axioms so they use `forall_τ` and `exists_τ`
+  * model building that uses `card_τ` to compute the actual domain of
+    the type. (the domain of `τ`
+    is the set of values `{x:τ | x < card_τ}`)
+
 ## Narrowing
 
-- simultaneous match (make and/or/imply based on that)
-  * also need to convert inputs that perform match on arguments (e.g. `less`)
-    into this simultaneous match, automatically
-  * keep it shallow (no deep patterns)
-  * allow `default` case (to avoid explosion) AND wildcard patterns,
-    which are critical for accurate explanations (implementation similar
-    to current parallel and)
-  * optim: if one matched term only has wildcards, remove it (irrelevant).
-    This can happen as a result of other optimizations.
-  * e.g, `and x y = match x,y with
-     | false, _ -> false | _, false -> false | true, true -> true end`
-
-- maybe parallel match is better than simultaneous match (more accurate
-  in combination with following optim, as you can have some cases
-  with nested matches and some cases in which the inner match collapses
-  into one cstor; e.g. for `less`, matching on snd argument first
-  will have sub-case collapse to `false` automatically).
+- discuss how to narrow HOF arguments with Koen (they can only be used
+  on finite set of values, therefore simulate them by a finite dispatch
+  table… or by their `app` function using already existing support
+  for non-HO functions?)
 
 - optimization of `match t with p1 -> c t1 | … | pn -> c tn`
   where `c` is the same cstor in every branch, into
@@ -38,19 +43,6 @@
   * → even further: factor together the branches of simultaneous matching
     that return the same constructor, even if there still remains several
     branches.
-
-- detect and prove (by simple induction), when possible, that some
-  boolean function's argument's depth is smaller than another argument's?
-  e.g. for `find` in `ty_infer`, depth of env must be ≥ depth of index
-  for it to return `some`. A builtin `smaller_depth a b` would be used to
-  prune early?
-
-- turn uninterpreted terms into datatypes isomorphic to `nat`
-  * using a special value `card_τ : τ` to limit the range of `∧_τ` and `∨_τ`
-    and compute domains (the domain of `τ` is the set of values `{x:τ | x <
-    card_τ}`)
-  * introduce the special `<` (or `≤`) defined on datatypes, used
-    for symmetry-breaking too?
 
 - conflict generalization
   (e.g. failed equalities with a meta on RHS)
@@ -80,7 +72,33 @@
 - generic "parallel" operator (to be used by and, or, but also
   other functions such as +_nat — maybe if they are detected to be symmetric?)
 
-# SMT
+## On Hold
+
+- simultaneous match (make and/or/imply based on that)
+  * also need to convert inputs that perform match on arguments (e.g. `less`)
+    into this simultaneous match, automatically
+  * keep it shallow (no deep patterns)
+  * allow `default` case (to avoid explosion) AND wildcard patterns,
+    which are critical for accurate explanations (implementation similar
+    to current parallel and)
+  * optim: if one matched term only has wildcards, remove it (irrelevant).
+    This can happen as a result of other optimizations.
+  * e.g, `and x y = match x,y with
+     | false, _ -> false | _, false -> false | true, true -> true end`
+
+- maybe parallel match is better than simultaneous match (more accurate
+  in combination with following optim, as you can have some cases
+  with nested matches and some cases in which the inner match collapses
+  into one cstor; e.g. for `less`, matching on snd argument first
+  will have sub-case collapse to `false` automatically).
+
+- detect and prove (by simple induction), when possible, that some
+  boolean function's argument's depth is smaller than another argument's?
+  e.g. for `find` in `ty_infer`, depth of env must be ≥ depth of index
+  for it to return `some`. A builtin `smaller_depth a b` would be used to
+  prune early?
+
+## SMT
 
 - reduction rules (if/case/proj/test)
 - communication with SAT (set term_nf/propagations)
@@ -94,8 +112,7 @@
     with if/case provides the guards that lead to blocked calls)
 - start testing on simple examples
 
-
-**FIX**:
+## FIX
 ./smbc.native --backtrace --debug 5 --check examples/uf3.smt2
 (should be unsat)
 
