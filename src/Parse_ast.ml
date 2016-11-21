@@ -277,6 +277,8 @@ module Tip = struct
       | A.Stmt_assert_not (_::_, _) ->
         tip_errorf ?loc "cannot convert polymorphic goal@ `@[%a@]`"
           A.pp_stmt st
+      | A.Stmt_lemma _ ->
+        tip_error ?loc "smbc does not know how to handle `lemma` statements"
       | A.Stmt_check_sat -> None
 
 end

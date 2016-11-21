@@ -17,7 +17,7 @@ depends: [
   "containers" { > "0.16" }
   "sequence" { >= "0.4" }
   "msat" { >= "0.4" & < "0.5" }
-  "tip-parser"
+  "tip-parser" { >= "0.3" }
   "menhir"
 ]
 available: [
