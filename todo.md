@@ -2,6 +2,27 @@
 
 ## Now
 
+## Narrowing
+
+- replace iterative increment of `depth` by `size`: should explore
+  the search space in a much more interesting way
+  * each constant `c` lazily maps to a set of literals `size(c)≤n`
+    for each `n≥1`. It contains a list of such literals for which
+    the constraints on `c.cases` (and those cases themselves) have been
+    emitted to the SAT solver
+    + NOTE: list, or just the maximum `n`? should
+        satisfy the invariant that if `size(c)≤n+1` emitted, then `size(c)≤n` too
+  * keep queue of constants that are not fully constrainted w.r.t current
+    max size; when incrementing the max size, just re-start from the
+    goal (+axioms) and update relevant constants `c` by:
+    + if `c` not expanded, expand it
+    + if `c` can have max size `n+k` but only constrained up to `n`, enumerate
+      the possible redistribution of `n+i` among `c` sub-constants
+      for each `i=1…(k-1)`. For instance, the case `c=A(c1,c2)` will
+      enumerate all clauses `size(c)≤n+2 ⇒ size(c1)≤a ∧ size(c2)≤b`
+      for each `{ (a,b) | a>0,b>0,a+b=n+1 }`.
+    + then flag `c` as constrained for the new size.
+
 - experiment to remove uninterpreted types in core, and replace them
   with the following (amounts to replacing finite model finding with
   computational narrowing)
@@ -17,8 +38,6 @@
   * model building that uses `card_τ` to compute the actual domain of
     the type. (the domain of `τ`
     is the set of values `{x:τ | x < card_τ}`)
-
-## Narrowing
 
 - discuss how to narrow HOF arguments with Koen (they can only be used
   on finite set of values, therefore simulate them by a finite dispatch
