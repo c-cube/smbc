@@ -131,8 +131,6 @@ let apply_subst (subst:subst) t =
            (fun (vars,rhs) ->
               let subst, vars = rename_vars subst vars in
               vars, aux subst rhs) m)
-    | A.Switch (u,m) ->
-      A.switch (aux subst u) (ID.Map.map (aux subst) m)
     | A.Let (x,t,u) ->
       let subst', x' = rename_var subst x in
       A.let_ x' (aux subst t) (aux subst' u)
@@ -237,20 +235,6 @@ let rec eval_whnf (m:t) (subst:subst) (t:term): term = match A.term_view t with
                 subst vars cstor_args
             in
             eval_whnf m subst' rhs
-    end
-  | A.Switch (u, map) ->
-    let u = eval_whnf m subst u in
-    begin match as_domain_elt m.env u with
-      | None ->
-        let map = ID.Map.map (apply_subst subst) map in
-        A.switch u map
-      | Some cst ->
-        begin match ID.Map.get cst map with
-          | Some rhs -> eval_whnf m subst rhs
-          | None ->
-            let map = ID.Map.map (apply_subst subst) map in
-            A.switch u map
-        end
     end
   | A.Not f ->
     let f = eval_whnf m subst f in

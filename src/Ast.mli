@@ -86,7 +86,6 @@ and term_cell =
   | App of term * term list
   | If of term * term * term
   | Match of term * (var list * term) ID.Map.t
-  | Switch of term * term ID.Map.t (* switch on constants *)
   | Let of var * term * term
   | Fun of var * term
   | Forall of var * term
@@ -118,7 +117,6 @@ val const : ID.t -> Ty.t -> term
 val app : term -> term list -> term
 val if_ : term -> term -> term -> term
 val match_ : term -> (var list * term) ID.Map.t -> term
-val switch : term -> term ID.Map.t -> term
 val let_ : var -> term -> term -> term
 val fun_ : var -> term -> term
 val fun_l : var list -> term -> term

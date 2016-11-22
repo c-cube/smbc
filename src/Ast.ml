@@ -140,7 +140,6 @@ and term_cell =
   | App of term * term list
   | If of term * term * term
   | Match of term * (var list * term) ID.Map.t
-  | Switch of term * term ID.Map.t (* switch on constants *)
   | Let of var * term * term
   | Fun of var * term
   | Forall of var * term
@@ -183,14 +182,6 @@ let rec term_to_sexp t = match t.term with
                 [ S.of_list (S.atom "case" :: ID.to_sexp c :: List.map var_sexp_ vars);
                   term_to_sexp rhs]
          )))
-    |> S.of_list
-  | Switch (t, m) ->
-    (S.atom "switch" :: term_to_sexp t ::
-      (ID.Map.to_list m
-       |> List.map
-         (fun (c, rhs) ->
-            S.of_list [S.atom "case"; ID.to_sexp c; term_to_sexp rhs])
-         ))
     |> S.of_list
   | Let (v,t,u) ->
     S.of_list [S.atom "let"; var_sexp_ v; term_to_sexp t; term_to_sexp u]
@@ -290,13 +281,6 @@ let match_ t m =
            ID.pp c1 ID.pp c Ty.pp rhs1.ty Ty.pp rhs.ty)
     m;
   mk_ (Match (t,m)) rhs1.ty
-
-let switch u m =
-  try
-    let _, t1 = ID.Map.choose m in
-    mk_ (Switch (u,m)) t1.ty
-  with Not_found ->
-    invalid_arg "Ast.switch: empty list of cases"
 
 let let_ v t u =
   if not (Ty.equal (Var.ty v) t.ty)
@@ -797,7 +781,7 @@ let id_to_tip : ID.t -> string =
   fun id ->
     try ID.Tbl.find id_to_tip_tbl id
     with Not_found ->
-      let prefix = 
+      let prefix =
         let p = ID.to_string id |> sanitize_name in
         if CCString.for_all (function '-'|'0'..'9'->true | _ -> false) p
         then "num_" ^ p (* TODO: option to control that, once nunchaku parses it *)
@@ -844,17 +828,6 @@ let rec term_to_tip (t:term): TA.term = match t.term with
               term_to_tip rhs))
     in
     TA.match_ (term_to_tip t) m
-  | Switch (t,m) ->
-    let t = term_to_tip t in
-    begin match ID.Map.to_list m with
-      | [] -> assert false
-      | (_, last_rhs) :: tail ->
-        List.fold_left
-          (fun else_ (c, rhs) ->
-             let test = TA.eq t (TA.const (id_to_tip c)) in
-             TA.if_ test (term_to_tip rhs) else_)
-          (term_to_tip last_rhs) tail
-    end
   | True -> TA.true_
   | False -> TA.false_
   | Let (v,t,u) ->
