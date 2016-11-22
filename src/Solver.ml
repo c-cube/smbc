@@ -1006,7 +1006,117 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
 
     let pp = pp_top ~ids:true
 
-    let pp_dot_all _out () = ()
+    (* environment for evaluation: not-yet-evaluated terms *)
+    type eval_env = term DB_env.t
+
+    (* shift open De Bruijn indices by [k] *)
+    let shift_db k (t:term) : term =
+      if k=0 then t
+      else (
+        let rec aux depth t : term = match t.term_cell with
+          | DB (level, ty) ->
+            if level >= depth then db (DB.make (level+k) ty) else t
+          | Const _ -> t
+          | True
+          | False -> t
+          | Fun (ty, body) ->
+            let body' = aux (depth+1) body in
+            if body==body' then t else fun_ ty body'
+          | Mu body ->
+            let body' = aux (depth+1) body in
+            if body==body' then t else mu body'
+          | Quant (q, uty, body) ->
+            let body' = aux (depth+1) body in
+            if body==body' then t else quant q uty body'
+          | Match (u, m) ->
+            let u = aux depth u in
+            let m =
+              ID.Map.map
+                (fun (tys,rhs) ->
+                   tys, aux (depth + List.length tys) rhs)
+                m
+            in
+            match_ u m
+          | Switch (u, m) ->
+            let u = aux depth u in
+            (* NOTE: [m] should not contain De Bruijn indices at all *)
+            switch u m
+          | If (a,b,c) ->
+            let a' = aux depth a in
+            let b' = aux depth b in
+            let c' = aux depth c in
+            if a==a' && b==b' && c==c' then t else if_ a' b' c'
+          | App (_,[]) -> assert false
+          | App (f, l) ->
+            let f' = aux depth f in
+            let l' = aux_l depth l in
+            if f==f' && CCList.equal (==) l l' then t else app f' l'
+          | Builtin b -> builtin (map_builtin (aux depth) b)
+          | Check_assign _
+          | Check_empty_uty _
+            -> t (* closed *)
+        and aux_l d l =
+          List.map (aux d) l
+        in
+        aux 0 t
+      )
+
+    (* just evaluate the De Bruijn indices, and return
+       the explanations used to evaluate subterms *)
+    let eval_db (env:eval_env) (t:term) : term =
+      if DB_env.size env = 0
+      then t (* trivial *)
+      else (
+        let rec aux env t : term = match t.term_cell with
+          | DB d ->
+            begin match DB_env.get d env with
+              | None -> t
+              | Some t' -> t'
+            end
+          | Const _ -> t
+          | True
+          | False -> t
+          | Fun (ty, body) ->
+            let body' = aux (DB_env.push_none env) body in
+            if body==body' then t else fun_ ty body'
+          | Mu body ->
+            let body' = aux (DB_env.push_none env) body in
+            if body==body' then t else mu body'
+          | Quant (q, uty, body) ->
+            let body' = aux (DB_env.push_none env) body in
+            if body==body' then t else quant q uty body'
+          | Match (u, m) ->
+            let u = aux env u in
+            let m =
+              ID.Map.map
+                (fun (tys,rhs) ->
+                   tys, aux (DB_env.push_none_l tys env) rhs)
+                m
+            in
+            match_ u m
+          | Switch (u, m) ->
+            let u = aux env u in
+            (* NOTE: [m] should not contain De Bruijn indices at all *)
+            switch u m
+          | If (a,b,c) ->
+            let a' = aux env a in
+            let b' = aux env b in
+            let c' = aux env c in
+            if a==a' && b==b' && c==c' then t else if_ a' b' c'
+          | App (_,[]) -> assert false
+          | App (f, l) ->
+            let f' = aux env f in
+            let l' = aux_l env l in
+            if f==f' && CCList.equal (==) l l' then t else app f' l'
+          | Builtin b -> builtin (map_builtin (aux env) b)
+          | Check_assign _
+          | Check_empty_uty _
+            -> t (* closed *)
+        and aux_l env l =
+          List.map (aux env) l
+        in
+        aux env t
+      )
   end
 
   let pp_lit out l =
@@ -1749,118 +1859,6 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
 
   (** {2 Reduction to Normal Form} *)
   module Reduce = struct
-    (* environment for evaluation: not-yet-evaluated terms *)
-    type eval_env = term DB_env.t
-
-    (* shift open De Bruijn indices by [k] *)
-    let shift_db k (t:term) : term =
-      if k=0 then t
-      else (
-        let rec aux depth t : term = match t.term_cell with
-          | DB (level, ty) ->
-            if level >= depth then Term.db (DB.make (level+k) ty) else t
-          | Const _ -> t
-          | True
-          | False -> t
-          | Fun (ty, body) ->
-            let body' = aux (depth+1) body in
-            if body==body' then t else Term.fun_ ty body'
-          | Mu body ->
-            let body' = aux (depth+1) body in
-            if body==body' then t else Term.mu body'
-          | Quant (q, uty, body) ->
-            let body' = aux (depth+1) body in
-            if body==body' then t else Term.quant q uty body'
-          | Match (u, m) ->
-            let u = aux depth u in
-            let m =
-              ID.Map.map
-                (fun (tys,rhs) ->
-                   tys, aux (depth + List.length tys) rhs)
-                m
-            in
-            Term.match_ u m
-          | Switch (u, m) ->
-            let u = aux depth u in
-            (* NOTE: [m] should not contain De Bruijn indices at all *)
-            Term.switch u m
-          | If (a,b,c) ->
-            let a' = aux depth a in
-            let b' = aux depth b in
-            let c' = aux depth c in
-            if a==a' && b==b' && c==c' then t else Term.if_ a' b' c'
-          | App (_,[]) -> assert false
-          | App (f, l) ->
-            let f' = aux depth f in
-            let l' = aux_l depth l in
-            if f==f' && CCList.equal (==) l l' then t else Term.app f' l'
-          | Builtin b -> Term.builtin (Term.map_builtin (aux depth) b)
-          | Check_assign _
-          | Check_empty_uty _
-            -> t (* closed *)
-        and aux_l d l =
-          List.map (aux d) l
-        in
-        aux 0 t
-      )
-
-    (* just evaluate the De Bruijn indices, and return
-       the explanations used to evaluate subterms *)
-    let eval_db (env:eval_env) (t:term) : term =
-      if DB_env.size env = 0
-      then t (* trivial *)
-      else (
-        let rec aux env t : term = match t.term_cell with
-          | DB d ->
-            begin match DB_env.get d env with
-              | None -> t
-              | Some t' -> t'
-            end
-          | Const _ -> t
-          | True
-          | False -> t
-          | Fun (ty, body) ->
-            let body' = aux (DB_env.push_none env) body in
-            if body==body' then t else Term.fun_ ty body'
-          | Mu body ->
-            let body' = aux (DB_env.push_none env) body in
-            if body==body' then t else Term.mu body'
-          | Quant (q, uty, body) ->
-            let body' = aux (DB_env.push_none env) body in
-            if body==body' then t else Term.quant q uty body'
-          | Match (u, m) ->
-            let u = aux env u in
-            let m =
-              ID.Map.map
-                (fun (tys,rhs) ->
-                   tys, aux (DB_env.push_none_l tys env) rhs)
-                m
-            in
-            Term.match_ u m
-          | Switch (u, m) ->
-            let u = aux env u in
-            (* NOTE: [m] should not contain De Bruijn indices at all *)
-            Term.switch u m
-          | If (a,b,c) ->
-            let a' = aux env a in
-            let b' = aux env b in
-            let c' = aux env c in
-            if a==a' && b==b' && c==c' then t else Term.if_ a' b' c'
-          | App (_,[]) -> assert false
-          | App (f, l) ->
-            let f' = aux env f in
-            let l' = aux_l env l in
-            if f==f' && CCList.equal (==) l l' then t else Term.app f' l'
-          | Builtin b -> Term.builtin (Term.map_builtin (aux env) b)
-          | Check_assign _
-          | Check_empty_uty _
-            -> t (* closed *)
-        and aux_l env l =
-          List.map (aux env) l
-        in
-        aux env t
-      )
-
     let cycle_check_tbl : unit Term.Tbl.t = Term.Tbl.create 32
 
     (* [cycle_check sub into] checks whether [sub] occurs in [into] under
@@ -1942,7 +1940,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         | Mu body ->
           (* [mu x. body] becomes [body[x := mu x. body]] *)
           let env = DB_env.singleton t in
-          Explanation.empty, eval_db env body
+          Explanation.empty, Term.eval_db env body
         | Quant (q,uty,body) ->
           begin match uty.uty_status with
             | None -> Explanation.empty, t
@@ -1952,7 +1950,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
                 | Lazy_some tup -> tup
               in
               let t1() =
-                eval_db (DB_env.singleton (Term.const c_head)) body
+                Term.eval_db (DB_env.singleton (Term.const c_head)) body
               in
               let t2() =
                 Term.quant q uty_tail body
@@ -2006,7 +2004,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
                     (* evaluate arguments *)
                     let env = DB_env.push_l l DB_env.empty in
                     (* replace in [rhs] *)
-                    let rhs = eval_db env rhs in
+                    let rhs = Term.eval_db env rhs in
                     (* evaluate new [rhs] *)
                     compute_nf rhs
                   )
@@ -2089,7 +2087,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         compute_nf_app new_env e body other_args
       | _ ->
         (* cannot reduce, unless [f] reduces to something else. *)
-        let e_f, f' = eval_db env f |> compute_nf in
+        let e_f, f' = Term.eval_db env f |> compute_nf in
         let exp = Explanation.append e e_f in
         if Term.equal f f'
         then (
@@ -2721,7 +2719,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         begin match find_env env v with
           | Some (t', depth_t'), _ ->
             assert (env.depth >= depth_t');
-            let t' = Reduce.shift_db (env.depth - depth_t') t' in
+            let t' = Term.shift_db (env.depth - depth_t') t' in
             t'
           | None, Some d ->
             let ty = Ast.Var.ty v |> conv_ty in
