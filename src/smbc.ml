@@ -35,22 +35,7 @@ let solve ~config (ast:Ast.statement list) : unit =
     let deepening_step = config.deepening_step
   end in
   let module S = Solver.Make(Conf)(struct end) in
-  let print_term_graph = match config.dot_term_graph with
-    | None -> []
-    | Some file ->
-      let doit() =
-        Log.debugf 1 (fun k->k "print term graph in `%s`" file);
-        CCIO.with_out file
-          (fun oc ->
-             let fmt = Format.formatter_of_out_channel oc in
-             S.pp_term_graph fmt ())
-      in
-      [doit]
-  in
-  let on_exit =
-    print_term_graph
-    @ []
-  in
+  let on_exit = [] in
   (* solve *)
   S.add_statement_l ast;
   let res = S.solve ~on_exit ~check:config.check () in
