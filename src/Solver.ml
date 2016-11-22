@@ -999,7 +999,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         | Builtin (B_eq (a,b)) ->
           fpf out "(@[<hv1>=@ %a@ %a@])" pp a pp b
         | Check_assign (c,t) ->
-          fpf out "(@[<hv1>:=@ %a@ %a@])" Typed_cst.pp c pp t
+          fpf out "(@[<hv1>:=?@ %a@ %a@])" Typed_cst.pp c pp t
         | Check_empty_uty uty -> fpf out "(@[check_empty %a@])" pp_uty uty
       in
       pp out t
