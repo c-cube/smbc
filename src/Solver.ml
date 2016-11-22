@@ -1948,6 +1948,74 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         aux env t
       )
 
+    exception Ty_fail of term * Ty.t DB_env.t
+
+    (* check types. Fails in case of error. *)
+    let ty_check (top_t:term): unit =
+      let rec aux env t: unit = match t.term_cell with
+        | DB d ->
+          begin match DB_env.get d env with
+            | None -> errorf "in `@[%a@]`,@ var %d not bound" Term.pp top_t (DB.level d)
+            | Some ty -> aux_assert t env (Ty.equal ty t.term_ty)
+          end
+        | Const _
+        | True
+        | False -> ()
+        | Fun (ty_arg, body) ->
+          aux_same_ty t env t.term_ty (Ty.arrow ty_arg body.term_ty);
+          aux (DB_env.push ty_arg env) body
+        | Mu body ->
+          aux_same_ty t env t.term_ty body.term_ty;
+          aux (DB_env.push t.term_ty env) body
+        | Quant (_, uty, body) ->
+          let lazy ty_arg = uty.uty_self in
+          aux_same_ty t env t.term_ty (Ty.arrow ty_arg body.term_ty);
+          aux (DB_env.push ty_arg env) body
+        | Match (u, m) ->
+          aux env u;
+          ID.Map.iter
+            (fun _ (tys,rhs) ->
+               aux_same_ty t env rhs.term_ty t.term_ty;
+               let env = DB_env.push_l tys env in
+               aux env rhs)
+              m
+        | Switch (u, _) ->
+          aux env u (* TODO *)
+          (* NOTE: [m] should not contain De Bruijn indices at all *)
+        | If (a,b,c) ->
+          aux_same_ty t env a.term_ty Ty.prop;
+          aux_same_ty t env b.term_ty c.term_ty;
+          aux_same_ty t env b.term_ty t.term_ty;
+          aux env a;
+          aux env b;
+          aux env c
+        | App (_,[]) -> assert false
+        | App (f, l) ->
+          aux env f;
+          aux_l env l
+        | Builtin b ->
+          aux_same_ty t env Ty.prop t.term_ty;
+          ignore (Term.map_builtin (fun t -> aux env t; t) b)
+        | Check_assign (c,u) ->
+          aux_same_ty t env Ty.prop t.term_ty;
+          aux_same_ty t env (Typed_cst.ty c) u.term_ty;
+          aux env u
+        | Check_empty_uty _ ->
+          aux_same_ty t env Ty.prop t.term_ty
+          (* closed *)
+      and aux_l env l =
+        List.iter (aux env) l
+      and aux_assert t env b =
+        if not b then raise (Ty_fail (t, env))
+      and aux_same_ty t env a b =
+        aux_assert t env (Ty.equal a b)
+      in
+      try aux DB_env.empty top_t
+      with Ty_fail (sub,env) ->
+        errorf "(@[term `@[%a@]`@ \
+                is ill-typed at subterm `%a`@ in env `%a`@])"
+          Term.pp top_t Term.pp sub CCFormat.Dump.(list (option Ty.pp)) env.db_st
+
     let cycle_check_tbl : unit Term.Tbl.t = Term.Tbl.create 32
 
     (* [cycle_check sub into] checks whether [sub] occurs in [into] under
@@ -2916,6 +2984,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       let t' = conv_term_rec empty_env t in
       Log.debugf 2
         (fun k->k "(@[conv_term@ @[%a@]@ yields: %a@])" Ast.pp_term t Term.pp t');
+      Reduce.ty_check t';
       t'
 
     let add_statement st =
