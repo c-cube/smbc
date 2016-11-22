@@ -2927,6 +2927,10 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           List.iter
             (fun (id,_,_) ->
                let c = ID.Tbl.find decl_ty_ id |> Lazy.force in
+               begin match c.cst_kind with
+                 | Cst_defined  (_, lazy _) -> () (* also force definition *)
+                 | _ -> assert false
+               end;
                (* also register the constant for expansion *)
                declare_defined_cst c
             )
