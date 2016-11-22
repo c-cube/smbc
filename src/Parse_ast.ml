@@ -198,6 +198,14 @@ module Tip = struct
       | A.And l -> and_ (List.map aux l)
       | A.Imply (a,b) -> imply (aux a) (aux b)
       | A.Eq (a,b) -> eq (aux a) (aux b)
+      | A.Distinct ([] | [_]) ->
+        tip_error "`distinct` should have at least 2 arguments"
+      | A.Distinct l ->
+        (* encode [distinct t1...tn] into [And_{i,j<i} ti!=tj] *)
+        List.map aux l
+        |> CCList.diagonal
+        |> List.map (fun (a,b) -> not_ (eq a b))
+        |> and_
       | A.Not a -> not_ (aux a)
       | A.Let (l, rhs) ->
         List.fold_right
