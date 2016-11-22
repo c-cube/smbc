@@ -1839,7 +1839,57 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     (* environment for evaluation: not-yet-evaluated terms *)
     type eval_env = term DB_env.t
 
-    (* TODO: add a cache to {!eval_db}? *)
+    (* shift open De Bruijn indices by [k] *)
+    let shift_db k (t:term) : term =
+      if k=0 then t
+      else (
+        let rec aux depth t : term = match t.term_cell with
+          | DB (level, ty) ->
+            if level >= depth then Term.db (DB.make (level+k) ty) else t
+          | Const _ -> t
+          | True
+          | False -> t
+          | Fun (ty, body) ->
+            let body' = aux (depth+1) body in
+            if body==body' then t else Term.fun_ ty body'
+          | Mu body ->
+            let body' = aux (depth+1) body in
+            if body==body' then t else Term.mu body'
+          | Quant (q, uty, body) ->
+            let body' = aux (depth+1) body in
+            if body==body' then t else Term.quant q uty body'
+          | Match (u, m) ->
+            let u = aux depth u in
+            let m =
+              ID.Map.map
+                (fun (tys,rhs) ->
+                   tys, aux (depth + List.length tys) rhs)
+                m
+            in
+            Term.match_ u m
+          | Switch (u, m) ->
+            let u = aux depth u in
+            (* NOTE: [m] should not contain De Bruijn indices at all *)
+            Term.switch u m
+          | If (a,b,c) ->
+            let a' = aux depth a in
+            let b' = aux depth b in
+            let c' = aux depth c in
+            if a==a' && b==b' && c==c' then t else Term.if_ a' b' c'
+          | App (_,[]) -> assert false
+          | App (f, l) ->
+            let f' = aux depth f in
+            let l' = aux_l depth l in
+            if f==f' && CCList.equal (==) l l' then t else Term.app f' l'
+          | Builtin b -> Term.builtin (Term.map_builtin (aux depth) b)
+          | Check_assign _
+          | Check_empty_uty _
+            -> t (* closed *)
+        and aux_l d l =
+          List.map (aux d) l
+        in
+        aux 0 t
+      )
 
     (* just evaluate the De Bruijn indices, and return
        the explanations used to evaluate subterms *)
@@ -2708,7 +2758,28 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     let decl_ty_ : cst lazy_t ID.Tbl.t = ID.Tbl.create 16
 
     (* environment for variables *)
-    type conv_env = (Ast.var * term option) list
+    type conv_env = {
+      let_bound: (term * int) ID.Map.t; (* let-bound variables, to be replaced. int=depth at binding position *)
+      bound: int ID.Map.t; (* set of bound variables. int=depth at binding position *)
+      depth: int;
+    }
+
+    let empty_env : conv_env =
+      {let_bound=ID.Map.empty; bound=ID.Map.empty; depth=0}
+
+    let add_bound env v =
+      { env with
+        depth=env.depth+1;
+        bound=ID.Map.add (Ast.Var.id v) env.depth env.bound }
+
+    (* add [v := t] to bindings. Depth is not increment (there will be no binders) *)
+    let add_let_bound env v t =
+      { env with
+        let_bound=ID.Map.add (Ast.Var.id v) (t,env.depth) env.let_bound }
+
+    let find_env env v =
+      let id = Ast.Var.id v in
+      ID.Map.get id env.let_bound, ID.Map.get id env.bound
 
     let rec conv_ty (ty:Ast.Ty.t): Ty.t = match ty with
       | Ast.Ty.Prop -> Ty.prop
@@ -2734,21 +2805,25 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         let l = List.map (conv_term_rec env) l in
         Term.app f l
       | Ast.Var v ->
-        begin match
-            CCList.find_idx (fun (v',_) -> Ast.Var.equal v v') env
-          with
-            | None -> errorf "could not find var `%a`" Ast.Var.pp v
-            | Some (i,(_, None)) ->
-              let ty = Ast.Var.ty v |> conv_ty in
-              Term.db (DB.make i ty)
-            | Some (_,(_,Some t)) -> t
+        begin match find_env env v with
+          | Some (t', depth_t'), _ ->
+            assert (env.depth >= depth_t');
+            let t' = Reduce.shift_db (env.depth - depth_t') t' in
+            t'
+          | None, Some d ->
+            let ty = Ast.Var.ty v |> conv_ty in
+            let level = env.depth - d - 1 in
+            Term.db (DB.make level ty)
+          | None, None -> errorf "could not find var `%a`" Ast.Var.pp v
         end
       | Ast.Fun (v,body) ->
-        let body = conv_term_rec ((v,None)::env) body in
+        let env' = add_bound env v in
+        let body = conv_term_rec env' body in
         let ty = Ast.Var.ty v |> conv_ty in
         Term.fun_ ty body
       | Ast.Forall (v,body) ->
-        let body = conv_term_rec ((v,None)::env) body in
+        let env' = add_bound env v in
+        let body = conv_term_rec env' body in
         let uty =
           let ty = Ast.Var.ty v |> conv_ty in
           match Ty.view ty with
@@ -2757,7 +2832,8 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         in
         Term.forall uty body
       | Ast.Exists (v,body) ->
-        let body = conv_term_rec ((v,None)::env) body in
+        let env' = add_bound env v in
+        let body = conv_term_rec env' body in
         let uty =
           let ty = Ast.Var.ty v |> conv_ty in
           match Ty.view ty with
@@ -2766,7 +2842,8 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         in
         Term.exists uty body
       | Ast.Mu (v,body) ->
-        let body = conv_term_rec ((v,None)::env) body in
+        let env' = add_bound env v in
+        let body = conv_term_rec env' body in
         Term.mu body
       | Ast.Match (u,m) ->
         let any_rhs_depends_vars = ref false in (* some RHS depends on matched arg? *)
@@ -2776,7 +2853,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
                let n_vars = List.length vars in
                let env', tys =
                  CCList.fold_map
-                   (fun env v -> (v,None)::env, Ast.Var.ty v |> conv_ty)
+                   (fun env v -> add_bound env v, Ast.Var.ty v |> conv_ty)
                    env vars
                in
                let rhs = conv_term_rec env' rhs in
@@ -2815,7 +2892,8 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       | Ast.Let (v,t,u) ->
         (* substitute on the fly *)
         let t = conv_term_rec env t in
-        conv_term_rec ((v, Some t)::env) u
+        let env' = add_let_bound env v t in
+        conv_term_rec env' u
       | Ast.If (a,b,c) ->
         let b = conv_term_rec env b in
         let c = conv_term_rec env c in
@@ -2835,7 +2913,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         end
 
     let conv_term t =
-      let t' = conv_term_rec [] t in
+      let t' = conv_term_rec empty_env t in
       Log.debugf 2
         (fun k->k "(@[conv_term@ @[%a@]@ yields: %a@])" Ast.pp_term t Term.pp t');
       t'
@@ -2856,8 +2934,8 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
               (fun env v ->
                  let ty = Ast.Var.ty v |> conv_ty in
                  let c = Typed_cst.make_undef (Ast.Var.id v) ty in
-                 (v,Some (Term.const c)) :: env, c)
-              []
+                 add_let_bound env v (Term.const c), c)
+              empty_env
               vars
           in
           (* model should contain values of [consts] *)
