@@ -27,4 +27,7 @@ watch:
 benchs: build
 	frogtest run -c benchmarks/smbc.toml --meta `git rev-parse HEAD`
 
+hbmc_benchs: build
+	frogtest run -c benchs_hbmc/conf.toml
+
 .PHONY: watch benchs clean build test
