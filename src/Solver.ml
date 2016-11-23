@@ -2154,14 +2154,34 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
 
   let model_env_ : Ast.env ref = ref Ast.env_empty
 
-  (* list of (uninterpreted) types we are interested in *)
-  let model_utys : Ty.t list ref = ref []
-
   let add_cst_support_ (c:cst): unit =
     CCList.Ref.push model_support_ c
 
-  let add_ty_support_ (ty:Ty.t): unit =
+  (* encoding of an uninterpreted type, as a datatype + builtin forall/exist *)
+  type uty_encoding = {
+    uty_id: ID.t; (* the ID of the type *)
+    uty_ty: ty_h; (* the type *)
+    uty_card: cst; (* cardinality bound *)
+    uty_zero: cst; (* the [zero] constructor *)
+    uty_succ: cst; (* the [succ] constructor *)
+    uty_forall: cst;
+    uty_exists: cst;
+  }
+
+  (* map a uty to its encoding *)
+  let tbl_uty : uty_encoding ID.Tbl.t = ID.Tbl.create 64
+
+  (* list of (uninterpreted) types we are interested in *)
+  let model_utys : uty_encoding list ref = ref []
+
+  let add_ty_support_ (ty:uty_encoding): unit =
     CCList.Ref.push model_utys ty
+
+  (* find the encoding of this uninterpreted type *)
+  let uty_find_encoding (uty_id:ID.t) : uty_encoding =
+    try ID.Tbl.find tbl_uty uty_id
+    with Not_found ->
+      errorf "could not find encoding of type %a" ID.pp uty_id
 
   module Conv = struct
     (* for converting Ast.Ty into Ty *)
@@ -2194,24 +2214,6 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     let find_env env v =
       let id = Ast.Var.id v in
       ID.Map.get id env.let_bound, ID.Map.get id env.bound
-
-    (* encoding of an uninterpreted type, as a datatype + builtin forall/exist *)
-    type uty_encoding = {
-      uty_ty: ty_h; (* the type *)
-      uty_card: cst; (* cardinality bound *)
-      uty_zero: cst; (* the [zero] constructor *)
-      uty_forall: cst;
-      uty_exists: cst;
-    }
-
-    (* map a uty to its encoding *)
-    let tbl_uty : uty_encoding ID.Tbl.t = ID.Tbl.create 64
-
-    (* find the encoding of this uninterpreted type *)
-    let uty_find_encoding (uty_id:ID.t) : uty_encoding =
-      try ID.Tbl.find tbl_uty uty_id
-      with Not_found ->
-        errorf "could not find encoding of type %a" ID.pp uty_id
 
     let uty_find_encoding_ty (ty:Ast.Ty.t) : uty_encoding =
       match ty with
@@ -2445,15 +2447,17 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       let uty_forall = ID.Tbl.find decl_ty_ id_forall |> Lazy.force in
       let uty_exists = ID.Tbl.find decl_ty_ id_exists |> Lazy.force in
       let uty = {
+        uty_id;
         uty_ty=uty;
         uty_card;
         uty_zero=zero;
+        uty_succ=Lazy.force succ;
         uty_forall;
         uty_exists;
       } in
       ID.Tbl.add tbl_uty uty_id uty;
       (* model should contain domain of [ty] *)
-      add_ty_support_ uty.uty_ty;
+      add_ty_support_ uty;
       ()
 
     let add_statement st =
@@ -2517,6 +2521,53 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           add_ty_decl uty_id
 
     let add_statement_l = List.iter add_statement
+  end
+
+  (** {2 Main} *)
+
+  type unknown =
+    | U_timeout
+    | U_max_depth
+    | U_incomplete
+
+  type model = Model.t
+  let pp_model = Model.pp
+
+  type res =
+    | Sat of model
+    | Unsat (* TODO: proof *)
+    | Unknown of unknown
+
+  (** {2 Build a Model} *)
+  module Model_build = struct
+    (* constants from [0] to [card uty - 1] *)
+    type domain = {
+      dom_uty: uty_encoding;
+      dom_csts: ID.t array;
+    }
+
+    type domains = domain Ty.Tbl.t
+
+    (* follow "normal form" pointers deeply in the term *)
+    let deref_deep (t:term) : term =
+      let rec aux t =
+        let _, t = Reduce.compute_nf t in
+        match t.term_cell with
+          | True | False | DB _ -> t
+          | Const _ -> t
+          | App (f,l) ->
+            Term.app (aux f) (List.map aux l)
+          | If (a,b,c) -> Term.if_ (aux a)(aux b)(aux c)
+          | Match (u,m) ->
+            let m = ID.Map.map (fun (tys,rhs) -> tys, aux rhs) m in
+            Term.match_ (aux u) m
+          | Fun (ty,body) -> Term.fun_ ty (aux body)
+          | Mu body -> Term.mu (aux body)
+          | Builtin b -> Term.builtin (Term.map_builtin aux b)
+          | Check_assign _
+            -> assert false
+      in
+      aux t
 
     module A = Ast
 
@@ -2542,7 +2593,31 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       let env = DB_env.push_l (List.map A.var vars) env in
       f vars env
 
-    let term_to_ast (t:term): Ast.term =
+    (* conversion from a nat-like datatype to an integer *)
+    let t_as_n (uty_enc:uty_encoding) (t:term): int option =
+      let rec aux n t = match t.term_cell with
+        | Const c when Typed_cst.equal c uty_enc.uty_zero -> Some n
+        | App ({term_cell=Const c; _}, [sub]) when Typed_cst.equal c uty_enc.uty_succ ->
+          aux (n+1) sub
+        | _ -> None
+      in
+      aux 0 (deref_deep t)
+
+    let t_as_n_exn uty_enc t = match t_as_n uty_enc t with
+      | Some n -> n
+      | None -> errorf "cannot interpret term `@[%a@]`@ as a domain element" Term.pp t
+
+    let is_db_0 (t:term): bool = match t.term_cell with
+      | DB (0,_) -> true | _ -> false
+
+    let const_of_dom (dom:domain) (i:int): Ast.term =
+      if not (i>=0 && i < Array.length dom.dom_csts) then (
+        errorf "cannot access the %d-th constant in dom(%a) (card %d)"
+          i Ty.pp dom.dom_uty.uty_ty (Array.length dom.dom_csts)
+      );
+      A.const dom.dom_csts.(i) (ty_to_ast dom.dom_uty.uty_ty)
+
+    let term_to_ast (doms:domains) (t:term): Ast.term =
       let rec aux env t = match t.term_cell with
         | True -> A.true_
         | False -> A.false_
@@ -2551,13 +2626,21 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
             | Some t' -> t'
             | None -> errorf "cannot find DB %a in env" Term.pp t
           end
-        | Const cst -> A.const cst.cst_id (ty_to_ast t.term_ty)
-        | App (f,l) -> A.app (aux env f) (List.map (aux env) l)
+        | Const cst ->
+          try_as_dom_elt t
+            ~default:(fun () -> A.const cst.cst_id (ty_to_ast t.term_ty))
+        | App (f,l) ->
+          try_as_dom_elt t
+            ~default:(fun () -> A.app (aux env f) (List.map (aux env) l))
         | Fun (ty,bod) ->
           with_var ty env
             ~f:(fun v env -> A.fun_ v (aux env bod))
         | Mu _ -> assert false
         | If (a,b,c) -> A.if_ (aux env a)(aux env b) (aux env c)
+        | Match (u,_) when Ty.Tbl.mem doms u.term_ty ->
+          (* convert pattern matching on uninterpreted types into decision trees *)
+          let dom = Ty.Tbl.find doms u.term_ty in
+          match_to_ite env dom t
         | Match (u,m) ->
           let u = aux env u in
           let m =
@@ -2577,91 +2660,122 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           end
         | Check_assign (c,t) ->
           aux env (Term.eq (Term.const c) t) (* becomes a mere equality *)
-      in aux DB_env.empty t
+
+      and try_as_dom_elt t ~default =
+        begin match Ty.Tbl.get doms t.term_ty with
+          | Some dom ->
+            (* try to convert [t] as a domain constant *)
+            begin match t_as_n dom.dom_uty t with
+              | Some i ->
+                Log.debugf 5
+                  (fun k->k "@[<2>converted `@[%a@]`@ into dom constant %d@])"
+                      Term.pp t i);
+                const_of_dom dom i
+              | None -> default()
+            end
+          | None -> default()
+        end
+
+      (* convert a [match] on this uninterpreted type (given by its domain)
+         into a nested if-then-else testing against [dom.dom_csts] *)
+      and match_to_ite env (dom:domain) (top_t:term): Ast.term =
+        (* @param n the number of successors already seen *)
+        let rec aux_match n u0 m : Ast.term =
+          Format.printf "at %d@." n;
+          (* unfold match further *)
+          assert (ID.Map.cardinal m = 2);
+          let case_zero =
+            match ID.Map.get (Typed_cst.id dom.dom_uty.uty_zero) m with
+              | Some ([], rhs) -> aux env rhs
+              | None | Some _ ->
+                errorf "in `@[%a@]`,@ no case for Zero" Term.pp t
+          and case_succ =
+            match ID.Map.get (Typed_cst.id dom.dom_uty.uty_succ) m with
+              | Some ([_],rhs) ->
+                begin match rhs.term_cell with
+                  | Match (u1, m1)
+                    when Ty.equal t.term_ty dom.dom_uty.uty_ty
+                      && is_db_0 u1
+                      && n+1 < Array.length dom.dom_csts ->
+                    (* recurse in subtree *)
+                    aux_match (n+1) u0 m1
+                  | _ ->
+                    aux env rhs (* the "else" case *)
+                end
+              | None | Some _ ->
+                errorf "in `@[%a@]`,@ no case for Succ" Term.pp top_t
+          in
+          Ast.if_
+            (Ast.eq u0 (const_of_dom dom n))
+            case_zero
+            case_succ
+        in
+        match top_t.term_cell with
+          | Match (u0, m) ->
+            let u0 = aux env u0 in
+            aux_match 0 u0 m
+          | _ -> assert false
+      in
+      Log.debugf 5 (fun k->k "(@[<2>convert_term `@[%a@]`@])" Term.pp t);
+      aux DB_env.empty t
+
+    (* build a domain of the appropriate size for this uninterpreted type *)
+    let compute_domain (uty_enc:uty_encoding): domain =
+      let uty_id = uty_enc.uty_id in
+      (* compute cardinal *)
+      let card = t_as_n_exn uty_enc (Term.const uty_enc.uty_card) in
+      Log.debugf 3
+        (fun k->k "@[<2>uninterpreted type %a@ has cardinality %d@]" ID.pp uty_id card);
+      assert (card > 0);
+      (* now build constants from [0] to [card-1] *)
+      let dom =
+        Array.init card
+          (fun i -> ID.makef "$%a_%d" ID.pp_name uty_id i)
+      in
+      {dom_uty=uty_enc; dom_csts=dom}
+
+    let build () : model =
+      let env = !model_env_ in
+      (* compute domains of uninterpreted types *)
+      let doms : domains =
+        !model_utys
+        |> Sequence.of_list
+        |> Sequence.map
+          (fun uty -> uty.uty_ty, compute_domain uty)
+        |> Ty.Tbl.of_seq
+      in
+      (* compute values of meta variables *)
+      let consts =
+        !model_support_
+        |> Sequence.of_list
+        |> Sequence.map
+          (fun c ->
+             (* find normal form of [c] *)
+             let t = Term.const c in
+             let t = deref_deep t |> term_to_ast doms in
+             c.cst_id, t)
+        |> ID.Map.of_seq
+      and top_goals =
+        Top_goals.to_seq
+        |> Sequence.map (term_to_ast doms)
+        |> Sequence.to_list
+      in
+      (* now we can convert domains *)
+      let domains =
+        Ty.Tbl.to_seq doms
+        |> Sequence.map
+          (fun (ty,dom) ->
+             let dom = Array.to_list dom.dom_csts in
+             ty_to_ast ty, dom)
+        |> Ast.Ty.Map.of_seq
+      in
+      Model.make ~env ~consts ~domains ~top_goals
+
+    let check m =
+      Log.debugf 1 (fun k->k "checking model…");
+      Log.debugf 5 (fun k->k "(@[<1>candidate model: %a@])" Model.pp m);
+      Model.check m
   end
-
-  (** {2 Main} *)
-
-  type unknown =
-    | U_timeout
-    | U_max_depth
-    | U_incomplete
-
-  type model = Model.t
-  let pp_model = Model.pp
-
-  type res =
-    | Sat of model
-    | Unsat (* TODO: proof *)
-    | Unknown of unknown
-
-  (* follow "normal form" pointers deeply in the term *)
-  let deref_deep (doms:cst list Ty.Tbl.t) (t:term) : term =
-    let rec aux t =
-      let _, t = Reduce.compute_nf t in
-      match t.term_cell with
-        | True | False | DB _ -> t
-        | Const _ -> t
-        | App (f,l) ->
-          Term.app (aux f) (List.map aux l)
-        | If (a,b,c) -> Term.if_ (aux a)(aux b)(aux c)
-        | Match (u,m) ->
-          let m = ID.Map.map (fun (tys,rhs) -> tys, aux rhs) m in
-          Term.match_ (aux u) m
-        | Fun (ty,body) -> Term.fun_ ty (aux body)
-        | Mu body -> Term.mu (aux body)
-        | Builtin b -> Term.builtin (Term.map_builtin aux b)
-        | Check_assign _
-          -> assert false
-    in
-    aux t
-
-  (* TODO: find corresponding cardinal constant *)
-  let find_domain_ (uty_id:ID.t): cst list =
-    assert false (* TODO *)
-
-  let compute_model_ () : model =
-    let env = !model_env_ in
-    (* compute domains of uninterpreted types *)
-    let doms =
-      !model_utys
-      |> Sequence.of_list
-      |> Sequence.map
-        (fun ty -> match ty.ty_cell with
-           | Atomic (id, _) -> ty, find_domain_ id
-           | _ -> assert false)
-      |> Ty.Tbl.of_seq
-    in
-    (* compute values of meta variables *)
-    let consts =
-      !model_support_
-      |> Sequence.of_list
-      |> Sequence.map
-        (fun c ->
-           (* find normal form of [c] *)
-           let t = Term.const c in
-           let t = deref_deep doms t |> Conv.term_to_ast in
-           c.cst_id, t)
-      |> ID.Map.of_seq
-    in
-    (* now we can convert domains *)
-    let domains =
-      Ty.Tbl.to_seq doms
-      |> Sequence.map
-        (fun (ty,dom) -> Conv.ty_to_ast ty, List.map Typed_cst.id dom)
-      |> Ast.Ty.Map.of_seq
-    in
-    Model.make ~env ~consts ~domains
-
-  let model_check m =
-    Log.debugf 1 (fun k->k "checking model…");
-    Log.debugf 5 (fun k->k "(@[<1>candidate model: %a@])" Model.pp m);
-    let goals =
-      Top_goals.to_seq
-      |> Sequence.map Conv.term_to_ast
-      |> Sequence.to_list
-    in
-    Model.check m ~goals
 
   let clause_of_mclause (c:M.St.clause): Clause.t =
     M.Proof.to_list c |> List.map (fun a -> a.M.St.lit) |> Clause.make
@@ -2773,12 +2887,12 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         (* restrict depth *)
         match M.solve ~assumptions:[cur_lit] () with
           | M.Sat _ ->
-            let m = compute_model_ () in
+            let m = Model_build.build () in
             Log.debugf 1
               (fun k->k "@{<Yellow>** found SAT@} at depth %a"
                   ID.pp cur_depth);
             do_on_exit ~on_exit;
-            if check then model_check m;
+            if check then Model_build.check m;
             Sat m
           | M.Unsat us ->
             (* check if [max depth] literal involved in proof;
