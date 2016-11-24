@@ -2788,6 +2788,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       {dom_uty=uty_enc; dom_csts=dom}
 
     let build () : model =
+      Log.debug 2 "building model…";
       let env = !model_env_ in
       (* compute domains of uninterpreted types *)
       let doms : domains =
@@ -2829,6 +2830,12 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       Log.debugf 5 (fun k->k "(@[<1>candidate model: %a@])" Model.pp m);
       Model.check m
   end
+
+  (*
+    FIXME: constraint on every toplevel constant of every uninterpreted type [u],
+    forcing it to be smaller than card_u (how exactly? special builtin `<`, that
+    propagates properly then?)
+     *)
 
   let clause_of_mclause (c:M.St.clause): Clause.t =
     M.Proof.to_list c |> List.map (fun a -> a.M.St.lit) |> Clause.make
