@@ -150,4 +150,5 @@ let () =
       (if !dot_term_graph_ = "" then None else Some !dot_term_graph_);
     check= !check_;
   } in
+  MemprofHelpers.start 1E-4 20 100; (* NOTE: see https://github.com/jhjourdan/ocaml/tree/memprof *)
   solve ~config ast
