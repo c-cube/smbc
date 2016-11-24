@@ -201,6 +201,8 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     let is_data t =
       match t.ty_cell with | Atomic (_, Data _) -> true | _ -> false
 
+    let is_arrow t = match t.ty_cell with Arrow _ -> true | _ -> false
+
     let unfold ty : t list * t =
       let rec aux acc ty = match ty.ty_cell with
         | Arrow (a,b) -> aux (a::acc) b
@@ -1989,22 +1991,31 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
   *)
 
   module Top_goals: sig
-    val push : term -> unit
+    val push : ?internal:bool -> term -> unit
+    (** [push g] registers [g] as a goal to be checked.
+        @param part_of_encoding (default false) if true, goal is internal
+        and will not be returned by {!to_seq} *)
+
     val to_seq : term Sequence.t
+    (** Sequence of non-internal goals *)
+
     val check: unit -> unit
   end = struct
+    type internal = bool
+
     (* list of terms to fully evaluate *)
-    let toplevel_goals_ : term list ref = ref []
+    let toplevel_goals_ : (term * internal) list ref = ref []
 
     (* add [t] to the set of terms that must be evaluated *)
-    let push (t:term): unit =
-      toplevel_goals_ := t :: !toplevel_goals_;
+    let push ?(internal=false) (t:term): unit =
+      toplevel_goals_ := (t, internal) :: !toplevel_goals_;
       ()
 
-    let to_seq k = List.iter k !toplevel_goals_
+    let to_seq yield =
+      List.iter (fun (goal,int) -> if not int then yield goal) !toplevel_goals_
 
     (* check that this term fully evaluates to [true] *)
-    let is_true_ (t:term): bool =
+    let is_true_ (t,_int): bool =
       let _, t' = Reduce.compute_nf t in
       assert (Term.equal t' (Reduce.get_nf t |> snd));
       match t'.term_cell with
@@ -2026,15 +2037,15 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
                    | None -> assert false
                    | Some (_,_,i) -> i.cst_cases <> Lazy_none)
              in
-             let pp_lit out l =
-               let e, nf = Reduce.get_nf l in
+             let pp_goal out (g,_) =
+               let e, nf = Reduce.get_nf g in
                Format.fprintf out
                  "(@[<hv1>%a@ nf: %a@ exp: %a@ deps: (@[<hv>%a@])@])"
-                 Term.pp l Term .pp nf Explanation.pp e
+                 Term.pp g Term .pp nf Explanation.pp e
                  (Utils.pp_list pp_dep) nf.term_deps
              in
              k "(@[<hv1>status_watched_lit@ (@[<v>%a@])@])"
-               (Utils.pp_list pp_lit) !toplevel_goals_);
+               (Utils.pp_list pp_goal) !toplevel_goals_);
         assert false;
       )
   end
@@ -2377,8 +2388,8 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
            declare_defined_cst c)
         l
 
-    let add_assert (t:term) =
-      Top_goals.push t;
+    let add_assert ?internal (t:term) =
+      Top_goals.push ?internal t;
       push_clause (Clause.make [Lit.atom t])
 
     (* declare a datatype corresponding to [uty_id] *)
@@ -2406,7 +2417,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       let uty_card = Typed_cst.make_undef uty_card_id uty in
       ID.Tbl.add decl_ty_ uty_card_id (Lazy.from_val uty_card);
       (* assert [card != 0] *)
-      add_assert
+      add_assert ~internal:true
         (Term.not_
            (Term.eq (Term.const uty_card) (Term.const zero)));
       (* define forall and exist *)
@@ -2617,8 +2628,67 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       );
       A.const dom.dom_csts.(i) (ty_to_ast dom.dom_uty.uty_ty)
 
+    type special =
+      | S_dom_elt of domain * int
+      | S_forall of uty_encoding * ty_h * term
+      | S_exist of uty_encoding * ty_h * term
+      | S_none
+
+    let is_forall_ doms ty_arg f z = match Ty.Tbl.get doms ty_arg, f.term_cell with
+      | Some dom, Const c ->
+        Typed_cst.equal c dom.dom_uty.uty_forall && Typed_cst.equal z dom.dom_uty.uty_zero
+      | _ -> false
+
+    let is_exists_ doms ty_arg f z = match Ty.Tbl.get doms ty_arg, f.term_cell with
+      | Some dom, Const c ->
+        Typed_cst.equal c dom.dom_uty.uty_exists && Typed_cst.equal z dom.dom_uty.uty_zero
+      | _ -> false
+
+    let as_special (doms:domains) (t:term): special = match t.term_cell with
+      | App (f, [{term_cell=Const z;_};{term_cell=Fun (ty_arg,body);_}])
+        when is_forall_ doms ty_arg f z ->
+        let dom = Ty.Tbl.find doms ty_arg in
+        S_forall (dom.dom_uty, ty_arg, body)
+      | App (f, [{term_cell=Const z;_};{term_cell=Fun (ty_arg,body);_}])
+        when is_exists_ doms ty_arg f z ->
+        let dom = Ty.Tbl.find doms ty_arg in
+        S_exist (dom.dom_uty, ty_arg, body)
+      | App _
+      | Const _ ->
+        begin match Ty.Tbl.get doms t.term_ty with
+          | Some dom ->
+            (* try to convert [t] as a domain constant *)
+            begin match t_as_n dom.dom_uty t with
+              | Some i ->
+                S_dom_elt (dom,i)
+              | None -> S_none
+            end
+          | None -> S_none
+        end
+      | _ -> S_none
+
     let term_to_ast (doms:domains) (t:term): Ast.term =
-      let rec aux env t = match t.term_cell with
+      (* toplevel decoder *)
+      let rec aux env t = match as_special doms t with
+        | S_dom_elt (dom,i) ->
+          Log.debugf 5
+            (fun k->k "@[<2>converting `@[%a@]`@ into dom constant %d@])"
+                Term.pp t i);
+          const_of_dom dom i
+        | S_forall (_uty, ty_arg, body) ->
+          Log.debugf 5
+            (fun k->k "@[<2>converting `@[%a@]`@ into `forall`@])" Term.pp t);
+          with_var ty_arg env
+            ~f:(fun v env -> A.forall v (aux env body))
+        | S_exist (_uty, ty_arg, body) ->
+          Log.debugf 5
+            (fun k->k "@[<2>converting `@[%a@]`@ into `exists`@])" Term.pp t);
+          with_var ty_arg env
+            ~f:(fun v env -> A.exists v (aux env body))
+        | S_none -> aux_normal env t
+
+      (* "normal" cases *)
+      and aux_normal env t = match t.term_cell with
         | True -> A.true_
         | False -> A.false_
         | DB d ->
@@ -2627,11 +2697,9 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
             | None -> errorf "cannot find DB %a in env" Term.pp t
           end
         | Const cst ->
-          try_as_dom_elt t
-            ~default:(fun () -> A.const cst.cst_id (ty_to_ast t.term_ty))
+          A.const cst.cst_id (ty_to_ast t.term_ty)
         | App (f,l) ->
-          try_as_dom_elt t
-            ~default:(fun () -> A.app (aux env f) (List.map (aux env) l))
+          A.app (aux env f) (List.map (aux env) l)
         | Fun (ty,bod) ->
           with_var ty env
             ~f:(fun v env -> A.fun_ v (aux env bod))
@@ -2660,21 +2728,6 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           end
         | Check_assign (c,t) ->
           aux env (Term.eq (Term.const c) t) (* becomes a mere equality *)
-
-      and try_as_dom_elt t ~default =
-        begin match Ty.Tbl.get doms t.term_ty with
-          | Some dom ->
-            (* try to convert [t] as a domain constant *)
-            begin match t_as_n dom.dom_uty t with
-              | Some i ->
-                Log.debugf 5
-                  (fun k->k "@[<2>converted `@[%a@]`@ into dom constant %d@])"
-                      Term.pp t i);
-                const_of_dom dom i
-              | None -> default()
-            end
-          | None -> default()
-        end
 
       (* convert a [match] on this uninterpreted type (given by its domain)
          into a nested if-then-else testing against [dom.dom_csts] *)
