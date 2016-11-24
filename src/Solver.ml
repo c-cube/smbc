@@ -55,12 +55,10 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
 
   (* main term cell *)
   type term = {
-    mutable term_id: int; (* unique ID *)
-    mutable term_ty: ty_h;
+    mutable term_ty: delayed_ty;
+    mutable term_hash: int; (* cached hash *)
     term_cell: term_cell;
-    mutable term_nf: (term * explanation) option;
-      (* normal form + explanation of why *)
-    mutable term_deps: term_dep list;
+    term_deps: term_dep list;
     (* set of undefined constants
        that can make evaluation go further *)
   }
@@ -83,6 +81,10 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     | Check_assign of cst * term (* check a literal *)
     | Check_empty_uty of ty_uninterpreted_slice (* check it's empty *)
 
+  and delayed_ty =
+    | DTy_direct of ty_h
+    | DTy_lazy of (unit -> ty_h)
+
   and db = int * ty_h
 
   and quant =
@@ -99,7 +101,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
   and builtin =
     | B_not of term
     | B_eq of term * term
-    | B_and of term * term * term * term (* parallel and *)
+    | B_and of term * explanation * term * explanation (* parallel and *)
     | B_or of term * term
     | B_imply of term * term
 
@@ -137,6 +139,9 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
   and lit = {
     lit_view: lit_view;
     lit_sign: bool;
+    mutable lit_id: int; (* hashconsing ID *)
+    mutable lit_nf: (term * explanation) option; (* current normal form *)
+    mutable lit_neg: lit; (* negation *)
   }
 
   and lit_view =
@@ -328,10 +333,6 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       if n < env.db_size then List.nth env.db_st n else None
   end
 
-  let term_equal_ (a:term) b = a==b
-  let term_hash_ a = a.term_id
-  let term_cmp_ a b = CCOrd.int_ a.term_id b.term_id
-
   module Typed_cst = struct
     type t = cst
 
@@ -402,36 +403,9 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
   let hash_uty uty =
     Hash.combine3 104 (Ty.hash (Lazy.force uty.uty_self)) uty.uty_offset
 
-  let cmp_lit a b =
-    let c = CCOrd.bool_ a.lit_sign b.lit_sign in
-    if c<>0 then c
-    else
-      let int_of_cell_ = function
-        | Lit_fresh _ -> 0
-        | Lit_atom _ -> 1
-        | Lit_assign _ -> 2
-        | Lit_uty_empty _ -> 3
-      in
-      match a.lit_view, b.lit_view with
-        | Lit_fresh i1, Lit_fresh i2 -> ID.compare i1 i2
-        | Lit_atom t1, Lit_atom t2 -> term_cmp_ t1 t2
-        | Lit_assign (c1,t1), Lit_assign (c2,t2) ->
-          CCOrd.(Typed_cst.compare c1 c2 <?> (term_cmp_, t1, t2))
-        | Lit_uty_empty u1, Lit_uty_empty u2 -> cmp_uty u1 u2
-        | Lit_fresh _, _
-        | Lit_atom _, _
-        | Lit_assign _, _
-        | Lit_uty_empty _, _ ->
-          CCOrd.int_ (int_of_cell_ a.lit_view) (int_of_cell_ b.lit_view)
-
-  let hash_lit a =
-    let sign = a.lit_sign in
-    match a.lit_view with
-      | Lit_fresh i -> Hash.combine3 1 (Hash.bool sign) (ID.hash i)
-      | Lit_atom t -> Hash.combine3 2 (Hash.bool sign) (term_hash_ t)
-      | Lit_assign (c,t) ->
-        Hash.combine4 3 (Hash.bool sign) (Typed_cst.hash c) (term_hash_ t)
-      | Lit_uty_empty uty -> Hash.combine3 4 (Hash.bool sign) (hash_uty uty)
+  let cmp_lit a b = CCInt.compare a.lit_id b.lit_id
+  let eq_lit a b = a.lit_id=b.lit_id
+  let hash_lit a = a.lit_id
 
   let pp_uty out uty =
     let n = uty.uty_offset in
@@ -456,7 +430,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
 
     type stack_cell =
       | S_set_nf of
-          term * (term * explanation) option
+          lit * (term * explanation) option
           (* t1.nf <- t2 *)
       | S_set_cst_case of
           cst_info * (explanation * term) option
@@ -475,7 +449,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         (fun k->k "@{<Yellow>** now at level %d (backtrack)@}" l);
       while CCVector.length st_ > l do
         match CCVector.pop_exn st_ with
-          | S_set_nf (t, nf) -> t.term_nf <- nf;
+          | S_set_nf (t, nf) -> t.lit_nf <- nf;
           | S_set_cst_case (info, c) -> info.cst_cur_case <- c;
           | S_set_uty (uty, s) -> uty.uty_status <- s;
       done;
@@ -488,8 +462,8 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       Log.debugf 2 (fun k->k "@{<Yellow>** now at level %d (push)@}" l);
       ()
 
-    let push_set_nf_ (t:term) =
-      CCVector.push st_ (S_set_nf (t, t.term_nf))
+    let push_set_nf_ (l:lit) =
+      CCVector.push st_ (S_set_nf (l, l.lit_nf))
 
     let push_set_cst_case_ (i:cst_info) =
       CCVector.push st_ (S_set_cst_case (i, i.cst_cur_case))
@@ -505,115 +479,14 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
   module Term = struct
     type t = term
 
-    let sub_hash (t:term): int = t.term_id
-
-    module H = Hashcons.Make(struct
-        type t = term
-
-        (* shallow hash *)
-        let hash (t:term) : int = match t.term_cell with
-          | True -> 1
-          | False -> 2
-          | DB d -> Hash.combine DB.hash 3 d
-          | Const c ->
-            Hash.combine2 4 (Typed_cst.hash c)
-          | App (f,l) ->
-            Hash.combine3 5 f.term_id (Hash.list sub_hash l)
-          | Fun (ty, f) -> Hash.combine3 6 (Ty.hash ty) f.term_id
-          | If (a,b,c) -> Hash.combine4 7 a.term_id b.term_id c.term_id
-          | Match (u,m) ->
-            let hash_case (tys,rhs) =
-              Hash.combine2 (Hash.list Ty.hash tys) rhs.term_id
-            in
-            let hash_m =
-              Hash.seq (Hash.pair ID.hash hash_case) (ID.Map.to_seq m)
-            in
-            Hash.combine3 8 u.term_id hash_m
-          | Builtin (B_not a) -> Hash.combine2 20 a.term_id
-          | Builtin (B_and (t1,t2,t3,t4)) ->
-            Hash.list sub_hash [t1;t2;t3;t4]
-          | Builtin (B_or (t1,t2)) -> Hash.combine3 22 t1.term_id t2.term_id
-          | Builtin (B_imply (t1,t2)) -> Hash.combine3 23 t1.term_id t2.term_id
-          | Builtin (B_eq (t1,t2)) -> Hash.combine3 24 t1.term_id t2.term_id
-          | Mu sub -> Hash.combine sub_hash 30 sub
-          | Switch (t, tbl) ->
-            Hash.combine3 31 (sub_hash t) tbl.switch_id
-          | Quant (q,ty,bod) ->
-            Hash.combine4 32 (Hash.poly q) (hash_uty ty) (sub_hash bod)
-          | Check_assign (c,t) ->
-            Hash.combine3 33 (Typed_cst.hash c) (sub_hash t)
-          | Check_empty_uty uty ->
-            Hash.combine2 34 (hash_uty uty)
-
-        (* equality that relies on physical equality of subterms *)
-        let equal t1 t2 : bool = match t1.term_cell, t2.term_cell with
-          | True, True
-          | False, False -> true
-          | DB x, DB y -> DB.equal x y
-          | Const (c1), Const (c2) ->
-            Typed_cst.equal c1 c2
-          | App (f1, l1), App (f2, l2) ->
-            f1 == f2 && CCList.equal (==) l1 l2
-          | Fun (ty1,f1), Fun (ty2,f2) -> Ty.equal ty1 ty2 && f1 == f2
-          | If (a1,b1,c1), If (a2,b2,c2) ->
-            a1 == a2 && b1 == b2 && c1 == c2
-          | Match (u1, m1), Match (u2, m2) ->
-            u1 == u2 &&
-            ID.Map.for_all
-              (fun k1 (_,rhs1) ->
-                 try rhs1 == snd (ID.Map.find k1 m2)
-                 with Not_found -> false)
-              m1
-            &&
-            ID.Map.for_all (fun k2 _ -> ID.Map.mem k2 m1) m2
-          | Switch (t1,m1), Switch (t2,m2) ->
-            t1==t2 && m1.switch_id = m2.switch_id
-          | Builtin b1, Builtin b2 ->
-            begin match b1, b2 with
-              | B_not a1, B_not a2 -> a1 == a2
-              | B_and (a1,b1,c1,d1), B_and (a2,b2,c2,d2) ->
-                a1 == a2 && b1 == b2 && c1 == c2 && d1 == d2
-              | B_or (a1,b1), B_or (a2,b2)
-              | B_eq (a1,b1), B_eq (a2,b2)
-              | B_imply (a1,b1), B_imply (a2,b2) -> a1 == a2 && b1 == b2
-              | B_not _, _ | B_and _, _ | B_eq _, _
-              | B_or _, _ | B_imply _, _ -> false
-            end
-          | Mu t1, Mu t2 -> t1==t2
-          | Quant (q1,ty1,bod1), Quant (q2,ty2,bod2) ->
-            q1=q2 && equal_uty ty1 ty2 && bod1==bod2
-          | Check_assign (c1,t1), Check_assign (c2,t2) ->
-            Typed_cst.equal c1 c2 && term_equal_ t1 t2
-          | Check_empty_uty u1, Check_empty_uty u2 ->
-            equal_uty u1 u2
-          | True, _
-          | False, _
-          | DB _, _
-          | Const _, _
-          | App _, _
-          | Fun _, _
-          | If _, _
-          | Match _, _
-          | Builtin _, _
-          | Mu _, _
-          | Switch _, _
-          | Quant _, _
-          | Check_assign _, _
-          | Check_empty_uty _, _
-            -> false
-
-        let set_id t i = t.term_id <- i
-      end)
-
     let mk_bool_ (b:bool) : term =
       let t = {
-        term_id= -1;
-        term_ty=Ty.prop;
+        term_ty=DTy_direct Ty.prop;
+        term_hash= -1;
         term_cell=if b then True else False;
-        term_nf=None;
         term_deps=[];
       } in
-      H.hashcons t
+      t
 
     let true_ = mk_bool_ true
     let false_ = mk_bool_ false
@@ -624,12 +497,6 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       | Term_dep_sub of term
       | Term_dep_sub2 of term * term
       | Term_dep_uty of ty_uninterpreted_slice
-
-    type delayed_ty =
-      | DTy_direct of ty_h
-      | DTy_lazy of (unit -> ty_h)
-
-    let sorted_merge_ l1 l2 = CCList.sorted_merge_uniq ~cmp:compare l1 l2
 
     let cmp_term_dep_ a b =
       let to_int_ = function
@@ -646,36 +513,34 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       | Dep_uty _, _
         -> CCOrd.int_ (to_int_ a) (to_int_ b)
 
+    (* return cached type, or compute it and cache it *)
+    let ty t = match t.term_ty with
+      | DTy_direct ty -> ty
+      | DTy_lazy f ->
+        let ty = f () in
+        t.term_ty <- DTy_direct ty;
+        ty
+
     (* build a term. If it's new, add it to the watchlist
        of every member of [watching] *)
     let mk_term_ ~(deps:deps) cell ~(ty:delayed_ty) : term =
+      (* compute evaluation dependencies *)
+      let deps = match deps with
+        | Term_dep_none -> []
+        | Term_dep_cst c -> [Dep_cst c]
+        | Term_dep_sub t -> t.term_deps
+        | Term_dep_sub2 (a,b) ->
+          CCList.sorted_merge_uniq
+            ~cmp:cmp_term_dep_ a.term_deps b.term_deps
+        | Term_dep_uty uty -> [Dep_uty uty]
+      in
       let t = {
-        term_id= -1;
-        term_ty=Ty.prop; (* will be changed *)
+        term_ty=ty;
+        term_hash= -1;
         term_cell=cell;
-        term_nf=None;
-        term_deps=[];
+        term_deps=deps;
       } in
-      let t' = H.hashcons t in
-      if t==t' then (
-        (* compute ty *)
-        t.term_ty <- begin match ty with
-          | DTy_direct ty -> ty
-          | DTy_lazy f -> f ()
-        end;
-        (* compute evaluation dependencies *)
-        let deps = match deps with
-          | Term_dep_none -> []
-          | Term_dep_cst c -> [Dep_cst c]
-          | Term_dep_sub t -> t.term_deps
-          | Term_dep_sub2 (a,b) ->
-            CCList.sorted_merge_uniq
-              ~cmp:cmp_term_dep_ a.term_deps b.term_deps
-          | Term_dep_uty uty -> [Dep_uty uty]
-        in
-        t'.term_deps <- deps
-      );
-      t'
+      t
 
     let db d =
       mk_term_ ~deps:Term_dep_none (DB d) ~ty:(DTy_direct (DB.ty d))
@@ -687,11 +552,11 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       in
       mk_term_ ~deps (Const c) ~ty:(DTy_direct (Typed_cst.ty c))
 
-    (* type of an application *)
-    let rec app_ty_ ty l : Ty.t = match Ty.view ty, l with
-      | _, [] -> ty
+    (* type of an application of a function of type [ty_f] *)
+    let rec app_ty_ ty_f l : Ty.t = match Ty.view ty_f, l with
+      | _, [] -> ty_f
       | Arrow (ty_a,ty_rest), a::tail ->
-        assert (Ty.equal ty_a a.term_ty);
+        assert (Ty.equal ty_a (ty a));
         app_ty_ ty_rest tail
       | (Prop | Atomic _), _::_ ->
         assert false
@@ -704,37 +569,34 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           | App (f1, l1) ->
             let l' = l1 @ l in
             mk_term_ ~deps:(Term_dep_sub f1) (App (f1, l'))
-              ~ty:(DTy_lazy (fun () -> app_ty_ f1.term_ty l'))
+              ~ty:(DTy_lazy (fun () -> app_ty_ (ty f1) l'))
           | _ ->
             mk_term_ ~deps:(Term_dep_sub f) (App (f,l))
-              ~ty:(DTy_lazy (fun () -> app_ty_ f.term_ty l))
+              ~ty:(DTy_lazy (fun () -> app_ty_ (ty f) l))
         in
         t
 
     let app_cst f l = app (const f) l
 
-    let fun_ ty body =
+    let fun_ ty_arg body =
       (* do not add watcher: propagation under λ forbidden *)
-      mk_term_ ~deps:Term_dep_none (Fun (ty, body))
-        ~ty:(DTy_lazy (fun () -> Ty.arrow ty body.term_ty))
+      mk_term_ ~deps:Term_dep_none (Fun (ty_arg, body))
+        ~ty:(DTy_lazy (fun () -> Ty.arrow ty_arg (ty body)))
 
     let fun_l = List.fold_right fun_
 
     let mu t =
-      mk_term_ ~deps:Term_dep_none (Mu t) ~ty:(DTy_direct t.term_ty)
+      mk_term_ ~deps:Term_dep_none (Mu t) ~ty:t.term_ty
 
     (* TODO: check types *)
 
     let match_ u m =
-      (* propagate only from [u] *)
-      let t =
-        mk_term_ ~deps:(Term_dep_sub u) (Match (u,m))
-          ~ty:(DTy_lazy (fun () ->
-              let _, (_,rhs) = ID.Map.choose m in
-              rhs.term_ty
-            ))
+      let ty =
+        let _, (_,rhs) = ID.Map.choose m in
+        rhs.term_ty
       in
-      t
+      mk_term_ ~deps:(Term_dep_sub u) (Match (u,m))
+        ~ty
 
     let switch u m =
       let t =
@@ -744,21 +606,15 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       t
 
     let if_ a b c =
-      assert (Ty.equal b.term_ty c.term_ty);
+      assert (Ty.equal (ty b) (ty c));
       (* propagate under test only *)
       let t =
         mk_term_ ~deps:(Term_dep_sub a)
-          (If (a,b,c)) ~ty:(DTy_direct b.term_ty) in
+          (If (a,b,c)) ~ty:b.term_ty in
       t
 
     let builtin_ ~deps b =
       (* normalize a bit *)
-      let b = match b with
-        | B_eq (a,b) when a.term_id > b.term_id -> B_eq (b,a)
-        | B_and (a,b,c,d) when a.term_id > b.term_id -> B_and (b,a,d,c)
-        | B_or (a,b) when a.term_id > b.term_id -> B_or (b,a)
-        | _ -> b
-      in
       let t = mk_term_ ~deps (Builtin b) ~ty:(DTy_direct Ty.prop) in
       t
 
@@ -773,7 +629,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     let builtin b =
       let deps = match b with
         | B_not u -> Term_dep_sub u
-        | B_and (_,_,a,b)
+        | B_and (a,_,b,_)
         | B_or (a,b)
         | B_eq (a,b) | B_imply (a,b) -> Term_dep_sub2 (a,b)
       in
@@ -792,7 +648,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       | _ -> t, true
 
     let quant q uty body =
-      assert (Ty.is_prop body.term_ty);
+      assert (Ty.is_prop (ty body));
       (* evaluation is blocked by the uninterpreted type *)
       let deps = Term_dep_uty uty in
       mk_term_ ~deps ~ty:(DTy_direct Ty.prop) (Quant (q,uty,body))
@@ -800,14 +656,13 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     let forall = quant Forall
     let exists = quant Exists
 
-    let and_ a b = builtin_ ~deps:(Term_dep_sub2 (a,b)) (B_and (a,b,a,b))
+    let and_ a b = builtin_ ~deps:(Term_dep_sub2 (a,b)) (B_and (a,E_empty,b,E_empty))
     let or_ a b = builtin_ ~deps:(Term_dep_sub2 (a,b)) (B_or (a,b))
     let imply a b = builtin_ ~deps:(Term_dep_sub2 (a,b)) (B_imply (a,b))
     let eq a b = builtin_ ~deps:(Term_dep_sub2 (a,b)) (B_eq (a,b))
-    let neq a b = not_ (eq a b)
 
-    let and_par a b c d =
-      builtin_ ~deps:(Term_dep_sub2 (c,d)) (B_and (a,b,c,d))
+    let and_par a e_a b e_b =
+      builtin_ ~deps:(Term_dep_sub2 (a,b)) (B_and (a,e_a,b,e_b))
 
     (* "eager" and, evaluating [a] first *)
     let and_eager a b = if_ a b false_
@@ -833,10 +688,9 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         | B_not t ->
           let acc, t' = f acc t in
           acc, B_not t'
-        | B_and (a,b,c,d) ->
+        | B_and (a,e_a,b,e_b) ->
           let acc, a, b = fold_binary acc a b in
-          let acc, c, d = fold_binary acc c d in
-          acc, B_and (a,b,c,d)
+          acc, B_and (a,e_a,b,e_b)
         | B_or (a,b) ->
           let acc, a, b = fold_binary acc a b in
           acc, B_or (a, b)
@@ -860,13 +714,111 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       | B_or (a,b)
       | B_imply (a,b)
       | B_eq (a,b) -> yield a; yield b
-      | B_and (a,b,c,d) -> yield a; yield b; yield c; yield d
+      | B_and (a,_,b,_) -> yield a; yield b
 
-    let ty t = t.term_ty
+    (* hash *)
+    let rec hash (t:term) : int =
+      if t.term_hash >= 0 then t.term_hash
+      else (
+        let h = match t.term_cell with
+          | True -> 1
+          | False -> 2
+          | DB d -> Hash.combine DB.hash 3 d
+          | Const c -> Hash.combine2 4 (Typed_cst.hash c)
+          | App (f,l) ->
+            Hash.combine3 5 (hash f) (Hash.list hash l)
+          | Fun (ty, f) -> Hash.combine3 6 (Ty.hash ty) (hash f)
+          | If (a,b,c) -> Hash.combine4 7 (hash a) (hash b) (hash c)
+          | Match (u,m) ->
+            let hash_case (tys,rhs) =
+              Hash.combine2 (Hash.list Ty.hash tys) (hash rhs)
+            in
+            let hash_m =
+              Hash.seq (Hash.pair ID.hash hash_case) (ID.Map.to_seq m)
+            in
+            Hash.combine3 8 (hash u) hash_m
+          | Builtin (B_not a) -> Hash.combine2 20 (hash a)
+          | Builtin (B_and (t1,_,t3,_)) ->
+            Hash.list hash [t1;t3]
+          | Builtin (B_or (t1,t2)) -> Hash.combine3 22 (hash t1) (hash t2)
+          | Builtin (B_imply (t1,t2)) -> Hash.combine3 23 (hash t1) (hash t2)
+          | Builtin (B_eq (t1,t2)) -> Hash.combine3 24 (hash t1) (hash t2)
+          | Mu sub -> Hash.combine hash 30 sub
+          | Switch (t, tbl) ->
+            Hash.combine3 31 (hash t) tbl.switch_id
+          | Quant (q,ty,bod) ->
+            Hash.combine4 32 (Hash.poly q) (hash_uty ty) (hash bod)
+          | Check_assign (c,t) ->
+            Hash.combine3 33 (Typed_cst.hash c) (hash t)
+          | Check_empty_uty uty ->
+            Hash.combine2 34 (hash_uty uty)
+        in
+        assert (h >= 0);
+        (* caching *)
+        t.term_hash <- h;
+        h
+      )
 
-    let equal = term_equal_
-    let hash = term_hash_
-    let compare a b = CCOrd.int_ a.term_id b.term_id
+    let rec equal t1 t2 : bool =
+      t1==t2
+      ||
+      (* if both hash are >= 0, require that they are equal *)
+      begin (t1.term_hash <0 || t2.term_hash <0 || t1.term_hash=t2.term_hash) &&
+      match t1.term_cell, t2.term_cell with
+        | True, True
+        | False, False -> true
+        | DB x, DB y -> DB.equal x y
+        | Const c1, Const c2 -> Typed_cst.equal c1 c2
+        | App (f1, l1), App (f2, l2) ->
+          equal f1 f2 && CCList.equal equal l1 l2
+        | Fun (ty1,f1), Fun (ty2,f2) -> Ty.equal ty1 ty2 && equal f1 f2
+        | If (a1,b1,c1), If (a2,b2,c2) ->
+          equal a1 a2 && equal b1 b2 && equal c1 c2
+        | Match (u1, m1), Match (u2, m2) ->
+          equal u1 u2 &&
+          ID.Map.for_all
+            (fun k1 (_,rhs1) ->
+               try equal rhs1 (snd (ID.Map.find k1 m2))
+               with Not_found -> false)
+            m1
+          &&
+          ID.Map.for_all (fun k2 _ -> ID.Map.mem k2 m1) m2
+        | Builtin b1, Builtin b2 ->
+          begin match b1, b2 with
+            | B_not a1, B_not a2 -> equal a1 a2
+            | B_and (a1,_,b1,_), B_and (a2,_,b2,_) ->
+              equal a1 a2 && equal b1 b2
+            | B_or (a1,b1), B_or (a2,b2)
+            | B_eq (a1,b1), B_eq (a2,b2)
+            | B_imply (a1,b1), B_imply (a2,b2) -> equal a1 a2 && equal b1 b2
+            | B_not _, _ | B_and _, _ | B_eq _, _
+            | B_or _, _ | B_imply _, _ -> false
+          end
+        | Mu t1, Mu t2 -> t1==t2
+        | Switch (t1,m1), Switch (t2,m2) ->
+          t1==t2 && m1.switch_id = m2.switch_id
+        | Quant (q1,ty1,bod1), Quant (q2,ty2,bod2) ->
+          q1=q2 && equal_uty ty1 ty2 && bod1==bod2
+        | Check_assign (c1,t1), Check_assign (c2,t2) ->
+          Typed_cst.equal c1 c2 && equal t1 t2
+        | Check_empty_uty u1, Check_empty_uty u2 ->
+          equal_uty u1 u2
+        | True, _
+        | False, _
+        | DB _, _
+        | Const _, _
+        | App _, _
+        | Fun _, _
+        | If _, _
+        | Match _, _
+        | Builtin _, _
+        | Mu _, _
+        | Switch _, _
+        | Quant _, _
+        | Check_assign _, _
+        | Check_empty_uty _, _
+          -> false
+      end
 
     module As_key = struct
         type t = term
@@ -949,12 +901,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     let fpf = Format.fprintf
 
     let pp_top ~ids out t =
-      let rec pp out t =
-        pp_rec out t;
-        if Config.pp_hashcons then Format.fprintf out "/%d" t.term_id;
-        ()
-
-      and pp_rec out t = match t.term_cell with
+      let rec pp out t = match t.term_cell with
         | True -> CCFormat.string out "true"
         | False -> CCFormat.string out "false"
         | DB d -> DB.pp out d
@@ -988,7 +935,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           fpf out "(@[switch %a@ (@[<hv>%a@])@])"
             pp t print_map (ID.Tbl.to_seq m.switch_tbl)
         | Builtin (B_not t) -> fpf out "(@[<hv1>not@ %a@])" pp t
-        | Builtin (B_and (_, _, a,b)) ->
+        | Builtin (B_and (a, _, b, _)) ->
           fpf out "(@[<hv1>and@ %a@ %a@])" pp a pp b
         | Builtin (B_or (a,b)) ->
           fpf out "(@[<hv1>or@ %a@ %a@])" pp a pp b
@@ -1136,6 +1083,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     val sign : t -> bool
     val view : t -> lit_view
     val as_atom : t -> (term * bool) option
+    val as_atom_exn : t -> term * bool
     val fresh_with : ID.t -> t
     val fresh : unit -> t
     val dummy : t
@@ -1157,14 +1105,66 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
   end = struct
     type t = lit
 
-    let neg l = {l with lit_sign=not l.lit_sign}
+    let neg l = l.lit_neg
+
+    let equal_lit_ a b =
+      a.lit_sign = b.lit_sign &&
+      begin match a.lit_view, b.lit_view with
+        | Lit_fresh i1, Lit_fresh i2 -> ID.equal i1 i2
+        | Lit_atom t1, Lit_atom t2 -> Term.equal t1 t2
+        | Lit_assign (c1,t1), Lit_assign (c2,t2) ->
+          Typed_cst.equal c1 c2 && Term.equal t1 t2
+        | Lit_uty_empty u1, Lit_uty_empty u2 -> equal_uty u1 u2
+        | Lit_fresh _, _
+        | Lit_atom _, _
+        | Lit_assign _, _
+        | Lit_uty_empty _, _
+          -> false
+      end
+
+    let hash_lit_ a =
+      let sign = a.lit_sign in
+      begin match a.lit_view with
+        | Lit_fresh i -> Hash.combine3 1 (Hash.bool sign) (ID.hash i)
+        | Lit_atom t -> Hash.combine3 2 (Hash.bool sign) (Term.hash t)
+        | Lit_assign (c,t) ->
+          Hash.combine4 3 (Hash.bool sign) (Typed_cst.hash c) (Term.hash t)
+        | Lit_uty_empty uty -> Hash.combine3 4 (Hash.bool sign) (hash_uty uty)
+      end
+
+    module H = Hashcons.Make(struct
+        type t = lit
+        let equal = equal_lit_
+        let hash = hash_lit_
+        let set_id lit id =
+          assert (lit.lit_id = -1);
+          lit.lit_id <- id
+      end)
 
     let sign t = t.lit_sign
     let view (t:t): lit_view = t.lit_view
 
-    let abs t: t = {t with lit_sign=true}
+    let abs t: t = if t.lit_sign then t else neg t
 
-    let make ~sign v = {lit_sign=sign; lit_view=v}
+    let rec make ~sign view: lit =
+      let rec lit = {
+        lit_id= -1;
+        lit_view=view;
+        lit_nf=None;
+        lit_sign= sign;
+        lit_neg=lit;
+      } in
+      let lit' = H.hashcons lit in
+      if lit == lit' then (
+        assert (lit'.lit_neg == lit');
+        lit'.lit_neg <- make view ~sign:(not sign); (* ensure negation exists *)
+        begin match view, sign with
+          | Lit_atom t, true -> lit.lit_nf <- Some (t, E_empty);
+          | Lit_atom t, false -> lit.lit_nf <- Some (Term.not_ t, E_empty);
+          | _ -> ()
+        end
+      );
+      lit'
 
     (* assume the ID is fresh *)
     let fresh_with id = make ~sign:true (Lit_fresh id)
@@ -1197,9 +1197,13 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       | Lit_atom t -> Some (t, lit.lit_sign)
       | _ -> None
 
+    let as_atom_exn lit = match as_atom lit with
+      | Some (t,b) -> t, b
+      | None -> invalid_arg "Lit.as_atom_exn"
+
     let hash = hash_lit
     let compare = cmp_lit
-    let equal a b = compare a b = 0
+    let equal = eq_lit
     let pp = pp_lit
     let print = pp
 
@@ -1923,43 +1927,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     let cycle_check ~(sub:term) (into:term): bool =
       cycle_check_l ~sub [into]
 
-    (* set the normal form of [t], propagate to watchers *)
-    let set_nf_ t new_t (e:explanation) : unit =
-      if Term.equal t new_t then ()
-      else (
-        Backtrack.push_set_nf_ t;
-        t.term_nf <- Some (new_t, e);
-        Log.debugf 5
-          (fun k->k
-              "(@[<hv1>set_nf@ @[%a@]@ @[%a@]@ :explanation @[<hv>%a@]@])"
-              Term.pp t Term.pp new_t Explanation.pp e);
-      )
-
-    let get_nf t : explanation * term =
-      match t.term_nf with
-        | None -> Explanation.empty, t
-        | Some (new_t,e) -> e, new_t
-
-    let as_uninterpreted_dom_elt (t:term): ID.t option =
-      match t.term_cell with
-        | Const {cst_kind=Cst_uninterpreted_dom_elt _; cst_id; _} -> Some cst_id
-        | _ -> None
-
-    (* compute the normal form of this term. We know at least one of its
-       subterm(s) has been reduced *)
-    let rec compute_nf (t:term) : explanation * term =
-      (* follow the "normal form" pointer *)
-      match t.term_nf with
-        | Some (t', e) ->
-          let exp, nf = compute_nf_add e t' in
-          (* path compression here *)
-          if not (Term.equal t' nf)
-          then set_nf_ t nf exp;
-          exp, nf
-        | None -> compute_nf_noncached t
-
-    and compute_nf_noncached t =
-      assert (t.term_nf = None);
+    let rec compute_nf t =
       match t.term_cell with
         | DB _ -> Explanation.empty, t
         | True | False ->
@@ -2011,7 +1979,6 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         | Builtin b ->
           (* try boolean reductions *)
           let e, t' = compute_builtin ~old:t b in
-          set_nf_ t t' e;
           e, t'
         | If (a,b,c) ->
           let e_a, a' = compute_nf a in
@@ -2026,7 +1993,6 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           (* merge evidence from [a]'s normal form and [b/c]'s
              normal form *)
           let e = Explanation.append e_a e_branch in
-          set_nf_ t t' e;
           e, t'
         | Match (u, m) ->
           let e_u, u' = compute_nf u in
@@ -2053,12 +2019,12 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
             | None -> Explanation.empty, default()
           in
           let e = Explanation.append e_u e_branch in
-          set_nf_ t t' e;
           e, t'
         | Switch (u, m) ->
           let e_u, u' = compute_nf u in
-          begin match as_uninterpreted_dom_elt u' with
-            | Some u_id ->
+          begin match Term.as_domain_elt u' with
+            | Some (c, _, _) ->
+              let u_id = c.cst_id in
               (* do a lookup for this value! *)
               let rhs =
                 match ID.Tbl.get m.switch_tbl u_id with
@@ -2086,7 +2052,6 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           in
           (* merge explanations *)
           let e = Explanation.append e_reduce e_f in
-          set_nf_ t new_t e;
           e, new_t
         | Check_assign (c, case) ->
           begin match c.cst_kind with
@@ -2094,7 +2059,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
               Explanation.empty, t
             | Cst_undef (_, ({cst_cur_case=Some (_,case');_} as info), _) ->
               assert (match info.cst_cases with
-                | Lazy_some l -> List.memq case l | Lazy_none -> false);
+                | Lazy_some l -> CCList.Set.mem ~eq:Term.equal case l | Lazy_none -> false);
               (* NOTE: instead of saying [c=c10 --> false] because [c:=c1],
                  or because [c:=c2], etc. we can cut more search space by
                  explaining it by [not (c=c10)]  *)
@@ -2118,9 +2083,9 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       | Const {cst_kind=Cst_defined (_, lazy def_f); _}, l ->
         (* reduce [f l] into [def_f l] when [f := def_f] *)
         compute_nf_app env e def_f l
-      | Fun (_ty, body), arg :: other_args ->
+      | Fun (ty_arg, body), arg :: other_args ->
         (* beta-reduce *)
-        assert (Ty.equal _ty arg.term_ty);
+        assert (Ty.equal ty_arg (Term.ty arg));
         let new_env = DB_env.push arg env in
         (* apply [body] to [other_args] *)
         compute_nf_app new_env e body other_args
@@ -2159,12 +2124,12 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         (* [a or b] becomes [not (not a and not b)] *)
         let a' = Term.not_ a in
         let b' = Term.not_ b in
-        compute_nf (Term.not_ (Term.and_par a' b' a' b'))
+        compute_nf (Term.not_ (Term.and_ a' b'))
       | B_imply (a,b) ->
         (* [a => b] becomes [not [a and not b]] *)
         let b' = Term.not_ b in
-        compute_nf (Term.not_ (Term.and_par a b' a b'))
-      | B_eq (a,b) when Ty.is_prop a.term_ty ->
+        compute_nf (Term.not_ (Term.and_ a b'))
+      | B_eq (a,b) when Ty.is_prop (Term.ty a) ->
         let e_a, a' = compute_nf a in
         let e_b, b' = compute_nf b in
         let e_ab = Explanation.append e_a e_b in
@@ -2180,12 +2145,12 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
             in
             e_ab, t'
         end
-      | B_and (a,b,c,d) ->
+      | B_and (a,e_a,b,e_b) ->
         (* evaluate [c] and [d], but only provide some explanation
            once their conjunction reduces to [true] or [false]. *)
-        let e_a, c' = compute_nf a in
-        let e_b, d' = compute_nf b in
-        begin match c'.term_cell, d'.term_cell with
+        let e_a, a' = compute_nf_add e_a a in
+        let e_b, b' = compute_nf_add e_b b in
+        begin match a'.term_cell, b'.term_cell with
           | False, False ->
             (* combine explanations here *)
             Explanation.or_ e_a e_b, Term.false_
@@ -2198,13 +2163,13 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
             e_ab, Term.true_
           | _ ->
             let t' =
-              if c==c' && d==d' then old else Term.and_par a b c' d'
+              if a==a' && a==b' then old else Term.and_par a' e_a b' e_b
             in
             (* keep the explanations for when the value is true/false *)
             Explanation.empty, t'
         end
       | B_eq (a,b) ->
-        assert (not (Ty.is_prop a.term_ty));
+        assert (not (Ty.is_prop (Term.ty a)));
         let e_a, a' = compute_nf a in
         let e_b, b' = compute_nf b in
         let e_ab = Explanation.append e_a e_b in
@@ -2335,14 +2300,32 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           | _ -> e_ab, default()
         end
 
-    let compute_nf_lit (lit:lit): explanation * lit =
-      match Lit.view lit with
-        | Lit_fresh _
-        | Lit_assign (_,_)
-        | Lit_uty_empty _ -> Explanation.empty, lit
-        | Lit_atom t ->
-          let e, t' = compute_nf t in
-          e, Lit.atom ~sign:(Lit.sign lit) t'
+    (* set the normal form of [t], propagate to watchers *)
+    let set_nf_lit_ (t:lit) old_t new_t (e:explanation) : unit =
+      if Term.equal old_t new_t then ()
+      else (
+        Backtrack.push_set_nf_ t;
+        t.lit_nf <- Some (new_t, e);
+        Log.debugf 5
+          (fun k->k
+              "(@[<hv1>set_nf@ @[%a@]@ @[%a@]@ :explanation @[<hv>%a@]@])"
+              Lit.pp t Term.pp new_t Explanation.pp e);
+      )
+
+    (* follow the "normal form" pointer *)
+    let compute_nf_lit (t:lit): explanation * term = match t.lit_nf with
+      | Some (old_nf, e) ->
+        let exp, nf = compute_nf_add e old_nf in
+        (* path compression here *)
+        if not (old_nf == nf) then (
+          set_nf_lit_ t old_nf nf exp;
+        );
+        exp, nf
+      | None -> assert false
+
+    let get_nf_lit (t:lit) = match t.lit_nf with
+      | Some (t,e) -> e, t
+      | None -> assert false
   end
 
   (** {2 A literal asserted to SAT}
@@ -2351,24 +2334,26 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       in the current partial model. *)
 
   module Top_terms : sig
-    type t = private term
+    type t = private lit
 
+    val of_term : term -> t
     val to_lit : t -> Lit.t
     val pp : t CCFormat.printer
     val watch : term -> unit
-    val update : t -> unit (** re-check value, maybe propagate *)
+    val update : t -> unit
+    (** re-check value, maybe propagate *)
+
     val is_top_term : term -> bool
     val size : unit -> int
     val to_seq : t Sequence.t
     val update_all : unit -> unit (** update all top terms *)
   end = struct
-    type t = term
-    (* actually, the watched lit is [Lit.atom t], but we link
-       [t] directly because this way we have direct access to its
-       normal form *)
+    type t = lit
 
-    let to_lit = Lit.atom ~sign:true
-    let pp = Term.pp
+    let to_lit t = t
+    let pp = Lit.pp
+    let of_term t = Lit.atom t
+    let abs (t:t) : t = Lit.abs t
 
     (* clauses for [e => l] *)
     let clause_imply (l:lit) (e:explanation): Clause.t Sequence.t =
@@ -2376,64 +2361,59 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       |> Sequence.map
         (fun guard -> l :: guard |> Clause.make)
 
-    let propagate_lit_ (l:t) (e:explanation): unit =
-      let cs = clause_imply (to_lit l) e |> Sequence.to_rev_list in
+    let propagate_lit_ (t:lit) (e:explanation): unit =
+      let cs = clause_imply t e |> Sequence.to_rev_list in
       Log.debugf 4
         (fun k->k
-            "(@[<hv1>@{<green>propagate_lit@}@ %a@ nf: %a@ clauses: (@[%a@])@])"
-            pp l pp (snd (Reduce.compute_nf l)) (Utils.pp_list Clause.pp) cs);
+            "(@[<hv1>@{<green>propagate_lit@}@ %a@ clauses: (@[%a@])@])"
+            Lit.pp t (Utils.pp_list Clause.pp) cs);
       incr stat_num_propagations;
       Clause.push_new_l cs;
       ()
 
-    let expand_cst_ (t:t)(c:cst) : unit =
-      assert (Ty.is_prop t.term_ty);
-      Log.debugf 2
-        (fun k->k "(@[<1>watch_cst@ %a@ %a@])" Typed_cst.pp c Term.pp t);
+    let expand_cst_ (c:cst) : unit =
+      Log.debugf 2 (fun k->k "(@[<1>watch_cst@ %a@])" Typed_cst.pp c);
       Expand.expand_cst c;
       ()
 
-    let expand_uty_ (t:t)(uty:ty_uninterpreted_slice) : unit =
-      assert (Ty.is_prop t.term_ty);
-      Log.debugf 2
-        (fun k->k "(@[<1>watch_uty@ %a@ %a@])" pp_uty uty Term.pp t);
+    let expand_uty_ (uty:ty_uninterpreted_slice) : unit =
+      Log.debugf 2 (fun k->k "(@[<1>watch_uty@ %a@])" pp_uty uty);
       Expand.expand_uty uty;
       ()
 
-    let expand_dep (t:t) (d:term_dep) : unit = match d with
-      | Dep_cst c -> expand_cst_ t c
-      | Dep_uty uty -> expand_uty_ t uty
+    let expand_dep (d:term_dep) : unit = match d with
+      | Dep_cst c -> expand_cst_ c
+      | Dep_uty uty -> expand_uty_ uty
 
     (* evaluate [t] in current partial model, and expand the constants
        that block it *)
     let update (t:t): unit =
-      assert (Ty.is_prop t.term_ty);
-      let e, new_t = Reduce.compute_nf t in
+      let e, new_t = Reduce.compute_nf_lit t in
       (* if [new_t = true/false], propagate literal *)
-      begin match new_t.term_cell with
-        | True -> propagate_lit_ t e
-        | False -> propagate_lit_ (Term.not_ t) e
+      begin match new_t.term_cell, t.lit_sign with
+        | True, true | False, false -> propagate_lit_ t e
+        | True, false | False, true -> propagate_lit_ (Lit.neg t) e
         | _ ->
           Log.debugf 4
             (fun k->k
                 "(@[<1>update@ %a@ @[<1>:normal_form@ %a@]@ \
                  :deps (@[%a@])@ :exp @[<hv>%a@]@])"
-                Term.pp t Term.pp new_t
+                pp t Term.pp new_t
                 (Utils.pp_list pp_dep) new_t.term_deps
                 Explanation.pp e);
-          List.iter (expand_dep t) new_t.term_deps;
+          List.iter expand_dep new_t.term_deps;
       end;
       ()
 
     (* NOTE: we use a list because it's lightweight, fast to iterate
        on, and we only add elements in it at the beginning *)
-    let top_ : term list ref = ref []
+    let top_ : t list ref = ref []
 
-    let mem_top_ (t:term): bool =
-      List.exists (Term.equal t) !top_
+    let mem_top_ (t:t): bool =
+      List.exists (fun t' -> Lit.equal (abs t) (abs t')) !top_
 
-    let watch (lit:term) =
-      let lit, _ = Term.abs lit in
+    let watch (t:term) =
+      let lit = of_term t in
       if not (mem_top_ lit) then (
         Log.debugf 3
           (fun k->k "(@[<1>@{<green>watch_lit@}@ %a@])" pp lit);
@@ -2442,29 +2422,17 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         update lit;
       )
 
-    let is_top_term (lit:t) : bool =
-      let lit, _ = Term.abs lit in
+    let is_top_term (t:term) : bool =
+      let lit = of_term t in
       mem_top_ lit
 
     let to_seq yield = List.iter yield !top_
 
     let size () = List.length !top_
 
-    (* is the dependency updated, i.e. decided by the SAT solver? *)
-    let dep_updated (d:term_dep): bool = match d with
-      | Dep_cst {cst_kind=Cst_undef (_, i, _); _} ->
-        CCOpt.is_some i.cst_cur_case
-      | Dep_cst _ -> assert false
-      | Dep_uty uty ->
-        CCOpt.is_some uty.uty_status
-
     (* update all top terms (whose dependencies have been changed) *)
     let update_all () =
       to_seq
-      |> Sequence.filter
-        (fun t ->
-           let _, nf = Reduce.get_nf t in
-           List.exists dep_updated nf.term_deps)
       |> Sequence.iter update
   end
 
@@ -2504,21 +2472,29 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     val check: unit -> unit
   end = struct
     (* list of terms to fully evaluate *)
-    let toplevel_goals_ : term list ref = ref []
+    let toplevel_goals_ : lit list ref = ref []
 
     (* add [t] to the set of terms that must be evaluated *)
     let push (t:term): unit =
-      toplevel_goals_ := t :: !toplevel_goals_;
+      let lit = Lit.atom t in
+      toplevel_goals_ := lit :: !toplevel_goals_;
       ()
 
-    let to_seq k = List.iter k !toplevel_goals_
+    let to_seq_ k = List.iter k !toplevel_goals_
+
+    let to_seq =
+      to_seq_
+      |> Sequence.map
+        (fun lit ->
+           let t, b = Lit.as_atom_exn lit in
+           if b then t else Term.not_ t)
 
     (* check that this term fully evaluates to [true] *)
-    let is_true_ (t:term): bool =
-      let _, t' = Reduce.compute_nf t in
-      assert (Term.equal t' (Reduce.get_nf t |> snd));
-      match t'.term_cell with
-        | True -> true
+    let is_true_ (t:lit): bool =
+      let _, t' = Reduce.compute_nf_lit t in
+      match t'.term_cell, t.lit_sign with
+        | True, true
+        | False, false -> true
         | _ -> false
 
     let check () =
@@ -2529,7 +2505,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           (fun k->
              let pp_dep out = function
                | Dep_cst c ->
-                 let _, nf = Reduce.get_nf (Term.const c) in
+                 let _, nf = Reduce.compute_nf (Term.const c) in
                  Format.fprintf out
                    "(@[%a@ nf:%a@ :expanded %B@])"
                    Typed_cst.pp c Term.pp nf
@@ -2542,10 +2518,10 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
                    pp_uty uty (uty.uty_pair<>Lazy_none)
              in
              let pp_lit out l =
-               let e, nf = Reduce.get_nf l in
+               let e, nf = Reduce.get_nf_lit l in
                Format.fprintf out
                  "(@[<hv1>%a@ nf: %a@ exp: %a@ deps: (@[<hv>%a@])@])"
-                 Term.pp l Term .pp nf Explanation.pp e
+                 Lit.pp l Term .pp nf Explanation.pp e
                  (Utils.pp_list pp_dep) nf.term_deps
              in
              k "(@[<hv1>status_watched_lit@ (@[<v>%a@])@])"
@@ -2627,19 +2603,22 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       Log.debugf 2
         (fun k->k "(@[<1>@{<green>assume_lit@}@ @[%a@]@])" Lit.pp lit);
       (* check consistency first *)
-      let e, lit' = Reduce.compute_nf_lit lit in
-      begin match Lit.view lit' with
+      begin match Lit.view lit with
         | Lit_fresh _ -> ()
-        | Lit_atom {term_cell=True; _} -> ()
-        | Lit_atom {term_cell=False; _} ->
-          (* conflict! *)
-          let cs =
-            clause_guard_of_exp_ e
-            |> Sequence.map
-              (fun guard -> Lit.neg lit :: guard |> Clause.make)
-          in
-          Sequence.iter Clause.push_new cs
-        | Lit_atom _ -> ()
+        | Lit_atom _ ->
+          let e, t' = Reduce.compute_nf_lit lit in
+          begin match t'.term_cell with
+            | True -> ()
+            | False ->
+              (* conflict! *)
+              let cs =
+                clause_guard_of_exp_ e
+                |> Sequence.map
+                  (fun guard -> Lit.neg lit :: guard |> Clause.make)
+              in
+              Sequence.iter Clause.push_new cs
+            | _ -> ()
+          end
         | Lit_assign(c, t) ->
           if Lit.sign lit then assert_choice c t
         | Lit_uty_empty uty ->
@@ -2825,8 +2804,8 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         let rhs_l =
           ID.Map.values m
           |> Sequence.map snd
-          |> Sequence.sort_uniq ~cmp:Term.compare
           |> Sequence.to_rev_list
+          |> CCList.Set.uniq ~eq:Term.equal
         in
         begin match rhs_l with
           | [x] when not (!any_rhs_depends_vars) ->
@@ -2999,7 +2978,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
             | Some t' -> t'
             | None -> errorf "cannot find DB %a in env" Term.pp t
           end
-        | Const cst -> A.const cst.cst_id (ty_to_ast t.term_ty)
+        | Const cst -> A.const cst.cst_id (ty_to_ast (Term.ty t))
         | App (f,l) -> A.app (aux env f) (List.map (aux env) l)
         | Fun (ty,bod) ->
           with_var ty env
@@ -3034,7 +3013,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         | Builtin b ->
           begin match b with
             | B_not t -> A.not_ (aux env t)
-            | B_and (a,b,_,_) -> A.and_ (aux env a) (aux env b)
+            | B_and (a,_,b,_) -> A.and_ (aux env a) (aux env b)
             | B_or (a,b) -> A.or_ (aux env a) (aux env b)
             | B_eq (a,b) -> A.eq (aux env a) (aux env b)
             | B_imply (a,b) -> A.imply (aux env a) (aux env b)
