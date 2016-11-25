@@ -350,14 +350,13 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     let make_defined id ty t = make id (Cst_defined (ty, t))
     let make_uty_dom_elt id ty uty = make id (Cst_uninterpreted_dom_elt (ty,uty))
 
-    let make_undef ?parent ?exist_if ?slice id ty =
+    let depth (c:t): int = match c.cst_kind with
+      | Cst_undef (_, i, _) -> i.cst_depth
+      | _ -> assert false
+
+    let make_undef ?parent ?exist_if ?slice ~depth:cst_depth id ty =
+      assert (CCOpt.for_all (fun p -> cst_depth > depth p) parent);
       let info =
-        let cst_depth = match parent with
-          | Some {cst_kind=Cst_undef (_, i, _); _} -> i.cst_depth + 1
-          | Some _ ->
-            invalid_arg "make_const: parent should be a constant"
-          | None -> 0
-        in
         { cst_depth;
           cst_parent=parent;
           cst_exist_conds=CCOpt.get_lazy (fun ()->ref []) exist_if;
@@ -367,10 +366,6 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         }
       in
       make id (Cst_undef (ty, info, slice))
-
-    let depth (c:t): int = match c.cst_kind with
-      | Cst_undef (_, i, _) -> i.cst_depth
-      | _ -> assert false
 
     let as_undefined (c:t)
       : (t * Ty.t * cst_info * ty_uninterpreted_slice option) option =
@@ -1482,10 +1477,10 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     (* make a fresh constant, with a unique name *)
     let new_cst_ =
       let n = ref 0 in
-      fun ?slice ?exist_if ~parent name ty ->
+      fun ?slice ?exist_if ~parent ~depth name ty ->
         let id = ID.makef "?%s_%d" name !n in
         incr n;
-        Typed_cst.make_undef ?slice ?exist_if ~parent id ty
+        Typed_cst.make_undef ?slice ?exist_if ~parent ~depth id ty
 
     (* [imply_opt g cs] returns [F => cs] if [g=Some F], or [cs] otherwise *)
     let imply_opt g (c:Lit.t list): Lit.t list = match g with
@@ -1574,7 +1569,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
 
     (* build clause(s) that explains that [c] must be one of its
        cases *)
-    let clauses_of_cases (c:cst) (l:term list) (depth:int): Clause.t list =
+    let clauses_of_cases (c:cst) (l:term list): Clause.t list =
       let info = match Typed_cst.as_undefined c with
         | None -> assert false
         | Some (_,_,info,_) -> info
@@ -1649,15 +1644,15 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         : term list * Clause.t list  =
       assert (info.cst_cases = Lazy_none);
       (* make a sub-constant with given type *)
-      let mk_sub_cst ?slice ?exist_if ~parent ty_arg =
+      let mk_sub_cst ?slice ?exist_if ~parent ~depth ty_arg =
         let basename = Ty.mangle ty_arg in
-        new_cst_ ?slice ?exist_if basename ty_arg ~parent
+        new_cst_ ?slice ?exist_if basename ty_arg ~parent ~depth
       in
       (* table of already built constants, by type *)
       let memo : (cst * cst_exist_conds) list Ty.Tbl.t = Ty.Tbl.create 16 in
       (* get or create a constant that has this type *)
       let get_or_create_cst
-          ~(parent:cst) ~(used:cst list ref) ty_arg
+          ~(parent:cst) ~(used:cst list ref) ~depth ty_arg
           : cst * cst_exist_conds =
         let usable =
           Ty.Tbl.get_or ~or_:[] memo ty_arg
@@ -1668,7 +1663,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           | [] ->
             (* make a new constant and remember it *)
             let plist = ref [] in
-            let cst = mk_sub_cst ~exist_if:plist ~parent ty_arg in
+            let cst = mk_sub_cst ~exist_if:plist ~parent ~depth ty_arg in
             Ty.Tbl.add_list memo ty_arg (cst,plist);
             used := cst :: !used; (* cannot use it in the same case *)
             cst, plist
@@ -1692,8 +1687,11 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
                  let args =
                    List.map
                      (fun ty_arg ->
+                        (* depth increases linearly in the number of arguments *)
+                        let depth = info.cst_depth + List.length ty_args in
+                        assert (depth > info.cst_depth);
                         let c, plist =
-                          get_or_create_cst ty_arg ~parent:cst ~used
+                          get_or_create_cst ty_arg ~parent:cst ~used ~depth
                         in
                         let cond = lazy (Lit.cst_choice cst (Lazy.force case)) in
                         plist := cond :: !plist;
@@ -1721,7 +1719,10 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
             let cond = lazy (Lit.uty_choice_nonempty uty) in
             let plist = ref [cond] in
             (* [cst = cst'], but [cst'] is deeper and belongs to the next slice *)
-            let cst' = mk_sub_cst ty ~slice:uty_tail ~exist_if:plist ~parent:cst in
+            let depth = info.cst_depth+1 in
+            let cst' =
+              mk_sub_cst ty ~slice:uty_tail ~exist_if:plist ~parent:cst ~depth
+            in
             Term.const cst'
           in
           (* additional clause to specify that [is_empty uty_tail => cst = case1] *)
@@ -1741,8 +1742,9 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
             match Ty.view ty_arg with
             | Prop ->
               (* make a test on [the_param] *)
-              let then_ = mk_sub_cst ty_ret ~parent:cst ~exist_if |> Term.const in
-              let else_ = mk_sub_cst ty_ret ~parent:cst ~exist_if |> Term.const in
+              let depth = info.cst_depth+1 in
+              let then_ = mk_sub_cst ty_ret ~depth ~parent:cst ~exist_if |> Term.const in
+              let else_ = mk_sub_cst ty_ret ~depth ~parent:cst ~exist_if |> Term.const in
               Term.if_ the_param then_ else_
             | Atomic (_, Data cstors) ->
               (* we cannot enumerate all functions on datatypes *)
@@ -1758,7 +1760,10 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
                      let n_ty_args = List.length ty_cstor_args in
                      (* build a function over the cstor arguments *)
                      let ty_sub_f = Ty.arrow_l ty_cstor_args ty_ret in
-                     let sub_f = mk_sub_cst ty_sub_f ~parent:cst ~exist_if in
+                     let depth = info.cst_depth+1 in
+                     let sub_f =
+                       mk_sub_cst ty_sub_f ~parent:cst ~exist_if ~depth
+                     in
                      (* apply [sub_f] to the cstor's arguments *)
                      let sub_params =
                        List.mapi
@@ -1777,7 +1782,8 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
               (* by case. We make a flat table from values to new
                  meta-variables of type [ty_ret] *)
               let switch_make_new () =
-                let sub = mk_sub_cst ty_ret ~parent:cst ~exist_if in
+                let depth = info.cst_depth+1 in
+                let sub = mk_sub_cst ty_ret ~depth ~parent:cst ~exist_if in
                 Term.const sub
               in
               let m = {
@@ -1798,7 +1804,8 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           and body_const = lazy (
             let exist_if = ref [lazy (Lit.cst_choice cst (Lazy.force fun_const))] in
             (* only one parent in any case *)
-            let c' = mk_sub_cst ty_ret ~parent:cst ~exist_if in
+            let depth = info.cst_depth+1 in
+            let c' = mk_sub_cst ty_ret ~depth ~parent:cst ~exist_if in
             Term.const c'
           )
           and fun_const =
@@ -1810,7 +1817,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           [Term.true_; Term.false_], []
       in
       (* build clauses *)
-      let case_clauses = clauses_of_cases cst by_ty info.cst_depth in
+      let case_clauses = clauses_of_cases cst by_ty in
       by_ty, List.rev_append other_clauses case_clauses
 
     (* expand the given constant so that, later, it will be
@@ -2873,7 +2880,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
             CCList.fold_map
               (fun env v ->
                  let ty = Ast.Var.ty v |> conv_ty in
-                 let c = Typed_cst.make_undef (Ast.Var.id v) ty in
+                 let c = Typed_cst.make_undef ~depth:0 (Ast.Var.id v) ty in
                  add_let_bound env v (Term.const c), c)
               empty_env
               vars
@@ -2900,7 +2907,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         | Ast.Decl (id, ty) ->
           assert (not (ID.Tbl.mem decl_ty_ id));
           let ty = conv_ty ty in
-          let cst = Typed_cst.make_undef id ty in
+          let cst = Typed_cst.make_undef ~depth:0 id ty in
           add_cst_support_ cst; (* need it in model *)
           ID.Tbl.add decl_ty_ id (Lazy.from_val cst)
         | Ast.Data l ->
@@ -3083,7 +3090,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           then (
             (* make a new unknown constant of the proper type *)
             let c =
-              Typed_cst.make_undef
+              Typed_cst.make_undef ~depth:0
                 (ID.makef "?default_%s" (Ty.mangle m.switch_ty_ret))
                 m.switch_ty_ret
             in
