@@ -1359,6 +1359,9 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     val current_lit : unit -> Lit.t
     val next : unit -> state
     val lit_of_depth : int -> Lit.t option
+    val lit_max_smaller_than : int -> int * Lit.t
+    (** maximal literal strictly smaller than the given depth *)
+
     val pp: t CCFormat.printer
   end = struct
     type t = int
@@ -1394,7 +1397,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     let lits_ : (int, Lit.t) Hashtbl.t = Hashtbl.create 32
 
     (* get the literal correspond to depth [d], if any *)
-    let lit_of_depth d : Lit.t option =
+    let rec lit_of_depth d : Lit.t option =
       if d < step_ || (d mod step_ <> 0) || d > max_depth
       then None
       else match CCHashtbl.get lits_ d with
@@ -1402,7 +1405,31 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         | None ->
           let lit = mk_lit_ d in
           Hashtbl.add lits_ d lit;
+          (* relation with previous lit: [prev_lit => lit] *)
+          begin match prev d with
+            | None -> assert (d=step_); ()
+            | Some prev_lit ->
+              let c = Clause.make [Lit.neg prev_lit; lit] in
+              Clause.push_new c;
+          end;
           Some lit
+
+    (* previous literal *)
+    and prev d : Lit.t option =
+      assert (d mod step_ = 0);
+      lit_of_depth (d - step_)
+
+    let lit_max_smaller_than d =
+      (* find the largest [prev_depth]
+         s.t. [prev_depth mod step=0] and [prev_depth<d] *)
+      let d_prev = max 0 (d-1) in
+      let prev_depth = d_prev - (d_prev mod step_) in
+      assert (prev_depth >= 0 && (prev_depth mod step_ = 0));
+      match lit_of_depth prev_depth with
+        | Some lit -> prev_depth, lit
+        | None ->
+          assert (prev_depth = 0);
+          prev_depth, Lit.atom Term.true_
 
     (* initial state *)
     let start_ =
@@ -1532,12 +1559,22 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         | Lazy_some (hd,tl) ->
           hd, tl, [] (* already expanded *)
 
+    let depth_of_term (t:term): int option =
+      Term.to_seq t
+      |> Sequence.filter_map
+        (fun sub -> match sub.term_cell with
+           | Const {cst_kind=Cst_undef (_,info,_); _} -> Some info.cst_depth
+           | Switch (_,{switch_cst={cst_kind=Cst_undef (_,info,_); _}; _}) ->
+             (* in this case, the map will contain metas of depth
+                [info.cst_depth+1], even though they might not
+                exist already *)
+             Some (info.cst_depth + 1)
+           | _ -> None)
+      |> Sequence.max ~lt:(fun a b ->a<b)
+
     (* build clause(s) that explains that [c] must be one of its
        cases *)
     let clauses_of_cases (c:cst) (l:term list) (depth:int): Clause.t list =
-      (* guard for non-constant cases (depth limit) *)
-      let lit_guard = Iterative_deepening.lit_of_depth depth in
-      let guard_is_some = CCOpt.is_some lit_guard in
       let info = match Typed_cst.as_undefined c with
         | None -> assert false
         | Some (_,_,info,_) -> info
@@ -1547,34 +1584,26 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           (fun (lazy lits) -> lits)
           !(info.cst_exist_conds)
       in
-      (* lits with a boolean indicating whether they have
-           to be depth-guarded *)
+      (* lits with the corresponding depth guard, if any *)
       let lits =
         List.map
           (fun rhs ->
              let lit = Lit.cst_choice c rhs in
-             (* does [rhs] use constants deeper than [d]? *)
-             let needs_guard =
-               guard_is_some &&
-               Term.to_seq rhs
-               |> Sequence.exists
-                 (fun sub -> match sub.term_cell with
-                    | Const {cst_kind=Cst_undef (_,info,_); _} ->
-                      (* is [sub] a constant deeper than [d]? *)
-                      info.cst_depth > depth
-                    | Switch (_,{switch_cst={cst_kind=Cst_undef (_,info,_); _}; _}) ->
-                      (* in this case, the map will contain metas of depth
-                         [info.cst_depth+1], even though they might not
-                         exist already *)
-                      info.cst_depth >= depth
-                    | _ -> false)
+             let guard = match depth_of_term rhs with
+               | None -> None
+               | Some depth_rhs ->
+                 let _, guard = Iterative_deepening.lit_max_smaller_than depth_rhs in
+                 Some guard
              in
-             lit, needs_guard)
+             lit, guard)
           l
       in
+      (* NOTE: still needed? *)
+      let cs_possible_depth = [] in
+      (*
       (* if all cases go over the depth limit, then we must revert the
          choice of [parent] *)
-      let all_need_guard = List.for_all snd lits in
+      let all_need_guard = List.for_all (fun (_,g) -> CCOpt.is_some g) lits in
       let cs_possible_depth = match lit_guard, guard_parent, all_need_guard with
         | _, [], true -> assert false (* depth 0 ?! *)
         | Some guard, _::_, true ->
@@ -1586,6 +1615,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
             guard_parent
         | _ -> []
       in
+      *)
       (* at least one case. We only enforce that if the
          parent constant has the proper case *)
       let cs_choose : Clause.t list =
@@ -1600,11 +1630,10 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       (* enforce depth limit *)
       and cs_limit : Clause.t list =
         CCList.flat_map
-          (fun (lit,needs_guard) ->
-             match lit_guard, needs_guard with
-               | None, true -> assert false
-               | Some guard, true ->
-                 (* depth limit and this literal are incompatible *)
+          (fun (lit,guard_opt) ->
+             match guard_opt with
+               | Some guard ->
+                 (* if [lit], then [not (depth <= max_depth_rhs-1)] *)
                  [Clause.make [ Lit.neg lit; Lit.neg guard ]]
                | _ -> [])
           lits
