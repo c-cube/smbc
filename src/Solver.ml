@@ -362,7 +362,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           cst_parent=parent;
           cst_exist_conds=CCOpt.get_lazy (fun ()->ref []) exist_if;
           cst_cases=Lazy_none;
-          cst_complete=false;
+          cst_complete=true;
           cst_cur_case=None;
         }
       in
@@ -1681,7 +1681,6 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       let by_ty, other_clauses = match Ty.view ty with
         | Atomic (_, Data cstors) ->
           (* datatype: refine by picking the head constructor *)
-          info.cst_complete <- true;
           List.map
             (fun (lazy c) ->
                let rec case = lazy (
@@ -1717,7 +1716,6 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           let c_head, uty_tail, cs = expand_uninterpreted_slice uty in
           (* two cases: either [c_head], or some new, deeper constant somewhere
              in the slice [uty_tail] *)
-          info.cst_complete <- false;
           let case1 = Term.const c_head in
           let case2 =
             let cond = lazy (Lit.uty_choice_nonempty uty) in
@@ -1747,6 +1745,8 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
               let else_ = mk_sub_cst ty_ret ~parent:cst ~exist_if |> Term.const in
               Term.if_ the_param then_ else_
             | Atomic (_, Data cstors) ->
+              (* we cannot enumerate all functions on datatypes *)
+              info.cst_complete <- false;
               (* match without recursion on some parameter *)
               let m =
                 cstors
