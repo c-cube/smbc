@@ -61,7 +61,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
   type db_index = int
 
   type 'a db_env = {
-    db_st: 'a list;   (* the stack *)
+    db_st: 'a RAL.t;  (* the stack *)
     db_size: int;     (* the stack size *)
   }
 
@@ -69,10 +69,14 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     | Forall
     | Exists
 
+  type let_kind =
+    | Let_lazy
+    | Let_eager
+
   (* program: the static part of computations *)
   type prgm =
     | P_return of prgm_const (* return value (in current env) *)
-    | P_let of prgm * prgm
+    | P_let of let_kind * prgm * prgm
     (* [Let (a,b)] means putting a thunk of [a] on the stack at position [0],
        then evaluating [b] *)
     | P_match of db_index * (int * prgm) ID.Map.t
@@ -328,28 +332,26 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
   module DB_env = struct
     type 'a t = 'a db_env
 
-    let push x env = { db_size=env.db_size+1; db_st=x :: env.db_st }
+    let push x env = { db_size=env.db_size+1; db_st=RAL.cons x env.db_st }
     let push_l l env = List.fold_left (fun e x -> push x e) env l
-    let empty = {db_st=[]; db_size=0}
-    let singleton x = {db_st=[x]; db_size=1}
+    let empty = {db_st=RAL.empty; db_size=0}
+    let singleton x = {db_st=RAL.return x; db_size=1}
     let size env = env.db_size
     let get n env : _ option =
-      if n < env.db_size then Some (List.nth env.db_st n) else None
+      if n < env.db_size then Some (RAL.get_exn env.db_st n) else None
     let get_exn n env =
-      if n < env.db_size then List.nth env.db_st n else invalid_arg "DB_env.get_exn"
+      if n < env.db_size then RAL.get_exn env.db_st n else invalid_arg "DB_env.get_exn"
     let set_ n v env =
       if n >= env.db_size then invalid_arg "DB_env.set";
-      {env with db_st = CCList.Idx.set env.db_st n v}
+      {env with db_st = RAL.set env.db_st n v}
     let pp pp_x out e =
-      let l = List.mapi (fun i o -> i,o) e.db_st in
-      begin match l with
-        | [] -> ()
-        | _ ->
-          let pp_pair out (i,x) =
-            Format.fprintf out "@[%d: %a@]" i pp_x x
-          in
-          Utils.pp_list ~sep:"," pp_pair out l
-      end
+      let l = RAL.mapi ~f:(fun i o -> i,o) e.db_st in
+      if not (RAL.is_empty l) then (
+        let pp_pair out (i,x) =
+          Format.fprintf out "@[%d: %a@]" i pp_x x
+        in
+        RAL.print ~sep:"," pp_pair out l
+      )
   end
 
   module Cst_undef = struct
@@ -476,7 +478,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     let var v = C_var v
 
     let return v = P_return v
-    let let_ a b = P_let (a,b)
+    let let_ k a b = P_let (k,a,b)
     let match_ u m = P_match (u,m)
     let if_ a b c = P_if (a,b,c)
     let call p args = P_call (p,args)
@@ -496,9 +498,12 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       | C_dom_elt c -> ID.pp out c.dom_elt_id
       | C_var v -> pp_db out v
 
+    let pp_let_kind out =
+      function Let_lazy -> () | Let_eager -> Fmt.string out "!"
+
     let rec pp out = function
       | P_return v -> fpf out "(@[<2>return@ %a@])" pp_const v
-      | P_let (a,b) -> fpf out "(@[<2>let@ %a@ %a@])" pp a pp b
+      | P_let (k,a,b) -> fpf out "(@[<2>let%a@ %a@ %a@])" pp_let_kind k pp a pp b
       | P_match (u,m) ->
         let pp_bind out (id,(n,rhs)) =
           fpf out "(@[<1>%a/%d@ %a@])" ID.pp id n pp rhs
@@ -1668,7 +1673,12 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           (* eval [c] in current environment *)
           let th = Thunk.eval_const env c in
           compute_nf_add e th
-        | P_let (a, b) ->
+        | P_let (Let_eager, a, b) ->
+          (* evaluate [a] right now and push it on the stack *)
+          let e, th_a = compute_nf_prgm e a env in
+          let env = DB_env.push th_a env in
+          compute_nf_prgm e b env
+        | P_let (Let_lazy, a, b) ->
           (* push a lazy thunk for computing [a] onto the stack, then eval [b] *)
           let th_a = Thunk.ref_ (Thunk.lazy_ a env) in
           let env = DB_env.push th_a env in
@@ -2019,7 +2029,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       |> Sequence.map
         (fun lit ->
            let t, b = Lit.as_atom_exn lit in
-           if b then t else Term.not_ t)
+           if b then t else Thunk.not_ t)
 
     (* check that this term fully evaluates to [true] *)
     let is_true_ (t:lit): bool =
@@ -2211,14 +2221,19 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     (* for converting Ast.Ty into Ty *)
     let ty_tbl_ : Ty.t lazy_t ID.Tbl.t = ID.Tbl.create 16
 
+    type decl_ty_entry =
+      | Decl_cst_undef of cst_undef
+      | Decl_cstor of cstor
+
     (* for converting constants *)
-    let decl_ty_ : cst lazy_t ID.Tbl.t = ID.Tbl.create 16
+    let decl_ty_ : decl_ty_entry lazy_t ID.Tbl.t = ID.Tbl.create 16
 
     (* environment for variables *)
     type conv_env = {
-      let_bound: (term * int) ID.Map.t; (* let-bound variables, to be replaced. int=depth at binding position *)
-      bound: int ID.Map.t; (* set of bound variables. int=depth at binding position *)
+      bindings: (prgm * int) ID.Map.t;
+      (* set ofbound variables. int=depth at binding position (for shifting) *)
       depth: int;
+      (* size of [bindings] *)
     }
 
     let empty_env : conv_env =
@@ -2245,6 +2260,176 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           with Not_found -> errorf "type %a not in ty_tbl" ID.pp id
         end
       | Ast.Ty.Arrow (a,b) -> Ty.arrow (conv_ty a) (conv_ty b)
+
+    (* TODO:
+       translate terms into programs (with some additional fun
+       that converts to values, to be used to return values more
+       efficiently: when returning [cstor args], use the specialized
+       fun to convert [args] into values, too).
+
+       Most operations should be relatively straightforward. For the
+       other (mostly values) we separate the computations
+       and the resulting shape by introducing let-bindings.
+       The function returning values should also return some lazy let bindings
+       that will wrap the entire value. *)
+
+    (* compilation to programs *)
+    let rec term_to_prgm (env:conv_env) (t:Ast.term): prgm =
+      begin match Ast.term_view t with
+        | Ast.True -> Prgm.true_
+        | Ast.False -> Prgm.false_
+        | Ast.Const id ->
+          begin match ID.Tbl.get decl_ty_ id with
+            | Some (lazy (Decl_cst_undef c)) -> Prgm.const c
+            | Some (lazy (Decl_cstor c)) -> Prgm.cstor0 c
+            | None ->
+              errorf "could not find constant `%a`" ID.pp id
+          end
+        | Ast.App (f, l) ->
+          (* first, convert [l] *)
+          let env', bindings =
+            CCList.fold_map
+              (fun env arg ->
+                 let arg = term_to_prgm env arg in
+                 (* let! introduce the argument *)
+                 let v = ID.make "_" in
+                 let env = add_bound env v in
+                 env, (v, arg))
+              env l
+          in
+          let args = List.map (fun (v,_) -> Prgm.var
+          let res = match Ast.term_view f with
+            | Ast.Const id when ID.Tbl.mem decl_ty_ id ->
+              let lazy entry = ID.Tbl.find decl_ty_ id in
+              begin match entry with
+                | Decl_cstor c ->
+                  Prgm.cstor c (List.map (fun (v,_) -> Prgm.var v)) bindings
+                | _ -> Prgm.call (term_to_prgm env f)
+                | Decl_cst_undef c ->
+                  Prgm.call (Prgm.const c) (
+              end
+
+            | _ ->
+              let f = conv_term_rec env f in
+              let l = List.map (conv_term_rec env) bindings in
+              Prgm.call f l
+          end
+        | Ast.Var v ->
+          begin match find_env env v with
+            | Some (t', depth_t'), _ ->
+              assert (env.depth >= depth_t');
+              let t' = Term.shift_db (env.depth - depth_t') t' in
+              t'
+            | None, Some d ->
+              let ty = Ast.Var.ty v |> conv_ty in
+              let level = env.depth - d - 1 in
+              Term.db (DB.make level ty)
+            | None, None -> errorf "could not find var `%a`" Ast.Var.pp v
+          end
+        | Ast.Fun (v,body) ->
+          let env' = add_bound env v in
+          let body = conv_term_rec env' body in
+          let ty = Ast.Var.ty v |> conv_ty in
+          Term.fun_ ty body
+        | Ast.Forall (v,body) ->
+          let env' = add_bound env v in
+          let body = conv_term_rec env' body in
+          let uty =
+            let ty = Ast.Var.ty v |> conv_ty in
+            match Ty.view ty with
+              | Atomic (_, Uninterpreted uty) -> uty
+              | _ -> errorf "forall: need to quantify on an uninterpreted type, not %a" Ty.pp ty
+          in
+          Term.forall uty body
+        | Ast.Exists (v,body) ->
+          let env' = add_bound env v in
+          let body = conv_term_rec env' body in
+          let uty =
+            let ty = Ast.Var.ty v |> conv_ty in
+            match Ty.view ty with
+              | Atomic (_, Uninterpreted uty) -> uty
+              | _ -> errorf "exists: need to quantify on an uninterpreted type, not %a" Ty.pp ty
+          in
+          Term.exists uty body
+        | Ast.Mu (v,body) ->
+          let env' = add_bound env v in
+          let body = conv_term_rec env' body in
+          Term.mu body
+        | Ast.Match (u,m) ->
+          let any_rhs_depends_vars = ref false in (* some RHS depends on matched arg? *)
+          let m =
+            ID.Map.map
+              (fun (vars,rhs) ->
+                 let n_vars = List.length vars in
+                 let env', tys =
+                   CCList.fold_map
+                     (fun env v -> add_bound env v, Ast.Var.ty v |> conv_ty)
+                     env vars
+                 in
+                 let rhs = conv_term_rec env' rhs in
+                 let depends_on_vars =
+                   Term.to_seq_depth rhs
+                   |> Sequence.exists
+                     (fun (t,k) -> match t.term_cell with
+                        | DB db ->
+                          DB.level db < n_vars + k (* [k]: number of intermediate binders *)
+                        | _ -> false)
+                 in
+                 if depends_on_vars then any_rhs_depends_vars := true;
+                 tys, rhs)
+              m
+          in
+          (* optim: check whether all branches return the same term, that
+             does not depend on matched variables *)
+          (* TODO: do the closedness check during conversion, above *)
+          let rhs_l =
+            ID.Map.values m
+            |> Sequence.map snd
+            |> Sequence.to_rev_list
+            |> CCList.Set.uniq ~eq:Term.equal
+          in
+          begin match rhs_l with
+            | [x] when not (!any_rhs_depends_vars) ->
+              (* every branch yields the same [x], which does not depend
+                 on the argument: remove the match and return [x] instead *)
+              x
+            | _ ->
+              let u = conv_term_rec env u in
+              Term.match_ u m
+          end
+        | Ast.Switch _ ->
+          errorf "cannot convert switch %a" Ast.pp_term t
+        | Ast.Let (v,t,u) ->
+          (* substitute on the fly *)
+          let t = conv_term_rec env t in
+          let env' = add_let_bound env v t in
+          conv_term_rec env' u
+        | Ast.If (a,b,c) ->
+          let b = conv_term_rec env b in
+          let c = conv_term_rec env c in
+          (* optim: [if _ b b --> b] *)
+          if Term.equal b c
+          then b
+          else Term.if_ (conv_term_rec env a) b c
+        | Ast.Not t -> Term.not_ (conv_term_rec env t)
+        | Ast.Binop (op,a,b) ->
+          let a = conv_term_rec env a in
+          let b = conv_term_rec env b in
+          begin match op with
+            | Ast.And -> Term.and_ a b
+            | Ast.Or -> Term.or_ a b
+            | Ast.Imply -> Term.imply a b
+            | Ast.Eq -> Term.eq a b
+          end
+      end
+
+    (* convert this term into a program constant, as much as possible.
+       It also returns a new environment containing local bindings
+       (an extension of the input env) *)
+  and term_to_value (env:conv_env) (t:Ast.term): conv_env * prgm_const =
+    begin match Ast.term_view t with
+      | _ -> 
+    end
 
     let rec conv_term_rec
         (env: conv_env)
