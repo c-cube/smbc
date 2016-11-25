@@ -22,6 +22,9 @@ module type CONFIG = sig
   (** progress display progress bar *)
 
   val pp_hashcons: bool
+
+  val dimacs_file : string option
+  (** File for dumping the SAT problem *)
 end
 
 (** {2 The Main Solver} *)
@@ -3263,7 +3266,17 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         if incomplete then PS_incomplete else PS_complete
     end
 
+  let dump_dimacs () = match Config.dimacs_file with
+    | None -> ()
+    | Some file ->
+      Log.debugf 2 (fun k->k "dump SAT problem into file `%s`" file);
+      CCIO.with_out file
+        (fun oc ->
+           let out = Format.formatter_of_out_channel oc in
+           Format.fprintf out "@[<v>%a@]@." M.export_dimacs ())
+
   let solve ?(on_exit=[]) ?(check=true) () =
+    let on_exit = dump_dimacs :: on_exit in
     let module ID = Iterative_deepening in
     (* iterated deepening *)
     let rec iter state = match state with

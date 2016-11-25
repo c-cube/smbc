@@ -8,6 +8,7 @@ type config = {
   dot_term_graph: string option;
   pp_hashcons: bool;
   progress : bool;
+  dimacs: string option;
   deepening_step: int option;
   check: bool;
 }
@@ -33,6 +34,7 @@ let solve ~config (ast:Ast.statement list) : unit =
     let pp_hashcons = config.pp_hashcons
     let progress = config.progress
     let deepening_step = config.deepening_step
+    let dimacs_file = config.dimacs
   end in
   let module S = Solver.Make(Conf)(struct end) in
   let on_exit = [] in
@@ -62,6 +64,7 @@ let depth_step_ = ref 1
 let check_ = ref false
 let timeout_ = ref ~-1
 let syntax_ = ref Ast.Auto
+let dimacs_ = ref "" (* file to put sat problem in *)
 
 let file = ref `None
 
@@ -106,6 +109,7 @@ let options =
     "--backtrace", Arg.Unit (fun () -> Printexc.record_backtrace true), " enable backtrace";
     "--depth-step", Arg.Set_int depth_step_, " increment for iterative deepening";
     "--timeout", Arg.Set_int timeout_, " timeout (in s)";
+    "--dimacs", Arg.Set_string dimacs_, " file to output dimacs problem into";
     "-t", Arg.Set_int timeout_, " alias to --timeout";
   ]
 
@@ -144,6 +148,7 @@ let () =
     print_stat = !stats_;
     progress = !progress_;
     pp_hashcons = !pp_hashcons_;
+    dimacs = (if !dimacs_ = "" then None else Some !dimacs_);
     deepening_step =
       (if !depth_step_ = 0 then None else Some !depth_step_);
     dot_term_graph =

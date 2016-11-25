@@ -15,6 +15,9 @@ module type CONFIG = sig
   (** progress display progress bar *)
 
   val pp_hashcons: bool
+
+  val dimacs_file : string option
+  (** File for dumping the SAT problem *)
 end
 
 module Make(C:CONFIG)(Dummy : sig end) : sig
