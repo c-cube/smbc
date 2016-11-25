@@ -2057,13 +2057,15 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           begin match c.cst_kind with
             | Cst_undef (_, {cst_cur_case=None;_}, _) ->
               Explanation.empty, t
-            | Cst_undef (_, ({cst_cur_case=Some (_,case');_} as info), _) ->
-              assert (match info.cst_cases with
+            | Cst_undef (_, ({cst_cur_case=Some (_,case');_} as _info), _) ->
+              (*
+              assert (match _info.cst_cases with
                 | Lazy_some l -> CCList.Set.mem ~eq:Term.equal case l | Lazy_none -> false);
+                 *)
               (* NOTE: instead of saying [c=c10 --> false] because [c:=c1],
                  or because [c:=c2], etc. we can cut more search space by
                  explaining it by [not (c=c10)]  *)
-              let lit = Lit.cst_choice c case in
+              let lit = Lit.cst_choice c case in (* TODO: instead, store cstor? *)
               if Term.equal case case'
               then Explanation.return lit, Term.true_
               else Explanation.return (Lit.neg lit), Term.false_
