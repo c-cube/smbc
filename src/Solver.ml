@@ -1726,11 +1726,16 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           compute_nf_add e th
         | P_not a ->
           compute_nf_add e (DB_env.get_exn a env)
-        | P_call (p_cont, []) -> compute_nf_prgm e p_cont env
+        | P_call (p_cont, []) -> compute_nf_prgm e p_cont DB_env.empty
         | P_call (p_cont, args) ->
-          (* push [args] on the stack, then jump *)
+          (* new stack for args, then jump *)
+          (* TODO: do not exactly wrap into [lazy]. Instead, we should have
+             a "cheap_eval" function that keeps values as they are,
+             dereferences in the environment, but do not do match/if or
+             function calls (in this case, it uses [lazy]). This makes
+             passing values cheap, and other arguments reasonable. *)
           let args = List.map (fun p_a -> Thunk.lazy_ p_a env) args in
-          let env = DB_env.push_l args env in
+          let env = DB_env.push_l args DB_env.empty in
           compute_nf_prgm e p_cont env
       end
 
