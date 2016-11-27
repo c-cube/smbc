@@ -61,7 +61,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
   type db_index = int
 
   type 'a db_env = {
-    db_st: 'a RAL.t;  (* the stack *)
+    db_st: 'a list;  (* the stack *)
     db_size: int;     (* the stack size *)
   }
 
@@ -332,25 +332,25 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
   module DB_env = struct
     type 'a t = 'a db_env
 
-    let push x env = { db_size=env.db_size+1; db_st=RAL.cons x env.db_st }
+    let push x env = { db_size=env.db_size+1; db_st=x::env.db_st }
     let push_l l env = List.fold_left (fun e x -> push x e) env l
-    let empty = {db_st=RAL.empty; db_size=0}
-    let singleton x = {db_st=RAL.return x; db_size=1}
+    let empty = {db_st=[]; db_size=0}
+    let singleton x = {db_st=[x]; db_size=1}
     let size env = env.db_size
     let get n env : _ option =
-      if n < env.db_size then Some (RAL.get_exn env.db_st n) else None
+      if n < env.db_size then Some (List.nth env.db_st n) else None
     let get_exn n env =
-      if n < env.db_size then RAL.get_exn env.db_st n else invalid_arg "DB_env.get_exn"
+      if n < env.db_size then List.nth env.db_st n else invalid_arg "DB_env.get_exn"
     let set_ n v env =
       if n >= env.db_size then invalid_arg "DB_env.set";
-      {env with db_st = RAL.set env.db_st n v}
+      {env with db_st = CCList.Idx.set env.db_st n v}
     let pp pp_x out e =
-      let l = RAL.mapi ~f:(fun i o -> i,o) e.db_st in
-      if not (RAL.is_empty l) then (
+      let l = List.mapi (fun i o -> i,o) e.db_st in
+      if not (CCList.is_empty l) then (
         let pp_pair out (i,x) =
           Format.fprintf out "@[%d: %a@]" i pp_x x
         in
-        RAL.print ~sep:"," pp_pair out l
+        Fmt.list ~sep:"," pp_pair out l
       )
   end
 
