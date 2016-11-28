@@ -138,6 +138,8 @@ val imply : term -> term -> term
 val true_ : term
 val false_ : term
 
+val unfold_fun : term -> var list * term
+
 (** {2 Printing} *)
 
 val term_to_sexp : term to_sexp

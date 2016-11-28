@@ -57,13 +57,37 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     | Lazy_some of 'a
     | Lazy_none
 
-  (* reference into the stack *)
-  type db_index = int
+  module Subst : sig
+    type +'a t
+    val empty : 'a t
+    val add : ID.t -> 'a -> 'a t -> 'a t
+    val set : ID.t -> 'a -> 'a t -> 'a t
+    val mem : ID.t -> _ t -> bool
+    val get : ID.t -> 'a t -> 'a option
+    val find : ID.t -> 'a t -> 'a
+    val add_list : (ID.t * 'a) list -> 'a t -> 'a t
+    val of_list : (ID.t * 'a) list -> 'a t
+    val pp : 'a CCFormat.printer -> 'a t CCFormat.printer
+  end = struct
+    type 'a t = 'a ID.Map.t
+    let empty = ID.Map.empty
+    let mem = ID.Map.mem
+    let add v x m = assert (not (mem v m)); ID.Map.add v x m
+    let set v x m = assert (mem v m); ID.Map.add v x m
+    let get = ID.Map.get
+    let find v m =
+      try ID.Map.find v m
+      with Not_found -> errorf "@[<2>could not find %a@ in subst@]" ID.pp v
+    let add_list l m = List.fold_left (fun m (v,t) -> add v t m) m l
+    let of_list l = add_list l empty
+    let pp pp_x out m =
+      fpf out "{@[<hv>%a@]}"
+        (ID.Map.print ~start:"" ~stop:"" ~sep:"," ~arrow:":=" ID.pp pp_x) m
+  end
 
-  type 'a db_env = {
-    db_st: 'a list;  (* the stack *)
-    db_size: int;     (* the stack size *)
-  }
+  type local_var = ID.t
+
+  let pp_local_var = ID.pp
 
   type quant =
     | Forall
@@ -76,23 +100,24 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
   (* program: the static part of computations *)
   type prgm =
     | P_return of prgm_const (* return value (in current env) *)
-    | P_let of let_kind * prgm * prgm
+    | P_let of let_kind * local_var * prgm * prgm
     (* [Let (a,b)] means putting a thunk of [a] on the stack at position [0],
        then evaluating [b] *)
-    | P_match of db_index * (int * prgm) ID.Map.t
+    | P_match of local_var * (local_var list * prgm) ID.Map.t
     (* [match k m] matches value number [k] on the stack against [m].
-       An entry [(n,cont)] in [m] means that [n] values have to be pushed
-       on the stack before calling continuation [cont] *)
-    | P_if of db_index * prgm * prgm
+       An entry [(vars,cont)] in [m] means that arguments to the constructor
+       must be bound to [vars] in the local env 
+       before calling continuation [cont] *)
+    | P_if of local_var * prgm * prgm
     (* depending on value of [k], follow one of the branches *)
-    | P_call of prgm * prgm list
+    | P_call of prgm * (local_var * prgm) list
     (* call given program with the arguments *)
     | P_lazy of prgm lazy_t
     (* used for recursion *)
-    | P_and of db_index * db_index
-    | P_not of db_index
-    | P_eq of db_index * db_index
-    | P_equiv of db_index * db_index
+    | P_and of prgm * prgm
+    | P_not of prgm
+    | P_eq of prgm * prgm
+    | P_equiv of prgm * prgm
 
   (* TODO: switch/quant/check *)
 
@@ -103,7 +128,8 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     | C_cstor of cstor * prgm_const list (* apply constructor *)
     | C_dom_elt of dom_elt (* domain element *)
     | C_const of cst_undef (* undefined constant. Will evaluated further *)
-    | C_var of db_index (* dereference eagerly *)
+    | C_var of local_var (* dereference eagerly *)
+    | C_eval of prgm
 
   (* an on-going (or terminated) computation, using call-by-need.
      A thunk is either resolved (into a weak-head normal form)
@@ -129,10 +155,10 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
        [T_ref] is useful for sharing computations. *)
     | T_lazy of prgm * eval_env
     (* unevaluated thunk *)
-    | T_suspend of prgm * db_index * eval_env * explanation
+    | T_suspend of prgm * local_var * eval_env * explanation
     (* a suspended program: the current codepointer,
-       with the stack. The evaluation is blocked because the program
-       needs the value of something on the stack (whose index is given).
+       with the local environment. The evaluation is blocked because
+       the program needs the value of something in [env] (the variable).
        There is a partial explanation attached, for when this reduces to a value *)
     | T_check_assign of cst_undef * value
     (* [T_check_assign (c,v)] is true if [c := v], false otherwise *)
@@ -141,7 +167,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
   and thunk_ref = (explanation * thunk) ref
 
   (* environment for evaluation *)
-  and eval_env = thunk db_env
+  and eval_env = thunk Subst.t
 
   (** A value in WHNF *)
   and value =
@@ -201,7 +227,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     | Ty_prop
     | Ty_atomic of ID.t * ty_atomic
   and ty_atomic =
-    | Ty_data of (cstor * ty) lazy_t list
+    | Ty_data of cstor lazy_t list
     | Ty_uninterpreted of ty_uninterpreted_slice
 
   (* this is a disjunction of sufficient conditions for the existence of
@@ -329,31 +355,6 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     module Tbl = CCHashtbl.Make(struct type t=ty let equal=equal let hash=hash end)
   end
 
-  module DB_env = struct
-    type 'a t = 'a db_env
-
-    let push x env = { db_size=env.db_size+1; db_st=x::env.db_st }
-    let push_l l env = List.fold_left (fun e x -> push x e) env l
-    let empty = {db_st=[]; db_size=0}
-    let singleton x = {db_st=[x]; db_size=1}
-    let size env = env.db_size
-    let get n env : _ option =
-      if n < env.db_size then Some (List.nth env.db_st n) else None
-    let get_exn n env =
-      if n < env.db_size then List.nth env.db_st n else invalid_arg "DB_env.get_exn"
-    let set_ n v env =
-      if n >= env.db_size then invalid_arg "DB_env.set";
-      {env with db_st = CCList.Idx.set env.db_st n v}
-    let pp pp_x out e =
-      let l = List.mapi (fun i o -> i,o) e.db_st in
-      if not (CCList.is_empty l) then (
-        let pp_pair out (i,x) =
-          Format.fprintf out "@[%d: %a@]" i pp_x x
-        in
-        Fmt.list ~sep:"," pp_pair out l
-      )
-  end
-
   module Cst_undef = struct
     type t = cst_undef
 
@@ -476,9 +477,12 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     let dom_elt c = C_dom_elt c
     let const c = C_const c
     let var v = C_var v
+    let eval p = match p with
+      | P_return c -> c (* [eval (return x) --> x] *)
+      | _ -> C_eval p
 
     let return v = P_return v
-    let let_ k a b = P_let (k,a,b)
+    let let_ k v a b = P_let (k,v,a,b)
     let match_ u m = P_match (u,m)
     let if_ a b c = P_if (a,b,c)
     let call p args = P_call (p,args)
@@ -488,7 +492,38 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     let eq a b = P_eq (a,b)
     let equiv a b = P_equiv (a,b)
 
-    let rec pp_const out = function
+    let pp_let_kind out =
+      function Let_lazy -> () | Let_eager -> Fmt.string out "!"
+
+    let pp_vars out = function
+      | [] -> ()
+      | l -> fpf out "@ %a" (Utils.pp_list pp_local_var) l
+
+    let rec pp out = function
+      | P_return v -> fpf out "(@[<2>return@ %a@])" pp_const v
+      | P_let (k,v,a,b) ->
+        fpf out "(@[<2>let%a@ %a := %a@ %a@])" pp_let_kind k ID.pp v pp a pp b
+      | P_match (u,m) ->
+        let pp_bind out (id,(vars,rhs)) =
+          fpf out "(@[<1>@[<hv2>%a%a@]@ %a@])" ID.pp id pp_vars vars pp rhs
+        in
+        let print_map =
+          Fmt.seq ~start:"" ~stop:"" ~sep:" " pp_bind
+        in
+        fpf out "(@[match %a@ (@[<hv>%a@])@])"
+          pp_local_var u print_map (ID.Map.to_seq m)
+      | P_if (a,b,c) ->
+        fpf out "(@[<hv2>if %a@ %a@ %a@])" pp_local_var a pp b pp c
+      | P_call (p,args) ->
+        let pp_arg out (v,t) = fpf out "(@[<2>%a@ := %a@])" pp_local_var v pp t in
+        fpf out "(@[<2>call@ %a@ args: [@[%a@]]@])" pp p (Utils.pp_list pp_arg) args
+      | P_lazy _ -> Fmt.string out "<lazy>"
+      | P_and (a,b) -> fpf out "(@[<2>and@ %a@ %a@])" pp a pp b
+      | P_eq (a,b) -> fpf out "(@[<2>eq@ %a@ %a@])" pp a pp b
+      | P_equiv (a,b) -> fpf out "(@[<2>equiv@ %a@ %a@])" pp a pp b
+      | P_not a -> fpf out "(@[not@ %a@])" pp a
+
+    and pp_const out = function
       | C_true -> Fmt.string out "true"
       | C_false -> Fmt.string out "false"
       | C_cstor (a,[]) -> ID.pp out a.cstor_id
@@ -496,32 +531,8 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         fpf out "(@[%a@ %a@])" ID.pp a.cstor_id (Utils.pp_list pp_const) l
       | C_const c -> Cst_undef.pp out c
       | C_dom_elt c -> ID.pp out c.dom_elt_id
-      | C_var v -> pp_db out v
-
-    let pp_let_kind out =
-      function Let_lazy -> () | Let_eager -> Fmt.string out "!"
-
-    let rec pp out = function
-      | P_return v -> fpf out "(@[<2>return@ %a@])" pp_const v
-      | P_let (k,a,b) -> fpf out "(@[<2>let%a@ %a@ %a@])" pp_let_kind k pp a pp b
-      | P_match (u,m) ->
-        let pp_bind out (id,(n,rhs)) =
-          fpf out "(@[<1>%a/%d@ %a@])" ID.pp id n pp rhs
-        in
-        let print_map =
-          Fmt.seq ~start:"" ~stop:"" ~sep:" " pp_bind
-        in
-        fpf out "(@[match %a@ (@[<hv>%a@])@])"
-          pp_db u print_map (ID.Map.to_seq m)
-      | P_if (a,b,c) ->
-        fpf out "(@[<hv2>if %a@ %a@ %a@])" pp_db a pp b pp c
-      | P_call (p,args) ->
-        fpf out "(@[<2>call@ %a@ args: [@[%a@]]@])" pp p (Utils.pp_list pp) args
-      | P_lazy _ -> Fmt.string out "<lazy>"
-      | P_and (a,b) -> fpf out "(@[<2>and@ %a@ %a@])" pp_db a pp_db b
-      | P_eq (a,b) -> fpf out "(@[<2>eq@ %a@ %a@])" pp_db a pp_db b
-      | P_equiv (a,b) -> fpf out "(@[<2>equiv@ %a@ %a@])" pp_db a pp_db b
-      | P_not a -> fpf out "(@[not@ %a@])" pp_db a
+      | C_var v -> pp_local_var out v
+      | C_eval p -> fpf out "(@[eval@ %a@])" pp p
   end
 
   let cmp_dep_ a b =
@@ -551,10 +562,10 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     | T_ref {contents=(_,u)} -> fpf out "(@[<2>ref@ %a@])" pp_thunk u
     | T_lazy (p,env) ->
       fpf out "(@[<2>lazy %a@ [@[%a@]]@])"
-        Prgm.pp p (DB_env.pp pp_thunk) env
-    | T_suspend (p,i,env,_) ->
-      fpf out "(@[<2>suspend %a@ [@[%a@]]/%d@])"
-        Prgm.pp p (DB_env.pp pp_thunk) env i
+        Prgm.pp p (Subst.pp pp_thunk) env
+    | T_suspend (p,v,env,_) ->
+      fpf out "(@[<2>suspend `@[%a@]`@ on %a@ in [@[%a@]]@])"
+        Prgm.pp p pp_local_var v (Subst.pp pp_thunk) env
     | T_check_assign (c,v) ->
       fpf out "(@[<2>check %a :=@ %a@])" Cst_undef.pp c pp_value v
 
@@ -612,7 +623,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       | T_par_and (a,_,b,_) | T_equiv (a,b) | T_eq (a,b) ->
         merge_deps (deps a) (deps b)
       | T_ref {contents=(_,u)} -> deps u
-      | T_suspend (_,i,env,_) -> deps (DB_env.get_exn i env)
+      | T_suspend (_,v,env,_) -> deps (Subst.find v env)
 
     let mk_ view = {
       t_view=view;
@@ -663,14 +674,14 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
 
     let lazy_ p env = mk_ (T_lazy (p, env))
 
-    let suspend p i env e =
-      assert (i >= 0 && i < DB_env.size env);
-      mk_ (T_suspend (p,i,env,e))
+    let suspend p v env e =
+      assert (Subst.mem v env);
+      mk_ (T_suspend (p,v,env,e))
 
     let pp = pp_thunk
 
     (* evaluate program literal under given environment *)
-    let rec eval_const (env:thunk db_env) (v:prgm_const) : thunk =
+    let rec eval_const (env:eval_env) (v:prgm_const) : thunk =
       begin match v with
         | C_true -> true_
         | C_false -> false_
@@ -678,7 +689,8 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         | C_cstor (a,l) -> cstor a (List.map (eval_const env) l)
         | C_dom_elt c -> dom_elt c
         | C_const c -> cst_undef c
-        | C_var i -> DB_env.get_exn i env
+        | C_var v -> Subst.find v env
+        | C_eval p -> lazy_ p env (* freeze for now *)
       end
 
     (* return [Some] iff the term is an undefined constant *)
@@ -1320,7 +1332,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         | Ty_atomic (_, Ty_data cstors) ->
           (* datatype: refine by picking the head constructor *)
           List.map
-            (fun (lazy (c_id, c_ty)) ->
+            (fun (lazy ({cstor_id=c_id; cstor_ty=c_ty} as c)) ->
                let rec case = lazy (
                  let ty_args, _ = Ty.unfold c_ty in
                  (* elements of [memo] already used when generating the
@@ -1341,7 +1353,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
                         Thunk.cst_undef c)
                      ty_args
                  in
-                 Value.cstor c_id args
+                 Value.cstor c args
                ) in
                Lazy.force case)
             cstors, []
@@ -1648,15 +1660,15 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         | T_lazy (p, env) ->
           (* start execution of [p] in environment [env] *)
           compute_nf_prgm E.empty p env
-        | T_suspend (p, i, env, e) ->
-          let t_i = DB_env.get_exn i env in
+        | T_suspend (p, v, env, e) ->
+          let t_i = Subst.find v env in
           let e, t_i' = compute_nf_add e t_i in
-          let env' = if t_i==t_i' then env else DB_env.set_ i t_i' env in
+          let env' = if t_i==t_i' then env else Subst.set v t_i' env in
           if Thunk.is_value t_i'
           then compute_nf_prgm e p env'
           else (
             (* do not return yet *)
-            let new_t = if env==env' then t else Thunk.suspend p i env' e in
+            let new_t = if env==env' then t else Thunk.suspend p v env' e in
             E.empty, new_t
           )
       end
@@ -1673,29 +1685,29 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           (* eval [c] in current environment *)
           let th = Thunk.eval_const env c in
           compute_nf_add e th
-        | P_let (Let_eager, a, b) ->
+        | P_let (Let_eager, v, a, b) ->
           (* evaluate [a] right now and push it on the stack *)
           let e, th_a = compute_nf_prgm e a env in
-          let env = DB_env.push th_a env in
+          let env = Subst.add v th_a env in
           compute_nf_prgm e b env
-        | P_let (Let_lazy, a, b) ->
+        | P_let (Let_lazy, v, a, b) ->
           (* push a lazy thunk for computing [a] onto the stack, then eval [b] *)
           let th_a = Thunk.ref_ (Thunk.lazy_ a env) in
-          let env = DB_env.push th_a env in
+          let env = Subst.add v th_a env in
           compute_nf_prgm e b env
         | P_lazy (lazy p_cont) -> compute_nf_prgm e p_cont env
         | P_match (v, m) ->
-          let th = DB_env.get_exn v env in
+          let th = Subst.find v env in
           let e, th' = compute_nf_add e th in
-          let env' = if th==th' then env else DB_env.set_ v th' env in
+          let env' = if th==th' then env else Subst.set v th' env in
           begin match Thunk.view th with
             | T_value (V_cstor (c, args)) ->
               begin match ID.Map.get c.cstor_id m with
                 | None -> assert false
-                | Some (n, p_cont) ->
+                | Some (vars, p_cont) ->
                   (* follow [p_cont] *)
-                  assert (n = List.length args);
-                  let env' = DB_env.push_l args env' in
+                  assert (List.length vars = List.length args);
+                  let env' = List.fold_right2 Subst.add vars args env' in
                   compute_nf_prgm e p_cont env'
               end
             | T_value _ -> assert false
@@ -1704,9 +1716,9 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
               E.empty, Thunk.suspend p v env' e
           end
         | P_if (v,a,b) ->
-          let th = DB_env.get_exn v env in
+          let th = Subst.find v env in
           let e, th' = compute_nf_add e th in
-          let env' = if th==th' then env else DB_env.set_ v th' env in
+          let env' = if th==th' then env else Subst.set v th' env in
           begin match Thunk.view th with
             | T_value V_true -> compute_nf_prgm e a env'
             | T_value V_false -> compute_nf_prgm e b env'
@@ -1716,17 +1728,24 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
               E.empty, Thunk.suspend p v env' e
           end
         | P_equiv (a,b) ->
-          let th = Thunk.equiv (DB_env.get_exn a env) (DB_env.get_exn b env) in
+          let th_a = Thunk.ref_ (Thunk.lazy_ a env) in
+          let th_b = Thunk.ref_ (Thunk.lazy_ b env) in
+          let th = Thunk.equiv th_a th_b in
           compute_nf_add e th
         | P_eq (a,b) ->
-          let th = Thunk.eq (DB_env.get_exn a env) (DB_env.get_exn b env) in
+          let th_a = Thunk.ref_ (Thunk.lazy_ a env) in
+          let th_b = Thunk.ref_ (Thunk.lazy_ b env) in
+          let th = Thunk.eq th_a th_b in
           compute_nf_add e th
         | P_and (a,b) ->
-          let th = Thunk.and_ (DB_env.get_exn a env) (DB_env.get_exn b env) in
+          let th_a = Thunk.ref_ (Thunk.lazy_ a env) in
+          let th_b = Thunk.ref_ (Thunk.lazy_ b env) in
+          let th = Thunk.and_ th_a th_b in
           compute_nf_add e th
         | P_not a ->
-          compute_nf_add e (DB_env.get_exn a env)
-        | P_call (p_cont, []) -> compute_nf_prgm e p_cont DB_env.empty
+          let th_a = Thunk.ref_ (Thunk.lazy_ a env) in
+          compute_nf_add e (Thunk.not_ th_a)
+        | P_call (p_cont, []) -> compute_nf_prgm e p_cont Subst.empty
         | P_call (p_cont, args) ->
           (* new stack for args, then jump *)
           (* TODO: do not exactly wrap into [lazy]. Instead, we should have
@@ -1734,8 +1753,8 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
              dereferences in the environment, but do not do match/if or
              function calls (in this case, it uses [lazy]). This makes
              passing values cheap, and other arguments reasonable. *)
-          let args = List.map (fun p_a -> Thunk.lazy_ p_a env) args in
-          let env = DB_env.push_l args DB_env.empty in
+          let args = List.map (fun (v,p_a) -> v,Thunk.lazy_ p_a env) args in
+          let env = Subst.of_list args in
           compute_nf_prgm e p_cont env
       end
 
@@ -2229,34 +2248,24 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     type decl_ty_entry =
       | Decl_cst_undef of cst_undef
       | Decl_cstor of cstor
+      | Decl_fun of prgm lazy_t * local_var list (* defined function + set of variables *)
 
     (* for converting constants *)
     let decl_ty_ : decl_ty_entry lazy_t ID.Tbl.t = ID.Tbl.create 16
 
     (* environment for variables *)
     type conv_env = {
-      bindings: (prgm * int) ID.Map.t;
-      (* set ofbound variables. int=depth at binding position (for shifting) *)
-      depth: int;
-      (* size of [bindings] *)
+      subst: local_var Subst.t;
+      (* local renaming *)
     }
 
-    let empty_env : conv_env =
-      {let_bound=ID.Map.empty; bound=ID.Map.empty; depth=0}
+    let empty_env : conv_env = { subst=Subst.empty }
 
-    let add_bound env v =
-      { env with
-        depth=env.depth+1;
-        bound=ID.Map.add (Ast.Var.id v) env.depth env.bound }
-
-    (* add [v := t] to bindings. Depth is not increment (there will be no binders) *)
-    let add_let_bound env v t =
-      { env with
-        let_bound=ID.Map.add (Ast.Var.id v) (t,env.depth) env.let_bound }
+    let add_bound env v v' = { subst=Subst.add v v' env.subst }
 
     let find_env env v =
       let id = Ast.Var.id v in
-      ID.Map.get id env.let_bound, ID.Map.get id env.bound
+      Subst.get id env.subst
 
     let rec conv_ty (ty:Ast.Ty.t): Ty.t = match ty with
       | Ast.Ty.Prop -> Ty.prop
@@ -2266,79 +2275,65 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         end
       | Ast.Ty.Arrow (a,b) -> Ty.arrow (conv_ty a) (conv_ty b)
 
-    (* TODO:
-       translate terms into programs (with some additional fun
-       that converts to values, to be used to return values more
-       efficiently: when returning [cstor args], use the specialized
-       fun to convert [args] into values, too).
+    let gensym =
+      let n = ref 0 in
+      fun prefix ->
+        incr n;
+        ID.makef "%s_%d" prefix !n
 
-       Most operations should be relatively straightforward. For the
-       other (mostly values) we separate the computations
-       and the resulting shape by introducing let-bindings.
-       The function returning values should also return some lazy let bindings
-       that will wrap the entire value. *)
+    let gensym_ty ty = gensym (Ty.mangle (conv_ty ty))
 
     (* compilation to programs *)
-    let rec term_to_prgm (env:conv_env) (t:Ast.term): prgm =
+    let rec term_to_prgm_rec (env:conv_env) (t:Ast.term): prgm =
       begin match Ast.term_view t with
-        | Ast.True -> Prgm.true_
-        | Ast.False -> Prgm.false_
+        | Ast.True -> Prgm.true_ |> Prgm.return
+        | Ast.False -> Prgm.false_ |> Prgm.return
         | Ast.Const id ->
           begin match ID.Tbl.get decl_ty_ id with
-            | Some (lazy (Decl_cst_undef c)) -> Prgm.const c
-            | Some (lazy (Decl_cstor c)) -> Prgm.cstor0 c
+            | Some (lazy (Decl_cst_undef c)) -> Prgm.const c |> Prgm.return
+            | Some (lazy (Decl_cstor c)) -> Prgm.cstor0 c |> Prgm.return
+            | Some (lazy (Decl_fun (body,[]))) -> Prgm.call (Prgm.lazy_ body) []
+            | Some (lazy (Decl_fun (_,_::_))) ->
+              errorf "cannot partially apply function `%a`" ID.pp id
             | None ->
               errorf "could not find constant `%a`" ID.pp id
           end
         | Ast.App (f, l) ->
           (* first, convert [l] *)
-          let env', bindings =
-            CCList.fold_map
-              (fun env arg ->
-                 let arg = term_to_prgm env arg in
-                 (* let! introduce the argument *)
-                 let v = ID.make "_" in
-                 let env = add_bound env v in
-                 env, (v, arg))
-              env l
-          in
-          let args = List.map (fun (v,_) -> Prgm.var
-          let res = match Ast.term_view f with
+          let l = List.map (term_to_prgm_rec env) l in
+          begin match Ast.term_view f with
             | Ast.Const id when ID.Tbl.mem decl_ty_ id ->
               let lazy entry = ID.Tbl.find decl_ty_ id in
               begin match entry with
                 | Decl_cstor c ->
-                  Prgm.cstor c (List.map (fun (v,_) -> Prgm.var v)) bindings
-                | _ -> Prgm.call (term_to_prgm env f)
-                | Decl_cst_undef c ->
-                  Prgm.call (Prgm.const c) (
+                  (* [f] is a constructor, use [C_cstor] *)
+                  Prgm.cstor c (List.map Prgm.eval l) |> Prgm.return
+                | Decl_fun (body,vars) ->
+                  if List.length vars <> List.length l then (
+                    errorf "cannot partially apply function `%a`" ID.pp id
+                  );
+                  let args = List.combine vars l in
+                  Prgm.call (Prgm.lazy_ body) args
+                | Decl_cst_undef _ ->
+                  errorf "cannot call undef fun %a" ID.pp id (* TODO *)
               end
-
             | _ ->
-              let f = conv_term_rec env f in
-              let l = List.map (conv_term_rec env) bindings in
-              Prgm.call f l
+              errorf "cannot call %a" Ast.pp_term f
           end
         | Ast.Var v ->
-          begin match find_env env v with
-            | Some (t', depth_t'), _ ->
-              assert (env.depth >= depth_t');
-              let t' = Term.shift_db (env.depth - depth_t') t' in
-              t'
-            | None, Some d ->
-              let ty = Ast.Var.ty v |> conv_ty in
-              let level = env.depth - d - 1 in
-              Term.db (DB.make level ty)
-            | None, None -> errorf "could not find var `%a`" Ast.Var.pp v
+          (* lookup in env *)
+          begin match Subst.get (Ast.Var.id v) env.subst with
+            | Some v' -> Prgm.var v' |> Prgm.return
+            | None -> 
+              Prgm.var (Ast.Var.id v) |> Prgm.return
           end
-        | Ast.Fun (v,body) ->
-          let env' = add_bound env v in
-          let body = conv_term_rec env' body in
-          let ty = Ast.Var.ty v |> conv_ty in
-          Term.fun_ ty body
+        | Ast.Fun _ ->
+          assert false (* TODO? *)
         | Ast.Forall (v,body) ->
+          assert false
+            (* TODO
           let env' = add_bound env v in
-          let body = conv_term_rec env' body in
+          let body = term_to_prgm env' body in
           let uty =
             let ty = Ast.Var.ty v |> conv_ty in
             match Ty.view ty with
@@ -2346,9 +2341,12 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
               | _ -> errorf "forall: need to quantify on an uninterpreted type, not %a" Ty.pp ty
           in
           Term.forall uty body
+               *)
         | Ast.Exists (v,body) ->
+          assert false
+            (* TODO
           let env' = add_bound env v in
-          let body = conv_term_rec env' body in
+          let body = term_to_prgm env' body in
           let uty =
             let ty = Ast.Var.ty v |> conv_ty in
             match Ty.view ty with
@@ -2356,11 +2354,17 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
               | _ -> errorf "exists: need to quantify on an uninterpreted type, not %a" Ty.pp ty
           in
           Term.exists uty body
+               *)
         | Ast.Mu (v,body) ->
+          assert false
+            (* TODO
           let env' = add_bound env v in
-          let body = conv_term_rec env' body in
+          let body = term_to_prgm env' body in
           Term.mu body
+            *)
         | Ast.Match (u,m) ->
+          let u = term_to_prgm_rec env u in
+          (* TODO: fix this?
           let any_rhs_depends_vars = ref false in (* some RHS depends on matched arg? *)
           let m =
             ID.Map.map
@@ -2371,7 +2375,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
                      (fun env v -> add_bound env v, Ast.Var.ty v |> conv_ty)
                      env vars
                  in
-                 let rhs = conv_term_rec env' rhs in
+                 let rhs = term_to_prgm env' rhs in
                  let depends_on_vars =
                    Term.to_seq_depth rhs
                    |> Sequence.exists
@@ -2386,12 +2390,11 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           in
           (* optim: check whether all branches return the same term, that
              does not depend on matched variables *)
-          (* TODO: do the closedness check during conversion, above *)
           let rhs_l =
             ID.Map.values m
             |> Sequence.map snd
             |> Sequence.to_rev_list
-            |> CCList.Set.uniq ~eq:Term.equal
+            |> CCList.Set.uniq ~eq:Prgm.equal
           in
           begin match rhs_l with
             | [x] when not (!any_rhs_depends_vars) ->
@@ -2399,171 +2402,66 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
                  on the argument: remove the match and return [x] instead *)
               x
             | _ ->
-              let u = conv_term_rec env u in
+              let u = term_to_prgm env u in
               Term.match_ u m
           end
+          *)
+          let m =
+            ID.Map.map
+              (fun (vars,rhs) ->
+                 let bindings =
+                   List.map (fun v -> Ast.Var.id v, gensym_ty (Ast.Var.ty v)) vars
+                 in
+                 let env' = {subst=Subst.add_list bindings env.subst} in
+                 List.map snd bindings, term_to_prgm_rec env' rhs)
+              m
+          in
+          (* result is: [let v = u in match v m] *)
+          let v = gensym (Ty.mangle (conv_ty t.Ast.ty )) in
+          Prgm.let_ Let_eager v u (Prgm.match_ v m)
         | Ast.Switch _ ->
           errorf "cannot convert switch %a" Ast.pp_term t
         | Ast.Let (v,t,u) ->
-          (* substitute on the fly *)
-          let t = conv_term_rec env t in
-          let env' = add_let_bound env v t in
-          conv_term_rec env' u
+          let t = term_to_prgm_rec env t in
+          let v' = ID.copy (Ast.Var.id v) in
+          let env' = add_bound env (Ast.Var.id v) v' in
+          let u = term_to_prgm_rec env' u in
+          Prgm.let_ Let_lazy v' t u
         | Ast.If (a,b,c) ->
-          let b = conv_term_rec env b in
-          let c = conv_term_rec env c in
+          let v = gensym_ty a.Ast.ty in
+          let a = term_to_prgm_rec env a in
+          let b = term_to_prgm_rec env b in
+          let c = term_to_prgm_rec env c in
+          Prgm.let_ Let_eager v a (Prgm.if_ v b c)
+          (* TODO
           (* optim: [if _ b b --> b] *)
           if Term.equal b c
           then b
-          else Term.if_ (conv_term_rec env a) b c
-        | Ast.Not t -> Term.not_ (conv_term_rec env t)
+          else Term.if_ (term_to_prgm env a) b c
+          *)
+        | Ast.Not t -> Prgm.not_ (term_to_prgm_rec env t)
         | Ast.Binop (op,a,b) ->
-          let a = conv_term_rec env a in
-          let b = conv_term_rec env b in
+          let ty_a = a.Ast.ty in
+          let a = term_to_prgm_rec env a in
+          let b = term_to_prgm_rec env b in
           begin match op with
-            | Ast.And -> Term.and_ a b
-            | Ast.Or -> Term.or_ a b
-            | Ast.Imply -> Term.imply a b
-            | Ast.Eq -> Term.eq a b
+            | Ast.And -> Prgm.and_ a b
+            | Ast.Or -> Prgm.not_ (Prgm.and_ (Prgm.not_ a) (Prgm.not_ b))
+            | Ast.Imply -> Prgm.not_ (Prgm.and_ a (Prgm.not_ b))
+            | Ast.Eq ->
+              if Ast.Ty.equal Ast.Ty.prop ty_a
+              then Prgm.equiv a b
+              else Prgm.eq a b
           end
       end
 
-    (* convert this term into a program constant, as much as possible.
-       It also returns a new environment containing local bindings
-       (an extension of the input env) *)
-  and term_to_value (env:conv_env) (t:Ast.term): conv_env * prgm_const =
-    begin match Ast.term_view t with
-      | _ -> 
-    end
-
-    let rec conv_term_rec
-        (env: conv_env)
-        (t:Ast.term): term = match Ast.term_view t with
-      | Ast.True -> Term.true_
-      | Ast.False -> Term.false_
-      | Ast.Const id ->
-        begin
-          try ID.Tbl.find decl_ty_ id |> Lazy.force |> Term.const
-          with Not_found ->
-            errorf "could not find constant `%a`" ID.pp id
-        end
-      | Ast.App (f, l) ->
-        let f = conv_term_rec env f in
-        let l = List.map (conv_term_rec env) l in
-        Term.app f l
-      | Ast.Var v ->
-        begin match find_env env v with
-          | Some (t', depth_t'), _ ->
-            assert (env.depth >= depth_t');
-            let t' = Term.shift_db (env.depth - depth_t') t' in
-            t'
-          | None, Some d ->
-            let ty = Ast.Var.ty v |> conv_ty in
-            let level = env.depth - d - 1 in
-            Term.db (DB.make level ty)
-          | None, None -> errorf "could not find var `%a`" Ast.Var.pp v
-        end
-      | Ast.Fun (v,body) ->
-        let env' = add_bound env v in
-        let body = conv_term_rec env' body in
-        let ty = Ast.Var.ty v |> conv_ty in
-        Term.fun_ ty body
-      | Ast.Forall (v,body) ->
-        let env' = add_bound env v in
-        let body = conv_term_rec env' body in
-        let uty =
-          let ty = Ast.Var.ty v |> conv_ty in
-          match Ty.view ty with
-            | Atomic (_, Uninterpreted uty) -> uty
-            | _ -> errorf "forall: need to quantify on an uninterpreted type, not %a" Ty.pp ty
-        in
-        Term.forall uty body
-      | Ast.Exists (v,body) ->
-        let env' = add_bound env v in
-        let body = conv_term_rec env' body in
-        let uty =
-          let ty = Ast.Var.ty v |> conv_ty in
-          match Ty.view ty with
-            | Atomic (_, Uninterpreted uty) -> uty
-            | _ -> errorf "exists: need to quantify on an uninterpreted type, not %a" Ty.pp ty
-        in
-        Term.exists uty body
-      | Ast.Mu (v,body) ->
-        let env' = add_bound env v in
-        let body = conv_term_rec env' body in
-        Term.mu body
-      | Ast.Match (u,m) ->
-        let any_rhs_depends_vars = ref false in (* some RHS depends on matched arg? *)
-        let m =
-          ID.Map.map
-            (fun (vars,rhs) ->
-               let n_vars = List.length vars in
-               let env', tys =
-                 CCList.fold_map
-                   (fun env v -> add_bound env v, Ast.Var.ty v |> conv_ty)
-                   env vars
-               in
-               let rhs = conv_term_rec env' rhs in
-               let depends_on_vars =
-                 Term.to_seq_depth rhs
-                 |> Sequence.exists
-                   (fun (t,k) -> match t.term_cell with
-                      | DB db ->
-                        DB.level db < n_vars + k (* [k]: number of intermediate binders *)
-                      | _ -> false)
-               in
-               if depends_on_vars then any_rhs_depends_vars := true;
-               tys, rhs)
-            m
-        in
-        (* optim: check whether all branches return the same term, that
-           does not depend on matched variables *)
-        (* TODO: do the closedness check during conversion, above *)
-        let rhs_l =
-          ID.Map.values m
-          |> Sequence.map snd
-          |> Sequence.to_rev_list
-          |> CCList.Set.uniq ~eq:Term.equal
-        in
-        begin match rhs_l with
-          | [x] when not (!any_rhs_depends_vars) ->
-            (* every branch yields the same [x], which does not depend
-               on the argument: remove the match and return [x] instead *)
-            x
-          | _ ->
-            let u = conv_term_rec env u in
-            Term.match_ u m
-        end
-      | Ast.Switch _ ->
-        errorf "cannot convert switch %a" Ast.pp_term t
-      | Ast.Let (v,t,u) ->
-        (* substitute on the fly *)
-        let t = conv_term_rec env t in
-        let env' = add_let_bound env v t in
-        conv_term_rec env' u
-      | Ast.If (a,b,c) ->
-        let b = conv_term_rec env b in
-        let c = conv_term_rec env c in
-        (* optim: [if _ b b --> b] *)
-        if Term.equal b c
-        then b
-        else Term.if_ (conv_term_rec env a) b c
-      | Ast.Not t -> Term.not_ (conv_term_rec env t)
-      | Ast.Binop (op,a,b) ->
-        let a = conv_term_rec env a in
-        let b = conv_term_rec env b in
-        begin match op with
-          | Ast.And -> Term.and_ a b
-          | Ast.Or -> Term.or_ a b
-          | Ast.Imply -> Term.imply a b
-          | Ast.Eq -> Term.eq a b
-        end
-
-    let conv_term t =
-      let t' = conv_term_rec empty_env t in
+    let term_to_prgm t : prgm =
+      let t' = term_to_prgm_rec empty_env t in
       Log.debugf 2
-        (fun k->k "(@[conv_term@ @[%a@]@ yields: %a@])" Ast.pp_term t Term.pp t');
+        (fun k->k "(@[term_to_prgm@ @[%a@]@ yields: %a@])" Ast.pp_term t Prgm.pp t');
       t'
+
+    let term_to_thunk t : thunk = Thunk.lazy_ (term_to_prgm t) Subst.empty
 
     let add_statement st =
       Log.debugf 2
@@ -2571,26 +2469,34 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       model_env_ := Ast.env_add_statement !model_env_ st;
       match st with
         | Ast.Assert t ->
-          let t = conv_term t in
+          let t = term_to_thunk t in
           Top_goals.push t;
           push_clause (Clause.make [Lit.atom t])
         | Ast.Goal (vars, t) ->
           (* skolemize *)
-          let env, consts =
-            CCList.fold_map
-              (fun env v ->
+          let bindings =
+            List.map
+              (fun v ->
                  let ty = Ast.Var.ty v |> conv_ty in
-                 let c = Cst_undef.make_undef ~depth:0 (Ast.Var.id v) ty in
-                 add_let_bound env v (Term.const c), c)
-              empty_env
+                 let c = Cst_undef.make ~depth:0 (Ast.Var.id v) ty in
+                 Ast.Var.id v, c)
               vars
           in
           (* model should contain values of [consts] *)
-          List.iter add_cst_support_ consts;
-          let t = conv_term_rec env t in
+          List.iter add_cst_support_ (List.map snd bindings);
+          (* [let v1=c1 in … in t] *)
+          let t =
+            term_to_prgm t
+            |> List.fold_right
+              (fun (v,c) t -> Prgm.let_ Let_eager v (Prgm.const c |> Prgm.return) t)
+              bindings
+          in
+          let t = Thunk.ref_ (Thunk.lazy_ t Subst.empty) in
           Top_goals.push t;
           push_clause (Clause.make [Lit.atom t])
         | Ast.TyDecl id ->
+          assert false
+          (* TODO
           let rec ty = lazy (
             let ty0 = {
               uty_self=ty;
@@ -2604,12 +2510,16 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           (* model should contain domain of [ty] *)
           add_ty_support_ (Lazy.force ty);
           ID.Tbl.add ty_tbl_ id ty
+             *)
         | Ast.Decl (id, ty) ->
+          assert false
+          (* TODO
           assert (not (ID.Tbl.mem decl_ty_ id));
           let ty = conv_ty ty in
           let cst = Cst_undef.make_undef ~depth:0 id ty in
           add_cst_support_ cst; (* need it in model *)
           ID.Tbl.add decl_ty_ id (Lazy.from_val cst)
+             *)
         | Ast.Data l ->
           (* declare the type, and all the constructors *)
           List.iter
@@ -2619,15 +2529,12 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
                    ID.Map.to_seq data_cstors
                    |> Sequence.map
                      (fun (id_c, ty_c) ->
-                        let c = lazy (
-                          let ty_c = conv_ty ty_c in
-                          Cst_undef.make_cstor id_c ty_c
-                        ) in
-                        ID.Tbl.add decl_ty_ id_c c; (* declare *)
+                        let c = lazy {cstor_id=id_c; cstor_ty=conv_ty ty_c} in
+                        ID.Tbl.add decl_ty_ id_c (lazy (Decl_cstor (Lazy.force c)));
                         c)
                    |> Sequence.to_rev_list
                  in
-                 Ty.atomic data_id (Data cstors)
+                 Ty.atomic data_id (Ty_data cstors);
                ) in
                ID.Tbl.add ty_tbl_ data_id ty;
             )
@@ -2640,24 +2547,22 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         | Ast.Define l ->
           (* declare the mutually recursive functions *)
           List.iter
-            (fun (id,ty,rhs) ->
-               let ty = conv_ty ty in
-               let rhs = lazy (conv_term rhs) in
-               let cst = lazy (
-                 Cst_undef.make_defined id ty rhs
-               ) in
-               ID.Tbl.add decl_ty_ id cst)
+            (fun (id,_ty,rhs) ->
+               let vars, body = Ast.unfold_fun rhs in
+               let body = lazy (term_to_prgm body) in
+               ID.Tbl.add decl_ty_ id
+                 (lazy (Decl_fun (body, List.map Ast.Var.id vars))))
             l;
           (* force thunks *)
           List.iter
             (fun (id,_,_) ->
-               let c = ID.Tbl.find decl_ty_ id |> Lazy.force in
-               begin match c.cst_kind with
-                 | Cst_defined  (_, lazy _) -> () (* also force definition *)
+               let entry = ID.Tbl.find decl_ty_ id |> Lazy.force in
+               begin match entry with
+                 | Decl_fun (lazy _, _) -> () (* also force definition *)
                  | _ -> assert false
                end;
                (* also register the constant for expansion *)
-               declare_defined_cst c
+               declare_defined_cst entry
             )
             l
 
@@ -2665,10 +2570,10 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
 
     module A = Ast
 
-    let rec ty_to_ast (t:Ty.t): A.Ty.t = match t.ty_cell with
-      | Prop -> A.Ty.Prop
-      | Atomic (id,_) -> A.Ty.const id
-      | Arrow (a,b) -> A.Ty.arrow (ty_to_ast a) (ty_to_ast b)
+    let rec ty_to_ast (t:Ty.t): A.Ty.t = match Ty.view t with
+      | Ty_prop -> A.Ty.Prop
+      | Ty_atomic (id,_) -> A.Ty.const id
+      | Ty_arrow (a,b) -> A.Ty.arrow (ty_to_ast a) (ty_to_ast b)
 
     let fresh_var =
       let n = ref 0 in
@@ -2679,14 +2584,18 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
 
     let with_var ty env ~f =
       let v = fresh_var ty in
-      let env = DB_env.push (A.var v) env in
+      let env = Subst.add (A.Var.id v) (A.var v) env in
       f v env
 
     let with_vars tys env ~f =
       let vars = List.map fresh_var tys in
-      let env = DB_env.push_l (List.map A.var vars) env in
+      let env =
+        Subst.add_list (List.map (fun v->Ast.Var.id v, A.var v) vars) env
+      in
       f vars env
 
+    let rec term_to_ast (t:thunk): Ast.term = assert false
+    (* TODO
     let term_to_ast (t:term): Ast.term =
       let rec aux env t = match t.term_cell with
         | True -> A.true_
@@ -2740,6 +2649,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           aux env (Term.eq (Term.const c) t) (* becomes a mere equality *)
         | Check_empty_uty _ -> assert false
       in aux DB_env.empty t
+       *)
   end
 
   (** {2 Main} *)
@@ -2758,7 +2668,8 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     | Unknown of unknown
 
   (* follow "normal form" pointers deeply in the term *)
-  let deref_deep (doms:cst list Ty.Tbl.t) (t:term) : term =
+  let deref_deep (doms:cst_undef list Ty.Tbl.t) (t:thunk) : thunk =
+    (* TODO
     let rec aux t =
       let _, t = Reduce.compute_nf t in
       match t.term_cell with
@@ -2812,8 +2723,10 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           -> assert false
     in
     aux t
+    *)
+    assert false
 
-  let rec find_domain_ (uty:ty_uninterpreted_slice): cst list =
+  let rec find_domain_ (uty:ty_uninterpreted_slice): cst_undef list =
     match uty.uty_status, uty.uty_pair with
       | _, Lazy_none -> [] (* we did not need this slice *)
       | None, Lazy_some _ -> assert false
@@ -2828,8 +2741,8 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       !model_utys
       |> Sequence.of_list
       |> Sequence.map
-        (fun ty -> match ty.ty_cell with
-           | Atomic (_, Uninterpreted uty) -> ty, find_domain_ uty
+        (fun ty -> match Ty.view ty with
+           | Ty_atomic (_, Ty_uninterpreted uty) -> ty, find_domain_ uty
            | _ -> assert false)
       |> Ty.Tbl.of_seq
     in
@@ -2840,7 +2753,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       |> Sequence.map
         (fun c ->
            (* find normal form of [c] *)
-           let t = Term.const c in
+           let t = Thunk.cst_undef c in
            let t = deref_deep doms t |> Conv.term_to_ast in
            c.cst_id, t)
       |> ID.Map.of_seq
@@ -2953,11 +2866,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           |> Sequence.flat_map Clause.to_seq
           |> Sequence.exists
             (fun lit -> match Lit.view lit with
-               | Lit_assign (c,_) ->
-                 begin match c.cst_kind with
-                   | Cst_undef (_, i, _) when not i.cst_complete -> true
-                   | _ -> false
-                 end
+               | Lit_assign (c,_) -> not c.cst_complete
                | _ -> false)
         in
         if incomplete then PS_incomplete else PS_complete
