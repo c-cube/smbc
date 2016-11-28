@@ -714,6 +714,44 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         | C_eval p -> lazy_ p env (* freeze for now *)
       end
 
+    (* under-approximation of equality *)
+    let rec equal_simple (a:t)(b:t): bool =
+      a == b ||
+      begin match view a, view b with
+        | T_value v1, T_value v2 ->
+          equal_value_simple v1 v2
+        | T_const c1, T_const c2 -> Cst_undef.equal c1 c2
+        | T_check_assign (c1,v1), T_check_assign (c2,v2) ->
+          Cst_undef.equal c1 c2 && Value.equal_shallow v1 v2
+        | T_not t1, T_not t2 -> equal_simple t1 t2
+        | T_ref _, _
+        | T_eq _, _
+        | T_equiv _, _
+        | T_not _, _
+        | T_suspend _, _
+        | T_par_and _, _
+        | T_seq_and _, _
+        | T_lazy _, _
+        | T_const _, _
+        | T_value _, _
+        | T_check_assign _, _
+          -> false
+      end
+
+    and equal_value_simple (a:value)(b:value): bool = match a, b with
+      | V_true, V_true
+      | V_false, V_false -> true
+      | V_dom_elt c1, V_dom_elt c2 -> ID.equal c1.dom_elt_id c2.dom_elt_id
+      | V_cstor (c1,l1), V_cstor (c2,l2) ->
+        ID.equal c1.cstor_id c2.cstor_id &&
+        CCList.equal equal_simple l1 l2
+      | V_fun _, _ -> assert false (* no equality on functions *)
+      | V_true, _
+      | V_false, _
+      | V_dom_elt _, _
+      | V_cstor _, _
+        -> false
+
     (* return [Some] iff the term is an undefined constant *)
     let as_cst_undef (t:thunk): cst_undef option = match view t with
       | T_const c -> Some c | _ -> None
@@ -1631,9 +1669,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
               e_b, Thunk.false_
             | _ ->
               (* no reduction yet *)
-              let t' =
-                if a==a' && b==b' then t else Thunk.and_par a' e_a b' e_b
-              in
+              let t' = Thunk.and_par a' e_a b' e_b in
               E.empty, t'
           end
         | T_seq_and (a,b) ->
@@ -1671,19 +1707,14 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           e_a, a (* optim for values *)
         | T_ref (_,({contents=(e_a, a)} as t_ref)) ->
           let e_a, a' = compute_nf_add e_a a in
+          (* memoize *)
+          if a != a' then (
+            Backtrack.push_set_nf_ t_ref;
+            t_ref := (e_a, a');
+          );
           begin match Thunk.view a' with
             | T_value _ -> e_a, a' (* return value *)
-            | T_ref (_,{contents=(e_b, b)}) ->
-              (* compress: [ref (ref u) --> ref u] *)
-              Backtrack.push_set_nf_ t_ref;
-              t_ref := (E.append e_a e_b, b);
-              E_empty, t (* not a value yet *)
             | _ ->
-              (* evaluation stays blocked, but makes some progress *)
-              if a != a' then (
-                Backtrack.push_set_nf_ t_ref;
-                t_ref := (e_a, a');
-              );
               E.empty, t (* not a value yet, continue sharing computation *)
           end
         | T_lazy (p, env) ->
@@ -1806,6 +1837,8 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         if a==a' && b==b' then eq_ab else Thunk.eq a' b'
       in
       begin match Thunk.as_unif a', Thunk.as_unif b' with
+        | _ when Thunk.equal_simple a' b' ->
+          e_ab, Thunk.true_ (* syntactic equality *)
         | Thunk.Unif_cstor (c1,l1), Thunk.Unif_cstor (c2,l2) ->
           if not (ID.equal c1.cstor_id c2.cstor_id)
           then
