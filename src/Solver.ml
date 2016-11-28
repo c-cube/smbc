@@ -110,10 +110,10 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
        before calling continuation [cont] *)
     | P_if of local_var * prgm * prgm
     (* depending on value of [k], follow one of the branches *)
-    | P_call of prgm * (local_var * prgm) list
+    | P_call of local_var * prgm list
     (* call given program with the arguments *)
-    | P_lazy of prgm lazy_t
-    (* used for recursion *)
+    | P_lazy of prgm lazy_t * string
+    (* used for recursion (with a description) *)
     | P_and of prgm * prgm
     | P_not of prgm
     | P_eq of prgm * prgm
@@ -128,6 +128,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     | C_cstor of cstor * prgm_const list (* apply constructor *)
     | C_dom_elt of dom_elt (* domain element *)
     | C_const of cst_undef (* undefined constant. Will evaluated further *)
+    | C_fun of local_var list * prgm (* function *)
     | C_var of local_var (* dereference eagerly *)
     | C_eval of prgm
 
@@ -175,6 +176,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     | V_false
     | V_cstor of cstor * thunk list
     | V_dom_elt of dom_elt
+    | V_fun of local_var list * prgm
 
   (* bag of atomic explanations. It is optimized for traversal
      and fast cons/snoc/append *)
@@ -480,13 +482,16 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     let eval p = match p with
       | P_return c -> c (* [eval (return x) --> x] *)
       | _ -> C_eval p
+    let fun_ vars body = match vars with
+      | [] -> eval body
+      | _ -> C_fun (vars, body)
 
     let return v = P_return v
     let let_ k v a b = P_let (k,v,a,b)
     let match_ u m = P_match (u,m)
     let if_ a b c = P_if (a,b,c)
     let call p args = P_call (p,args)
-    let lazy_ p = P_lazy p
+    let lazy_ ?(descr="") p = P_lazy (p, descr)
     let and_ a b = P_and (a,b)
     let not_ a = P_not a
     let eq a b = P_eq (a,b)
@@ -500,37 +505,41 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       | l -> fpf out "@ %a" (Utils.pp_list pp_local_var) l
 
     let rec pp out = function
-      | P_return v -> fpf out "(@[<2>return@ %a@])" pp_const v
+      | P_return v -> fpf out "(@[<1>return@ %a@])" pp_const v
       | P_let (k,v,a,b) ->
-        fpf out "(@[<2>let%a@ %a := %a@ %a@])" pp_let_kind k ID.pp v pp a pp b
+        fpf out "(@[<1>let%a@ %a %a@ %a@])" pp_let_kind k ID.pp v pp a pp b
       | P_match (u,m) ->
         let pp_bind out (id,(vars,rhs)) =
-          fpf out "(@[<1>@[<hv2>%a%a@]@ %a@])" ID.pp id pp_vars vars pp rhs
+          if vars=[]
+          then fpf out "(@[<1>case %a@ %a@])" ID.pp id pp rhs
+          else fpf out "(@[<1>case (@[<h>%a%a@])@ %a@])" ID.pp id pp_vars vars pp rhs
         in
         let print_map =
           Fmt.seq ~start:"" ~stop:"" ~sep:" " pp_bind
         in
-        fpf out "(@[match %a@ (@[<hv>%a@])@])"
+        fpf out "(@[<1>match@ %a@ (@[<hv>%a@])@])"
           pp_local_var u print_map (ID.Map.to_seq m)
       | P_if (a,b,c) ->
-        fpf out "(@[<hv2>if %a@ %a@ %a@])" pp_local_var a pp b pp c
+        fpf out "(@[<hv1>if %a@ %a@ %a@])" pp_local_var a pp b pp c
       | P_call (p,args) ->
-        let pp_arg out (v,t) = fpf out "(@[<2>%a@ := %a@])" pp_local_var v pp t in
-        fpf out "(@[<2>call@ %a@ args: [@[%a@]]@])" pp p (Utils.pp_list pp_arg) args
-      | P_lazy _ -> Fmt.string out "<lazy>"
-      | P_and (a,b) -> fpf out "(@[<2>and@ %a@ %a@])" pp a pp b
-      | P_eq (a,b) -> fpf out "(@[<2>eq@ %a@ %a@])" pp a pp b
-      | P_equiv (a,b) -> fpf out "(@[<2>equiv@ %a@ %a@])" pp a pp b
-      | P_not a -> fpf out "(@[not@ %a@])" pp a
+        fpf out "(@[<hv1>call@ %a@ %a@])"
+          pp_local_var p (Utils.pp_list pp) args
+      | P_lazy (_,descr) -> fpf out "<lazy %s>" descr
+      | P_and (a,b) -> fpf out "(@[<hv1>and@ %a@ %a@])" pp a pp b
+      | P_eq (a,b) -> fpf out "(@[<hv1>=@ %a@ %a@])" pp a pp b
+      | P_equiv (a,b) -> fpf out "(@[<hv1>equiv@ %a@ %a@])" pp a pp b
+      | P_not a -> fpf out "(@[<1>not@ %a@])" pp a
 
     and pp_const out = function
       | C_true -> Fmt.string out "true"
       | C_false -> Fmt.string out "false"
       | C_cstor (a,[]) -> ID.pp out a.cstor_id
       | C_cstor (a,l) ->
-        fpf out "(@[%a@ %a@])" ID.pp a.cstor_id (Utils.pp_list pp_const) l
+        fpf out "(@[<hv>%a@ %a@])" ID.pp a.cstor_id (Utils.pp_list pp_const) l
       | C_const c -> Cst_undef.pp out c
       | C_dom_elt c -> ID.pp out c.dom_elt_id
+      | C_fun (vars, body) ->
+        fpf out "(@[fun (@[%a@])@ %a@])" (Utils.pp_list pp_local_var) vars pp body
       | C_var v -> pp_local_var out v
       | C_eval p -> fpf out "(@[eval@ %a@])" pp p
   end
@@ -554,20 +563,20 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
   let rec pp_thunk out (t:thunk): unit = match t.t_view with
     | T_value v -> pp_value out v
     | T_const c -> Cst_undef.pp out c
-    | T_par_and (a,_,b,_) -> fpf out "(@[<hv2>and@ %a@ %a@])" pp_thunk a pp_thunk b
-    | T_seq_and (a,b) -> fpf out "(@[<hv2>&&@ %a@ %a@])" pp_thunk a pp_thunk b
-    | T_eq (a,b) -> fpf out "(@[<hv2>=@ %a@ %a@])" pp_thunk a pp_thunk b
-    | T_equiv (a,b) -> fpf out "(@[<hv2><=>@ %a@ %a@])" pp_thunk a pp_thunk b
-    | T_not a -> fpf out "(@[<2>not@ %a@])" pp_thunk a
-    | T_ref {contents=(_,u)} -> fpf out "(@[<2>ref@ %a@])" pp_thunk u
+    | T_par_and (a,_,b,_) -> fpf out "(@[<hv>and@ %a@ %a@])" pp_thunk a pp_thunk b
+    | T_seq_and (a,b) -> fpf out "(@[<hv>&&@ %a@ %a@])" pp_thunk a pp_thunk b
+    | T_eq (a,b) -> fpf out "(@[<hv>=@ %a@ %a@])" pp_thunk a pp_thunk b
+    | T_equiv (a,b) -> fpf out "(@[<hv><=>@ %a@ %a@])" pp_thunk a pp_thunk b
+    | T_not a -> fpf out "(@[not@ %a@])" pp_thunk a
+    | T_ref {contents=(_,u)} -> fpf out "(@[ref@ %a@])" pp_thunk u
     | T_lazy (p,env) ->
-      fpf out "(@[<2>lazy %a@ [@[%a@]]@])"
+      fpf out "(@[<1>lazy %a@ [@[%a@]]@])"
         Prgm.pp p (Subst.pp pp_thunk) env
     | T_suspend (p,v,env,_) ->
-      fpf out "(@[<2>suspend `@[%a@]`@ on %a@ in [@[%a@]]@])"
+      fpf out "(@[<1>suspend `@[%a@]`@ on %a@ in [@[%a@]]@])"
         Prgm.pp p pp_local_var v (Subst.pp pp_thunk) env
     | T_check_assign (c,v) ->
-      fpf out "(@[<2>check %a :=@ %a@])" Cst_undef.pp c pp_value v
+      fpf out "(@[<1>check %a :=@ %a@])" Cst_undef.pp c pp_value v
 
   and pp_value out (v:value): unit = match v with
     | V_true -> Fmt.string out "true"
@@ -576,6 +585,8 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     | V_cstor (a,l) ->
       fpf out "(@[%a@ %a@])" ID.pp a.cstor_id (Utils.pp_list pp_thunk) l
     | V_dom_elt c -> ID.pp out c.dom_elt_id
+    | V_fun (vars, body) ->
+      fpf out "(@[<1>fun (@[%a@])@ %a@])" Prgm.pp_vars vars Prgm.pp body
 
   module Value = struct
     type t = value
@@ -591,6 +602,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       | V_false, V_false -> true
       | V_dom_elt c1, V_dom_elt c2 -> ID.equal c1.dom_elt_id c2.dom_elt_id
       | V_cstor (c1,_), V_cstor (c2,_) -> ID.equal c1.cstor_id c2.cstor_id
+      | V_fun _, _ -> false (* TODO: basic function comparison? or named functions? *)
       | V_true, _
       | V_false, _
       | V_dom_elt _, _
@@ -603,6 +615,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       | V_dom_elt c -> Hash.combine2 3 (ID.hash c.dom_elt_id)
       | V_cstor (c,l) ->
         Hash.combine3 4 (ID.hash c.cstor_id) (Hash.int (List.length l))
+      | V_fun _ -> 5
 
     let pp = pp_value
   end
@@ -674,6 +687,10 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
 
     let lazy_ p env = mk_ (T_lazy (p, env))
 
+    let fun_ vars body = match vars with
+      | [] -> lazy_ body Subst.empty
+      | _ -> value (V_fun (vars,body))
+
     let suspend p v env e =
       assert (Subst.mem v env);
       mk_ (T_suspend (p,v,env,e))
@@ -690,6 +707,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         | C_dom_elt c -> dom_elt c
         | C_const c -> cst_undef c
         | C_var v -> Subst.find v env
+        | C_fun (vars,body) -> fun_ vars body
         | C_eval p -> lazy_ p env (* freeze for now *)
       end
 
@@ -1228,6 +1246,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
              | T_const c -> max cur_max (Cst_undef.depth c + 1)
              | _ -> cur_max)
           0 l
+      | V_fun _ -> 0
 
     (* build clause(s) that explains that [c] must be one of its
        cases *)
@@ -1332,7 +1351,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         | Ty_atomic (_, Ty_data cstors) ->
           (* datatype: refine by picking the head constructor *)
           List.map
-            (fun (lazy ({cstor_id=c_id; cstor_ty=c_ty} as c)) ->
+            (fun (lazy ({cstor_ty=c_ty; _} as c)) ->
                let rec case = lazy (
                  let ty_args, _ = Ty.unfold c_ty in
                  (* elements of [memo] already used when generating the
@@ -1649,6 +1668,11 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           let e_a, a' = compute_nf_add e_a a in
           begin match Thunk.view a' with
             | T_value _ -> e_a, a' (* return value *)
+            | T_ref {contents=(e_b, b)} ->
+              (* compress: [ref (ref u) --> ref u] *)
+              Backtrack.push_set_nf_ t_ref;
+              t_ref := (E.append e_a e_b, b);
+              E_empty, t (* not a value yet *)
             | _ ->
               (* evaluation stays blocked, but makes some progress *)
               if a != a' then (
@@ -1695,7 +1719,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           let th_a = Thunk.ref_ (Thunk.lazy_ a env) in
           let env = Subst.add v th_a env in
           compute_nf_prgm e b env
-        | P_lazy (lazy p_cont) -> compute_nf_prgm e p_cont env
+        | P_lazy (lazy p_cont, _) -> compute_nf_prgm e p_cont env
         | P_match (v, m) ->
           let th = Subst.find v env in
           let e, th' = compute_nf_add e th in
@@ -1745,17 +1769,28 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         | P_not a ->
           let th_a = Thunk.ref_ (Thunk.lazy_ a env) in
           compute_nf_add e (Thunk.not_ th_a)
-        | P_call (p_cont, []) -> compute_nf_prgm e p_cont Subst.empty
-        | P_call (p_cont, args) ->
-          (* new stack for args, then jump *)
-          (* TODO: do not exactly wrap into [lazy]. Instead, we should have
-             a "cheap_eval" function that keeps values as they are,
-             dereferences in the environment, but do not do match/if or
-             function calls (in this case, it uses [lazy]). This makes
-             passing values cheap, and other arguments reasonable. *)
-          let args = List.map (fun (v,p_a) -> v,Thunk.lazy_ p_a env) args in
-          let env = Subst.of_list args in
-          compute_nf_prgm e p_cont env
+        | P_call (f, []) -> E.empty, Subst.find f env
+        | P_call (f, args) ->
+          let th_f = Subst.find f env in
+          let e, tf_f' = compute_nf_add e th_f in
+          let env' = if th_f==tf_f' then env else Subst.set f tf_f' env in
+          begin match Thunk.view th_f with
+            | T_value (V_fun (vars, body)) ->
+              assert (List.length vars = List.length args);
+              (* TODO: do not exactly wrap into [lazy]. Instead, we should have
+                 a "cheap_eval" function that keeps values as they are,
+                 dereferences in the environment, but do not do match/if or
+                 function calls (in this case, it uses [lazy]). This should make
+                 passing values cheap, and other arguments reasonable. *)
+              let args = List.map (fun p_a -> Thunk.lazy_ p_a env) args in
+              (* new stack for args, then jump to [body] *)
+              let env = Subst.of_list (List.combine vars args) in
+              compute_nf_prgm e body env
+            | T_value _ -> assert false (* typing *)
+            | _ ->
+              (* suspend, waiting for [th_f] to become a proper function *)
+              E.empty, Thunk.suspend p f env' e
+          end
       end
 
     and compute_nf_eq eq_ab a b =
@@ -2248,7 +2283,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     type decl_ty_entry =
       | Decl_cst_undef of cst_undef
       | Decl_cstor of cstor
-      | Decl_fun of prgm lazy_t * local_var list (* defined function + set of variables *)
+      | Decl_fun of prgm lazy_t (* defined function *)
 
     (* for converting constants *)
     let decl_ty_ : decl_ty_entry lazy_t ID.Tbl.t = ID.Tbl.create 16
@@ -2292,9 +2327,9 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           begin match ID.Tbl.get decl_ty_ id with
             | Some (lazy (Decl_cst_undef c)) -> Prgm.const c |> Prgm.return
             | Some (lazy (Decl_cstor c)) -> Prgm.cstor0 c |> Prgm.return
-            | Some (lazy (Decl_fun (body,[]))) -> Prgm.call (Prgm.lazy_ body) []
-            | Some (lazy (Decl_fun (_,_::_))) ->
-              errorf "cannot partially apply function `%a`" ID.pp id
+            | Some (lazy (Decl_fun (lazy f))) ->
+              let v = gensym_ty t.Ast.ty in
+              Prgm.let_ Let_eager v f (Prgm.call v [])
             | None ->
               errorf "could not find constant `%a`" ID.pp id
           end
@@ -2308,17 +2343,15 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
                 | Decl_cstor c ->
                   (* [f] is a constructor, use [C_cstor] *)
                   Prgm.cstor c (List.map Prgm.eval l) |> Prgm.return
-                | Decl_fun (body,vars) ->
-                  if List.length vars <> List.length l then (
-                    errorf "cannot partially apply function `%a`" ID.pp id
-                  );
-                  let args = List.combine vars l in
-                  Prgm.call (Prgm.lazy_ body) args
+                | Decl_fun fun_ ->
+                  let v = gensym_ty t.Ast.ty in
+                  let fun_ = Prgm.lazy_ ~descr:(ID.to_string id) fun_ in
+                  Prgm.let_ Let_eager v fun_ (Prgm.call v l)
                 | Decl_cst_undef _ ->
                   errorf "cannot call undef fun %a" ID.pp id (* TODO *)
               end
             | _ ->
-              errorf "cannot call %a" Ast.pp_term f
+              errorf "cannot call `%a`" Ast.pp_term f
           end
         | Ast.Var v ->
           (* lookup in env *)
@@ -2328,7 +2361,8 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
               Prgm.var (Ast.Var.id v) |> Prgm.return
           end
         | Ast.Fun _ ->
-          assert false (* TODO? *)
+          let vars, body = Ast.unfold_fun t in
+          Prgm.fun_ (List.map Ast.Var.id vars) (term_to_prgm_rec env body) |> Prgm.return
         | Ast.Forall (v,body) ->
           assert false
             (* TODO
@@ -2548,17 +2582,15 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           (* declare the mutually recursive functions *)
           List.iter
             (fun (id,_ty,rhs) ->
-               let vars, body = Ast.unfold_fun rhs in
-               let body = lazy (term_to_prgm body) in
-               ID.Tbl.add decl_ty_ id
-                 (lazy (Decl_fun (body, List.map Ast.Var.id vars))))
+               let fun_ = lazy (term_to_prgm rhs) in
+               ID.Tbl.add decl_ty_ id (lazy (Decl_fun fun_)))
             l;
           (* force thunks *)
           List.iter
             (fun (id,_,_) ->
                let entry = ID.Tbl.find decl_ty_ id |> Lazy.force in
                begin match entry with
-                 | Decl_fun (lazy _, _) -> () (* also force definition *)
+                 | Decl_fun (lazy _) -> () (* also force definition *)
                  | _ -> assert false
                end;
                (* also register the constant for expansion *)
