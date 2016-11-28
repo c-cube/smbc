@@ -377,9 +377,9 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         | Cst_defined _ | Cst_cstor _ | Cst_uninterpreted_dom_elt _ -> None
 
     let as_undefined_exn (c:t): t * Ty.t * cst_info * ty_uninterpreted_slice option=
-      match as_undefined c with
-        | Some tup -> tup
-        | None -> assert false
+      match c.cst_kind with
+        | Cst_undef (ty,i,slice) -> c,ty,i,slice
+        | Cst_defined _ | Cst_cstor _ | Cst_uninterpreted_dom_elt _ -> assert false
 
     let equal a b = ID.equal a.cst_id b.cst_id
     let compare a b = ID.compare a.cst_id b.cst_id
@@ -2588,12 +2588,12 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         slice.TI.push lits ();
       done
 
-    (* assert [c := new_t], or conflict *)
-    let assert_choice (c:cst)(new_t:term) : unit =
+    (* assert [c := new_t] (which is, [lit]), or conflict *)
+    let assert_choice ~lit (c:cst)(new_t:term) : unit =
       let _, _, info, _ = Typed_cst.as_undefined_exn c in
       begin match info.cst_cur_case with
         | None ->
-          let e = Explanation.return (Lit.cst_choice c new_t) in
+          let e = Explanation.return lit in
           Backtrack.push_set_cst_case_ info;
           info.cst_cur_case <- Some (e, new_t);
         | Some (_,new_t') ->
@@ -2604,6 +2604,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       end
 
     let assert_uty
+        ~lit
         (uty:ty_uninterpreted_slice)
         (status:ty_uninterpreted_status)
       : unit =
@@ -2612,7 +2613,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         pp_uty uty pp_uty_status status);
       begin match uty.uty_status with
         | None ->
-          let e = Explanation.return (Lit.uty_choice_status uty status) in
+          let e = Explanation.return lit in
           Backtrack.push_uty_status uty;
           uty.uty_status <- Some (e, status);
         | Some (_, ((Uty_empty | Uty_nonempty) as s)) ->
@@ -2641,10 +2642,10 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           Sequence.iter Clause.push_new cs
         | Lit_atom _ -> ()
         | Lit_assign(c, t) ->
-          if Lit.sign lit then assert_choice c t
+          if Lit.sign lit then assert_choice ~lit c t
         | Lit_uty_empty uty ->
           let status = if Lit.sign lit then Uty_empty else Uty_nonempty in
-          assert_uty uty status
+          assert_uty ~lit uty status
       end
 
     (* propagation from the bool solver *)
