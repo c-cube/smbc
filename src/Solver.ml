@@ -106,7 +106,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     | P_match of local_var * (local_var list * prgm) ID.Map.t
     (* [match k m] matches value number [k] on the stack against [m].
        An entry [(vars,cont)] in [m] means that arguments to the constructor
-       must be bound to [vars] in the local env 
+       must be bound to [vars] in the local env
        before calling continuation [cont] *)
     | P_if of local_var * prgm * prgm
     (* depending on value of [k], follow one of the branches *)
@@ -362,6 +362,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
 
     let id t = t.cst_id
     let depth (c:t): int = c.cst_depth
+    let ty t = t.cst_ty
 
     let make ?parent ?exist_if ?slice ~depth:cst_depth id ty =
       assert (CCOpt.for_all (fun p -> cst_depth > depth p) parent);
@@ -2212,8 +2213,12 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
                 clause_guard_of_exp_ e
                 |> Sequence.map
                   (fun guard -> Lit.neg lit :: guard |> Clause.make)
+                |> Sequence.to_rev_list
               in
-              Sequence.iter Clause.push_new cs
+              Log.debugf 5
+                (fun k->k "(@[conflict@ %a@ clauses: (@[%a@])@])"
+                    Lit.pp lit (Utils.pp_list Clause.pp) cs);
+              Clause.push_new_l cs
             | _ -> ()
           end
         | Lit_assign(c, t) ->
@@ -2357,7 +2362,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           (* lookup in env *)
           begin match Subst.get (Ast.Var.id v) env.subst with
             | Some v' -> Prgm.var v' |> Prgm.return
-            | None -> 
+            | None ->
               Prgm.var (Ast.Var.id v) |> Prgm.return
           end
         | Ast.Fun _ ->
@@ -2512,7 +2517,8 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
             List.map
               (fun v ->
                  let ty = Ast.Var.ty v |> conv_ty in
-                 let c = Cst_undef.make ~depth:0 (Ast.Var.id v) ty in
+                 let new_id = ID.copy (Ast.Var.id v) in
+                 let c = Cst_undef.make ~depth:0 new_id ty in
                  Ast.Var.id v, c)
               vars
           in
@@ -2626,62 +2632,30 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       in
       f vars env
 
-    let rec term_to_ast (t:thunk): Ast.term = assert false
-    (* TODO
-    let term_to_ast (t:term): Ast.term =
-      let rec aux env t = match t.term_cell with
-        | True -> A.true_
-        | False -> A.false_
-        | DB d ->
-          begin match DB_env.get d env with
-            | Some t' -> t'
-            | None -> errorf "cannot find DB %a in env" Term.pp t
+    (* convert a thunk into a [Ast.term] *)
+    let thunk_to_ast (t:thunk): Ast.term =
+      let rec aux env t = match Thunk.view t with
+        | T_value v ->
+          begin match v with
+            | V_true -> A.true_
+            | V_false -> A.false_
+            | V_dom_elt c -> A.const c.dom_elt_id (ty_to_ast c.dom_elt_ty)
+            | V_cstor (c,l) ->
+              A.app
+                (A.const c.cstor_id (ty_to_ast c.cstor_ty))
+                (List.map (aux env) l)
+            | V_fun _ -> assert false (* TODO: recover types? *)
           end
-        | Const cst -> A.const cst.cst_id (ty_to_ast (Term.ty t))
-        | App (f,l) -> A.app (aux env f) (List.map (aux env) l)
-        | Fun (ty,bod) ->
-          with_var ty env
-            ~f:(fun v env -> A.fun_ v (aux env bod))
-        | Mu _ -> assert false
-        | If (a,b,c) -> A.if_ (aux env a)(aux env b) (aux env c)
-        | Match (u,m) ->
-          let u = aux env u in
-          let m =
-            ID.Map.map
-              (fun (tys,rhs) ->
-                 with_vars tys env ~f:(fun vars env -> vars, aux env rhs))
-              m
-          in
-          A.match_ u m
-        | Switch (u,m) ->
-          let u = aux env u in
-          let m =
-            ID.Tbl.to_seq m.switch_tbl
-            |> Sequence.map (fun (c,rhs) -> c, aux env rhs)
-            |> ID.Map.of_seq
-          in
-          A.switch u m
-        | Quant (q,uty,bod) ->
-          let lazy ty = uty.uty_self in
-          with_var ty env
-            ~f:(fun v env ->
-              let bod = aux env bod in
-              match q with
-                | Forall -> A.forall v bod
-                | Exists -> A.exists v bod)
-        | Builtin b ->
-          begin match b with
-            | B_not t -> A.not_ (aux env t)
-            | B_and (a,_,b,_) -> A.and_ (aux env a) (aux env b)
-            | B_or (a,b) -> A.or_ (aux env a) (aux env b)
-            | B_eq (a,b) -> A.eq (aux env a) (aux env b)
-            | B_imply (a,b) -> A.imply (aux env a) (aux env b)
-          end
-        | Check_assign (c,t) ->
-          aux env (Term.eq (Term.const c) t) (* becomes a mere equality *)
-        | Check_empty_uty _ -> assert false
-      in aux DB_env.empty t
-       *)
+        | T_const c -> A.const (Cst_undef.id c) (Cst_undef.ty c |> ty_to_ast)
+        | T_not a -> A.not_ (aux env a)
+        | T_suspend _
+        | T_lazy _ -> assert false (* TODO? *)
+        | T_check_assign _ -> assert false
+        | T_equiv (a,b) | T_eq (a,b) -> A.eq (aux env a) (aux env b)
+        | T_seq_and (a,b) | T_par_and (a,_,b,_) -> A.and_ (aux env a)(aux env b)
+        | T_ref {contents=(_,u)} -> aux env u
+      in
+      aux Subst.empty t
   end
 
   (** {2 Main} *)
@@ -2701,62 +2675,27 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
 
   (* follow "normal form" pointers deeply in the term *)
   let deref_deep (doms:cst_undef list Ty.Tbl.t) (t:thunk) : thunk =
-    (* TODO
     let rec aux t =
       let _, t = Reduce.compute_nf t in
-      match t.term_cell with
-        | True | False | DB _ -> t
-        | Const _ -> t
-        | App (f,l) ->
-          Term.app (aux f) (List.map aux l)
-        | If (a,b,c) -> Term.if_ (aux a)(aux b)(aux c)
-        | Match (u,m) ->
-          let m = ID.Map.map (fun (tys,rhs) -> tys, aux rhs) m in
-          Term.match_ (aux u) m
-        | Switch (u,m) ->
-          let dom =
-            try Ty.Tbl.find doms m.switch_ty_arg
-            with Not_found ->
-              errorf "could not find domain of type %a" Ty.pp m.switch_ty_arg
-          in
-          let switch_tbl=
-            ID.Tbl.to_seq m.switch_tbl
-            |> Sequence.filter_map
-              (fun (id,rhs) ->
-                 (* only keep this case if [member id dom] *)
-                 if List.exists (fun c -> ID.equal id c.cst_id) dom
-                 then Some (id, aux rhs)
-                 else None)
-            |> ID.Tbl.of_seq
-          in
-          if ID.Tbl.length switch_tbl = 0
-          then (
-            (* make a new unknown constant of the proper type *)
-            let c =
-              Cst_undef.make_undef ~depth:0
-                (ID.makef "?default_%s" (Ty.mangle m.switch_ty_ret))
-                m.switch_ty_ret
-            in
-            Term.const c
-          ) else (
-            let m =
-                 { m with
-                     switch_tbl;
-                     switch_id=new_switch_id_();
-                 } in
-            Term.switch (aux u) m
-          )
-        | Quant (q,uty,body) -> Term.quant q uty (aux body)
-        | Fun (ty,body) -> Term.fun_ ty (aux body)
-        | Mu body -> Term.mu (aux body)
-        | Builtin b -> Term.builtin (Term.map_builtin aux b)
-        | Check_assign _
-        | Check_empty_uty _
-          -> assert false
+      match Thunk.view t with
+        | T_const _ -> t
+        | T_value v ->
+          begin match v with
+            | V_true | V_false | V_dom_elt _ | V_cstor (_,[]) | V_fun _ -> t
+            | V_cstor (c, l) ->
+              Thunk.cstor c (List.map aux l)  (* evaluate under constructors *)
+          end
+        | T_seq_and (a,b)
+        | T_par_and (a,_,b,_) -> Thunk.and_ (aux a) (aux b)
+        | T_eq (a,b) -> Thunk.eq (aux a) (aux b)
+        | T_equiv (a,b) -> Thunk.equiv (aux a) (aux b)
+        | T_not a -> Thunk.not_ (aux a)
+        | T_ref {contents=(_,b)} -> aux b
+        | T_lazy _ -> assert false
+        | T_check_assign _
+        | T_suspend _ -> t (* blocked *)
     in
     aux t
-    *)
-    assert false
 
   let rec find_domain_ (uty:ty_uninterpreted_slice): cst_undef list =
     match uty.uty_status, uty.uty_pair with
@@ -2786,7 +2725,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         (fun c ->
            (* find normal form of [c] *)
            let t = Thunk.cst_undef c in
-           let t = deref_deep doms t |> Conv.term_to_ast in
+           let t = deref_deep doms t |> Conv.thunk_to_ast in
            c.cst_id, t)
       |> ID.Map.of_seq
     in
@@ -2804,7 +2743,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     Log.debugf 5 (fun k->k "(@[<1>candidate model: %a@])" Model.pp m);
     let goals =
       Top_goals.to_seq
-      |> Sequence.map Conv.term_to_ast
+      |> Sequence.map Conv.thunk_to_ast
       |> Sequence.to_list
     in
     Model.check m ~goals
