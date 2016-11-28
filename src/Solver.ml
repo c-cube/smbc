@@ -1347,17 +1347,20 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     type t = private int
     val max_depth : t
 
-    type state =
-      | At of t * Lit.t
+    type 'a state =
+      | At of 'a
       | Exhausted
 
-    val reset : unit -> unit
-    val current : unit -> state
-    val current_depth : unit -> t
-    val current_lit : unit -> Lit.t
-    val next : unit -> state
-    val lit_of_depth : int -> Lit.t option
-    val lit_max_smaller_than : int -> int * Lit.t
+    type ty_state = (t * Lit.t) state
+    type global_state = (ty_h * t * Lit.t) list state
+
+    val add_ty : ty_h -> unit
+    (** A type for which there is at least one {!cst_undef} *)
+
+    val current : unit -> global_state
+    val next : ty_h -> ty_state
+    val lit_of_depth : ty_h -> int -> Lit.t option
+    val lit_max_smaller_than : ty_h -> int -> int * Lit.t
     (** maximal literal strictly smaller than the given depth *)
 
     val pp: t CCFormat.printer
@@ -1374,7 +1377,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         s
 
     (* truncate at powers of {!step_} *)
-    let max_depth =
+    let max_depth : t =
       if Config.max_depth < step_
       then errorf "max-depth should be >= %d" step_;
       let rem = Config.max_depth mod step_ in
@@ -1383,28 +1386,39 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       assert (res mod step_ = 0);
       res
 
-    type state =
-      | At of t * Lit.t
+    type 'a state =
+      | At of 'a
       | Exhausted
 
-    (* create a literal standing for [max_depth = d] *)
-    let mk_lit_ d : Lit.t =
-      let id = ID.makef "max_depth_leq_%d" d in
+    type ty_state = (t * Lit.t) state
+    type global_state = (ty_h * t * Lit.t) list state
+
+    let at x = At x
+
+    (* create a literal standing for [max_depth(ty) = d] *)
+    let mk_lit_ ty d : Lit.t =
+      let id = ID.makef "depth(%s)@<1>≤%d" (Ty.mangle ty) d in
       Lit.fresh_with id
 
-    let lits_ : (int, Lit.t) Hashtbl.t = Hashtbl.create 32
+    module Tbl = CCHashtbl.Make(struct
+        type t = ty_h * int
+        let equal (ty1,i1)(ty2,i2) = Ty.equal ty1 ty2 && i1=i2
+        let hash (ty,i) = Hash.combine2 (Ty.hash ty) i
+      end)
+
+    let lits_ : Lit.t Tbl.t = Tbl.create 32
 
     (* get the literal correspond to depth [d], if any *)
-    let rec lit_of_depth d : Lit.t option =
+    let rec lit_of_depth (ty:ty_h) (d:t) : Lit.t option =
       if d < step_ || (d mod step_ <> 0) || d > max_depth
       then None
-      else match CCHashtbl.get lits_ d with
+      else match Tbl.get lits_ (ty,d) with
         | Some l -> Some l
         | None ->
-          let lit = mk_lit_ d in
-          Hashtbl.add lits_ d lit;
+          let lit = mk_lit_ ty d in
+          Tbl.add lits_ (ty,d) lit;
           (* relation with previous lit: [prev_lit => lit] *)
-          begin match prev d with
+          begin match prev ty d with
             | None -> assert (d=step_); ()
             | Some prev_lit ->
               let c = Clause.make [Lit.neg prev_lit; lit] in
@@ -1413,62 +1427,68 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           Some lit
 
     (* previous literal *)
-    and prev d : Lit.t option =
+    and prev ty d : Lit.t option =
       assert (d mod step_ = 0);
-      lit_of_depth (d - step_)
+      lit_of_depth ty (d - step_)
 
-    let lit_max_smaller_than d =
+    let lit_max_smaller_than ty d =
       (* find the largest [prev_depth]
          s.t. [prev_depth mod step=0] and [prev_depth<d] *)
       let d_prev = max 0 (d-1) in
       let prev_depth = d_prev - (d_prev mod step_) in
       assert (prev_depth >= 0 && (prev_depth mod step_ = 0));
-      match lit_of_depth prev_depth with
+      match lit_of_depth ty prev_depth with
         | Some lit -> prev_depth, lit
         | None ->
           assert (prev_depth = 0);
           prev_depth, Lit.atom Term.true_
 
-    (* initial state *)
-    let start_ =
-      match lit_of_depth step_ with
-        | None -> assert false
-        | Some lit -> At (step_, lit)
+    (* set of types that must have a depth limit *)
+    let all_tys_ : ty_state Ty.Tbl.t = Ty.Tbl.create 16
 
-    let cur_ = ref start_
-    let reset () = cur_ := start_
-    let current () = !cur_
+    (* initial state for a type *)
+    let start_ ty = match lit_of_depth ty step_ with
+      | None -> assert false
+      | Some lit -> At (step_, lit)
 
-    let current_depth () = match !cur_ with
-      | Exhausted -> max_depth
-      | At (d,_) -> d
+    let add_ty ty =
+      if not (Ty.Tbl.mem all_tys_ ty) then (
+        Ty.Tbl.add all_tys_ ty (start_ ty)
+      )
 
-    let current_lit () = match !cur_ with
-      | Exhausted -> assert false
-      | At (_,lit) -> lit
+    let current () : global_state =
+      try
+        Ty.Tbl.to_list all_tys_
+        |> List.map
+          (fun (ty,st) -> match st with
+             | Exhausted -> raise Exit
+             | At (d,lit) -> ty, d, lit)
+        |> at
+      with Exit -> Exhausted
 
-    (* next state *)
-    let next () = match !cur_ with
-      | Exhausted -> assert false
-      | At (l_old, _) ->
+    (* next state for this type *)
+    let next ty = match Ty.Tbl.get all_tys_ ty with
+      | None -> assert false
+      | Some Exhausted -> assert false
+      | Some (At (d_old, _)) ->
         (* update level and current lit *)
-        let l = l_old + step_ in
+        let d = d_old + step_ in
         let st =
-          if l > max_depth
+          if d > max_depth
           then Exhausted
           else (
             let lit =
-              match lit_of_depth l with
+              match lit_of_depth ty d with
                 | Some lit -> lit
-                | None -> errorf "increased depth to %d, but not lit" l
+                | None -> errorf "increased depth to %d, but not lit" d
             in
             Log.debugf 2
               (fun k->k
-                  "(@[<1>iterative_deepening :level %d :lit %a@])" l Lit.pp lit);
-            At (l, lit)
+                  "(@[<1>iterative_deepening :level %d :lit %a@])" d Lit.pp lit);
+            At (d, lit)
           )
         in
-        cur_ := st;
+        Ty.Tbl.replace all_tys_ ty st;
         st
   end
 
@@ -1501,7 +1521,9 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
        [uty = empty] and [uty = c_head : uty_tail] *)
     let clauses_of_uty (uty:ty_uninterpreted_slice) : Clause.t list =
       let n = uty.uty_offset in
-      let guard = Iterative_deepening.lit_of_depth n in
+      let guard =
+        Iterative_deepening.lit_of_depth (Lazy.force uty.uty_self) n
+      in
       let lit_nonempty = Lit.uty_choice_nonempty uty in
       (* - if we have a parent:
            nonempty => the previous slice must also be nonempty
@@ -1573,9 +1595,9 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     (* build clause(s) that explains that [c] must be one of its
        cases *)
     let clauses_of_cases (c:cst) (l:term list): Clause.t list =
-      let info = match Typed_cst.as_undefined c with
+      let ty, info = match Typed_cst.as_undefined c with
         | None -> assert false
-        | Some (_,_,info,_) -> info
+        | Some (_,ty,info,_) -> ty, info
       in
       let guard_parent =
         List.map
@@ -1590,7 +1612,9 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
              let guard = match depth_of_term rhs with
                | None -> None
                | Some depth_rhs ->
-                 let _, guard = Iterative_deepening.lit_max_smaller_than depth_rhs in
+                 let _, guard =
+                   Iterative_deepening.lit_max_smaller_than ty depth_rhs
+                 in
                  Some guard
              in
              lit, guard)
@@ -2481,9 +2505,8 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
   end
 
   let print_progress () : unit =
-    Printf.printf "\r[%.2f] depth %d | expanded %d | clauses %d | lemmas %d | lits %d%!"
+    Printf.printf "\r[%.2f] expanded %d | clauses %d | lemmas %d | lits %d%!"
       (get_time())
-      (Iterative_deepening.current_depth() :> int)
       !stat_num_cst_expanded
       !stat_num_clause_push
       !stat_num_clause_tautology
@@ -3225,24 +3248,27 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     ()
 
   type proof_status =
-    | PS_depth_limited of Lit.t
+    | PS_depth_limited of Lit.Set.t
     | PS_complete
     | PS_incomplete
 
   let pp_proof_status out = function
     | PS_depth_limited lit ->
-      Format.fprintf out "(@[depth_limited@ by: %a@])" Lit.pp lit
+      Format.fprintf out "(@[depth_limited@ by: (@[%a@])@])"
+        (Lit.Set.print Lit.pp) lit
     | PS_complete -> CCFormat.string out "complete"
     | PS_incomplete -> CCFormat.string out "incomplete"
 
   (* precondition: solving under assumption [depth_lit] returned unsat *)
-  let proof_status depth_lit : proof_status =
+  let proof_status (lits:Lit.t list): proof_status =
     let sat_res =
       M_th.set_active false; (* no propagation, just check the boolean formula *)
       CCFun.finally
         ~h:(fun () -> M_th.set_active true)
         ~f:(fun () -> M.solve ~assumptions:[] ())
     in
+    (* FIXME: here we would need to analyze the unsat core instead,
+       to know which literals are involved… *)
     begin match sat_res with
       | M.Sat _ ->
         (* was unsat because of the assumption *)
@@ -3280,18 +3306,19 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     let on_exit = dump_dimacs :: on_exit in
     let module ID = Iterative_deepening in
     (* iterated deepening *)
-    let rec iter state = match state with
+    let rec iter (st:ID.global_state) = match st with
       | ID.Exhausted ->
         do_on_exit ~on_exit;
         Unknown U_max_depth
-      | ID.At (cur_depth, cur_lit) ->
+      | ID.At l ->
+        let assumptions = List.map (fun (_,_,lit) -> lit) l in
         (* restrict depth *)
-        match M.solve ~assumptions:[cur_lit] () with
+        begin match M.solve ~assumptions () with
           | M.Sat _ ->
             let m = compute_model_ () in
             Log.debugf 1
-              (fun k->k "@{<Yellow>** found SAT@} at depth %a"
-                  ID.pp cur_depth);
+              (fun k->k "@{<Yellow>** found SAT@} at depths (@[%a@])"
+                  (Utils.pp_list Lit.pp) assumptions);
             do_on_exit ~on_exit;
             if check then model_check m;
             Sat m
@@ -3302,16 +3329,17 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
             *)
             let p = us.SI.get_proof () in
             Log.debugf 4 (fun k->k "proof: @[%a@]@." pp_proof p);
-            let status = proof_status cur_lit in
+            let status = proof_status assumptions in
             Log.debugf 1
               (fun k->k
-                  "@{<Yellow>** found Unsat@} at depth %a;@ \
+                  "@{<Yellow>** found Unsat@}@ at depths (@[%a@]);@ \
                    status: %a"
-                  ID.pp cur_depth pp_proof_status status);
+                  (Utils.pp_list Lit.pp) assumptions
+                  pp_proof_status status);
             match status with
-              | PS_depth_limited _ ->
+              | PS_depth_limited lits ->
                 (* negation of the previous limit *)
-                push_clause (Clause.make [Lit.neg cur_lit]);
+                push_clause (Clause.make (List.map Lit.neg) lits);
                 iter (ID.next ()) (* deeper! *)
               | PS_incomplete ->
                 do_on_exit ~on_exit;
@@ -3319,6 +3347,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
               | PS_complete ->
                 do_on_exit ~on_exit;
                 Unsat
+        end
     in
     ID.reset ();
     iter (ID.current ())
