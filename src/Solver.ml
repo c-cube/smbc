@@ -1746,12 +1746,12 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           let th = Thunk.eval_const env c in
           compute_nf_add e th
         | P_let (Let_eager, v, a, b) ->
-          (* evaluate [a] right now and push it on the stack *)
+          (* evaluate [a] right now and push it into the env *)
           let e, th_a = compute_nf_prgm e a env in
           let env = Subst.add v th_a env in
           compute_nf_prgm e b env
         | P_let (Let_lazy, v, a, b) ->
-          (* push a lazy thunk for computing [a] onto the stack, then eval [b] *)
+          (* push a lazy thunk for computing [a] into the env, then eval [b] *)
           let th_a = Thunk.ref_ (Thunk.lazy_ a env) in
           let env = Subst.add v th_a env in
           compute_nf_prgm e b env
@@ -1779,7 +1779,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           let th = Subst.find v env in
           let e, th' = compute_nf_add e th in
           let env' = if th==th' then env else Subst.set v th' env in
-          begin match Thunk.view th with
+          begin match Thunk.view th' with
             | T_value V_true -> compute_nf_prgm e a env'
             | T_value V_false -> compute_nf_prgm e b env'
             | T_value _ -> assert false
@@ -1806,11 +1806,11 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           let e, th_a = compute_nf_prgm e a env in
           compute_nf_add e (Thunk.not_ th_a)
         | P_call (f, []) -> E.empty, Subst.find f env
-        | P_call (f, args) ->
-          let th_f = Subst.find f env in
-          let e, tf_f' = compute_nf_add e th_f in
-          let env' = if th_f==tf_f' then env else Subst.set f tf_f' env in
-          begin match Thunk.view th_f with
+        | P_call (v_f, args) ->
+          let th_f = Subst.find v_f env in
+          let e, th_f' = compute_nf_add e th_f in
+          let env' = if th_f==th_f' then env else Subst.set v_f th_f' env in
+          begin match Thunk.view th_f' with
             | T_value (V_fun (_, vars, body)) ->
               assert (List.length vars = List.length args);
               (* TODO: do not exactly wrap into [lazy]. Instead, we should have
@@ -1825,7 +1825,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
             | T_value _ -> assert false (* typing *)
             | _ ->
               (* suspend, waiting for [th_f] to become a proper function *)
-              E.empty, Thunk.suspend p f env' e
+              E.empty, Thunk.suspend p v_f env' e
           end
       end
 
