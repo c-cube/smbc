@@ -593,7 +593,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     | V_dom_elt c -> ID.pp out c.dom_elt_id
     | V_fun ({fun_id;_}, vars, body) ->
       fpf out "(@[<1>fun (@[%a@])@ %a@ as: %a@])"
-        Prgm.pp_vars vars Prgm.pp body ID.pp fun_id 
+        Prgm.pp_vars vars Prgm.pp body ID.pp fun_id
 
   module Value = struct
     type t = value
@@ -1624,7 +1624,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
             | T_value V_true, T_value V_true ->
               E.append e_a e_b, Thunk.true_
             | T_value V_false, T_value V_false ->
-              E.append e_a e_b, Thunk.false_
+              E.or_ e_a e_b, Thunk.false_
             | T_value V_false, _ ->
               e_a, Thunk.false_
             | _, T_value V_false ->
