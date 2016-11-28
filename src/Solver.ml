@@ -59,6 +59,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
 
   module Subst : sig
     type +'a t
+    val is_empty : _ t -> bool
     val empty : 'a t
     val add : ID.t -> 'a -> 'a t -> 'a t
     val set : ID.t -> 'a -> 'a t -> 'a t
@@ -70,6 +71,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     val pp : 'a CCFormat.printer -> 'a t CCFormat.printer
   end = struct
     type 'a t = 'a ID.Map.t
+    let is_empty = ID.Map.is_empty
     let empty = ID.Map.empty
     let mem = ID.Map.mem
     let add v x m = assert (not (mem v m)); ID.Map.add v x m
@@ -128,18 +130,14 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     | C_cstor of cstor * prgm_const list (* apply constructor *)
     | C_dom_elt of dom_elt (* domain element *)
     | C_const of cst_undef (* undefined constant. Will evaluated further *)
-    | C_fun of local_var list * prgm (* function *)
+    | C_fun of named_fun * local_var list * prgm (* (named) function *)
     | C_var of local_var (* dereference eagerly *)
     | C_eval of prgm
 
   (* an on-going (or terminated) computation, using call-by-need.
      A thunk is either resolved (into a weak-head normal form)
      or ongoing (as a suspension or some boolean operator) *)
-  and thunk = {
-    t_view: thunk_view; (* view *)
-    t_deps: thunk_deps lazy_t; (* blocking the thunk *)
-  }
-  and thunk_view =
+  and thunk =
     | T_value of value
     | T_const of cst_undef
     | T_par_and of thunk * explanation * thunk * explanation
@@ -149,10 +147,11 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     | T_eq of thunk * thunk
     | T_equiv of thunk * thunk
     | T_not of thunk
-    | T_ref of thunk_ref
-    (* [T_ref (e, t)] is a mutable reference that, conceptually,
-       evaluates into [t] with explanation [e]. It can be updated
-       when [t] reduces to [u], but this update is backtrackable.
+    | T_ref of thunk * thunk_ref
+    (* [T_ref (old, (e, t))] is a mutable reference that, conceptually,
+       evaluates into [t] with explanation [e]. It started with value [old].
+       It can be updated when [t] reduces to [u], but this update is
+       backtrackable.
        [T_ref] is useful for sharing computations. *)
     | T_lazy of prgm * eval_env
     (* unevaluated thunk *)
@@ -176,7 +175,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     | V_false
     | V_cstor of cstor * thunk list
     | V_dom_elt of dom_elt
-    | V_fun of local_var list * prgm
+    | V_fun of named_fun * local_var list * prgm
 
   (* bag of atomic explanations. It is optimized for traversal
      and fast cons/snoc/append *)
@@ -231,6 +230,11 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
   and ty_atomic =
     | Ty_data of cstor lazy_t list
     | Ty_uninterpreted of ty_uninterpreted_slice
+
+  and named_fun = {
+    fun_id: ID.t;
+    fun_ty: ty;
+  }
 
   (* this is a disjunction of sufficient conditions for the existence of
      some meta (cst). Each condition is a literal *)
@@ -483,9 +487,9 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     let eval p = match p with
       | P_return c -> c (* [eval (return x) --> x] *)
       | _ -> C_eval p
-    let fun_ vars body = match vars with
+    let fun_ nf vars body = match vars with
       | [] -> eval body
-      | _ -> C_fun (vars, body)
+      | _ -> C_fun (nf, vars, body)
 
     let return v = P_return v
     let let_ k v a b = P_let (k,v,a,b)
@@ -539,8 +543,9 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         fpf out "(@[<hv>%a@ %a@])" ID.pp a.cstor_id (Utils.pp_list pp_const) l
       | C_const c -> Cst_undef.pp out c
       | C_dom_elt c -> ID.pp out c.dom_elt_id
-      | C_fun (vars, body) ->
-        fpf out "(@[fun (@[%a@])@ %a@])" (Utils.pp_list pp_local_var) vars pp body
+      | C_fun ({fun_id;_}, vars, body) ->
+        fpf out "(@[fun (@[%a@])@ %a@ as: %a@])"
+          (Utils.pp_list pp_local_var) vars pp body ID.pp fun_id
       | C_var v -> pp_local_var out v
       | C_eval p -> fpf out "(@[eval@ %a@])" pp p
   end
@@ -561,7 +566,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         -> CCOrd.int_ (to_int_ a) (to_int_ b)
     end
 
-  let rec pp_thunk out (t:thunk): unit = match t.t_view with
+  let rec pp_thunk out (t:thunk): unit = match t with
     | T_value v -> pp_value out v
     | T_const c -> Cst_undef.pp out c
     | T_par_and (a,_,b,_) -> fpf out "(@[<hv>and@ %a@ %a@])" pp_thunk a pp_thunk b
@@ -569,7 +574,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     | T_eq (a,b) -> fpf out "(@[<hv>=@ %a@ %a@])" pp_thunk a pp_thunk b
     | T_equiv (a,b) -> fpf out "(@[<hv><=>@ %a@ %a@])" pp_thunk a pp_thunk b
     | T_not a -> fpf out "(@[not@ %a@])" pp_thunk a
-    | T_ref {contents=(_,u)} -> fpf out "(@[ref@ %a@])" pp_thunk u
+    | T_ref (_,{contents=(_,u)}) -> fpf out "(@[ref@ %a@])" pp_thunk u
     | T_lazy (p,env) ->
       fpf out "(@[<1>lazy %a@ [@[%a@]]@])"
         Prgm.pp p (Subst.pp pp_thunk) env
@@ -586,8 +591,9 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     | V_cstor (a,l) ->
       fpf out "(@[%a@ %a@])" ID.pp a.cstor_id (Utils.pp_list pp_thunk) l
     | V_dom_elt c -> ID.pp out c.dom_elt_id
-    | V_fun (vars, body) ->
-      fpf out "(@[<1>fun (@[%a@])@ %a@])" Prgm.pp_vars vars Prgm.pp body
+    | V_fun ({fun_id;_}, vars, body) ->
+      fpf out "(@[<1>fun (@[%a@])@ %a@ as: %a@])"
+        Prgm.pp_vars vars Prgm.pp body ID.pp fun_id 
 
   module Value = struct
     type t = value
@@ -624,25 +630,21 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
   module Thunk = struct
     type t = thunk
 
-    let view t = t.t_view
-    let deps (t:thunk): thunk_deps = Lazy.force t.t_deps
+    let view t = t
 
     let merge_deps = CCList.sorted_merge_uniq ~cmp:cmp_dep_
 
-    let compute_deps (t:thunk_view): thunk_deps = match t with
+    let rec deps (t:thunk): thunk_deps = match t with
       | T_check_assign (c,_) | T_const c -> [Dep_cst c]
       | T_lazy _
       | T_value _ -> []
       | T_seq_and (a, _) | T_not a -> deps a
       | T_par_and (a,_,b,_) | T_equiv (a,b) | T_eq (a,b) ->
         merge_deps (deps a) (deps b)
-      | T_ref {contents=(_,u)} -> deps u
+      | T_ref (_,{contents=(_,u)}) -> deps u
       | T_suspend (_,v,env,_) -> deps (Subst.find v env)
 
-    let mk_ view = {
-      t_view=view;
-      t_deps=lazy (compute_deps view);
-    }
+    let mk_ view = view
 
     let value v = mk_ (T_value v)
     let true_ = value V_true
@@ -650,7 +652,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     let cstor a l = value (V_cstor (a,l))
     let dom_elt c = value (V_dom_elt c)
 
-    let abs (t:thunk): t * bool = match t.t_view with
+    let abs (t:thunk): t * bool = match view t with
       | T_value V_false -> true_, false
       | T_not u -> u, false
       | _ -> t, true
@@ -659,7 +661,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
 
     let cst_undef c = mk_ (T_const c)
 
-    let not_ t = match t.t_view with
+    let not_ t = match view t with
       | T_not a -> a
       | T_value V_true -> false_
       | T_value V_false -> true_
@@ -680,17 +682,17 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
 
     let equiv a b = mk_ (T_equiv (a,b))
 
-    let ref_ t = mk_ (T_ref (ref (E_empty, t)))
-
-    let mk_ref r = mk_ (T_ref r)
+    let ref_ t = match view t with
+      | T_ref _ -> t
+      | _ -> mk_ (T_ref (t, ref (E_empty, t)))
 
     let check_assign c v = mk_ (T_check_assign (c,v))
 
     let lazy_ p env = mk_ (T_lazy (p, env))
 
-    let fun_ vars body = match vars with
+    let fun_ nf vars body = match vars with
       | [] -> lazy_ body Subst.empty
-      | _ -> value (V_fun (vars,body))
+      | _ -> value (V_fun (nf,vars,body))
 
     let suspend p v env e =
       assert (Subst.mem v env);
@@ -708,21 +710,21 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         | C_dom_elt c -> dom_elt c
         | C_const c -> cst_undef c
         | C_var v -> Subst.find v env
-        | C_fun (vars,body) -> fun_ vars body
+        | C_fun (nf,vars,body) -> fun_ nf vars body
         | C_eval p -> lazy_ p env (* freeze for now *)
       end
 
     (* return [Some] iff the term is an undefined constant *)
-    let as_cst_undef (t:thunk): cst_undef option = match t.t_view with
+    let as_cst_undef (t:thunk): cst_undef option = match view t with
       | T_const c -> Some c | _ -> None
 
     (* return [Some (cstor,ty,args)] if the thunk is a constructor
        applied to some arguments *)
-    let as_cstor_app (t:thunk): (cstor * thunk list) option = match t.t_view with
+    let as_cstor_app (t:thunk): (cstor * thunk list) option = match view t with
       | T_value (V_cstor (a,l)) -> Some (a,l)
       | _ -> None
 
-    let as_domain_elt (t:thunk): dom_elt option = match t.t_view with
+    let as_domain_elt (t:thunk): dom_elt option = match view t with
       | T_value (V_dom_elt c) -> Some c
       | _ -> None
 
@@ -733,7 +735,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       | Unif_dom_elt  of dom_elt
       | Unif_none
 
-    let as_unif (t:thunk): unif_form = match t.t_view with
+    let as_unif (t:thunk): unif_form = match view t with
       | T_const c -> Unif_cst c
       | T_value (V_cstor (a,l)) -> Unif_cstor (a,l)
       | T_value (V_dom_elt c) -> Unif_dom_elt c
@@ -758,6 +760,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     val abs : t -> t
     val sign : t -> bool
     val view : t -> lit_view
+    val is_atom : t -> bool
     val as_atom : t -> (thunk * bool) option
     val as_atom_exn : t -> thunk * bool
     val fresh_with : ID.t -> t
@@ -863,6 +866,8 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     let uty_choice_status uty s : t = match s with
       | Uty_empty -> uty_choice_empty uty
       | Uty_nonempty -> uty_choice_nonempty uty
+
+    let is_atom t = match t.lit_view with Lit_atom _ -> true | _ -> false
 
     let as_atom (lit:t) : (thunk * bool) option = match lit.lit_view with
       | Lit_atom (_,t) -> Some (t, lit.lit_sign)
@@ -1624,7 +1629,6 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
               e_a, Thunk.false_
             | _, T_value V_false ->
               e_b, Thunk.false_
-            | T_value _, _ | _, T_value _ -> assert false
             | _ ->
               (* no reduction yet *)
               let t' =
@@ -1663,13 +1667,13 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           end
         | T_eq (a,b) ->
           compute_nf_eq t a b
-        | T_ref {contents=(e_a, a)} when Thunk.is_value a ->
+        | T_ref (_,{contents=(e_a, a)}) when Thunk.is_value a ->
           e_a, a (* optim for values *)
-        | T_ref ({contents=(e_a, a)} as t_ref) ->
+        | T_ref (_,({contents=(e_a, a)} as t_ref)) ->
           let e_a, a' = compute_nf_add e_a a in
           begin match Thunk.view a' with
             | T_value _ -> e_a, a' (* return value *)
-            | T_ref {contents=(e_b, b)} ->
+            | T_ref (_,{contents=(e_b, b)}) ->
               (* compress: [ref (ref u) --> ref u] *)
               Backtrack.push_set_nf_ t_ref;
               t_ref := (E.append e_a e_b, b);
@@ -1753,22 +1757,22 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
               E.empty, Thunk.suspend p v env' e
           end
         | P_equiv (a,b) ->
-          let th_a = Thunk.ref_ (Thunk.lazy_ a env) in
-          let th_b = Thunk.ref_ (Thunk.lazy_ b env) in
+          let e, th_a = compute_nf_prgm e a env in
+          let e, th_b = compute_nf_prgm e b env in
           let th = Thunk.equiv th_a th_b in
           compute_nf_add e th
         | P_eq (a,b) ->
-          let th_a = Thunk.ref_ (Thunk.lazy_ a env) in
-          let th_b = Thunk.ref_ (Thunk.lazy_ b env) in
+          let e, th_a = compute_nf_prgm e a env in
+          let e, th_b = compute_nf_prgm e b env in
           let th = Thunk.eq th_a th_b in
           compute_nf_add e th
         | P_and (a,b) ->
-          let th_a = Thunk.ref_ (Thunk.lazy_ a env) in
-          let th_b = Thunk.ref_ (Thunk.lazy_ b env) in
-          let th = Thunk.and_ th_a th_b in
+          let e_a, th_a = compute_nf_prgm E.empty a env in
+          let e_b, th_b = compute_nf_prgm E.empty b env in
+          let th = Thunk.and_par th_a e_a th_b e_b in
           compute_nf_add e th
         | P_not a ->
-          let th_a = Thunk.ref_ (Thunk.lazy_ a env) in
+          let e, th_a = compute_nf_prgm e a env in
           compute_nf_add e (Thunk.not_ th_a)
         | P_call (f, []) -> E.empty, Subst.find f env
         | P_call (f, args) ->
@@ -1776,7 +1780,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           let e, tf_f' = compute_nf_add e th_f in
           let env' = if th_f==tf_f' then env else Subst.set f tf_f' env in
           begin match Thunk.view th_f with
-            | T_value (V_fun (vars, body)) ->
+            | T_value (V_fun (_, vars, body)) ->
               assert (List.length vars = List.length args);
               (* TODO: do not exactly wrap into [lazy]. Instead, we should have
                  a "cheap_eval" function that keeps values as they are,
@@ -1943,10 +1947,10 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
   module Top_terms : sig
     type t = private lit
 
-    val of_term : thunk -> t
+    val of_lit : lit -> t
     val to_lit : t -> Lit.t
     val pp : t Fmt.printer
-    val watch : thunk -> unit
+    val watch : lit -> unit
     val update : t -> unit
     (** re-check value, maybe propagate *)
 
@@ -1958,7 +1962,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
 
     let to_lit t = t
     let pp = Lit.pp
-    let of_term t = Lit.atom (Thunk.ref_ t) (* memoization *)
+    let of_lit t = t
     let abs (t:t) : t = Lit.abs t
 
     (* clauses for [e => l] *)
@@ -2018,8 +2022,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     let mem_top_ (t:t): bool =
       List.exists (fun t' -> Lit.equal (abs t) (abs t')) !top_
 
-    let watch (t:thunk) =
-      let lit = of_term t in
+    let watch (lit:lit) =
       if not (mem_top_ lit) then (
         Log.debugf 3
           (fun k->k "(@[<1>@{<green>watch_lit@}@ %a@])" pp lit);
@@ -2062,72 +2065,6 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
   (* TODO: find the proper code for "kill line" *)
   let flush_progress (): unit =
     Printf.printf "\r%-80d\r%!" 0
-
-  (** {2 Toplevel Goals}
-
-      List of toplevel goals to satisfy
-  *)
-
-  module Top_goals: sig
-    val push : thunk  -> unit
-    val to_seq : thunk Sequence.t
-    val check: unit -> unit
-  end = struct
-    (* list of terms to fully evaluate *)
-    let toplevel_goals_ : lit list ref = ref []
-
-    (* add [t] to the set of terms that must be evaluated *)
-    let push (t:thunk): unit =
-      let lit = Lit.atom t in
-      toplevel_goals_ := lit :: !toplevel_goals_;
-      ()
-
-    let to_seq_ k = List.iter k !toplevel_goals_
-
-    let to_seq =
-      to_seq_
-      |> Sequence.map
-        (fun lit ->
-           let t, b = Lit.as_atom_exn lit in
-           if b then t else Thunk.not_ t)
-
-    (* check that this term fully evaluates to [true] *)
-    let is_true_ (t:lit): bool =
-      let _, t' = Reduce.compute_nf_lit t in
-      match Thunk.view t' with
-        | T_value V_true -> true
-        | _ -> false
-
-    let check () =
-      if not (List.for_all is_true_ !toplevel_goals_)
-      then (
-        if Config.progress then flush_progress();
-        Log.debugf 1
-          (fun k->
-             let pp_dep out = function
-               | Dep_cst c ->
-                 let _, nf = Reduce.compute_nf (Thunk.cst_undef c) in
-                 fpf out
-                   "(@[%a@ nf:%a@ :expanded %B@])"
-                   Cst_undef.pp c Thunk.pp nf
-                   (c.cst_cases <> Lazy_none)
-               | Dep_uty uty ->
-                 fpf out
-                   "(@[%a@ :expanded %B@])"
-                   pp_uty uty (uty.uty_pair<>Lazy_none)
-             in
-             let pp_lit out l =
-               let e, nf = Reduce.compute_nf_lit l in
-               fpf out
-                 "(@[<hv1>%a@ nf: %a@ exp: %a@ deps: (@[<hv>%a@])@])"
-                 Lit.pp l Thunk.pp nf Explanation.pp e
-                 (Utils.pp_list pp_dep) (Thunk.deps nf)
-             in
-             k "(@[<hv1>status_watched_lit@ (@[<v>%a@])@])"
-               (Utils.pp_list pp_lit) !toplevel_goals_);
-        assert false;
-      )
-  end
 
   (* the "theory" part: propagations *)
   module M_th : sig
@@ -2259,11 +2196,77 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     (* reduce to normal form the literals, ensure they
          are added to the proper constant watchlist(s) *)
     Clause.to_seq c
-      |> Sequence.filter_map Lit.as_atom
-      |> Sequence.map fst
+      |> Sequence.filter Lit.is_atom
       |> Sequence.iter Top_terms.watch;
     incr stat_num_clause_push;
     M.assume [Clause.lits c]
+
+  (** {2 Toplevel Goals}
+
+      List of toplevel goals to satisfy
+  *)
+
+  module Top_goals: sig
+    val push : thunk  -> unit
+    val to_seq : thunk Sequence.t
+    val check: unit -> unit
+  end = struct
+    (* list of terms to fully evaluate *)
+    let toplevel_goals_ : lit list ref = ref []
+
+    (* add [t] to the set of terms that must be evaluated *)
+    let push (t:thunk): unit =
+      let lit = Lit.atom t in
+      toplevel_goals_ := lit :: !toplevel_goals_;
+      push_clause (Clause.make [lit]);
+      ()
+
+    let to_seq_ k = List.iter k !toplevel_goals_
+
+    let to_seq =
+      to_seq_
+      |> Sequence.map
+        (fun lit ->
+           let t, b = Lit.as_atom_exn lit in
+           if b then t else Thunk.not_ t)
+
+    (* check that this term fully evaluates to [true] *)
+    let is_true_ (t:lit): bool =
+      let _, t' = Reduce.compute_nf_lit t in
+      match Thunk.view t' with
+        | T_value V_true -> true
+        | _ -> false
+
+    let check () =
+      if not (List.for_all is_true_ !toplevel_goals_)
+      then (
+        if Config.progress then flush_progress();
+        Log.debugf 1
+          (fun k->
+             let pp_dep out = function
+               | Dep_cst c ->
+                 let _, nf = Reduce.compute_nf (Thunk.cst_undef c) in
+                 fpf out
+                   "(@[%a@ nf:%a@ :expanded %B@])"
+                   Cst_undef.pp c Thunk.pp nf
+                   (c.cst_cases <> Lazy_none)
+               | Dep_uty uty ->
+                 fpf out
+                   "(@[%a@ :expanded %B@])"
+                   pp_uty uty (uty.uty_pair<>Lazy_none)
+             in
+             let pp_lit out l =
+               let e, nf = Reduce.compute_nf_lit l in
+               fpf out
+                 "(@[<hv1>%a@ nf: %a@ exp: %a@ deps: (@[<hv>%a@])@])"
+                 Lit.pp l Thunk.pp nf Explanation.pp e
+                 (Utils.pp_list pp_dep) (Thunk.deps nf)
+             in
+             k "(@[<hv1>status_watched_lit@ (@[<v>%a@])@])"
+               (Utils.pp_list pp_lit) !toplevel_goals_);
+        assert false;
+      )
+  end
 
   (** {2 Conversion} *)
 
@@ -2324,7 +2327,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     let gensym_ty ty = gensym (Ty.mangle (conv_ty ty))
 
     (* compilation to programs *)
-    let rec term_to_prgm_rec (env:conv_env) (t:Ast.term): prgm =
+    let rec term_to_prgm_rec ?name (env:conv_env) (t:Ast.term): prgm =
       begin match Ast.term_view t with
         | Ast.True -> Prgm.true_ |> Prgm.return
         | Ast.False -> Prgm.false_ |> Prgm.return
@@ -2367,7 +2370,12 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           end
         | Ast.Fun _ ->
           let vars, body = Ast.unfold_fun t in
-          Prgm.fun_ (List.map Ast.Var.id vars) (term_to_prgm_rec env body) |> Prgm.return
+          let ty = conv_ty t.Ast.ty  in
+          let fun_id = match name with Some i->i | _ -> gensym "lambda" in
+          Prgm.fun_ {fun_id; fun_ty=ty}
+            (List.map Ast.Var.id vars)
+            (term_to_prgm_rec env body)
+          |> Prgm.return
         | Ast.Forall (v,body) ->
           assert false
             (* TODO
@@ -2494,8 +2502,8 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           end
       end
 
-    let term_to_prgm t : prgm =
-      let t' = term_to_prgm_rec empty_env t in
+    let term_to_prgm ?name t : prgm =
+      let t' = term_to_prgm_rec ?name empty_env t in
       Log.debugf 2
         (fun k->k "(@[term_to_prgm@ @[%a@]@ yields: %a@])" Ast.pp_term t Prgm.pp t');
       t'
@@ -2510,7 +2518,6 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         | Ast.Assert t ->
           let t = term_to_thunk t in
           Top_goals.push t;
-          push_clause (Clause.make [Lit.atom t])
         | Ast.Goal (vars, t) ->
           (* skolemize *)
           let bindings =
@@ -2533,7 +2540,6 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           in
           let t = Thunk.ref_ (Thunk.lazy_ t Subst.empty) in
           Top_goals.push t;
-          push_clause (Clause.make [Lit.atom t])
         | Ast.TyDecl id ->
           assert false
           (* TODO
@@ -2588,7 +2594,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           (* declare the mutually recursive functions *)
           List.iter
             (fun (id,_ty,rhs) ->
-               let fun_ = lazy (term_to_prgm rhs) in
+               let fun_ = lazy (term_to_prgm ~name:id rhs) in
                ID.Tbl.add decl_ty_ id (lazy (Decl_fun fun_)))
             l;
           (* force thunks *)
@@ -2632,30 +2638,67 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       in
       f vars env
 
+    let cst_undef_to_ast c = A.const c.cst_id (ty_to_ast c.cst_ty)
+    let cstor_to_ast c = A.const c.cstor_id (ty_to_ast c.cstor_ty)
+    let dom_elt_to_ast c = A.const c.dom_elt_id (ty_to_ast c.dom_elt_ty)
+    let nf_to_ast nf = A.const nf.fun_id (ty_to_ast nf.fun_ty)
+
     (* convert a thunk into a [Ast.term] *)
-    let thunk_to_ast (t:thunk): Ast.term =
+    let rec thunk_to_ast (env:eval_env) (t:thunk): Ast.term =
       let rec aux env t = match Thunk.view t with
-        | T_value v ->
-          begin match v with
-            | V_true -> A.true_
-            | V_false -> A.false_
-            | V_dom_elt c -> A.const c.dom_elt_id (ty_to_ast c.dom_elt_ty)
-            | V_cstor (c,l) ->
-              A.app
-                (A.const c.cstor_id (ty_to_ast c.cstor_ty))
-                (List.map (aux env) l)
-            | V_fun _ -> assert false (* TODO: recover types? *)
-          end
-        | T_const c -> A.const (Cst_undef.id c) (Cst_undef.ty c |> ty_to_ast)
+        | T_value v -> value_to_ast env v
+        | T_const c -> cst_undef_to_ast c
         | T_not a -> A.not_ (aux env a)
-        | T_suspend _
-        | T_lazy _ -> assert false (* TODO? *)
-        | T_check_assign _ -> assert false
+        | T_lazy (p,env) -> prgm_to_ast env p
+        | T_suspend (p,_,env',_) -> prgm_to_ast env' p
+        | T_check_assign (c,v) -> A.eq (cst_undef_to_ast c) (value_to_ast env v)
         | T_equiv (a,b) | T_eq (a,b) -> A.eq (aux env a) (aux env b)
         | T_seq_and (a,b) | T_par_and (a,_,b,_) -> A.and_ (aux env a)(aux env b)
-        | T_ref {contents=(_,u)} -> aux env u
+        | T_ref (old,_) -> aux env old
       in
-      aux Subst.empty t
+      aux env t
+
+    and value_to_ast (env:eval_env) v =
+      begin match v with
+        | V_true -> A.true_
+        | V_false -> A.false_
+        | V_dom_elt c -> dom_elt_to_ast c
+        | V_cstor (c,l) ->
+          A.app (cstor_to_ast c) (List.map (thunk_to_ast env) l)
+        | V_fun (nf,_,_) -> nf_to_ast nf
+      end
+
+    and prgm_to_ast (env:eval_env) (p:prgm): Ast.term = match p with
+      | P_return c -> prgm_const_to_ast env c
+      | P_let (_,v,t,u) ->
+        let env = Subst.add v (Thunk.lazy_ t env) env in
+        prgm_to_ast env u
+      | P_match (_,_) -> assert false
+      | P_if (v,a,b) ->
+        A.if_
+          (thunk_to_ast env (Subst.find v env))
+          (prgm_to_ast env a)
+          (prgm_to_ast env b)
+      | P_call (v,l) ->
+        A.app
+          (thunk_to_ast env (Subst.find v env))
+          (List.map (prgm_to_ast env) l)
+      | P_lazy (lazy p,_) -> prgm_to_ast env p
+      | P_and (a,b) -> A.and_ (prgm_to_ast env a) (prgm_to_ast env b)
+      | P_not a -> A.not_ (prgm_to_ast env a)
+      | P_eq (a,b)
+      | P_equiv (a,b) -> A.eq (prgm_to_ast env a) (prgm_to_ast env b)
+
+    and prgm_const_to_ast (env:eval_env) c = match c with
+      | C_true -> A.true_
+      | C_false -> A.false_
+      | C_dom_elt c -> dom_elt_to_ast c
+      | C_const c -> cst_undef_to_ast c
+      | C_fun (nf,_,_) -> nf_to_ast nf
+      | C_var v -> thunk_to_ast env (Subst.find v env)
+      | C_eval p -> prgm_to_ast env p
+      | C_cstor (c,l) ->
+        A.app (cstor_to_ast c) (List.map (prgm_const_to_ast env) l)
   end
 
   (** {2 Main} *)
@@ -2690,7 +2733,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         | T_eq (a,b) -> Thunk.eq (aux a) (aux b)
         | T_equiv (a,b) -> Thunk.equiv (aux a) (aux b)
         | T_not a -> Thunk.not_ (aux a)
-        | T_ref {contents=(_,b)} -> aux b
+        | T_ref (_,{contents=(_,b)}) -> aux b
         | T_lazy _ -> assert false
         | T_check_assign _
         | T_suspend _ -> t (* blocked *)
@@ -2725,7 +2768,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         (fun c ->
            (* find normal form of [c] *)
            let t = Thunk.cst_undef c in
-           let t = deref_deep doms t |> Conv.thunk_to_ast in
+           let t = deref_deep doms t |> Conv.thunk_to_ast Subst.empty in
            c.cst_id, t)
       |> ID.Map.of_seq
     in
@@ -2743,7 +2786,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     Log.debugf 5 (fun k->k "(@[<1>candidate model: %a@])" Model.pp m);
     let goals =
       Top_goals.to_seq
-      |> Sequence.map Conv.thunk_to_ast
+      |> Sequence.map (Conv.thunk_to_ast Subst.empty)
       |> Sequence.to_list
     in
     Model.check m ~goals
