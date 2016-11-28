@@ -959,34 +959,27 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
   module Explanation = struct
     include Explanation_base
 
-    let to_lists e: lit list Sequence.t =
+    let to_sets e: Lit.Set.t Sequence.t =
       let open Sequence.Infix in
       let rec aux acc = function
         | E_empty -> Sequence.return acc
-        | E_leaf x -> Sequence.return (x::acc)
+        | E_leaf x -> Sequence.return (Lit.Set.add x acc)
         | E_append (a,b,_) ->
           aux acc a >>= fun acc ->
           aux acc b
         | E_or (a,b,_) ->
           Sequence.append (aux acc a)(aux acc b)
       in
-      aux [] e
+      aux Lit.Set.empty e
 
-    let to_lists_l e: lit list list = to_lists e |> Sequence.to_rev_list
-
-    let to_lists_uniq e =
-      let f l = Lit.Set.of_list l |> Lit.Set.to_list in
-      to_lists e |> Sequence.map f
-
-    let to_lists_uniq_l e =
-      to_lists_uniq e |> Sequence.to_rev_list
+    let to_sets_l e: Lit.Set.t list = to_sets e |> Sequence.to_rev_list
 
     let pp out e =
       let pp1 out l =
         fpf out "(@[%a@])"
-          (Utils.pp_list Lit.pp) l
+          (Utils.pp_list Lit.pp) (Lit.Set.elements l)
       in
-      match to_lists_uniq_l e with
+      match to_sets_l e with
         | [] -> assert false
         | [e] -> pp1 out e
         | l ->
@@ -1608,11 +1601,9 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
          [e1 & e2 & ... & en => …], that is, the clause
          [not e1 | not e2 | ... | not en] *)
   let clause_guard_of_exp_ (e:explanation): Lit.t list Sequence.t =
-    let l = Explanation.to_lists e in
+    let l = Explanation.to_sets e in
     Sequence.map
-      (fun e ->
-         List.map Lit.neg e (* this is a guard! *)
-         |> CCList.sort_uniq ~cmp:Lit.compare)
+      (fun e -> Lit.Set.to_list e |> List.map Lit.neg)
       l
 
   (** {2 Reduction to Normal Form} *)
@@ -1723,7 +1714,17 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           );
           begin match Thunk.view a' with
             | T_value _ -> e_a, a' (* return value *)
+            | T_ref (_,{contents=(e_b, b)}) ->
+              (* compress: [ref (ref u) --> ref u] *)
+              Backtrack.push_set_nf_ t_ref;
+              t_ref := (E.append e_a e_b, b);
+              E_empty, t (* not a value yet *)
             | _ ->
+              (* evaluation stays blocked, but makes some progress *)
+              if a != a' then (
+                Backtrack.push_set_nf_ t_ref;
+                t_ref := (e_a, a');
+              );
               E.empty, t (* not a value yet, continue sharing computation *)
           end
         | T_lazy (p, env) ->
@@ -1731,13 +1732,13 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           compute_nf_prgm E.empty p env
         | T_suspend (p, v, env) ->
           let e_v, t_i = Subst.find v env in
-          let e_i, t_i' = compute_nf_add e_v t_i in
-          let env' = if t_i==t_i' then env else Subst.set v (e_i,t_i') env in
+          let e_v, t_i' = compute_nf_add e_v t_i in
+          let env' = Subst.set v (e_v,t_i') env in
           if Thunk.is_value t_i'
-          then compute_nf_prgm e_i p env'
+          then compute_nf_prgm e_v p env'
           else (
             (* do not return yet *)
-            let new_t = if env==env' then t else Thunk.suspend p v env' in
+            let new_t = Thunk.suspend p v env' in
             E.empty, new_t
           )
       end
@@ -1768,7 +1769,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         | P_match (v, m) ->
           let e_v, th_v = Subst.find v env in
           let e_v, th_v' = compute_nf_add e_v th_v in
-          let env' = if th_v==th_v' then env else Subst.set v (e_v,th_v') env in
+          let env' = Subst.set v (e_v,th_v') env in
           begin match Thunk.view th_v with
             | T_value (V_cstor (c, args)) ->
               begin match ID.Map.get c.cstor_id m with
@@ -1791,7 +1792,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         | P_if (v,a,b) ->
           let e_v, th_v = Subst.find v env in
           let e_v, th_v' = compute_nf_add e_v th_v in
-          let env' = if th_v==th_v' then env else Subst.set v (e_v,th_v') env in
+          let env' = Subst.set v (e_v,th_v') env in
           begin match Thunk.view th_v' with
             | T_value V_true -> compute_nf_prgm (E.append e_v e) a env'
             | T_value V_false -> compute_nf_prgm (E.append e_v e) b env'
@@ -1822,7 +1823,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         | P_call (v_f, args) ->
           let e_f, th_f = Subst.find v_f env in
           let e_f, th_f' = compute_nf_add e_f th_f in
-          let env' = if th_f==th_f' then env else Subst.set v_f (e_f,th_f') env in
+          let env' = Subst.set v_f (e_f,th_f') env in
           begin match Thunk.view th_f' with
             | T_value (V_fun (_, vars, body)) ->
               assert (List.length vars = List.length args);
