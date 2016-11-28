@@ -155,11 +155,10 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
        [T_ref] is useful for sharing computations. *)
     | T_lazy of prgm * eval_env
     (* unevaluated thunk *)
-    | T_suspend of prgm * local_var * eval_env * explanation
+    | T_suspend of prgm * local_var * eval_env
     (* a suspended program: the current codepointer,
        with the local environment. The evaluation is blocked because
-       the program needs the value of something in [env] (the variable).
-       There is a partial explanation attached, for when this reduces to a value *)
+       the program needs the value of something in [env] (the variable). *)
     | T_check_assign of cst_undef * value
     (* [T_check_assign (c,v)] is true if [c := v], false otherwise *)
 
@@ -167,7 +166,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
   and thunk_ref = (explanation * thunk) ref
 
   (* environment for evaluation *)
-  and eval_env = thunk Subst.t
+  and eval_env = (explanation * thunk) Subst.t
 
   (** A value in WHNF *)
   and value =
@@ -576,13 +575,15 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     | T_not a -> fpf out "(@[not@ %a@])" pp_thunk a
     | T_ref (_,{contents=(_,u)}) -> fpf out "(@[ref@ %a@])" pp_thunk u
     | T_lazy (p,env) ->
-      fpf out "(@[<1>lazy %a@ [@[%a@]]@])"
-        Prgm.pp p (Subst.pp pp_thunk) env
-    | T_suspend (p,v,env,_) ->
+      fpf out "(@[<1>lazy %a@ [@[%a@]]@])" Prgm.pp p pp_env env
+    | T_suspend (p,v,env) ->
       fpf out "(@[<1>suspend `@[%a@]`@ on %a@ in [@[%a@]]@])"
-        Prgm.pp p pp_local_var v (Subst.pp pp_thunk) env
+        Prgm.pp p pp_local_var v pp_env env
     | T_check_assign (c,v) ->
       fpf out "(@[<1>check %a :=@ %a@])" Cst_undef.pp c pp_value v
+
+  and pp_env_entry out (_,t) = pp_thunk out t
+  and pp_env out = Subst.pp pp_env_entry out
 
   and pp_value out (v:value): unit = match v with
     | V_true -> Fmt.string out "true"
@@ -594,6 +595,29 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     | V_fun ({fun_id;_}, vars, body) ->
       fpf out "(@[<1>fun (@[%a@])@ %a@ as: %a@])"
         Prgm.pp_vars vars Prgm.pp body ID.pp fun_id
+
+  module Explanation_base = struct
+    type t = explanation
+    let empty : t = E_empty
+    let return e = E_leaf e
+    let size = function
+      | E_empty -> 0
+      | E_leaf _ -> 1
+      | E_append (_,_,n) | E_or (_,_,n) -> n
+    let or_ a b = match a, b with
+      | E_empty, _ -> b
+      | _, E_empty -> a
+      | _ -> E_or (a, b, size a + size b)
+    let append s1 s2 = match s1, s2 with
+      | E_empty, _ -> s2
+      | _, E_empty -> s1
+      | _ -> E_append (s1, s2, size s1+size s2)
+    let cons e s = append (return e) s
+
+    let is_empty = function
+      | E_empty -> true
+      | E_leaf _ | E_or _ | E_append _ -> false (* by smart cstor *)
+  end
 
   module Value = struct
     type t = value
@@ -642,7 +666,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       | T_par_and (a,_,b,_) | T_equiv (a,b) | T_eq (a,b) ->
         merge_deps (deps a) (deps b)
       | T_ref (_,{contents=(_,u)}) -> deps u
-      | T_suspend (_,v,env,_) -> deps (Subst.find v env)
+      | T_suspend (_,v,env) -> deps (Subst.find v env |> snd)
 
     let mk_ view = view
 
@@ -694,24 +718,28 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       | [] -> lazy_ body Subst.empty
       | _ -> value (V_fun (nf,vars,body))
 
-    let suspend p v env e =
+    let suspend p v env =
       assert (Subst.mem v env);
-      mk_ (T_suspend (p,v,env,e))
+      mk_ (T_suspend (p,v,env))
 
     let pp = pp_thunk
 
     (* evaluate program literal under given environment *)
-    let rec eval_const (env:eval_env) (v:prgm_const) : thunk =
+    let rec eval_const (env:eval_env) (e:explanation) (v:prgm_const) : explanation * thunk =
       begin match v with
-        | C_true -> true_
-        | C_false -> false_
-        | C_cstor (a,[]) -> cstor a []
-        | C_cstor (a,l) -> cstor a (List.map (eval_const env) l)
-        | C_dom_elt c -> dom_elt c
-        | C_const c -> cst_undef c
-        | C_var v -> Subst.find v env
-        | C_fun (nf,vars,body) -> fun_ nf vars body
-        | C_eval p -> lazy_ p env (* freeze for now *)
+        | C_true -> e, true_
+        | C_false -> e, false_
+        | C_cstor (a,[]) -> e, cstor a []
+        | C_cstor (a,l) ->
+          let e, l = CCList.fold_map (eval_const env) e l in
+          e, cstor a l
+        | C_dom_elt c -> e, dom_elt c
+        | C_const c -> e, cst_undef c
+        | C_var v ->
+          let e_v, th = Subst.find v env in
+          Explanation_base.append e e_v, th
+        | C_fun (nf,vars,body) -> e, fun_ nf vars body
+        | C_eval p -> e, lazy_ p env (* freeze for now *)
       end
 
     (* under-approximation of equality *)
@@ -929,26 +957,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
   end
 
   module Explanation = struct
-    type t = explanation
-    let empty : t = E_empty
-    let return e = E_leaf e
-    let size = function
-      | E_empty -> 0
-      | E_leaf _ -> 1
-      | E_append (_,_,n) | E_or (_,_,n) -> n
-    let or_ a b = match a, b with
-      | E_empty, _ -> b
-      | _, E_empty -> a
-      | _ -> E_or (a, b, size a + size b)
-    let append s1 s2 = match s1, s2 with
-      | E_empty, _ -> s2
-      | _, E_empty -> s1
-      | _ -> E_append (s1, s2, size s1+size s2)
-    let cons e s = append (return e) s
-
-    let is_empty = function
-      | E_empty -> true
-      | E_leaf _ | E_or _ | E_append _ -> false (* by smart cstor *)
+    include Explanation_base
 
     let to_lists e: lit list Sequence.t =
       let open Sequence.Infix in
@@ -1720,15 +1729,15 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         | T_lazy (p, env) ->
           (* start execution of [p] in environment [env] *)
           compute_nf_prgm E.empty p env
-        | T_suspend (p, v, env, e) ->
-          let t_i = Subst.find v env in
-          let e, t_i' = compute_nf_add e t_i in
-          let env' = if t_i==t_i' then env else Subst.set v t_i' env in
+        | T_suspend (p, v, env) ->
+          let e_v, t_i = Subst.find v env in
+          let e_i, t_i' = compute_nf_add e_v t_i in
+          let env' = if t_i==t_i' then env else Subst.set v (e_i,t_i') env in
           if Thunk.is_value t_i'
-          then compute_nf_prgm e p env'
+          then compute_nf_prgm e_i p env'
           else (
             (* do not return yet *)
-            let new_t = if env==env' then t else Thunk.suspend p v env' e in
+            let new_t = if env==env' then t else Thunk.suspend p v env' in
             E.empty, new_t
           )
       end
@@ -1743,49 +1752,53 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       begin match Prgm.view p with
         | P_return c ->
           (* eval [c] in current environment *)
-          let th = Thunk.eval_const env c in
+          let e, th = Thunk.eval_const env e c in
           compute_nf_add e th
         | P_let (Let_eager, v, a, b) ->
           (* evaluate [a] right now and push it into the env *)
-          let e, th_a = compute_nf_prgm e a env in
-          let env = Subst.add v th_a env in
+          let e_a, th_a = compute_nf_prgm e a env in
+          let env = Subst.add v (e_a,th_a) env in
           compute_nf_prgm e b env
         | P_let (Let_lazy, v, a, b) ->
           (* push a lazy thunk for computing [a] into the env, then eval [b] *)
           let th_a = Thunk.ref_ (Thunk.lazy_ a env) in
-          let env = Subst.add v th_a env in
+          let env = Subst.add v (E.empty,th_a) env in
           compute_nf_prgm e b env
         | P_lazy (lazy p_cont, _) -> compute_nf_prgm e p_cont env
         | P_match (v, m) ->
-          let th = Subst.find v env in
-          let e, th' = compute_nf_add e th in
-          let env' = if th==th' then env else Subst.set v th' env in
-          begin match Thunk.view th with
+          let e_v, th_v = Subst.find v env in
+          let e_v, th_v' = compute_nf_add e_v th_v in
+          let env' = if th_v==th_v' then env else Subst.set v (e_v,th_v') env in
+          begin match Thunk.view th_v with
             | T_value (V_cstor (c, args)) ->
               begin match ID.Map.get c.cstor_id m with
                 | None -> assert false
                 | Some (vars, p_cont) ->
                   (* follow [p_cont] *)
                   assert (List.length vars = List.length args);
-                  let env' = List.fold_right2 Subst.add vars args env' in
-                  compute_nf_prgm e p_cont env'
+                  let env' =
+                    List.fold_right2
+                      (fun v a env -> Subst.add v (E.empty,a) env)
+                      vars args env'
+                  in
+                  compute_nf_prgm (E.append e e_v) p_cont env'
               end
             | T_value _ -> assert false
             | _ ->
               (* suspend, waiting for [th] to become a value *)
-              E.empty, Thunk.suspend p v env' e
+              e, Thunk.suspend p v env'
           end
         | P_if (v,a,b) ->
-          let th = Subst.find v env in
-          let e, th' = compute_nf_add e th in
-          let env' = if th==th' then env else Subst.set v th' env in
-          begin match Thunk.view th' with
-            | T_value V_true -> compute_nf_prgm e a env'
-            | T_value V_false -> compute_nf_prgm e b env'
+          let e_v, th_v = Subst.find v env in
+          let e_v, th_v' = compute_nf_add e_v th_v in
+          let env' = if th_v==th_v' then env else Subst.set v (e_v,th_v') env in
+          begin match Thunk.view th_v' with
+            | T_value V_true -> compute_nf_prgm (E.append e_v e) a env'
+            | T_value V_false -> compute_nf_prgm (E.append e_v e) b env'
             | T_value _ -> assert false
             | _ ->
               (* suspend, waiting for [th] to become a value *)
-              E.empty, Thunk.suspend p v env' e
+              e, Thunk.suspend p v env'
           end
         | P_equiv (a,b) ->
           let e, th_a = compute_nf_prgm e a env in
@@ -1805,11 +1818,11 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         | P_not a ->
           let e, th_a = compute_nf_prgm e a env in
           compute_nf_add e (Thunk.not_ th_a)
-        | P_call (f, []) -> E.empty, Subst.find f env
+        | P_call (f, []) -> Subst.find f env
         | P_call (v_f, args) ->
-          let th_f = Subst.find v_f env in
-          let e, th_f' = compute_nf_add e th_f in
-          let env' = if th_f==th_f' then env else Subst.set v_f th_f' env in
+          let e_f, th_f = Subst.find v_f env in
+          let e_f, th_f' = compute_nf_add e_f th_f in
+          let env' = if th_f==th_f' then env else Subst.set v_f (e_f,th_f') env in
           begin match Thunk.view th_f' with
             | T_value (V_fun (_, vars, body)) ->
               assert (List.length vars = List.length args);
@@ -1818,14 +1831,14 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
                  dereferences in the environment, but do not do match/if or
                  function calls (in this case, it uses [lazy]). This should make
                  passing values cheap, and other arguments reasonable. *)
-              let args = List.map (fun p_a -> Thunk.lazy_ p_a env) args in
+              let args = List.map (fun p_a -> E.empty, Thunk.lazy_ p_a env) args in
               (* new stack for args, then jump to [body] *)
               let env = Subst.of_list (List.combine vars args) in
-              compute_nf_prgm e body env
+              compute_nf_prgm (E.append e_f e) body env
             | T_value _ -> assert false (* typing *)
             | _ ->
               (* suspend, waiting for [th_f] to become a proper function *)
-              E.empty, Thunk.suspend p v_f env' e
+              e, Thunk.suspend p v_f env'
           end
       end
 
@@ -2689,7 +2702,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         | T_const c -> cst_undef_to_ast c
         | T_not a -> A.not_ (aux env a)
         | T_lazy (p,env) -> prgm_to_ast env p
-        | T_suspend (p,_,env',_) -> prgm_to_ast env' p
+        | T_suspend (p,_,env') -> prgm_to_ast env' p
         | T_check_assign (c,v) -> A.eq (cst_undef_to_ast c) (value_to_ast env v)
         | T_equiv (a,b) | T_eq (a,b) -> A.eq (aux env a) (aux env b)
         | T_seq_and (a,b) | T_par_and (a,_,b,_) -> A.and_ (aux env a)(aux env b)
@@ -2697,7 +2710,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       in
       aux env t
 
-    and value_to_ast (env:eval_env) v =
+    and value_to_ast (env:eval_env) v: Ast.term =
       begin match v with
         | V_true -> A.true_
         | V_false -> A.false_
@@ -2710,17 +2723,17 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     and prgm_to_ast (env:eval_env) (p:prgm): Ast.term = match p with
       | P_return c -> prgm_const_to_ast env c
       | P_let (_,v,t,u) ->
-        let env = Subst.add v (Thunk.lazy_ t env) env in
+        let env = Subst.add v (E_empty, Thunk.lazy_ t env) env in
         prgm_to_ast env u
       | P_match (_,_) -> assert false
       | P_if (v,a,b) ->
         A.if_
-          (thunk_to_ast env (Subst.find v env))
+          (thunk_to_ast env (Subst.find v env |> snd))
           (prgm_to_ast env a)
           (prgm_to_ast env b)
       | P_call (v,l) ->
         A.app
-          (thunk_to_ast env (Subst.find v env))
+          (thunk_to_ast env (Subst.find v env |> snd))
           (List.map (prgm_to_ast env) l)
       | P_lazy (lazy p,_) -> prgm_to_ast env p
       | P_and (a,b) -> A.and_ (prgm_to_ast env a) (prgm_to_ast env b)
@@ -2734,7 +2747,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       | C_dom_elt c -> dom_elt_to_ast c
       | C_const c -> cst_undef_to_ast c
       | C_fun (nf,_,_) -> nf_to_ast nf
-      | C_var v -> thunk_to_ast env (Subst.find v env)
+      | C_var v -> thunk_to_ast env (Subst.find v env |> snd)
       | C_eval p -> prgm_to_ast env p
       | C_cstor (c,l) ->
         A.app (cstor_to_ast c) (List.map (prgm_const_to_ast env) l)
