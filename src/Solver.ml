@@ -2358,6 +2358,12 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
                 | Decl_cst_undef _ ->
                   errorf "cannot call undef fun %a" ID.pp id (* TODO *)
               end
+            | Ast.Var v when Subst.mem (Ast.Var.id v) env.subst ->
+              (* lookup in environment *)
+              Prgm.call (Subst.find (Ast.Var.id v) env.subst) l
+            | Ast.Var v ->
+              (* will be in environment *)
+              Prgm.call (Ast.Var.id v) l
             | _ ->
               errorf "cannot call `%a`" Ast.pp_term f
           end
