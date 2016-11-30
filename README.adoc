@@ -16,6 +16,15 @@ opam install msat containers sequence
 make
 ----
 
+== Memory Profiling
+
+----
+opam sw 4.04.0+spacetime
+make
+OCAML_SPACETIME_INTERVAL=100 ./smbc.native --debug 1 --check examples/ty_infer.lisp
+prof_spacetime serve spacetime-<PID> -e smbc.native
+----
+
 == Name
 
 "Sat Modulo Bounded Checking"
