@@ -120,6 +120,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     | P_not of prgm
     | P_eq of prgm * prgm
     | P_equiv of prgm * prgm
+    | P_unreachable
 
   (* TODO: switch/quant/check *)
 
@@ -137,36 +138,19 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
   (* an on-going (or terminated) computation, using call-by-need.
      A thunk is either resolved (into a weak-head normal form)
      or ongoing (as a suspension or some boolean operator) *)
-  and thunk =
-    | T_value of value
-    | T_const of cst_undef
-    | T_par_and of thunk * explanation * thunk * explanation
-    (* parallel "and" of the two thunks *)
-    | T_seq_and of thunk * thunk
-    (* sequential "and" (left one first) *)
-    | T_eq of thunk * thunk
-    | T_equiv of thunk * thunk
-    | T_not of thunk
-    | T_ref of thunk * thunk_ref
-    (* [T_ref (old, (e, t))] is a mutable reference that, conceptually,
-       evaluates into [t] with explanation [e]. It started with value [old].
-       It can be updated when [t] reduces to [u], but this update is
-       backtrackable.
-       [T_ref] is useful for sharing computations. *)
-    | T_lazy of prgm * eval_env
-    (* unevaluated thunk *)
-    | T_suspend of prgm * local_var * eval_env
-    (* a suspended program: the current codepointer,
-       with the local environment. The evaluation is blocked because
-       the program needs the value of something in [env] (the variable). *)
-    | T_check_assign of cst_undef * value
-    (* [T_check_assign (c,v)] is true if [c := v], false otherwise *)
+  and thunk = {
+    mutable t_nf: (explanation * thunk_normal_form);
+    mutable t_prgm: prgm;
+    mutable t_env: eval_env;
+  }
 
-  (* a reference to a pair [explanation * thunk] *)
-  and thunk_ref = (explanation * thunk) ref
+  and thunk_normal_form =
+    | TNF_value of value (* done *)
+    | TNF_const of cst_undef (* same as this constant *)
+    | TNF_partial (* not finished yet *)
 
   (* environment for evaluation *)
-  and eval_env = (explanation * thunk) Subst.t
+  and eval_env = thunk Subst.t
 
   (** A value in WHNF *)
   and value =
@@ -421,16 +405,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
 
     let dummy_level = -1
 
-    type stack_cell =
-      | S_set_nf of
-          thunk_ref * (explanation * thunk)
-          (* t1.nf <- t2 *)
-      | S_set_cst_case of
-          cst_undef * (explanation * value) option
-          (* c1.cst_case <- t2 *)
-      | S_set_uty of
-          ty_uninterpreted_slice * (explanation * ty_uninterpreted_status) option
-          (* uty1.uty_status <- status2 *)
+    type stack_cell = unit -> unit
 
     type stack = stack_cell CCVector.vector
 
@@ -441,10 +416,8 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       Log.debugf 2
         (fun k->k "@{<Yellow>** now at level %d (backtrack)@}" l);
       while CCVector.length st_ > l do
-        match CCVector.pop_exn st_ with
-          | S_set_nf (t, nf) -> t := nf
-          | S_set_cst_case (cst, v) -> cst.cst_cur_case <- v;
-          | S_set_uty (uty, s) -> uty.uty_status <- s;
+        let f = CCVector.pop_exn st_ in
+        f ();
       done;
       ()
 
@@ -455,14 +428,17 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       Log.debugf 2 (fun k->k "@{<Yellow>** now at level %d (push)@}" l);
       ()
 
-    let push_set_nf_ (r:thunk_ref) =
-      CCVector.push st_ (S_set_nf (r, !r))
+    let push_thunk_nf_ (t:thunk) =
+      let old = t.t_nf in
+      CCVector.push st_ (fun () -> t.t_nf <- old)
 
     let push_set_cst_case_ (cst:cst_undef) =
-      CCVector.push st_ (S_set_cst_case (cst, cst.cst_cur_case))
+      let old = cst.cst_cur_case in
+      CCVector.push st_ (fun () -> cst.cst_cur_case <- old)
 
     let push_uty_status (uty:ty_uninterpreted_slice) =
-      CCVector.push st_ (S_set_uty (uty, uty.uty_status))
+      let old = uty.uty_status in
+      CCVector.push st_ (fun () -> uty.uty_status <- old);
   end
 
   let new_switch_id_ =
@@ -500,6 +476,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     let not_ a = P_not a
     let eq a b = P_eq (a,b)
     let equiv a b = P_equiv (a,b)
+    let unreachable = P_unreachable
 
     let pp_let_kind out =
       function Let_lazy -> () | Let_eager -> Fmt.string out "!"
@@ -533,6 +510,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       | P_eq (a,b) -> fpf out "(@[<hv1>=@ %a@ %a@])" pp a pp b
       | P_equiv (a,b) -> fpf out "(@[<hv1>equiv@ %a@ %a@])" pp a pp b
       | P_not a -> fpf out "(@[<1>not@ %a@])" pp a
+      | P_unreachable -> Fmt.string out "unreachable"
 
     and pp_const out = function
       | C_true -> Fmt.string out "true"
@@ -565,24 +543,14 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         -> CCOrd.int_ (to_int_ a) (to_int_ b)
     end
 
-  let rec pp_thunk out (t:thunk): unit = match t with
-    | T_value v -> pp_value out v
-    | T_const c -> Cst_undef.pp out c
-    | T_par_and (a,_,b,_) -> fpf out "(@[<hv>and@ %a@ %a@])" pp_thunk a pp_thunk b
-    | T_seq_and (a,b) -> fpf out "(@[<hv>&&@ %a@ %a@])" pp_thunk a pp_thunk b
-    | T_eq (a,b) -> fpf out "(@[<hv>=@ %a@ %a@])" pp_thunk a pp_thunk b
-    | T_equiv (a,b) -> fpf out "(@[<hv><=>@ %a@ %a@])" pp_thunk a pp_thunk b
-    | T_not a -> fpf out "(@[not@ %a@])" pp_thunk a
-    | T_ref (_,{contents=(_,u)}) -> fpf out "(@[ref@ %a@])" pp_thunk u
-    | T_lazy (p,env) ->
-      fpf out "(@[<1>lazy %a@ [@[%a@]]@])" Prgm.pp p pp_env env
-    | T_suspend (p,v,env) ->
-      fpf out "(@[<1>suspend `@[%a@]`@ on %a@ in [@[%a@]]@])"
-        Prgm.pp p pp_local_var v pp_env env
-    | T_check_assign (c,v) ->
-      fpf out "(@[<1>check %a :=@ %a@])" Cst_undef.pp c pp_value v
+  let rec pp_thunk out (t:thunk): unit = match t.t_nf with
+    | _, TNF_value v -> pp_value out v
+    | _, TNF_const c -> Cst_undef.pp out c
+    | _, TNF_partial ->
+      fpf out "(@[<1>thunk `@[%a@]`@ in [@[%a@]]@])"
+        Prgm.pp t.t_prgm pp_env t.t_env
 
-  and pp_env_entry out (_,t) = pp_thunk out t
+  and pp_env_entry out e = pp_thunk out e
   and pp_env out = Subst.pp pp_env_entry out
 
   and pp_value out (v:value): unit = match v with
@@ -654,91 +622,62 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
   module Thunk = struct
     type t = thunk
 
-    let view t = t
-
-    let merge_deps = CCList.sorted_merge_uniq ~cmp:cmp_dep_
-
-    let rec deps (t:thunk): thunk_deps = match t with
-      | T_check_assign (c,_) | T_const c -> [Dep_cst c]
-      | T_lazy _
-      | T_value _ -> []
-      | T_seq_and (a, _) | T_not a -> deps a
-      | T_par_and (a,_,b,_) | T_equiv (a,b) | T_eq (a,b) ->
-        merge_deps (deps a) (deps b)
-      | T_ref (_,{contents=(_,u)}) -> deps u
-      | T_suspend (_,v,env) -> deps (Subst.find v env |> snd)
+    let nf t = t.t_nf
+    let prgm t = t.t_prgm
+    let env t = t.t_env
 
     let mk_ view = view
 
-    let value v = mk_ (T_value v)
-    let true_ = value V_true
-    let false_ = value V_false
-    let cstor a l = value (V_cstor (a,l))
-    let dom_elt c = value (V_dom_elt c)
+    let value e v = {
+      t_nf=e, TNF_value v;
+      t_prgm=Prgm.unreachable;
+      t_env=Subst.empty;
+    }
 
-    let abs (t:thunk): t * bool = match view t with
-      | T_value V_false -> true_, false
-      | T_not u -> u, false
+    let true_ e = value e V_true
+    let false_ e = value e V_false
+    let cstor e a l = value e (V_cstor (a,l))
+    let dom_elt e c = value e (V_dom_elt c)
+
+    let abs (t:thunk): t * bool = match nf t with
+      | e, T_value V_false -> true_ e, false
+      | e, T_not u ->
+        assert false
+        (* FIXME: need to allocate a new one that just forwards to [u]?
+           u, false
+        *)
       | _ -> t, true
 
-    let is_value t = match view t with T_value _ -> true | _ -> false
+    let is_value t = match nf t with _, TNF_value _ -> true | _ -> false
 
-    let cst_undef c = mk_ (T_const c)
+    let cst_undef e c = {
+      t_nf = e, TNF_const c;
+      t_prgm = Prgm.unreachable;
+      t_env=Subst.empty;
+    }      
 
-    let not_ t = match view t with
-      | T_not a -> a
-      | T_value V_true -> false_
-      | T_value V_false -> true_
-      | _ -> mk_ (T_not t)
-
-    let and_ a b = mk_ (T_par_and (a, E_empty, b, E_empty))
-
-    let rec and_l = function
-      | [] -> true_
-      | [a] -> a
-      | a :: l -> and_ a (and_l l)
-
-    let and_par a e_a b e_b = mk_ (T_par_and (a, e_a, b, e_b))
-
-    let and_seq a b = mk_ (T_seq_and (a,b))
-
-    let eq a b = mk_ (T_eq (a,b))
-
-    let equiv a b = mk_ (T_equiv (a,b))
-
-    let ref_ t = match view t with
-      | T_ref _ -> t
-      | _ -> mk_ (T_ref (t, ref (E_empty, t)))
-
-    let check_assign c v = mk_ (T_check_assign (c,v))
-
-    let lazy_ p env = mk_ (T_lazy (p, env))
-
-    let fun_ nf vars body = match vars with
-      | [] -> lazy_ body Subst.empty
-      | _ -> value (V_fun (nf,vars,body))
-
-    let suspend p v env =
-      assert (Subst.mem v env);
-      mk_ (T_suspend (p,v,env))
+    (* build a new suspension *)
+    let make (p:prgm) (env:eval_env): t = {
+      t_nf=E_empty, TNF_partial;
+      t_prgm=p;
+      t_env=env;
+    }
 
     let pp = pp_thunk
 
     (* evaluate program literal under given environment *)
-    let rec eval_const (env:eval_env) (e:explanation) (v:prgm_const) : explanation * thunk =
+    let rec eval_const (env:eval_env) (e:explanation) (v:prgm_const) : thunk =
       begin match v with
-        | C_true -> e, true_
-        | C_false -> e, false_
-        | C_cstor (a,[]) -> e, cstor a []
+        | C_true -> true_ e
+        | C_false -> false_ e
+        | C_cstor (a,[]) -> cstor e a []
         | C_cstor (a,l) ->
-          let e, l = CCList.fold_map (eval_const env) e l in
-          e, cstor a l
-        | C_dom_elt c -> e, dom_elt c
-        | C_const c -> e, cst_undef c
-        | C_var v ->
-          let e_v, th = Subst.find v env in
-          Explanation_base.append e e_v, th
-        | C_fun (nf,vars,body) -> e, fun_ nf vars body
+          let e, l = CCList.fold_map (eval_const env e) e l in
+          cstor e a l
+        | C_dom_elt c -> dom_elt e c
+        | C_const c -> cst_undef e c
+        | C_var v -> Subst.find v env (*FIXME: [e] should not be there? *)
+        | C_fun (nf,vars,body) -> fun_ nf vars body
         | C_eval p -> e, lazy_ p env (* freeze for now *)
       end
 
@@ -1608,6 +1547,20 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
 
   (** {2 Reduction to Normal Form} *)
   module Reduce = struct
+
+    (* TODO: an accumulator (set?) of deps, imperatively updated
+       during evaluation *)
+    let merge_deps = CCList.sorted_merge_uniq ~cmp:cmp_dep_
+
+    let rec deps (t:thunk): thunk_deps = match t with
+      | T_check_assign (c,_) | T_const c -> [Dep_cst c]
+      | T_lazy _
+      | T_value _ -> []
+      | T_seq_and (a, _) | T_not a -> deps a
+      | T_par_and (a,_,b,_) | T_equiv (a,b) | T_eq (a,b) ->
+        merge_deps (deps a) (deps b)
+      | T_ref (_,{contents=(_,u)}) -> deps u
+      | T_suspend (_,v,env) -> deps (Subst.find v env |> snd)
 
     let cycle_check_l ~sub:_ _ = false
     (* TODO: not needed? or only on constants?
