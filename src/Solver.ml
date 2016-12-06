@@ -467,13 +467,15 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     | [] -> ()
     | l -> fpf out "@ %a" (Utils.pp_list pp_local_var) l
 
+  let pp_update out b = if b then Fmt.string out "_u"
+
   let rec pp_thunk out (t:thunk): unit = pp_thunk_view out !t
   and pp_thunk_view out t = match t with
     | T_value (_,v) -> pp_value out v
     | T_const (_,c) -> Cst_undef.pp out c
     | T_suspend (_,p,env,upd) ->
-      fpf out "(@[<1>thunk/%B `@[%a@]`@ in [@[%a@]]@])"
-        upd pp_prgm p pp_env env
+      fpf out "(@[<1>thunk%a `@[%a@]`@ in %a@])"
+        pp_update upd pp_prgm p pp_env env
     | T_forward (_,t') -> fpf out "(@[<1>fwd@ %a@])" pp_thunk t'
 
   and pp_env_entry out e = pp_thunk out e
@@ -711,12 +713,13 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
 
     (* a thunk for [a = b]
        TODO: simplifications *)
-    let eq (a:t)(b:t): t =
+    let eq : t -> t -> t =
       let x = ID.make "x" in
       let y = ID.make "y" in
       let prgm = Prgm.eq x y in
-      let env : eval_env = Subst.of_list [x, a; y, b] in
-      suspend ~upd:true E_empty prgm env
+      fun a b ->
+        let env : eval_env = Subst.of_list [x, a; y, b] in
+        suspend ~upd:true E_empty prgm env
 
     let and_ : t -> t -> t =
       let x = ID.make "x" in
@@ -810,7 +813,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
   let pp_lit out (l:lit): unit =
     let pp_lit_view out = function
       | Lit_fresh i -> fpf out "#%a" ID.pp i
-      | Lit_atom (i,t) -> fpf out "(@[<1>atom_%d@ %a@])" i Thunk.pp t
+      | Lit_atom (i,t) -> fpf out "(@[<1>atom_%d@ cur_nf: %a@])" i Thunk.pp t
       | Lit_assign (c,v) ->
         fpf out "(@[:= %a@ %a@])" Cst_undef.pp c Value.pp v
       | Lit_uty_empty u -> fpf out "(empty %a)" pp_uty u
@@ -1606,16 +1609,6 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
   (** {2 Reduction to Normal Form} *)
   module Reduce = struct
 
-    let expand_cst_ (c:cst_undef) : unit =
-      Log.debugf 2 (fun k->k "(@[<1>expand_cst@ %a@])" Cst_undef.pp c);
-      Expand.expand_cst c;
-      ()
-
-    let expand_uty_ (uty:ty_uninterpreted_slice) : unit =
-      Log.debugf 2 (fun k->k "(@[<1>expand_uty@ %a@])" pp_uty uty);
-      Expand.expand_uty uty;
-      ()
-
     let cycle_check_l ~sub:_ _ = false
     (* TODO: not needed? or only on constants?
     let cycle_check_tbl : unit Term.Tbl.t = Term.Tbl.create 32
@@ -1685,16 +1678,18 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         | T_const _
         | T_forward _
         | T_suspend _ -> None
-
       end
 
     and compute_nf_view (t:thunk): thunk_view =
+      Log.debugf 5 (fun k->k "(@[<v1>compute_nf@ %a@])" pp_thunk t);
       let view = Thunk.view t in
-      begin match Thunk.view t with
+      let res = match view with
         | T_value _ -> view
         | T_const (e, c) ->
           begin match c.cst_cur_case with
-            | None -> view
+            | None ->
+              Expand.expand_cst c;
+              view
             | Some (e', v) -> T_value (E.append e e', v)
           end
         | T_forward (e, t') ->
@@ -1710,7 +1705,11 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
             t := view';
           );
           view'
-      end
+      in
+      Log.debugf 5
+        (fun k->k "(@[<v1>... obtain@ %a@ exp: %a@])"
+            pp_thunk_view res E.pp (Thunk.expl_of_view res));
+      res
 
     (* compute the result of running this program in this environment.
        Return a new thunk view and an optional result *)
@@ -1725,7 +1724,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           begin match c.cst_cur_case with
             | None ->
               (* we are blocked by [c], expand it *)
-              expand_cst_ c;
+              Expand.expand_cst c;
               ret_suspend lst
             | Some (e', v) -> ret_value lst e' v
           end
@@ -1735,7 +1734,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           begin match c.cst_cur_case with
             | None ->
               (* we are blocked by [c], expand it *)
-              expand_cst_ c;
+              Expand.expand_cst c;
               ret_suspend lst
             | Some (e, v') ->
               if Value.equal_shallow v v'
@@ -1828,8 +1827,8 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
               ret_value lst (E.append e_a e_b) Value.true_ (* success *)
             | Some (e_a, V_false), Some (e_b, V_false) ->
               ret_value lst (E.or_ e_a e_b) Value.false_ (* double failure *)
-            | Some (e', V_false), None
-            | None, Some (e', V_false) ->
+            | Some (e', V_false), _
+            | _, Some (e', V_false) ->
               ret_value lst e' Value.false_ (* single failure *)
             | Some _, Some _ -> assert false
             | None, _
@@ -1878,6 +1877,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     and compute_nf_prgm_as_thunk lst : thunk =
       Thunk.mk_ (compute_nf_prgm lst)
 
+    (* TODO: flatten nested [T_forward] cases? *)
     and compute_nf_forward (e:explanation)(t:thunk): thunk_view =
       begin match compute_nf t with
         | None -> T_forward (e, t)
@@ -1977,6 +1977,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           compute_nf_forward e th
         | T_const (_, c), T_value (_, V_dom_elt dom_elt)
         | T_value (_, V_dom_elt dom_elt), T_const (_, c) ->
+          Expand.expand_cst c;
           assert false (* TODO *)
         | _ -> ret_suspend lst
       end
