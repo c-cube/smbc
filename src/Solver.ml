@@ -61,6 +61,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     type +'a t
     val is_empty : _ t -> bool
     val empty : 'a t
+    val singleton : ID.t -> 'a -> 'a t
     val add : ID.t -> 'a -> 'a t -> 'a t
     val set : ID.t -> 'a -> 'a t -> 'a t
     val mem : ID.t -> _ t -> bool
@@ -73,6 +74,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     type 'a t = 'a ID.Map.t
     let is_empty = ID.Map.is_empty
     let empty = ID.Map.empty
+    let singleton = ID.Map.singleton
     let mem = ID.Map.mem
     let add v x m = assert (not (mem v m)); ID.Map.add v x m
     let set v x m = assert (mem v m); ID.Map.add v x m
@@ -83,8 +85,9 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     let add_list l m = List.fold_left (fun m (v,t) -> add v t m) m l
     let of_list l = add_list l empty
     let pp pp_x out m =
+      let pp_pair out (k,v) = fpf out "@[<1>%a:=@,%a@]" ID.pp k pp_x v in
       fpf out "{@[<hv>%a@]}"
-        (ID.Map.print ~start:"" ~stop:"" ~sep:"," ~arrow:":=" ID.pp pp_x) m
+        (Fmt.seq ~start:"" ~stop:"" ~sep:"," pp_pair) (ID.Map.to_seq m)
   end
 
   type local_var = ID.t
@@ -102,6 +105,9 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
   (* program: the static part of computations *)
   type prgm =
     | P_return of prgm_const (* return value (in current env) *)
+    | P_jump of local_var (* jump to another thunk *)
+    | P_const of cst_undef (* jump to given constant *)
+    | P_check_assign of cst_undef * value
     | P_let of let_kind * local_var * prgm * prgm
     (* [Let (a,b)] means putting a thunk of [a] on the stack at position [0],
        then evaluating [b] *)
@@ -111,15 +117,15 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
        must be bound to [vars] in the local env
        before calling continuation [cont] *)
     | P_if of local_var * prgm * prgm
-    (* depending on value of [k], follow one of the branches *)
+    (* depending on value, follow one of the branches *)
     | P_call of local_var * prgm list
     (* call given program with the arguments *)
     | P_lazy of prgm lazy_t * string
     (* used for recursion (with a description) *)
-    | P_and of prgm * prgm
-    | P_not of prgm
-    | P_eq of prgm * prgm
-    | P_equiv of prgm * prgm
+    | P_and of local_var * local_var
+    | P_not of local_var
+    | P_eq of local_var * local_var
+    | P_equiv of local_var * local_var
     | P_unreachable
 
   (* TODO: switch/quant/check *)
@@ -128,26 +134,19 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
   and prgm_const =
     | C_true
     | C_false
-    | C_cstor of cstor * prgm_const list (* apply constructor *)
+    | C_cstor of cstor * local_var list (* apply constructor *)
     | C_dom_elt of dom_elt (* domain element *)
-    | C_const of cst_undef (* undefined constant. Will evaluated further *)
     | C_fun of named_fun * local_var list * prgm (* (named) function *)
-    | C_var of local_var (* dereference eagerly *)
-    | C_eval of prgm
 
   (* an on-going (or terminated) computation, using call-by-need.
-     A thunk is either resolved (into a weak-head normal form)
-     or ongoing (as a suspension or some boolean operator) *)
-  and thunk = {
-    mutable t_nf: (explanation * thunk_normal_form);
-    mutable t_prgm: prgm;
-    mutable t_env: eval_env;
-  }
-
-  and thunk_normal_form =
-    | TNF_value of value (* done *)
-    | TNF_const of cst_undef (* same as this constant *)
-    | TNF_partial (* not finished yet *)
+     A thunk is either resolved (into a weak-head normal form
+     or constant) or ongoing (as a suspension) *)
+  and thunk = thunk_view ref
+  and thunk_view =
+    | T_value of explanation * value (* done *)
+    | T_const of explanation * cst_undef (* same as this constant *)
+    | T_suspend of explanation * prgm * eval_env * bool (* true: update *)
+    | T_forward of explanation * thunk (* imitate given thunk *)
 
   (* environment for evaluation *)
   and eval_env = thunk Subst.t
@@ -395,9 +394,25 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     | Uty_empty -> Fmt.string out "empty"
     | Uty_nonempty -> Fmt.string out "non_empty"
 
+  let equal_dep (a:thunk_dep)(b:thunk_dep): bool = match a, b with
+    | Dep_cst c1, Dep_cst c2 -> Cst_undef.equal c1 c2
+    | Dep_uty u1, Dep_uty u2 -> equal_uty u1 u2
+    | Dep_cst _, _
+    | Dep_uty _, _ -> false
+
+  let hash_dep (a:thunk_dep): int = match a with
+    | Dep_cst c -> Hash.combine2 41 (Cst_undef.hash c)
+    | Dep_uty u -> Hash.combine2 42 (hash_uty u)
+
   let pp_dep out = function
     | Dep_cst c -> Cst_undef.pp out c
     | Dep_uty uty -> pp_uty out uty
+
+  module Dep_tbl = CCHashtbl.Make(struct
+      type t = thunk_dep
+      let equal = equal_dep
+      let hash = hash_dep
+    end)
 
   module Backtrack = struct
     type _level = level
@@ -429,8 +444,8 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       ()
 
     let push_thunk_nf_ (t:thunk) =
-      let old = t.t_nf in
-      CCVector.push st_ (fun () -> t.t_nf <- old)
+      let old = !t in
+      CCVector.push st_ (fun () -> t := old)
 
     let push_set_cst_case_ (cst:cst_undef) =
       let old = cst.cst_cur_case in
@@ -445,7 +460,77 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     let n = ref 0 in
     fun () -> incr n; !n
 
-  let pp_db out (i:int) = fpf out "%%%d" i
+  let pp_let_kind out =
+    function Let_lazy -> () | Let_eager -> Fmt.string out "!"
+
+  let pp_vars out = function
+    | [] -> ()
+    | l -> fpf out "@ %a" (Utils.pp_list pp_local_var) l
+
+  let rec pp_thunk out (t:thunk): unit = pp_thunk_view out !t
+  and pp_thunk_view out t = match t with
+    | T_value (_,v) -> pp_value out v
+    | T_const (_,c) -> Cst_undef.pp out c
+    | T_suspend (_,p,env,upd) ->
+      fpf out "(@[<1>thunk/%B `@[%a@]`@ in [@[%a@]]@])"
+        upd pp_prgm p pp_env env
+    | T_forward (_,t') -> fpf out "(@[<1>fwd@ %a@])" pp_thunk t'
+
+  and pp_env_entry out e = pp_thunk out e
+  and pp_env out = Subst.pp pp_env_entry out
+
+  and pp_value out (v:value): unit = match v with
+    | V_true -> Fmt.string out "true"
+    | V_false -> Fmt.string out "false"
+    | V_cstor (a,[]) -> ID.pp out a.cstor_id
+    | V_cstor (a,l) ->
+      fpf out "(@[%a@ %a@])" ID.pp a.cstor_id (Utils.pp_list pp_thunk) l
+    | V_dom_elt c -> ID.pp out c.dom_elt_id
+    | V_fun ({fun_id;_}, vars, body) ->
+      fpf out "(@[<1>fun (@[%a@])@ %a@ as: %a@])"
+        pp_vars vars pp_prgm body ID.pp fun_id
+
+  and pp_prgm out = function
+    | P_return v -> fpf out "(@[<1>return@ %a@])" pp_prgm_const v
+    | P_jump v -> fpf out "(@[<1>jump@ %a@])" pp_local_var v
+    | P_const c -> fpf out "(@[<1>cst %a@])" Cst_undef.pp c
+    | P_check_assign (c,v) -> fpf out "(@[<1>check %a@ := %a@])" Cst_undef.pp c pp_value v
+    | P_let (k,v,a,b) ->
+      fpf out "(@[<1>let%a@ %a %a@ %a@])" pp_let_kind k ID.pp v pp_prgm a pp_prgm b
+    | P_match (u,m) ->
+      let pp_bind out (id,(vars,rhs)) =
+        if vars=[]
+        then fpf out "(@[<1>case %a@ %a@])" ID.pp id pp_prgm rhs
+        else fpf out "(@[<1>case (@[<h>%a%a@])@ %a@])" ID.pp id pp_vars vars pp_prgm rhs
+      in
+      let print_map =
+        Fmt.seq ~start:"" ~stop:"" ~sep:" " pp_bind
+      in
+      fpf out "(@[<1>match@ %a@ (@[<hv>%a@])@])"
+        pp_local_var u print_map (ID.Map.to_seq m)
+    | P_if (a,b,c) ->
+      fpf out "(@[<hv1>if %a@ %a@ %a@])" pp_local_var a pp_prgm b pp_prgm c
+    | P_call (p,args) ->
+      fpf out "(@[<hv1>call@ %a@ %a@])"
+        pp_local_var p (Utils.pp_list pp_prgm) args
+    | P_lazy (_,descr) -> fpf out "<lazy %s>" descr
+    | P_and (a,b) -> fpf out "(@[<hv1>and@ %a@ %a@])" pp_local_var a pp_local_var b
+    | P_eq (a,b) -> fpf out "(@[<hv1>=@ %a@ %a@])" pp_local_var a pp_local_var b
+    | P_equiv (a,b) -> fpf out "(@[<hv1>equiv@ %a@ %a@])" pp_local_var a pp_local_var b
+    | P_not a -> fpf out "(@[<1>not@ %a@])" pp_local_var a
+    | P_unreachable -> Fmt.string out "unreachable"
+
+  and pp_prgm_const out = function
+    | C_true -> Fmt.string out "true"
+    | C_false -> Fmt.string out "false"
+    | C_cstor (a,[]) -> ID.pp out a.cstor_id
+    | C_cstor (a,l) ->
+      fpf out "(@[<hv>%a@ %a@])"
+        ID.pp a.cstor_id (Utils.pp_list pp_local_var) l
+    | C_dom_elt c -> ID.pp out c.dom_elt_id
+    | C_fun ({fun_id;_}, vars, body) ->
+      fpf out "(@[fun (@[%a@])@ %a@ as: %a@])"
+        (Utils.pp_list pp_local_var) vars pp_prgm body ID.pp fun_id
 
   module Prgm = struct
     type t = prgm
@@ -457,17 +542,15 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     let cstor c args = C_cstor (c,args)
     let cstor0 c = cstor c []
     let dom_elt c = C_dom_elt c
-    let const c = C_const c
-    let var v = C_var v
-    let eval p = match p with
-      | P_return c -> c (* [eval (return x) --> x] *)
-      | _ -> C_eval p
     let fun_ nf vars body = match vars with
-      | [] -> eval body
+      | [] -> assert false
       | _ -> C_fun (nf, vars, body)
 
     let return v = P_return v
+    let var v = P_jump v
+    let cst_undef c = P_const c
     let let_ k v a b = P_let (k,v,a,b)
+    let let_l k l1 l2 b = List.fold_right2 (let_ k) l1 l2 b
     let match_ u m = P_match (u,m)
     let if_ a b c = P_if (a,b,c)
     let call p args = P_call (p,args)
@@ -477,54 +560,29 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     let eq a b = P_eq (a,b)
     let equiv a b = P_equiv (a,b)
     let unreachable = P_unreachable
+    let check_assign c v = P_check_assign (c,v)
 
-    let pp_let_kind out =
-      function Let_lazy -> () | Let_eager -> Fmt.string out "!"
+    let gensym =
+      let n = ref 0 in
+      fun prefix ->
+        incr n;
+        ID.makef "%s_%d" prefix !n
 
-    let pp_vars out = function
-      | [] -> ()
-      | l -> fpf out "@ %a" (Utils.pp_list pp_local_var) l
+    let not_let : t -> t =
+      let v = gensym "bool" in
+      fun x -> let_ Let_eager v x (not_ v)
 
-    let rec pp out = function
-      | P_return v -> fpf out "(@[<1>return@ %a@])" pp_const v
-      | P_let (k,v,a,b) ->
-        fpf out "(@[<1>let%a@ %a %a@ %a@])" pp_let_kind k ID.pp v pp a pp b
-      | P_match (u,m) ->
-        let pp_bind out (id,(vars,rhs)) =
-          if vars=[]
-          then fpf out "(@[<1>case %a@ %a@])" ID.pp id pp rhs
-          else fpf out "(@[<1>case (@[<h>%a%a@])@ %a@])" ID.pp id pp_vars vars pp rhs
-        in
-        let print_map =
-          Fmt.seq ~start:"" ~stop:"" ~sep:" " pp_bind
-        in
-        fpf out "(@[<1>match@ %a@ (@[<hv>%a@])@])"
-          pp_local_var u print_map (ID.Map.to_seq m)
-      | P_if (a,b,c) ->
-        fpf out "(@[<hv1>if %a@ %a@ %a@])" pp_local_var a pp b pp c
-      | P_call (p,args) ->
-        fpf out "(@[<hv1>call@ %a@ %a@])"
-          pp_local_var p (Utils.pp_list pp) args
-      | P_lazy (_,descr) -> fpf out "<lazy %s>" descr
-      | P_and (a,b) -> fpf out "(@[<hv1>and@ %a@ %a@])" pp a pp b
-      | P_eq (a,b) -> fpf out "(@[<hv1>=@ %a@ %a@])" pp a pp b
-      | P_equiv (a,b) -> fpf out "(@[<hv1>equiv@ %a@ %a@])" pp a pp b
-      | P_not a -> fpf out "(@[<1>not@ %a@])" pp a
-      | P_unreachable -> Fmt.string out "unreachable"
+    let binop_let : (local_var -> local_var -> t) -> t -> t -> t =
+      let x = gensym "x" in
+      let y = gensym "y" in
+      fun f a b -> let_ Let_eager x a (let_ Let_eager y b (f x y))
 
-    and pp_const out = function
-      | C_true -> Fmt.string out "true"
-      | C_false -> Fmt.string out "false"
-      | C_cstor (a,[]) -> ID.pp out a.cstor_id
-      | C_cstor (a,l) ->
-        fpf out "(@[<hv>%a@ %a@])" ID.pp a.cstor_id (Utils.pp_list pp_const) l
-      | C_const c -> Cst_undef.pp out c
-      | C_dom_elt c -> ID.pp out c.dom_elt_id
-      | C_fun ({fun_id;_}, vars, body) ->
-        fpf out "(@[fun (@[%a@])@ %a@ as: %a@])"
-          (Utils.pp_list pp_local_var) vars pp body ID.pp fun_id
-      | C_var v -> pp_local_var out v
-      | C_eval p -> fpf out "(@[eval@ %a@])" pp p
+    let and_let = binop_let and_
+    let eq_let = binop_let eq
+    let equiv_let = binop_let equiv
+
+    let pp = pp_prgm
+    let pp_const = pp_prgm_const
   end
 
   let cmp_dep_ a b =
@@ -542,27 +600,6 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       | Dep_uty _, _
         -> CCOrd.int_ (to_int_ a) (to_int_ b)
     end
-
-  let rec pp_thunk out (t:thunk): unit = match t.t_nf with
-    | _, TNF_value v -> pp_value out v
-    | _, TNF_const c -> Cst_undef.pp out c
-    | _, TNF_partial ->
-      fpf out "(@[<1>thunk `@[%a@]`@ in [@[%a@]]@])"
-        Prgm.pp t.t_prgm pp_env t.t_env
-
-  and pp_env_entry out e = pp_thunk out e
-  and pp_env out = Subst.pp pp_env_entry out
-
-  and pp_value out (v:value): unit = match v with
-    | V_true -> Fmt.string out "true"
-    | V_false -> Fmt.string out "false"
-    | V_cstor (a,[]) -> ID.pp out a.cstor_id
-    | V_cstor (a,l) ->
-      fpf out "(@[%a@ %a@])" ID.pp a.cstor_id (Utils.pp_list pp_thunk) l
-    | V_dom_elt c -> ID.pp out c.dom_elt_id
-    | V_fun ({fun_id;_}, vars, body) ->
-      fpf out "(@[<1>fun (@[%a@])@ %a@ as: %a@])"
-        Prgm.pp_vars vars Prgm.pp body ID.pp fun_id
 
   module Explanation_base = struct
     type t = explanation
@@ -594,6 +631,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     let false_ = V_false
     let cstor a l = V_cstor (a,l)
     let dom_elt c= V_dom_elt c
+    let fun_ nf vars body = V_fun (nf,vars,body)
 
     (* shallow equality, sufficient in most cases. Do not look inside. *)
     let equal_shallow (a:t)(b:t): bool = match a, b with
@@ -622,86 +660,108 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
   module Thunk = struct
     type t = thunk
 
-    let nf t = t.t_nf
-    let prgm t = t.t_prgm
-    let env t = t.t_env
+    let view (t:t): thunk_view = !t
 
-    let mk_ view = view
+    let mk_ (view:thunk_view): t = ref view
 
-    let value e v = {
-      t_nf=e, TNF_value v;
-      t_prgm=Prgm.unreachable;
-      t_env=Subst.empty;
-    }
+    let expl_of_view (v:thunk_view): explanation = match v with
+      | T_value (e, _)
+      | T_const (e, _)
+      | T_forward (e, _)
+      | T_suspend (e, _, _, _) -> e
+
+    let expl (t:t): explanation = expl_of_view (view t)
+
+    let value e v : t = mk_ (T_value (e, v))
 
     let true_ e = value e V_true
     let false_ e = value e V_false
     let cstor e a l = value e (V_cstor (a,l))
     let dom_elt e c = value e (V_dom_elt c)
+    let fun_ e nf vars body = value e (Value.fun_ nf vars body)
 
-    let abs (t:thunk): t * bool = match nf t with
-      | e, T_value V_false -> true_ e, false
-      | e, T_not u ->
+    let abs (t:thunk): t * bool = match view t with
+      | T_value (e, V_false) -> true_ e, false
+      | T_const _ -> t, true
+      | T_suspend (_e, P_not _v, _env, _) ->
         assert false
         (* FIXME: need to allocate a new one that just forwards to [u]?
            u, false
         *)
       | _ -> t, true
 
-    let is_value t = match nf t with _, TNF_value _ -> true | _ -> false
+    let is_value t = match view t with T_value _ -> true | _ -> false
 
-    let cst_undef e c = {
-      t_nf = e, TNF_const c;
-      t_prgm = Prgm.unreachable;
-      t_env=Subst.empty;
-    }      
+    let cst_undef e c : t = mk_ (T_const (e, c))
 
     (* build a new suspension *)
-    let make (p:prgm) (env:eval_env): t = {
-      t_nf=E_empty, TNF_partial;
-      t_prgm=p;
-      t_env=env;
-    }
+    let suspend ~upd (e:explanation) (p:prgm) (env:eval_env): t =
+      mk_ (T_suspend (e, p, env, upd))
+
+    (* forward to given thnk *)
+    let forward e (t:thunk): t =
+      let v = match view t with
+        | T_forward (e', t') ->
+          T_forward (Explanation_base.append e e', t') (* flatten *)
+        | _ -> T_forward (e, t)
+      in
+      mk_ v
 
     let pp = pp_thunk
 
-    (* evaluate program literal under given environment *)
-    let rec eval_const (env:eval_env) (e:explanation) (v:prgm_const) : thunk =
-      begin match v with
-        | C_true -> true_ e
-        | C_false -> false_ e
-        | C_cstor (a,[]) -> cstor e a []
-        | C_cstor (a,l) ->
-          let e, l = CCList.fold_map (eval_const env e) e l in
-          cstor e a l
-        | C_dom_elt c -> dom_elt e c
-        | C_const c -> cst_undef e c
-        | C_var v -> Subst.find v env (*FIXME: [e] should not be there? *)
-        | C_fun (nf,vars,body) -> fun_ nf vars body
-        | C_eval p -> e, lazy_ p env (* freeze for now *)
-      end
+    (* a thunk for [a = b]
+       TODO: simplifications *)
+    let eq (a:t)(b:t): t =
+      let x = ID.make "x" in
+      let y = ID.make "y" in
+      let prgm = Prgm.eq x y in
+      let env : eval_env = Subst.of_list [x, a; y, b] in
+      suspend ~upd:true E_empty prgm env
 
-    (* under-approximation of equality *)
+    let and_ : t -> t -> t =
+      let x = ID.make "x" in
+      let y = ID.make "y" in
+      let and_prgm = Prgm.and_ x y in
+      let and_env a b : eval_env = Subst.of_list [x, a; y, b] in
+      fun a b ->
+        suspend ~upd:true E_empty and_prgm (and_env a b)
+
+    let not_ : t -> t =
+      let x = ID.make "x" in
+      let prgm = Prgm.not_ x in
+      fun a -> suspend ~upd:false E_empty prgm (Subst.singleton x a)
+
+    (* a thunk for [big_and l] *)
+    let and_l (l:t list): t =
+      let rec aux l = match l with
+        | [] -> value E_empty Value.true_
+        | [a] -> a
+        | a :: tail ->
+          let t_tail = aux tail in
+          and_ a t_tail
+      in
+      aux l
+
+    (* a thunk for [check c := v] *)
+    let check_assign (c:cst_undef)(v:value): thunk =
+      let prgm = Prgm.check_assign c v in
+      suspend ~upd:false E_empty prgm Subst.empty
+
+    (* under-approximation of equality, ignoring explanations *)
     let rec equal_simple (a:t)(b:t): bool =
       a == b ||
-      begin match view a, view b with
-        | T_value v1, T_value v2 ->
+      equal_simple_view (view a) (view b)
+
+    and equal_simple_view va vb =
+      begin match va, vb with
+        | T_value (_,v1), T_value (_,v2) ->
           equal_value_simple v1 v2
-        | T_const c1, T_const c2 -> Cst_undef.equal c1 c2
-        | T_check_assign (c1,v1), T_check_assign (c2,v2) ->
-          Cst_undef.equal c1 c2 && Value.equal_shallow v1 v2
-        | T_not t1, T_not t2 -> equal_simple t1 t2
-        | T_ref _, _
-        | T_eq _, _
-        | T_equiv _, _
-        | T_not _, _
-        | T_suspend _, _
-        | T_par_and _, _
-        | T_seq_and _, _
-        | T_lazy _, _
-        | T_const _, _
+        | T_const (_,c1), T_const (_,c2) -> Cst_undef.equal c1 c2
+        | T_forward (_,a'), _ -> equal_simple_view (view a') vb
+        | _, T_forward (_,b') -> equal_simple_view va (view b')
         | T_value _, _
-        | T_check_assign _, _
+        | T_const _, _
+        | T_suspend _, _
           -> false
       end
 
@@ -720,17 +780,17 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         -> false
 
     (* return [Some] iff the term is an undefined constant *)
-    let as_cst_undef (t:thunk): cst_undef option = match view t with
-      | T_const c -> Some c | _ -> None
+    let as_cst_undef (t:thunk): (explanation * cst_undef) option = match view t with
+      | T_const (e,c) -> Some (e,c) | _ -> None
 
     (* return [Some (cstor,ty,args)] if the thunk is a constructor
        applied to some arguments *)
-    let as_cstor_app (t:thunk): (cstor * thunk list) option = match view t with
-      | T_value (V_cstor (a,l)) -> Some (a,l)
+    let as_cstor_app (t:thunk): (explanation * cstor * thunk list) option = match view t with
+      | T_value (e,V_cstor (a,l)) -> Some (e,a,l)
       | _ -> None
 
-    let as_domain_elt (t:thunk): dom_elt option = match view t with
-      | T_value (V_dom_elt c) -> Some c
+    let as_domain_elt (t:thunk): (explanation * dom_elt) option = match view t with
+      | T_value (e, V_dom_elt c) -> Some (e,c)
       | _ -> None
 
     (* typical view for unification/equality *)
@@ -740,14 +800,14 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       | Unif_dom_elt  of dom_elt
       | Unif_none
 
-    let as_unif (t:thunk): unif_form = match view t with
-      | T_const c -> Unif_cst c
-      | T_value (V_cstor (a,l)) -> Unif_cstor (a,l)
-      | T_value (V_dom_elt c) -> Unif_dom_elt c
-      | _ -> Unif_none
+    let as_unif (t:thunk): explanation * unif_form = match view t with
+      | T_const (e,c) -> e, Unif_cst c
+      | T_value (e,V_cstor (a,l)) -> e,Unif_cstor (a,l)
+      | T_value (e,V_dom_elt c) -> e,Unif_dom_elt c
+      | _ -> expl t, Unif_none
   end
 
-  let pp_lit out l =
+  let pp_lit out (l:lit): unit =
     let pp_lit_view out = function
       | Lit_fresh i -> fpf out "#%a" ID.pp i
       | Lit_atom (i,t) -> fpf out "(@[<1>atom_%d@ %a@])" i Thunk.pp t
@@ -772,7 +832,6 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     val fresh : unit -> t
     val dummy : t
     val atom : ?sign:bool -> thunk -> t
-    val eq : thunk -> thunk -> t
     val cst_choice : cst_undef -> value -> t
     val uty_choice_empty : ty_uninterpreted_slice -> t
     val uty_choice_nonempty : ty_uninterpreted_slice -> t
@@ -864,7 +923,6 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         incr n;
         make ~sign (Lit_atom (!n,t))
 
-    let eq a b = atom ~sign:true (Thunk.eq a b)
     let cst_choice c t = make ~sign:true (Lit_assign (c, t))
     let uty_choice_empty uty = make ~sign:true (Lit_uty_empty uty)
     let uty_choice_nonempty uty : t = make ~sign:false (Lit_uty_empty uty)
@@ -1090,7 +1148,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         | Some lit -> prev_depth, lit
         | None ->
           assert (prev_depth = 0);
-          prev_depth, Lit.atom Thunk.true_
+          prev_depth, Lit.atom (Thunk.true_ E_empty)
 
     (* initial state *)
     let start_ =
@@ -1228,7 +1286,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       | V_cstor (_, l) ->
         List.fold_left
           (fun cur_max th -> match Thunk.view th with
-             | T_const c -> max cur_max (Cst_undef.depth c + 1)
+             | T_const (_, c) -> max cur_max (Cst_undef.depth c + 1)
              | _ -> cur_max)
           0 l
       | V_fun _ -> 0
@@ -1354,7 +1412,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
                         in
                         let cond = lazy (Lit.cst_choice cst (Lazy.force case)) in
                         plist := cond :: !plist;
-                        Thunk.cst_undef c)
+                        Thunk.cst_undef E_empty c)
                      ty_args
                  in
                  Value.cstor c args
@@ -1521,11 +1579,11 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       end
   end
 
-  let pp_dep_full out = function
+  let pp_dep_full out : thunk_dep -> unit = function
     | Dep_cst c ->
       let nf = match c.cst_cur_case with
-        | None -> Thunk.cst_undef c
-        | Some (_, v) -> Thunk.value v
+        | None -> Thunk.cst_undef E_empty c
+        | Some (e, v) -> Thunk.value e v
       in
       fpf out
         "(@[%a@ nf:%a@ :expanded %B@])"
@@ -1548,19 +1606,15 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
   (** {2 Reduction to Normal Form} *)
   module Reduce = struct
 
-    (* TODO: an accumulator (set?) of deps, imperatively updated
-       during evaluation *)
-    let merge_deps = CCList.sorted_merge_uniq ~cmp:cmp_dep_
+    let expand_cst_ (c:cst_undef) : unit =
+      Log.debugf 2 (fun k->k "(@[<1>expand_cst@ %a@])" Cst_undef.pp c);
+      Expand.expand_cst c;
+      ()
 
-    let rec deps (t:thunk): thunk_deps = match t with
-      | T_check_assign (c,_) | T_const c -> [Dep_cst c]
-      | T_lazy _
-      | T_value _ -> []
-      | T_seq_and (a, _) | T_not a -> deps a
-      | T_par_and (a,_,b,_) | T_equiv (a,b) | T_eq (a,b) ->
-        merge_deps (deps a) (deps b)
-      | T_ref (_,{contents=(_,u)}) -> deps u
-      | T_suspend (_,v,env) -> deps (Subst.find v env |> snd)
+    let expand_uty_ (uty:ty_uninterpreted_slice) : unit =
+      Log.debugf 2 (fun k->k "(@[<1>expand_uty@ %a@])" pp_uty uty);
+      Expand.expand_uty uty;
+      ()
 
     let cycle_check_l ~sub:_ _ = false
     (* TODO: not needed? or only on constants?
@@ -1592,226 +1646,268 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
 
     module E = Explanation
 
-    let rec compute_nf (t:thunk): explanation * thunk =
-      begin match Thunk.view t with
-        | T_value _ -> E.empty, t
-        | T_const c ->
-          begin match c.cst_cur_case with
-            | None -> E.empty, t
-            | Some (e, v) -> e, Thunk.value v
-          end
-        | T_check_assign (c, v) ->
-          begin match c.cst_cur_case with
-            | None -> E.empty, t
-            | Some (e, v') ->
-              if Value.equal_shallow v v'
-              then e, Thunk.true_
-              else e, Thunk.false_
-          end
-        | T_par_and (a, e_a, b, e_b) ->
-          let e_a, a' = compute_nf_add e_a a in
-          let e_b, b' = compute_nf_add e_b b in
-          begin match Thunk.view a', Thunk.view b' with
-            | T_value V_true, T_value V_true ->
-              E.append e_a e_b, Thunk.true_
-            | T_value V_false, T_value V_false ->
-              E.or_ e_a e_b, Thunk.false_
-            | T_value V_false, _ ->
-              e_a, Thunk.false_
-            | _, T_value V_false ->
-              e_b, Thunk.false_
-            | _ ->
-              (* no reduction yet *)
-              let t' = Thunk.and_par a' e_a b' e_b in
-              E.empty, t'
-          end
-        | T_seq_and (a,b) ->
-          let e_a, a' = compute_nf a in
-          begin match Thunk.view a' with
-            | T_value V_true -> compute_nf_add e_a b
-            | T_value V_false -> e_a, Thunk.false_
-            | _ ->
-              e_a, (if a==a' then t else Thunk.and_seq a' b)
-          end
-        | T_not u ->
-          let e_u, u' = compute_nf u in
-          begin match Thunk.view u' with
-            | T_value V_true -> e_u, Thunk.false_
-            | T_value V_false -> e_u, Thunk.true_
-            | T_value _ -> assert false
-            | _ ->
-              e_u, (if u==u' then t else Thunk.not_ u')
-          end
-        | T_equiv (a,b) ->
-          let e_a, a' = compute_nf a in
-          let e_b, b' = compute_nf b in
-          let e_ab = Explanation.append e_a e_b in
-          let default() = if a==a' && b==b' then t else Thunk.equiv a' b' in
-          begin match Thunk.view a', Thunk.view b' with
-            | T_value V_true, T_value V_true
-            | T_value V_false, T_value V_false -> e_ab, Thunk.true_
-            | T_value V_true, T_value V_false
-            | T_value V_false, T_value V_true -> e_ab, Thunk.false_
-            | _ ->  e_ab, default()
-          end
-        | T_eq (a,b) ->
-          compute_nf_eq t a b
-        | T_ref (_,{contents=(e_a, a)}) when Thunk.is_value a ->
-          e_a, a (* optim for values *)
-        | T_ref (_,({contents=(e_a, a)} as t_ref)) ->
-          let e_a, a' = compute_nf_add e_a a in
-          (* memoize *)
-          if a != a' then (
-            Backtrack.push_set_nf_ t_ref;
-            t_ref := (e_a, a');
-          );
-          begin match Thunk.view a' with
-            | T_value _ -> e_a, a' (* return value *)
-            | T_ref (_,{contents=(e_b, b)}) ->
-              (* compress: [ref (ref u) --> ref u] *)
-              Backtrack.push_set_nf_ t_ref;
-              t_ref := (E.append e_a e_b, b);
-              E_empty, t (* not a value yet *)
-            | _ ->
-              (* evaluation stays blocked, but makes some progress *)
-              if a != a' then (
-                Backtrack.push_set_nf_ t_ref;
-                t_ref := (e_a, a');
-              );
-              E.empty, t (* not a value yet, continue sharing computation *)
-          end
-        | T_lazy (p, env) ->
-          (* start execution of [p] in environment [env] *)
-          compute_nf_prgm E.empty p env
-        | T_suspend (p, v, env) ->
-          let e_v, t_i = Subst.find v env in
-          let e_v, t_i' = compute_nf_add e_v t_i in
-          let env' = Subst.set v (e_v,t_i') env in
-          if Thunk.is_value t_i'
-          then compute_nf_prgm e_v p env'
-          else (
-            (* do not return yet *)
-            let new_t = Thunk.suspend p v env' in
-            E.empty, new_t
-          )
+    (* evaluate program literal under given environment *)
+    let eval_const (env:eval_env) (v:prgm_const) : value =
+      begin match v with
+        | C_true -> Value.true_
+        | C_false -> Value.false_
+        | C_cstor (a,[]) -> Value.cstor a []
+        | C_cstor (a,l) ->
+          let l = List.map (fun v -> Subst.find v env) l in
+          Value.cstor a l
+        | C_dom_elt c -> Value.dom_elt c
+        | C_fun (nf,vars,body) -> Value.fun_ nf vars body
       end
 
-    (* compute nf of [t], append [e] to the explanation *)
-    and compute_nf_add (e : explanation) (t:thunk) : explanation * thunk =
-      let e', t' = compute_nf t in
-      Explanation.append e e', t'
+    (* state for evaluating a program *)
+    type local_eval_state = {
+      mutable count: int;
+      mutable e: explanation;
+      mutable p: prgm;
+      mutable env: eval_env;
+      upd: bool;
+    }
 
-    (* compute the result of running this program in this environment *)
-    and compute_nf_prgm (e: explanation) (p:prgm) (env:eval_env): explanation * thunk =
-      begin match Prgm.view p with
+    let incr_count (lst:local_eval_state) =
+      lst.count <- lst.count + 1
+
+    let ret_suspend (lst:local_eval_state): thunk_view =
+      T_suspend (lst.e, lst.p, lst.env, lst.upd)
+
+    let ret_value (lst:local_eval_state)(e:explanation)(v:value): thunk_view =
+      incr_count lst;
+      T_value (E.append lst.e e, v)
+
+    (* try to evaluate given thunk into a value *)
+    let rec compute_nf (t:thunk): (explanation * value) option =
+      begin match compute_nf_view t with
+        | T_value (e, v) -> Some (e, v)
+        | T_const _
+        | T_forward _
+        | T_suspend _ -> None
+
+      end
+
+    and compute_nf_view (t:thunk): thunk_view =
+      let view = Thunk.view t in
+      begin match Thunk.view t with
+        | T_value _ -> view
+        | T_const (e, c) ->
+          begin match c.cst_cur_case with
+            | None -> view
+            | Some (e', v) -> T_value (E.append e e', v)
+          end
+        | T_forward (e, t') ->
+          begin match compute_nf t' with
+            | None -> view
+            | Some (e', v) -> T_value (E.append e e', v)
+          end
+        | T_suspend (e, prgm, env, upd) ->
+          let lst = { e; p=prgm; env; upd; count=0; } in
+          let view' = compute_nf_prgm lst in
+          if upd && lst.count > 0 then (
+            Backtrack.push_thunk_nf_ t;
+            t := view';
+          );
+          view'
+      end
+
+    (* compute the result of running this program in this environment.
+       Return a new thunk view and an optional result *)
+    and compute_nf_prgm (lst:local_eval_state) : thunk_view
+      = match Prgm.view lst.p with
         | P_return c ->
           (* eval [c] in current environment *)
-          let e, th = Thunk.eval_const env e c in
-          compute_nf_add e th
+          let v = eval_const lst.env c in
+          ret_value lst E.empty v
+        | P_const c ->
+          (* check whether [c] is assigned yet *)
+          begin match c.cst_cur_case with
+            | None ->
+              (* we are blocked by [c], expand it *)
+              expand_cst_ c;
+              ret_suspend lst
+            | Some (e', v) -> ret_value lst e' v
+          end
+        | P_check_assign (c,v) ->
+          Expand.expand_cst c;
+          (* check whether [c] is assigned yet *)
+          begin match c.cst_cur_case with
+            | None ->
+              (* we are blocked by [c], expand it *)
+              expand_cst_ c;
+              ret_suspend lst
+            | Some (e, v') ->
+              if Value.equal_shallow v v'
+              then ret_value lst e Value.true_
+              else ret_value lst e Value.false_
+          end
+        | P_jump v ->
+          (* jump to sub-computation *)
+          let t = Subst.find v lst.env in
+          compute_nf_forward lst.e t
         | P_let (Let_eager, v, a, b) ->
           (* evaluate [a] right now and push it into the env *)
-          let e_a, th_a = compute_nf_prgm e a env in
-          let env = Subst.add v (e_a,th_a) env in
-          compute_nf_prgm e b env
+          let th_a =
+            compute_nf_prgm_as_thunk
+              {e=E.empty; p=a; count=0; env=lst.env; upd=false}
+          in
+          incr_count lst;
+          lst.env <- Subst.add v th_a lst.env;
+          lst.p <- b;
+          compute_nf_prgm lst
         | P_let (Let_lazy, v, a, b) ->
           (* push a lazy thunk for computing [a] into the env, then eval [b] *)
-          let th_a = Thunk.ref_ (Thunk.lazy_ a env) in
-          let env = Subst.add v (E.empty,th_a) env in
-          compute_nf_prgm e b env
-        | P_lazy (lazy p_cont, _) -> compute_nf_prgm e p_cont env
+          let th_a =
+            Thunk.suspend ~upd:true E.empty a lst.env
+          in
+          incr_count lst;
+          lst.env <- Subst.add v th_a lst.env;
+          lst.p <- b;
+          compute_nf_prgm lst;
+        | P_lazy (lazy p_cont, _) ->
+          incr_count lst;
+          lst.p <- p_cont;
+          compute_nf_prgm lst
         | P_match (v, m) ->
-          let e_v, th_v = Subst.find v env in
-          let e_v, th_v' = compute_nf_add e_v th_v in
-          let env' = Subst.set v (e_v,th_v') env in
-          begin match Thunk.view th_v with
-            | T_value (V_cstor (c, args)) ->
-              begin match ID.Map.get c.cstor_id m with
+          begin match compute_nf_find lst.env v with
+            | None ->
+              (* wait for [th_v] to be fully evaluated *)
+              ret_suspend lst
+            | Some (e_v, V_cstor (cstor, args)) ->
+              begin match ID.Map.get cstor.cstor_id m with
                 | None -> assert false
                 | Some (vars, p_cont) ->
                   (* follow [p_cont] *)
                   assert (List.length vars = List.length args);
                   let env' =
                     List.fold_right2
-                      (fun v a env -> Subst.add v (E.empty,a) env)
-                      vars args env'
+                      (fun v a env -> Subst.add v a env)
+                      vars args lst.env
                   in
-                  compute_nf_prgm (E.append e e_v) p_cont env'
+                  incr_count lst;
+                  lst.e <- E.append lst.e e_v;
+                  lst.p <- p_cont;
+                  lst.env <- env';
+                  compute_nf_prgm lst
               end
-            | T_value _ -> assert false
-            | _ ->
-              (* suspend, waiting for [th] to become a value *)
-              e, Thunk.suspend p v env'
+            | Some (_, _) -> assert false
           end
         | P_if (v,a,b) ->
-          let e_v, th_v = Subst.find v env in
-          let e_v, th_v' = compute_nf_add e_v th_v in
-          let env' = Subst.set v (e_v,th_v') env in
-          begin match Thunk.view th_v' with
-            | T_value V_true -> compute_nf_prgm (E.append e_v e) a env'
-            | T_value V_false -> compute_nf_prgm (E.append e_v e) b env'
-            | T_value _ -> assert false
-            | _ ->
-              (* suspend, waiting for [th] to become a value *)
-              e, Thunk.suspend p v env'
+          begin match compute_nf_find lst.env v with
+            | None ->
+              (* wait for [v] to become a value *)
+              ret_suspend lst
+            | Some (e_v, V_true) ->
+              incr_count lst;
+              lst.p <- a;
+              lst.e <- E.append lst.e e_v;
+              compute_nf_prgm lst
+            | Some (e_v, V_false) ->
+              incr_count lst;
+              lst.p <- b;
+              lst.e <- E.append lst.e e_v;
+              compute_nf_prgm lst
+            | Some (_, _) -> assert false
           end
         | P_equiv (a,b) ->
-          let e, th_a = compute_nf_prgm e a env in
-          let e, th_b = compute_nf_prgm e b env in
-          let th = Thunk.equiv th_a th_b in
-          compute_nf_add e th
-        | P_eq (a,b) ->
-          let e, th_a = compute_nf_prgm e a env in
-          let e, th_b = compute_nf_prgm e b env in
-          let th = Thunk.eq th_a th_b in
-          compute_nf_add e th
-        | P_and (a,b) ->
-          let e_a, th_a = compute_nf_prgm E.empty a env in
-          let e_b, th_b = compute_nf_prgm E.empty b env in
-          let th = Thunk.and_par th_a e_a th_b e_b in
-          compute_nf_add e th
-        | P_not a ->
-          let e, th_a = compute_nf_prgm e a env in
-          compute_nf_add e (Thunk.not_ th_a)
-        | P_call (f, []) -> Subst.find f env
-        | P_call (v_f, args) ->
-          let e_f, th_f = Subst.find v_f env in
-          let e_f, th_f' = compute_nf_add e_f th_f in
-          let env' = Subst.set v_f (e_f,th_f') env in
-          begin match Thunk.view th_f' with
-            | T_value (V_fun (_, vars, body)) ->
-              assert (List.length vars = List.length args);
-              (* TODO: do not exactly wrap into [lazy]. Instead, we should have
-                 a "cheap_eval" function that keeps values as they are,
-                 dereferences in the environment, but do not do match/if or
-                 function calls (in this case, it uses [lazy]). This should make
-                 passing values cheap, and other arguments reasonable. *)
-              let args = List.map (fun p_a -> E.empty, Thunk.lazy_ p_a env) args in
-              (* new stack for args, then jump to [body] *)
-              let env = Subst.of_list (List.combine vars args) in
-              compute_nf_prgm (E.append e_f e) body env
-            | T_value _ -> assert false (* typing *)
-            | _ ->
-              (* suspend, waiting for [th_f] to become a proper function *)
-              e, Thunk.suspend p v_f env'
+          begin match compute_nf_find2 lst.env a b with
+            | Some (e_a, V_true), Some (e_b, V_true)
+            | Some (e_a, V_false), Some (e_b, V_false) ->
+              ret_value lst (E.append e_a e_b) Value.true_
+            | Some (e_a, V_true), Some (e_b, V_false)
+            | Some (e_a, V_false), Some (e_b, V_true) ->
+              ret_value lst (E.append e_a e_b) Value.false_
+            | Some _, Some _ -> assert false
+            | None, _
+            | _, None -> ret_suspend lst
           end
+        | P_and (a,b) ->
+          begin match compute_nf_find2 lst.env a b with
+            | Some (e_a, V_true), Some (e_b, V_true) ->
+              ret_value lst (E.append e_a e_b) Value.true_ (* success *)
+            | Some (e_a, V_false), Some (e_b, V_false) ->
+              ret_value lst (E.or_ e_a e_b) Value.false_ (* double failure *)
+            | Some (e', V_false), None
+            | None, Some (e', V_false) ->
+              ret_value lst e' Value.false_ (* single failure *)
+            | Some _, Some _ -> assert false
+            | None, _
+            | _, None -> ret_suspend lst
+          end
+        | P_not a ->
+          begin match compute_nf_find lst.env a with
+            | Some (e', V_true) -> ret_value lst e' Value.false_
+            | Some (e', V_false) -> ret_value lst e' Value.true_
+            | Some _ -> assert false
+            | None -> ret_suspend lst
+          end
+        | P_call (f, []) ->
+          let th = Subst.find f lst.env in
+          compute_nf_forward lst.e th
+        | P_call (v_f, args) ->
+          begin match compute_nf_find lst.env v_f with
+            | None -> ret_suspend lst
+            | Some (e_f, V_fun (_, vars, body)) ->
+              (* evaluate function. First, evaluate a bit the
+                 arguments and put them in the environment *)
+              assert (List.length vars = List.length args);
+              let args =
+                List.map
+                  (fun p_a ->
+                     compute_nf_prgm_as_thunk {
+                       count=0; upd=true;
+                       e=E.empty; env=lst.env; p=p_a;
+                     })
+                  args
+              in
+              (* new stack for args, then jump to [body] *)
+              incr_count lst;
+              lst.env <- Subst.of_list (List.combine vars args);
+              lst.p <- body;
+              lst.e <- E.append e_f lst.e;
+              compute_nf_prgm lst
+            | Some _ -> assert false
+          end
+        | P_eq (a,b) ->
+          let th_a = Subst.find a lst.env in
+          let th_b = Subst.find b lst.env in
+          compute_nf_eq lst th_a th_b
+        | P_unreachable -> assert false
+
+    and compute_nf_prgm_as_thunk lst : thunk =
+      Thunk.mk_ (compute_nf_prgm lst)
+
+    and compute_nf_forward (e:explanation)(t:thunk): thunk_view =
+      begin match compute_nf t with
+        | None -> T_forward (e, t)
+        | Some (e', v) -> T_value (E.append e e', v)
       end
 
-    and compute_nf_eq eq_ab a b =
-      let e_a, a' = compute_nf a in
-      let e_b, b' = compute_nf b in
-      let e_ab = Explanation.append e_a e_b in
-      let default() =
-        if a==a' && b==b' then eq_ab else Thunk.eq a' b'
+    and compute_nf_find (env:eval_env)(v:local_var)
+      : (explanation*value) option =
+      let th_v = Subst.find v env in
+      compute_nf th_v
+
+    and compute_nf_find2 env a b =
+      compute_nf_find env a,
+      compute_nf_find env b
+
+    and compute_nf_eq (lst:local_eval_state) (a:thunk)(b:thunk): thunk_view =
+      let va = compute_nf_view a in
+      let vb = compute_nf_view b in
+      let e_ab =
+        E.append (Thunk.expl_of_view va) (Thunk.expl_of_view vb)
       in
-      begin match Thunk.as_unif a', Thunk.as_unif b' with
-        | _ when Thunk.equal_simple a' b' ->
-          e_ab, Thunk.true_ (* syntactic equality *)
-        | Thunk.Unif_cstor (c1,l1), Thunk.Unif_cstor (c2,l2) ->
+      begin match va, vb with
+        | _ when Thunk.equal_simple_view va vb ->
+          ret_value lst e_ab Value.true_
+        | T_value (_, V_cstor (c1,l1)), T_value (_, V_cstor (c2,l2)) ->
           if not (ID.equal c1.cstor_id c2.cstor_id)
           then
             (* [c1 ... = c2 ...] --> false, as distinct constructors
                can never be equal *)
-            e_ab, Thunk.false_
+            ret_value lst e_ab Value.false_
           else if ID.equal c1.cstor_id c2.cstor_id
                && List.length l1 = List.length l2
                && List.length l1 = List.length (fst (Ty.unfold c1.cstor_ty))
@@ -1820,24 +1916,24 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
                arguments are pairwise equal.
                We need to evaluate the arguments further (e.g.
                if they start with constructors) *)
-            List.map2 Thunk.eq l1 l2
-            |> Thunk.and_l
-            |> compute_nf_add e_ab
+            incr_count lst;
+            let th' = Thunk.and_l (List.map2 Thunk.eq l1 l2) in
+            compute_nf_forward lst.e th'
           )
-          else e_ab, default()
-        | Thunk.Unif_cstor (_, l), _ when cycle_check_l ~sub:b' l ->
+          else ret_suspend lst
+        | T_value (_, V_cstor (_, l)), _ when cycle_check_l ~sub:vb l ->
           (* acyclicity rule *)
-          e_ab, Thunk.false_
-        | _, Thunk.Unif_cstor (_, l) when cycle_check_l ~sub:a' l ->
-          e_ab, Thunk.false_
-        | Thunk.Unif_dom_elt c1, Thunk.Unif_dom_elt c2 ->
+          ret_value lst e_ab Value.false_
+        | _, T_value (_, V_cstor (_, l)) when cycle_check_l ~sub:va l ->
+          ret_value lst e_ab Value.false_
+        | T_value (_, V_dom_elt c1), T_value (_, V_dom_elt c2) ->
           (* domain elements: they are all distinct *)
           assert (Ty.equal c1.dom_elt_ty c2.dom_elt_ty);
           if ID.equal c1.dom_elt_id c2.dom_elt_id
-          then e_ab, Thunk.true_
-          else e_ab, Thunk.false_
-        | Thunk.Unif_cstor (cstor, args), Thunk.Unif_cst c
-        | Thunk.Unif_cst c, Thunk.Unif_cstor (cstor, args) ->
+          then ret_value lst e_ab Value.true_
+          else ret_value lst e_ab Value.false_
+        | T_const (_, c), T_value (_, V_cstor (cstor, args))
+        | T_value (_, V_cstor (cstor, args)), T_const (_, c) ->
           (* expand right now, so we can get a list of cases *)
           Expand.expand_cst c;
           begin match c.cst_cases with
@@ -1859,19 +1955,33 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
                 |> (function | Some x->x | None -> assert false)
               in
               assert (List.length sub_args = List.length args);
-              let check_case = Thunk.check_assign c case in
-              let check_subs =
-                List.map2 Thunk.eq args sub_args |> Thunk.and_l
+              let check_case =
+                Thunk.check_assign c case
+              and check_subs =
+                List.map2 Thunk.eq args sub_args
               in
               incr stat_num_unif;
-              (* eager "and", as a "if" *)
-              let new_thunk = Thunk.and_seq check_case check_subs in
-              compute_nf_add e_ab new_thunk
+              incr_count lst;
+              (* continue with this *)
+              let th = Thunk.and_l (check_case :: check_subs) in
+              let e = E.append e_ab lst.e in
+              compute_nf_forward e th
           end
-        | Thunk.Unif_dom_elt dom_elt, Thunk.Unif_cst c
-        | Thunk.Unif_cst c, Thunk.Unif_dom_elt dom_elt ->
-          assert false
-        (* TODO
+        | T_const (_, c), T_value (_, ((V_true | V_false) as v))
+        | T_value (_, ((V_true | V_false) as v)), T_const (_, c) ->
+          incr stat_num_unif;
+          incr_count lst;
+          Expand.expand_cst c;
+          let th = Thunk.check_assign c v in
+          let e = E.append e_ab lst.e in
+          compute_nf_forward e th
+        | T_const (_, c), T_value (_, V_dom_elt dom_elt)
+        | T_value (_, V_dom_elt dom_elt), T_const (_, c) ->
+          assert false (* TODO *)
+        | _ -> ret_suspend lst
+      end
+
+    (* TODO: uty
            let dom_elt_offset = uty_dom_elt.uty_offset in
            (* we know that [uty] is expanded deep enough that [dom_elt]
            exists, so we can simply reduce [?c = dom_elt_n] into
@@ -1926,17 +2036,21 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
            | _ -> assert false
            in
            traverse e_ab c uty_root
-        *)
-        | _ -> e_ab, default()
-      end
+    *)
 
     (* follow the "normal form" pointer *)
-    let compute_nf_lit (t:lit): explanation * thunk = match t.lit_view with
-      | Lit_atom (_, th) ->
-        let e, th = compute_nf th in
-        let th = if Lit.sign t then th else Thunk.not_ th in
-        e, th
-      | _ -> assert false
+    let compute_nf_lit (t:lit): (explanation * value) option
+      = match t.lit_view with
+        | Lit_atom (_, th) ->
+          begin match compute_nf th, Lit.sign t with
+            | None, _ -> None
+            | Some (e, V_true), true
+            | Some (e, V_false), false -> Some (e, V_true)
+            | Some (e, V_true), false
+            | Some (e, V_false), true -> Some (e, V_false)
+            | Some (_, _), _ -> assert false
+          end
+        | _ -> assert false
   end
 
   (** {2 A literal asserted to SAT}
@@ -1981,37 +2095,15 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       Clause.push_new_l cs;
       ()
 
-    let expand_cst_ (c:cst_undef) : unit =
-      Log.debugf 2 (fun k->k "(@[<1>watch_cst@ %a@])" Cst_undef.pp c);
-      Expand.expand_cst c;
-      ()
-
-    let expand_uty_ (uty:ty_uninterpreted_slice) : unit =
-      Log.debugf 2 (fun k->k "(@[<1>watch_uty@ %a@])" pp_uty uty);
-      Expand.expand_uty uty;
-      ()
-
-    let expand_dep (d:thunk_dep) : unit = match d with
-      | Dep_cst c -> expand_cst_ c
-      | Dep_uty uty -> expand_uty_ uty
-
     (* evaluate [t] in current partial model, and expand the constants
        that block it *)
     let update (t:t): unit =
-      let e, new_t = Reduce.compute_nf_lit t in
       (* if [new_t = true/false], propagate literal *)
-      begin match Thunk.view new_t with
-        | T_value V_true -> propagate_lit_ t e
-        | T_value V_false -> propagate_lit_ (Lit.neg t) e
-        | _ ->
-          Log.debugf 4
-            (fun k->k
-                "(@[<1>update@ %a@ @[<1>:normal_form@ %a@]@ \
-                 :deps (@[%a@])@ :exp @[<hv>%a@]@])"
-                pp t Thunk.pp new_t
-                (Utils.pp_list pp_dep) (Thunk.deps new_t)
-                Explanation.pp e);
-          List.iter expand_dep (Thunk.deps new_t);
+      begin match Reduce.compute_nf_lit t with
+        | Some (e, V_true) -> propagate_lit_ t e
+        | Some (e, V_false) -> propagate_lit_ (Lit.neg t) e
+        | Some _ -> assert false
+        | None -> ()
       end;
       ()
 
@@ -2141,10 +2233,9 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       begin match Lit.view lit with
         | Lit_fresh _ -> ()
         | Lit_atom _ ->
-          let e, t' = Reduce.compute_nf_lit lit in
-          begin match Thunk.view t' with
-            | T_value V_true -> ()
-            | T_value V_false ->
+          begin match Reduce.compute_nf_lit lit with
+            | Some (_, V_true) -> ()
+            | Some (e, V_false) ->
               (* conflict! *)
               let cs =
                 clause_guard_of_exp_ e
@@ -2209,7 +2300,6 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
   module Top_goals: sig
     val push : thunk  -> unit
     val to_seq : thunk Sequence.t
-    val check: unit -> unit
   end = struct
     (* list of terms to fully evaluate *)
     let toplevel_goals_ : lit list ref = ref []
@@ -2229,43 +2319,6 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         (fun lit ->
            let t, b = Lit.as_atom_exn lit in
            if b then t else Thunk.not_ t)
-
-    (* check that this term fully evaluates to [true] *)
-    let is_true_ (t:lit): bool =
-      let _, t' = Reduce.compute_nf_lit t in
-      match Thunk.view t' with
-        | T_value V_true -> true
-        | _ -> false
-
-    let check () =
-      if not (List.for_all is_true_ !toplevel_goals_)
-      then (
-        if Config.progress then flush_progress();
-        Log.debugf 1
-          (fun k->
-             let pp_dep out = function
-               | Dep_cst c ->
-                 let _, nf = Reduce.compute_nf (Thunk.cst_undef c) in
-                 fpf out
-                   "(@[%a@ nf:%a@ :expanded %B@])"
-                   Cst_undef.pp c Thunk.pp nf
-                   (c.cst_cases <> Lazy_none)
-               | Dep_uty uty ->
-                 fpf out
-                   "(@[%a@ :expanded %B@])"
-                   pp_uty uty (uty.uty_pair<>Lazy_none)
-             in
-             let pp_lit out l =
-               let e, nf = Reduce.compute_nf_lit l in
-               fpf out
-                 "(@[<hv1>%a@ nf: %a@ exp: %a@ deps: (@[<hv>%a@])@])"
-                 Lit.pp l Thunk.pp nf Explanation.pp e
-                 (Utils.pp_list pp_dep) (Thunk.deps nf)
-             in
-             k "(@[<hv1>status_watched_lit@ (@[<v>%a@])@])"
-               (Utils.pp_list pp_lit) !toplevel_goals_);
-        assert false;
-      )
   end
 
   (** {2 Conversion} *)
@@ -2318,13 +2371,8 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         end
       | Ast.Ty.Arrow (a,b) -> Ty.arrow (conv_ty a) (conv_ty b)
 
-    let gensym =
-      let n = ref 0 in
-      fun prefix ->
-        incr n;
-        ID.makef "%s_%d" prefix !n
-
-    let gensym_ty ty = gensym (Ty.mangle (conv_ty ty))
+    let gensym = Prgm.gensym
+    let gensym_ty ty = Prgm.gensym (Ty.mangle (conv_ty ty))
 
     (* compilation to programs *)
     let rec term_to_prgm_rec ?name (env:conv_env) (t:Ast.term): prgm =
@@ -2333,7 +2381,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         | Ast.False -> Prgm.false_ |> Prgm.return
         | Ast.Const id ->
           begin match ID.Tbl.get decl_ty_ id with
-            | Some (lazy (Decl_cst_undef c)) -> Prgm.const c |> Prgm.return
+            | Some (lazy (Decl_cst_undef c)) -> Prgm.cst_undef c
             | Some (lazy (Decl_cstor c)) -> Prgm.cstor0 c |> Prgm.return
             | Some (lazy (Decl_fun (lazy f))) ->
               let v = gensym_ty t.Ast.ty in
@@ -2342,27 +2390,30 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
               errorf "could not find constant `%a`" ID.pp id
           end
         | Ast.App (f, l) ->
-          (* first, convert [l] *)
-          let l = List.map (term_to_prgm_rec env) l in
           begin match Ast.term_view f with
             | Ast.Const id when ID.Tbl.mem decl_ty_ id ->
               let lazy entry = ID.Tbl.find decl_ty_ id in
               begin match entry with
                 | Decl_cstor c ->
-                  (* [f] is a constructor, use [C_cstor] *)
-                  Prgm.cstor c (List.map Prgm.eval l) |> Prgm.return
+                  (* [f] is a constructor, use [C_cstor] after let-binding
+                     every argument of [c] to a local variable *)
+                  let_l Let_lazy env l
+                    ~f:(fun args -> Prgm.cstor c args |> Prgm.return)
                 | Decl_fun fun_ ->
                   let v = gensym_ty t.Ast.ty in
                   let fun_ = Prgm.lazy_ ~descr:(ID.to_string id) fun_ in
+                  let l = List.map (term_to_prgm_rec env) l in
                   Prgm.let_ Let_eager v fun_ (Prgm.call v l)
                 | Decl_cst_undef _ ->
                   errorf "cannot call undef fun %a" ID.pp id (* TODO *)
               end
             | Ast.Var v when Subst.mem (Ast.Var.id v) env.subst ->
               (* lookup in environment *)
+              let l = List.map (term_to_prgm_rec env) l in
               Prgm.call (Subst.find (Ast.Var.id v) env.subst) l
             | Ast.Var v ->
               (* will be in environment *)
+              let l = List.map (term_to_prgm_rec env) l in
               Prgm.call (Ast.Var.id v) l
             | _ ->
               errorf "cannot call `%a`" Ast.pp_term f
@@ -2370,9 +2421,8 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         | Ast.Var v ->
           (* lookup in env *)
           begin match Subst.get (Ast.Var.id v) env.subst with
-            | Some v' -> Prgm.var v' |> Prgm.return
-            | None ->
-              Prgm.var (Ast.Var.id v) |> Prgm.return
+            | Some v' -> Prgm.var v'
+            | None -> Prgm.var (Ast.Var.id v)
           end
         | Ast.Fun _ ->
           let vars, body = Ast.unfold_fun t in
@@ -2481,32 +2531,47 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           let u = term_to_prgm_rec env' u in
           Prgm.let_ Let_lazy v' t u
         | Ast.If (a,b,c) ->
-          let v = gensym_ty a.Ast.ty in
-          let a = term_to_prgm_rec env a in
-          let b = term_to_prgm_rec env b in
-          let c = term_to_prgm_rec env c in
-          Prgm.let_ Let_eager v a (Prgm.if_ v b c)
+          let_ Let_eager env a
+            ~f:(fun v_a ->
+              let b = term_to_prgm_rec env b in
+              let c = term_to_prgm_rec env c in
+              Prgm.if_ v_a b c)
           (* TODO
           (* optim: [if _ b b --> b] *)
           if Term.equal b c
           then b
           else Term.if_ (term_to_prgm env a) b c
           *)
-        | Ast.Not t -> Prgm.not_ (term_to_prgm_rec env t)
+        | Ast.Not t ->
+          let_ Let_eager env t ~f:Prgm.not_
         | Ast.Binop (op,a,b) ->
           let ty_a = a.Ast.ty in
           let a = term_to_prgm_rec env a in
           let b = term_to_prgm_rec env b in
           begin match op with
-            | Ast.And -> Prgm.and_ a b
-            | Ast.Or -> Prgm.not_ (Prgm.and_ (Prgm.not_ a) (Prgm.not_ b))
-            | Ast.Imply -> Prgm.not_ (Prgm.and_ a (Prgm.not_ b))
+            | Ast.And -> Prgm.and_let a b
+            | Ast.Or ->
+              Prgm.not_let (Prgm.and_let (Prgm.not_let a) (Prgm.not_let b))
+            | Ast.Imply -> Prgm.not_let (Prgm.and_let a (Prgm.not_let b))
             | Ast.Eq ->
               if Ast.Ty.equal Ast.Ty.prop ty_a
-              then Prgm.equiv a b
-              else Prgm.eq a b
+              then Prgm.equiv_let a b
+              else Prgm.eq_let a b
           end
       end
+
+    (* [let_ t ~f] returns [let v=t in `f v`] where [v] is a fresh var *)
+    and let_ k env (t:Ast.term) ~f : Prgm.t =
+      let v = gensym_ty t.Ast.ty in
+      let t = term_to_prgm_rec env t in
+      let body = f v in
+      Prgm.let_ k v t body
+
+    and let_l k env (l:Ast.term list) ~f : Prgm.t =
+      let vars = List.map (fun t -> gensym_ty t.Ast.ty) l in
+      let l = List.map (term_to_prgm_rec env) l in
+      let body = f vars in
+      Prgm.let_l k vars l body
 
     let term_to_prgm ?name t : prgm =
       let t' = term_to_prgm_rec ?name empty_env t in
@@ -2514,7 +2579,8 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         (fun k->k "(@[term_to_prgm@ @[%a@]@ yields: %a@])" Ast.pp_term t Prgm.pp t');
       t'
 
-    let term_to_thunk t : thunk = Thunk.lazy_ (term_to_prgm t) Subst.empty
+    let term_to_thunk t : thunk =
+      Thunk.suspend ~upd:false E_empty (term_to_prgm t) Subst.empty
 
     let add_statement st =
       Log.debugf 2
@@ -2541,10 +2607,10 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           let t =
             term_to_prgm t
             |> List.fold_right
-              (fun (v,c) t -> Prgm.let_ Let_eager v (Prgm.const c |> Prgm.return) t)
+              (fun (v,c) t -> Prgm.let_ Let_eager v (Prgm.cst_undef c) t)
               bindings
           in
-          let t = Thunk.ref_ (Thunk.lazy_ t Subst.empty) in
+          let t = Thunk.suspend ~upd:true E_empty t Subst.empty in
           Top_goals.push t;
         | Ast.TyDecl id ->
           assert false
@@ -2644,23 +2710,18 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       in
       f vars env
 
-    let cst_undef_to_ast c = A.const c.cst_id (ty_to_ast c.cst_ty)
     let cstor_to_ast c = A.const c.cstor_id (ty_to_ast c.cstor_ty)
     let dom_elt_to_ast c = A.const c.dom_elt_id (ty_to_ast c.dom_elt_ty)
     let nf_to_ast nf = A.const nf.fun_id (ty_to_ast nf.fun_ty)
 
     (* convert a thunk into a [Ast.term] *)
-    let rec thunk_to_ast (env:eval_env) (t:thunk): Ast.term =
+    let rec thunk_to_ast (env:eval_env)(t:thunk): Ast.term =
       let rec aux env t = match Thunk.view t with
-        | T_value v -> value_to_ast env v
-        | T_const c -> cst_undef_to_ast c
-        | T_not a -> A.not_ (aux env a)
-        | T_lazy (p,env) -> prgm_to_ast env p
-        | T_suspend (p,_,env') -> prgm_to_ast env' p
-        | T_check_assign (c,v) -> A.eq (cst_undef_to_ast c) (value_to_ast env v)
-        | T_equiv (a,b) | T_eq (a,b) -> A.eq (aux env a) (aux env b)
-        | T_seq_and (a,b) | T_par_and (a,_,b,_) -> A.and_ (aux env a)(aux env b)
-        | T_ref (old,_) -> aux env old
+        | T_value (_,v) -> value_to_ast env v
+        | T_const (_,c) -> cst_undef_to_ast env c
+        | T_forward (_, t') -> aux env t'
+        | T_suspend (_, p, env', _) ->
+          prgm_to_ast env' p
       in
       aux env t
 
@@ -2674,37 +2735,45 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         | V_fun (nf,_,_) -> nf_to_ast nf
       end
 
+    and cst_undef_to_ast env (c:cst_undef): Ast.term =
+      begin match c.cst_cur_case with
+        | Some (_,v) ->  value_to_ast env v
+        | None ->
+          A.const c.cst_id (ty_to_ast c.cst_ty)
+      end
+
     and prgm_to_ast (env:eval_env) (p:prgm): Ast.term = match p with
+      | P_unreachable -> assert false
       | P_return c -> prgm_const_to_ast env c
+      | P_jump v -> var_to_ast env v
+      | P_const c -> cst_undef_to_ast env c
+      | P_check_assign (c,v) ->
+        A.eq (cst_undef_to_ast env c) (value_to_ast env v)
       | P_let (_,v,t,u) ->
-        let env = Subst.add v (E_empty, Thunk.lazy_ t env) env in
+        let env = Subst.add v (Thunk.suspend ~upd:false E_empty t env) env in
         prgm_to_ast env u
-      | P_match (_,_) -> assert false
+      | P_match (v,m) -> assert false (* TODO: we need the variables' types *)
       | P_if (v,a,b) ->
-        A.if_
-          (thunk_to_ast env (Subst.find v env |> snd))
-          (prgm_to_ast env a)
-          (prgm_to_ast env b)
+        A.if_ (var_to_ast env v) (prgm_to_ast env a) (prgm_to_ast env b)
       | P_call (v,l) ->
-        A.app
-          (thunk_to_ast env (Subst.find v env |> snd))
-          (List.map (prgm_to_ast env) l)
+        A.app (var_to_ast env v) (List.map (prgm_to_ast env) l)
       | P_lazy (lazy p,_) -> prgm_to_ast env p
-      | P_and (a,b) -> A.and_ (prgm_to_ast env a) (prgm_to_ast env b)
-      | P_not a -> A.not_ (prgm_to_ast env a)
+      | P_and (a,b) -> A.and_ (var_to_ast env a)(var_to_ast env b)
+      | P_not a -> A.not_ (var_to_ast env a)
       | P_eq (a,b)
-      | P_equiv (a,b) -> A.eq (prgm_to_ast env a) (prgm_to_ast env b)
+      | P_equiv (a,b) -> A.eq (var_to_ast env a) (var_to_ast env b)
 
     and prgm_const_to_ast (env:eval_env) c = match c with
       | C_true -> A.true_
       | C_false -> A.false_
       | C_dom_elt c -> dom_elt_to_ast c
-      | C_const c -> cst_undef_to_ast c
       | C_fun (nf,_,_) -> nf_to_ast nf
-      | C_var v -> thunk_to_ast env (Subst.find v env |> snd)
-      | C_eval p -> prgm_to_ast env p
       | C_cstor (c,l) ->
-        A.app (cstor_to_ast c) (List.map (prgm_const_to_ast env) l)
+        A.app (cstor_to_ast c) (List.map (var_to_ast env) l)
+
+    and var_to_ast (env:eval_env)(v:local_var) =
+      let t = Subst.find v env in
+      thunk_to_ast env t
   end
 
   (** {2 Main} *)
@@ -2721,30 +2790,6 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     | Sat of model
     | Unsat (* TODO: proof *)
     | Unknown of unknown
-
-  (* follow "normal form" pointers deeply in the term *)
-  let deref_deep (doms:cst_undef list Ty.Tbl.t) (t:thunk) : thunk =
-    let rec aux t =
-      let _, t = Reduce.compute_nf t in
-      match Thunk.view t with
-        | T_const _ -> t
-        | T_value v ->
-          begin match v with
-            | V_true | V_false | V_dom_elt _ | V_cstor (_,[]) | V_fun _ -> t
-            | V_cstor (c, l) ->
-              Thunk.cstor c (List.map aux l)  (* evaluate under constructors *)
-          end
-        | T_seq_and (a,b)
-        | T_par_and (a,_,b,_) -> Thunk.and_ (aux a) (aux b)
-        | T_eq (a,b) -> Thunk.eq (aux a) (aux b)
-        | T_equiv (a,b) -> Thunk.equiv (aux a) (aux b)
-        | T_not a -> Thunk.not_ (aux a)
-        | T_ref (_,{contents=(_,b)}) -> aux b
-        | T_lazy _ -> assert false
-        | T_check_assign _
-        | T_suspend _ -> t (* blocked *)
-    in
-    aux t
 
   let rec find_domain_ (uty:ty_uninterpreted_slice): cst_undef list =
     match uty.uty_status, uty.uty_pair with
@@ -2773,8 +2818,8 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       |> Sequence.map
         (fun c ->
            (* find normal form of [c] *)
-           let t = Thunk.cst_undef c in
-           let t = deref_deep doms t |> Conv.thunk_to_ast Subst.empty in
+           let t = Thunk.cst_undef E_empty c in
+           let t = Conv.thunk_to_ast Subst.empty t in
            c.cst_id, t)
       |> ID.Map.of_seq
     in
