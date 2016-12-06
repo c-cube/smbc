@@ -64,6 +64,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     val singleton : ID.t -> 'a -> 'a t
     val add : ID.t -> 'a -> 'a t -> 'a t
     val set : ID.t -> 'a -> 'a t -> 'a t
+    val add_or_set : ID.t -> 'a -> 'a t -> 'a t
     val mem : ID.t -> _ t -> bool
     val get : ID.t -> 'a t -> 'a option
     val find : ID.t -> 'a t -> 'a
@@ -78,6 +79,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     let mem = ID.Map.mem
     let add v x m = assert (not (mem v m)); ID.Map.add v x m
     let set v x m = assert (mem v m); ID.Map.add v x m
+    let add_or_set = ID.Map.add
     let get = ID.Map.get
     let find v m =
       try ID.Map.find v m
@@ -1752,7 +1754,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
               {e=E.empty; p=a; count=0; env=lst.env; upd=false}
           in
           incr_count lst;
-          lst.env <- Subst.add v th_a lst.env;
+          lst.env <- Subst.add_or_set v th_a lst.env;
           lst.p <- b;
           compute_nf_prgm lst
         | P_let (Let_lazy, v, a, b) ->
@@ -1761,7 +1763,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
             Thunk.suspend ~upd:true E.empty a lst.env
           in
           incr_count lst;
-          lst.env <- Subst.add v th_a lst.env;
+          lst.env <- Subst.add_or_set v th_a lst.env;
           lst.p <- b;
           compute_nf_prgm lst;
         | P_lazy (lazy p_cont, _) ->
