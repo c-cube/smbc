@@ -74,11 +74,12 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     | False
     | DB of db (* de bruijn indice *)
     | Const of cst
-    | App of term * term list
-    | Fun of ty_h * term
+    | App of term * term array
+    | App_cstor of cstor * term array (* fully applied cstor *)
+    | Fun of ty_h array * term (* n-ary lambda *)
     | Mu of term
     | If of term * term * term
-    | Match of term * (ty_h list * term) ID.Map.t
+    | Match of term * (ty_h array * term) ID.Map.t
     | Switch of term * switch_cell (* function table *)
     | Quant of quant * ty_uninterpreted_slice * term
       (* quantification on finite types *)
@@ -154,9 +155,14 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     cst_kind: cst_kind;
   }
 
+  and cstor = {
+    cstor_id: ID.t;
+    cstor_ty: ty_h;
+    cstor_arity: int;
+  }
+
   and cst_kind =
     | Cst_undef of cst_info * ty_uninterpreted_slice option
-    | Cst_cstor
     | Cst_uninterpreted_dom_elt of ty_uninterpreted (* uninterpreted domain constant *)
     | Cst_defined of term lazy_t
 
@@ -193,7 +199,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
 
   and ty_def =
     | Uninterpreted of ty_uninterpreted (* uninterpreted type, with its domain *)
-    | Data of cst lazy_t list (* set of constructors *)
+    | Data of cstor lazy_t list (* set of constructors *)
 
   and ty_cell =
     | Prop
@@ -270,6 +276,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
 
     let arrow a b = hashcons_ (Arrow (a,b))
     let arrow_l = List.fold_right arrow
+    let arrow_a = Array.fold_right arrow
 
     let is_prop t =
       match t.ty_cell with | Prop -> true | _ -> false
@@ -277,12 +284,20 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     let is_data t =
       match t.ty_cell with | Atomic (_, Data _) -> true | _ -> false
 
+    let rec arity t = match t.ty_cell with
+      | Arrow (_, b) -> 1 + arity b
+      | Prop | Atomic _ -> 0
+
     let unfold ty : t list * t =
       let rec aux acc ty = match ty.ty_cell with
         | Arrow (a,b) -> aux (a::acc) b
         | _ -> List.rev acc, ty
       in
       aux [] ty
+
+    let unfold_a ty =
+      let args, ret = unfold ty in
+      Array.of_list args, ret
 
     let rec pp out t = match t.ty_cell with
       | Prop -> CCFormat.string out "prop"
@@ -322,9 +337,11 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
 
     let push x env = { db_size=env.db_size+1; db_st=Some x :: env.db_st }
     let push_l l env = List.fold_left (fun e x -> push x e) env l
+    let push_a a env = Array.fold_left (fun e x -> push x e) env a
     let push_none env =
       { db_size=env.db_size+1; db_st=None::env.db_st }
     let push_none_l l env = List.fold_left (fun e _ -> push_none e) env l
+    let push_none_a a env = Array.fold_left (fun e _ -> push_none e) env a
     let empty = {db_st=[]; db_size=0}
     let singleton x = {db_st=[Some x]; db_size=1}
     let size env = env.db_size
@@ -343,10 +360,6 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     let ty t = t.cst_ty
 
     let make cst_id ty cst_kind = {cst_id; cst_ty=ty; cst_kind}
-    let make_cstor id ty =
-      let _, ret = Ty.unfold ty in
-      assert (Ty.is_data ret);
-      make id ty Cst_cstor
     let make_defined id ty t = make id ty (Cst_defined t)
     let make_uty_dom_elt id ty uty = make id ty (Cst_uninterpreted_dom_elt uty)
 
@@ -371,12 +384,12 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       : (t * Ty.t * cst_info * ty_uninterpreted_slice option) option =
       match c.cst_kind with
         | Cst_undef (i,slice) -> Some (c,c.cst_ty,i,slice)
-        | Cst_defined _ | Cst_cstor | Cst_uninterpreted_dom_elt _ -> None
+        | Cst_defined _ | Cst_uninterpreted_dom_elt _ -> None
 
     let as_undefined_exn (c:t): t * Ty.t * cst_info * ty_uninterpreted_slice option=
       match c.cst_kind with
         | Cst_undef (i,slice) -> c,c.cst_ty,i,slice
-        | Cst_defined _ | Cst_cstor | Cst_uninterpreted_dom_elt _ -> assert false
+        | Cst_defined _ | Cst_uninterpreted_dom_elt _ -> assert false
 
     let equal a b = ID.equal a.cst_id b.cst_id
     let compare a b = ID.compare a.cst_id b.cst_id
@@ -387,6 +400,17 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         type t = cst
         let compare = compare
       end)
+  end
+
+  module Cstor = struct
+    type t = cstor
+    let equal a b = ID.equal a.cstor_id b.cstor_id
+    let hash a = ID.hash a.cstor_id
+    let id a = a.cstor_id
+    let ty a = a.cstor_ty
+    let arity a = a.cstor_arity
+    let make id ty = {cstor_id=id; cstor_ty=ty; cstor_arity=Ty.arity ty}
+    let pp out a = ID.pp out a.cstor_id
   end
 
   let cmp_uty a b =
@@ -514,13 +538,15 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           | DB d -> Hash.combine DB.hash 3 d
           | Const c ->
             Hash.combine2 4 (Typed_cst.hash c)
+          | App_cstor (c,a) ->
+            Hash.combine3 5 (Cstor.hash c) (Hash.array sub_hash a)
           | App (f,l) ->
-            Hash.combine3 5 f.term_id (Hash.list sub_hash l)
-          | Fun (ty, f) -> Hash.combine3 6 (Ty.hash ty) f.term_id
+            Hash.combine3 51 f.term_id (Hash.array sub_hash l)
+          | Fun (tys, f) -> Hash.combine3 6 (Hash.array Ty.hash tys) f.term_id
           | If (a,b,c) -> Hash.combine4 7 a.term_id b.term_id c.term_id
           | Match (u,m) ->
             let hash_case (tys,rhs) =
-              Hash.combine2 (Hash.list Ty.hash tys) rhs.term_id
+              Hash.combine2 (Hash.array Ty.hash tys) rhs.term_id
             in
             let hash_m =
               Hash.seq (Hash.pair ID.hash hash_case) (ID.Map.to_seq m)
@@ -549,9 +575,12 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           | DB x, DB y -> DB.equal x y
           | Const (c1), Const (c2) ->
             Typed_cst.equal c1 c2
+          | App_cstor (f1, l1), App_cstor (f2, l2) ->
+            Cstor.equal f1 f2 && CCArray.equal (==) l1 l2
           | App (f1, l1), App (f2, l2) ->
-            f1 == f2 && CCList.equal (==) l1 l2
-          | Fun (ty1,f1), Fun (ty2,f2) -> Ty.equal ty1 ty2 && f1 == f2
+            f1 == f2 && CCArray.equal (==) l1 l2
+          | Fun (ty1,f1), Fun (ty2,f2) ->
+            CCArray.equal Ty.equal ty1 ty2 && f1 == f2
           | If (a1,b1,c1), If (a2,b2,c2) ->
             a1 == a2 && b1 == b2 && c1 == c2
           | Match (u1, m1), Match (u2, m2) ->
@@ -587,6 +616,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           | False, _
           | DB _, _
           | Const _, _
+          | App_cstor _, _
           | App _, _
           | Fun _, _
           | If _, _
@@ -677,45 +707,67 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     let db d =
       mk_term_ ~deps:Term_dep_none (DB d) ~ty:(DTy_direct (DB.ty d))
 
+    (* type of an application *)
+    let app_ty_a ty (a:term array) : Ty.t =
+      Array.fold_left
+        (fun ty arg -> match Ty.view ty with
+           | Arrow (ty_a,ty_rest) ->
+             assert (Ty.equal ty_a arg.term_ty);
+             ty_rest
+           | Prop | Atomic _ -> assert false)
+        ty a
+
+    let app_cstor c a =
+      assert (Cstor.arity c = Array.length a);
+      let ty = DTy_lazy (fun () -> app_ty_a (Cstor.ty c) a) in
+      mk_term_ ~deps:Term_dep_none (App_cstor (c, a)) ~ty
+
     let const c =
       let deps = match c.cst_kind with
         | Cst_undef _ -> Term_dep_cst c (* depends on evaluation! *)
-        | Cst_defined _ | Cst_cstor | Cst_uninterpreted_dom_elt _ -> Term_dep_none
+        | Cst_defined _ | Cst_uninterpreted_dom_elt _ -> Term_dep_none
       in
       mk_term_ ~deps (Const c) ~ty:(DTy_direct (Typed_cst.ty c))
 
-    (* type of an application *)
-    let rec app_ty_ ty l : Ty.t = match Ty.view ty, l with
-      | _, [] -> ty
-      | Arrow (ty_a,ty_rest), a::tail ->
-        assert (Ty.equal ty_a a.term_ty);
-        app_ty_ ty_rest tail
-      | (Prop | Atomic _), _::_ ->
-        assert false
+    let append_arr a1 a2 =
+      let n1 = Array.length a1 in
+      let n2 = Array.length a2 in
+      if n1=0 then a2
+      else if n2=0 then a1
+      else (
+        let res = Array.make (n1+n2) a1.(0) in
+        Array.blit a1 0 res 0 n1;
+        Array.blit a2 0 res n1 n2;
+        res
+      )
 
-    let app f l = match l with
-      | [] -> f
+    let app f a = match a with
+      | [||] -> f
       | _ ->
         (* watch head, not arguments *)
         let t = match f.term_cell with
-          | App (f1, l1) ->
-            let l' = l1 @ l in
-            mk_term_ ~deps:(Term_dep_sub f1) (App (f1, l'))
-              ~ty:(DTy_lazy (fun () -> app_ty_ f1.term_ty l'))
+          | App (f1, a1) ->
+            let a' = append_arr a1 a in
+            mk_term_ ~deps:(Term_dep_sub f1) (App (f1, a'))
+              ~ty:(DTy_lazy (fun () -> app_ty_a f1.term_ty a'))
           | _ ->
-            mk_term_ ~deps:(Term_dep_sub f) (App (f,l))
-              ~ty:(DTy_lazy (fun () -> app_ty_ f.term_ty l))
+            mk_term_ ~deps:(Term_dep_sub f) (App (f,a))
+              ~ty:(DTy_lazy (fun () -> app_ty_a f.term_ty a))
         in
         t
 
     let app_cst f l = app (const f) l
 
-    let fun_ ty body =
-      (* do not add watcher: propagation under λ forbidden *)
-      mk_term_ ~deps:Term_dep_none (Fun (ty, body))
-        ~ty:(DTy_lazy (fun () -> Ty.arrow ty body.term_ty))
+    let rec fun_ tys body = match tys, body.term_cell with
+      | [||], _ -> body
+      | _, Fun (tys', body') ->
+        fun_ (append_arr tys tys') body'
+      | _ ->
+        (* do not add watcher: propagation under λ forbidden *)
+        mk_term_ ~deps:Term_dep_none (Fun (tys, body))
+          ~ty:(DTy_lazy (fun () -> Ty.arrow_a tys body.term_ty))
 
-    let fun_l = List.fold_right fun_
+    let fun_l args f = fun_ (Array.of_list args) f
 
     let mu t =
       mk_term_ ~deps:Term_dep_none (Mu t) ~ty:(DTy_direct t.term_ty)
@@ -814,6 +866,8 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       | [t] -> t
       | a :: l -> and_ a (and_l l)
 
+    let and_a a = and_l (Array.to_list a)
+
     let or_l = function
       | [] -> false_
       | [t] -> t
@@ -880,11 +934,12 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         yield (t,k);
         match t.term_cell with
           | DB _ | Const _ | True | False -> ()
-          | App (f,l) -> aux k f; List.iter (aux k) l
+          | App_cstor (_,l) -> Array.iter (aux k) l
+          | App (f,l) -> aux k f; Array.iter (aux k) l
           | If (a,b,c) -> aux k a; aux k b; aux k c
           | Match (t, m) ->
             aux k t;
-            ID.Map.iter (fun _ (tys,rhs) -> aux (k+List.length tys) rhs) m
+            ID.Map.iter (fun _ (tys,rhs) -> aux (k+Array.length tys) rhs) m
           | Switch (u,_) -> aux k u (* ignore the table *)
           | Builtin b -> builtin_to_seq b (aux k)
           | Quant (_, _, body)
@@ -907,14 +962,9 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
 
     (* return [Some (cstor,ty,args)] if the term is a constructor
        applied to some arguments *)
-    let as_cstor_app (t:term): (cst * Ty.t * term list) option =
+    let as_cstor_app (t:term): (cstor * Ty.t * term array) option =
       match t.term_cell with
-        | Const ({cst_kind=Cst_cstor; _} as c) -> Some (c,c.cst_ty,[])
-        | App (f, l) ->
-          begin match f.term_cell with
-            | Const ({cst_kind=Cst_cstor; _} as c) -> Some (c,c.cst_ty,l)
-            | _ -> None
-          end
+        | App_cstor (c, a) -> Some (c,Cstor.ty c,a)
         | _ -> None
 
     let as_domain_elt (t:term): (cst * Ty.t * ty_uninterpreted_slice) option =
@@ -926,8 +976,8 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     (* typical view for unification/equality *)
     type unif_form =
       | Unif_cst of cst * Ty.t * cst_info * ty_uninterpreted_slice option
-      | Unif_cstor of cst * Ty.t * term list
-      | Unif_dom_elt  of cst * Ty.t * ty_uninterpreted_slice
+      | Unif_cstor of cstor * Ty.t * term array
+      | Unif_dom_elt of cst * Ty.t * ty_uninterpreted_slice
       | Unif_none
 
     let as_unif (t:term): unif_form = match t.term_cell with
@@ -935,12 +985,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         Unif_dom_elt (c,c.cst_ty,uty)
       | Const ({cst_kind=Cst_undef (info,slice); _} as c) ->
         Unif_cst (c,c.cst_ty,info,slice)
-      | Const ({cst_kind=Cst_cstor; _} as c) -> Unif_cstor (c,c.cst_ty,[])
-      | App (f, l) ->
-        begin match f.term_cell with
-          | Const ({cst_kind=Cst_cstor; _} as c) -> Unif_cstor (c,c.cst_ty,l)
-          | _ -> Unif_none
-        end
+      | App_cstor (c, a) -> Unif_cstor (c,Cstor.ty c,a)
       | _ -> Unif_none
 
     let fpf = Format.fprintf
@@ -957,10 +1002,12 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         | DB d -> DB.pp out d
         | Const c ->
           if ids then Typed_cst.pp out c else ID.pp_name out c.cst_id
+        | App_cstor (c,l) ->
+          fpf out "(@[<1>%a@ %a@])" Cstor.pp c (Utils.pp_array pp) l
         | App (f,l) ->
-          fpf out "(@[<1>%a@ %a@])" pp f (Utils.pp_list pp) l
-        | Fun (ty,f) ->
-          fpf out "(@[fun %a@ %a@])" Ty.pp ty pp f
+          fpf out "(@[<1>%a@ %a@])" pp f (Utils.pp_array pp) l
+        | Fun (tys,f) ->
+          fpf out "(@[fun (@[%a@])@ %a@])" (Utils.pp_array Ty.pp) tys pp f
         | Quant (q,uty,f) ->
           fpf out "(@[%a %a@ %a@])" pp_quant q pp_uty uty pp f
         | Mu sub -> fpf out "(@[mu@ %a@])" pp sub
@@ -1014,9 +1061,9 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           | Const _ -> t
           | True
           | False -> t
-          | Fun (ty, body) ->
-            let body' = aux (depth+1) body in
-            if body==body' then t else fun_ ty body'
+          | Fun (tys, body) ->
+            let body' = aux (depth+Array.length tys) body in
+            if body==body' then t else fun_ tys body'
           | Mu body ->
             let body' = aux (depth+1) body in
             if body==body' then t else mu body'
@@ -1028,7 +1075,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
             let m =
               ID.Map.map
                 (fun (tys,rhs) ->
-                   tys, aux (depth + List.length tys) rhs)
+                   tys, aux (depth + Array.length tys) rhs)
                 m
             in
             match_ u m
@@ -1041,17 +1088,20 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
             let b' = aux depth b in
             let c' = aux depth c in
             if a==a' && b==b' && c==c' then t else if_ a' b' c'
-          | App (_,[]) -> assert false
-          | App (f, l) ->
+          | App_cstor (c, a) ->
+            let a' = aux_a depth a in
+            if CCArray.equal (==) a a' then t else app_cstor c a'
+          | App (_,[||]) -> assert false
+          | App (f, a) ->
             let f' = aux depth f in
-            let l' = aux_l depth l in
-            if f==f' && CCList.equal (==) l l' then t else app f' l'
+            let l' = aux_a depth a in
+            if f==f' && CCArray.equal (==) a l' then t else app f' l'
           | Builtin b -> builtin (map_builtin (aux depth) b)
           | Check_assign _
           | Check_empty_uty _
             -> t (* closed *)
-        and aux_l d l =
-          List.map (aux d) l
+        and aux_a d l =
+          Array.map (aux d) l
         in
         aux 0 t
       )
@@ -1071,9 +1121,9 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           | Const _ -> t
           | True
           | False -> t
-          | Fun (ty, body) ->
-            let body' = aux (DB_env.push_none env) body in
-            if body==body' then t else fun_ ty body'
+          | Fun (tys, body) ->
+            let body' = aux (DB_env.push_none_a tys env) body in
+            if body==body' then t else fun_ tys body'
           | Mu body ->
             let body' = aux (DB_env.push_none env) body in
             if body==body' then t else mu body'
@@ -1085,7 +1135,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
             let m =
               ID.Map.map
                 (fun (tys,rhs) ->
-                   tys, aux (DB_env.push_none_l tys env) rhs)
+                   tys, aux (DB_env.push_none_a tys env) rhs)
                 m
             in
             match_ u m
@@ -1098,17 +1148,20 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
             let b' = aux env b in
             let c' = aux env c in
             if a==a' && b==b' && c==c' then t else if_ a' b' c'
-          | App (_,[]) -> assert false
-          | App (f, l) ->
+          | App (_,[||]) -> assert false
+          | App (f, a) ->
             let f' = aux env f in
-            let l' = aux_l env l in
-            if f==f' && CCList.equal (==) l l' then t else app f' l'
+            let a' = aux_a env a in
+            if f==f' && CCArray.equal (==) a a' then t else app f' a'
+          | App_cstor (c, a) ->
+            let a' = aux_a env a in
+            if CCArray.equal (==) a a' then t else app_cstor c a'
           | Builtin b -> builtin (map_builtin (aux env) b)
           | Check_assign _
           | Check_empty_uty _
             -> t (* closed *)
-        and aux_l env l =
-          List.map (aux env) l
+        and aux_a env l =
+          Array.map (aux env) l
         in
         aux env t
       )
@@ -1679,13 +1732,14 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           List.map
             (fun (lazy c) ->
                let rec case = lazy (
-                 let ty_args, _ = Typed_cst.ty c |> Ty.unfold in
+                 let ty_args, _ = Cstor.ty c |> Ty.unfold in
                  (* elements of [memo] already used when generating the
                     arguments of this particular case,
                     so we do not use a constant twice *)
                  let used = ref [] in
                  let args =
-                   List.map
+                   ty_args
+                   |> List.map
                      (fun ty_arg ->
                         let depth =
                           if Config.uniform_depth
@@ -1701,9 +1755,9 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
                         let cond = lazy (Lit.cst_choice cst (Lazy.force case)) in
                         plist := cond :: !plist;
                         Term.const c)
-                     ty_args
+                   |> Array.of_list
                  in
-                 Term.app_cst c args
+                 Term.app_cstor c args
                ) in
                Lazy.force case)
             cstors, []
@@ -1759,26 +1813,24 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
                 cstors
                 |> List.map
                   (fun (lazy cstor) ->
-                     let ty_cstor_args, _ =
-                       Typed_cst.ty cstor |> Ty.unfold
-                     in
-                     let n_ty_args = List.length ty_cstor_args in
+                     let ty_cstor_args, _ = Cstor.ty cstor |> Ty.unfold_a in
+                     let n_ty_args = Array.length ty_cstor_args in
                      (* build a function over the cstor arguments *)
-                     let ty_sub_f = Ty.arrow_l ty_cstor_args ty_ret in
+                     let ty_sub_f = Ty.arrow_a ty_cstor_args ty_ret in
                      let depth = info.cst_depth+1 in
                      let sub_f =
                        mk_sub_cst ty_sub_f ~parent:cst ~exist_if ~depth
                      in
                      (* apply [sub_f] to the cstor's arguments *)
                      let sub_params =
-                       List.mapi
+                       Array.mapi
                          (fun i ty_arg ->
                             let db_arg = DB.make (n_ty_args-i-1) ty_arg in
                             Term.db db_arg)
                          ty_cstor_args
                      in
                      let rhs = Term.app_cst sub_f sub_params in
-                     cstor.cst_id, (ty_cstor_args, rhs)
+                     Cstor.id cstor, (ty_cstor_args, rhs)
                   )
                 |> ID.Map.of_list
               in
@@ -1804,7 +1856,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
               assert false (* TODO: support HO? *)
           )
           and fun_destruct =
-            lazy (Term.fun_ ty_arg (Lazy.force body))
+            lazy (Term.fun_ [| ty_arg |] (Lazy.force body))
           (* constant function that does not look at input *)
           and body_const = lazy (
             let exist_if = ref [lazy (Lit.cst_choice cst (Lazy.force fun_const))] in
@@ -1814,7 +1866,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
             Term.const c'
           )
           and fun_const =
-            lazy (Term.fun_ ty_arg (Lazy.force body_const))
+            lazy (Term.fun_ [|ty_arg|] (Lazy.force body_const))
           in
           [Lazy.force fun_destruct; Lazy.force fun_const], []
         | Prop ->
@@ -1830,7 +1882,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     let expand_cst (c:cst): unit =
       let ty, info = match c.cst_kind with
         | Cst_undef (i,_) -> c.cst_ty,i
-        | Cst_defined _ | Cst_cstor | Cst_uninterpreted_dom_elt _ ->
+        | Cst_defined _ | Cst_uninterpreted_dom_elt _ ->
           assert false
       in
       let depth = info.cst_depth in
@@ -1904,7 +1956,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
 
     (* [cycle_check sub into] checks whether [sub] occurs in [into] under
        a non-empty path traversing only constructors. *)
-    let cycle_check_l ~(sub:term) (l:term list): bool =
+    let cycle_check_a ~(sub:term) (l:term array): bool =
       let tbl_ = cycle_check_tbl in
       Term.Tbl.clear tbl_;
       let rec aux u =
@@ -1916,14 +1968,14 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
             Term.Tbl.add tbl_ u ();
             match Term.as_cstor_app u with
               | None -> false
-              | Some (_, _, l) -> List.exists aux l
+              | Some (_, _, a) -> CCArray.exists aux a
           )
         end
       in
-      List.exists aux l
+      CCArray.exists aux l
 
     let cycle_check ~(sub:term) (into:term): bool =
-      cycle_check_l ~sub [into]
+      cycle_check_a ~sub [|into|]
 
     (* set the normal form of [t], propagate to watchers *)
     let set_nf_ t new_t (e:explanation) : unit =
@@ -1955,8 +2007,9 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         | Some (t', e) ->
           let exp, nf = compute_nf_add e t' in
           (* path compression here *)
-          if not (Term.equal t' nf)
-          then set_nf_ t nf exp;
+          if not (Term.equal t' nf) then (
+            set_nf_ t nf exp;
+          );
           exp, nf
         | None -> compute_nf_noncached t
 
@@ -1974,9 +2027,10 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
             | Cst_undef ({cst_cur_case=Some (e,new_t); _}, _) ->
               (* c := new_t, we can reduce *)
               compute_nf_add e new_t
-            | Cst_undef _ | Cst_uninterpreted_dom_elt _ | Cst_cstor ->
+            | Cst_undef _ | Cst_uninterpreted_dom_elt _ ->
               Explanation.empty, t
           end
+        | App_cstor _ -> Explanation.empty, t
         | Fun _ -> Explanation.empty, t (* no eval under lambda *)
         | Mu body ->
           (* [mu x. body] becomes [body[x := mu x. body]] *)
@@ -2036,22 +2090,19 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
             if u==u' then t else Term.match_ u' m
           in
           let e_branch, t' = match Term.as_cstor_app u' with
-            | Some (c, _, l) ->
-              begin
-                try
-                  let tys, rhs = ID.Map.find (Typed_cst.id c) m in
-                  if List.length tys = List.length l
-                  then (
-                    (* evaluate arguments *)
-                    let env = DB_env.push_l l DB_env.empty in
-                    (* replace in [rhs] *)
-                    let rhs = Term.eval_db env rhs in
-                    (* evaluate new [rhs] *)
-                    compute_nf rhs
-                  )
-                  else Explanation.empty, Term.match_ u' m
+            | Some (c, _, a) ->
+              let tys, rhs =
+                try ID.Map.find (Cstor.id c) m
                 with Not_found -> assert false
-              end
+              in
+              (* should match, by construction *)
+              assert (Array.length tys = Array.length a);
+              (* push arguments into a local env *)
+              let env = DB_env.push_a a DB_env.empty in
+              (* replace in [rhs] *)
+              let rhs = Term.eval_db env rhs in
+              (* evaluate new [rhs] *)
+              compute_nf rhs
             | None -> Explanation.empty, default()
           in
           let e = Explanation.append e_u e_branch in
@@ -2078,13 +2129,11 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
               let t' = if u==u' then t else Term.switch u' m in
               e_u, t'
           end
-        | App ({term_cell=Const {cst_kind=Cst_cstor; _}; _}, _) ->
-          Explanation.empty, t (* do not reduce under cstors *)
         | App (f, l) ->
           let e_f, f' = compute_nf f in
           (* now beta-reduce if needed *)
           let e_reduce, new_t =
-            compute_nf_app DB_env.empty Explanation.empty f' l
+            compute_nf_app Explanation.empty f' l
           in
           (* merge explanations *)
           let e = Explanation.append e_reduce e_f in
@@ -2105,7 +2154,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
               then Explanation.return lit, Term.true_
               else Explanation.return (Lit.neg lit), Term.false_
             | Cst_uninterpreted_dom_elt _
-            | Cst_cstor | Cst_defined _ ->
+            | Cst_defined _ ->
               assert false
           end
         | Check_empty_uty uty ->
@@ -2115,30 +2164,37 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
             | Some (e, Uty_nonempty) -> e, Term.false_
           end
 
-    (* apply [f] to [l], until no beta-redex is found *)
-    and compute_nf_app env e f l = match f.term_cell, l with
-      | Const {cst_kind=Cst_defined (lazy def_f); _}, l ->
+    (* apply [f] to [a], until no beta-redex is found *)
+    and compute_nf_app e f a = match f.term_cell with
+      | Const {cst_kind=Cst_defined (lazy def_f); _} ->
         (* reduce [f l] into [def_f l] when [f := def_f] *)
-        compute_nf_app env e def_f l
-      | Fun (_ty, body), arg :: other_args ->
-        (* beta-reduce *)
-        assert (Ty.equal _ty arg.term_ty);
-        let new_env = DB_env.push arg env in
-        (* apply [body] to [other_args] *)
-        compute_nf_app new_env e body other_args
-      | _ ->
-        (* cannot reduce, unless [f] reduces to something else. *)
-        let e_f, f' = Term.eval_db env f |> compute_nf in
-        let exp = Explanation.append e e_f in
-        if Term.equal f f'
-        then (
-          (* no more reduction *)
-          let t' = Term.app f' l in
-          exp, t'
+        compute_nf_app e def_f a
+      | Fun (tys, body) ->
+        let n = Array.length tys in
+        assert (n>0);
+        if Array.length a = n then (
+          (* beta-reduce *)
+          let env = DB_env.push_a a DB_env.empty in
+          let body = Term.eval_db env body in
+          compute_nf_add e body
+        ) else if Array.length a >= n then (
+          (* too many arguments, reduce for the [n] first ones *)
+          let args = Array.sub a 0 n in
+          let e', f' = compute_nf_app e f args in
+          (* apply to remaining args *)
+          let n' = Array.length a - n in
+          assert (n' > 0);
+          let other_args = Array.sub a n n' in
+          compute_nf_app e' f' other_args
         ) else (
-          (* try it again *)
-          compute_nf_app DB_env.empty exp f' l
+          (* no reduction is possible *)
+          let t' = Term.app f a in
+          Explanation.empty, t'
         )
+      | _ ->
+        (* cannot reduce, since [f] is already reduced *)
+        let t' = Term.app f a in
+        e, t'
 
     (* compute nf of [t], append [e] to the explanation *)
     and compute_nf_add (e : explanation) (t:term) : explanation * term =
@@ -2217,28 +2273,28 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         then e_ab, Term.true_ (* syntactic *)
         else begin match Term.as_unif a', Term.as_unif b' with
           | Term.Unif_cstor (c1,ty1,l1), Term.Unif_cstor (c2,_,l2) ->
-            if not (Typed_cst.equal c1 c2)
+            if not (Cstor.equal c1 c2)
             then
               (* [c1 ... = c2 ...] --> false, as distinct constructors
                  can never be equal *)
               e_ab, Term.false_
-            else if Typed_cst.equal c1 c2
-                 && List.length l1 = List.length l2
-                 && List.length l1 = List.length (fst (Ty.unfold ty1))
+            else if Cstor.equal c1 c2
             then (
+              assert (Array.length l1 = Array.length l2);
+              assert (Array.length l1 = Ty.arity ty1);
               (* same constructor, fully applied -> injectivity:
                  arguments are pairwise equal.
                  We need to evaluate the arguments further (e.g.
                  if they start with constructors) *)
-              List.map2 Term.eq l1 l2
-              |> Term.and_l
+              CCArray.map2 Term.eq l1 l2
+              |> Term.and_a
               |> compute_nf_add e_ab
             )
             else e_ab, default()
-          | Term.Unif_cstor (_, _, l), _ when cycle_check_l ~sub:b' l ->
+          | Term.Unif_cstor (_, _, l), _ when cycle_check_a ~sub:b' l ->
             (* acyclicity rule *)
             e_ab, Term.false_
-          | _, Term.Unif_cstor (_, _, l) when cycle_check_l ~sub:a' l ->
+          | _, Term.Unif_cstor (_, _, l) when cycle_check_a ~sub:a' l ->
             e_ab, Term.false_
           | Term.Unif_dom_elt (c1,ty1,_), Term.Unif_dom_elt (c2,ty2,_) ->
             (* domain elements: they are all distinct *)
@@ -2261,17 +2317,17 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
                   CCList.find_map
                     (fun t -> match Term.as_cstor_app t with
                        | Some (cstor', _, sub_metas) ->
-                         if Typed_cst.equal cstor cstor'
+                         if Cstor.equal cstor cstor'
                          then Some (t,sub_metas)
                          else None
                        | None -> assert false)
                     cases
                   |> (function | Some x->x | None -> assert false)
                 in
-                assert (List.length sub_metas = List.length args);
+                assert (Array.length sub_metas = Array.length args);
                 let check_case = Term.check_assign c case in
                 let check_subs =
-                  List.map2 Term.eq sub_metas args |> Term.and_l
+                  Array.map2 Term.eq sub_metas args |> Term.and_a
                 in
                 incr stat_num_unif;
                 (* eager "and", as a "if" *)
@@ -2708,7 +2764,9 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     let ty_tbl_ : Ty.t lazy_t ID.Tbl.t = ID.Tbl.create 16
 
     (* for converting constants *)
-    let decl_ty_ : cst lazy_t ID.Tbl.t = ID.Tbl.create 16
+    let cst_tbl_ : cst lazy_t ID.Tbl.t = ID.Tbl.create 16
+
+    let cstor_tbl_ : cstor lazy_t ID.Tbl.t = ID.Tbl.create 16
 
     (* environment for variables *)
     type conv_env = {
@@ -2748,15 +2806,33 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       | Ast.True -> Term.true_
       | Ast.False -> Term.false_
       | Ast.Const id ->
-        begin
-          try ID.Tbl.find decl_ty_ id |> Lazy.force |> Term.const
-          with Not_found ->
+        begin match ID.Tbl.get cst_tbl_ id, ID.Tbl.get cstor_tbl_ id with
+          | Some (lazy c), None -> Term.const c
+          | None, Some (lazy c) ->
+            if Cstor.arity c <> 0 then (
+              errorf "constructor %a should be fully applied" ID.pp id
+            );
+            Term.app_cstor c [||]
+          | Some _, Some _ -> assert false
+          | None, None ->
             errorf "could not find constant `%a`" ID.pp id
         end
       | Ast.App (f, l) ->
-        let f = conv_term_rec env f in
-        let l = List.map (conv_term_rec env) l in
-        Term.app f l
+        let a = List.map (conv_term_rec env) l |> Array.of_list in
+        begin match Ast.term_view f with
+          | Ast.Const id when ID.Tbl.mem cstor_tbl_ id ->
+            (* special case for constructors *)
+            let lazy c = ID.Tbl.find cstor_tbl_ id in
+            if Cstor.arity c <> Array.length a then (
+              errorf "constructor %a (arity %d) should be fully applied,@ \
+                      but is applied to (@[%a@])"
+                ID.pp id (Cstor.arity c) (Utils.pp_array Term.pp) a
+            );
+            Term.app_cstor c a
+          | _ ->
+            let f = conv_term_rec env f in
+            Term.app f a
+        end
       | Ast.Var v ->
         begin match find_env env v with
           | Some (t', depth_t'), _ ->
@@ -2769,11 +2845,13 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
             Term.db (DB.make level ty)
           | None, None -> errorf "could not find var `%a`" Ast.Var.pp v
         end
-      | Ast.Fun (v,body) ->
-        let env' = add_bound env v in
+      | Ast.Fun _ ->
+        let vars, body = Ast.unfold_fun t in
+        assert (vars <> []);
+        let env' = List.fold_left add_bound env vars in
         let body = conv_term_rec env' body in
-        let ty = Ast.Var.ty v |> conv_ty in
-        Term.fun_ ty body
+        let tys = Array.of_list vars |> Array.map Ast.Var.ty |> Array.map conv_ty in
+        Term.fun_ tys body
       | Ast.Forall (v,body) ->
         let env' = add_bound env v in
         let body = conv_term_rec env' body in
@@ -2819,7 +2897,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
                       | _ -> false)
                in
                if depends_on_vars then any_rhs_depends_vars := true;
-               tys, rhs)
+               Array.of_list tys, rhs)
             m
         in
         (* optim: check whether all branches return the same term, that
@@ -2911,11 +2989,11 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           add_ty_support_ (Lazy.force ty);
           ID.Tbl.add ty_tbl_ id ty
         | Ast.Decl (id, ty) ->
-          assert (not (ID.Tbl.mem decl_ty_ id));
+          assert (not (ID.Tbl.mem cst_tbl_ id));
           let ty = conv_ty ty in
           let cst = Typed_cst.make_undef ~depth:0 id ty in
           add_cst_support_ cst; (* need it in model *)
-          ID.Tbl.add decl_ty_ id (Lazy.from_val cst)
+          ID.Tbl.add cst_tbl_ id (Lazy.from_val cst)
         | Ast.Data l ->
           (* declare the type, and all the constructors *)
           List.iter
@@ -2927,9 +3005,9 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
                      (fun (id_c, ty_c) ->
                         let c = lazy (
                           let ty_c = conv_ty ty_c in
-                          Typed_cst.make_cstor id_c ty_c
+                          Cstor.make id_c ty_c
                         ) in
-                        ID.Tbl.add decl_ty_ id_c c; (* declare *)
+                        ID.Tbl.add cstor_tbl_ id_c c; (* declare *)
                         c)
                    |> Sequence.to_rev_list
                  in
@@ -2952,12 +3030,12 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
                let cst = lazy (
                  Typed_cst.make_defined id ty rhs
                ) in
-               ID.Tbl.add decl_ty_ id cst)
+               ID.Tbl.add cst_tbl_ id cst)
             l;
           (* force thunks *)
           List.iter
             (fun (id,_,_) ->
-               let c = ID.Tbl.find decl_ty_ id |> Lazy.force in
+               let c = ID.Tbl.find cst_tbl_ id |> Lazy.force in
                begin match c.cst_kind with
                  | Cst_defined (lazy _) -> () (* also force definition *)
                  | _ -> assert false
@@ -2989,9 +3067,12 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       f v env
 
     let with_vars tys env ~f =
-      let vars = List.map fresh_var tys in
-      let env = DB_env.push_l (List.map A.var vars) env in
+      let vars = Array.map fresh_var tys in
+      let env = DB_env.push_a (Array.map A.var vars) env in
       f vars env
+
+    let cstor_to_ast c = A.const (Cstor.id c) (Cstor.ty c |> ty_to_ast)
+    let cst_to_ast c = A.const (Typed_cst.id c) (Typed_cst.ty c |> ty_to_ast)
 
     let term_to_ast (t:term): Ast.term =
       let rec aux env t = match t.term_cell with
@@ -3002,11 +3083,12 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
             | Some t' -> t'
             | None -> errorf "cannot find DB %a in env" Term.pp t
           end
-        | Const cst -> A.const cst.cst_id (ty_to_ast t.term_ty)
-        | App (f,l) -> A.app (aux env f) (List.map (aux env) l)
-        | Fun (ty,bod) ->
-          with_var ty env
-            ~f:(fun v env -> A.fun_ v (aux env bod))
+        | Const cst -> cst_to_ast cst
+        | App_cstor (c,a) -> A.app_a (cstor_to_ast c) (Array.map (aux env) a)
+        | App (f,l) -> A.app_a (aux env f) (Array.map (aux env) l)
+        | Fun (tys,bod) ->
+          with_vars tys env
+            ~f:(fun vars env -> A.fun_a vars (aux env bod))
         | Mu _ -> assert false
         | If (a,b,c) -> A.if_ (aux env a)(aux env b) (aux env c)
         | Match (u,m) ->
@@ -3014,7 +3096,8 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           let m =
             ID.Map.map
               (fun (tys,rhs) ->
-                 with_vars tys env ~f:(fun vars env -> vars, aux env rhs))
+                 with_vars tys env
+                   ~f:(fun vars env -> Array.to_list vars, aux env rhs))
               m
           in
           A.match_ u m
@@ -3070,8 +3153,9 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       match t.term_cell with
         | True | False | DB _ -> t
         | Const _ -> t
-        | App (f,l) ->
-          Term.app (aux f) (List.map aux l)
+        | App_cstor (c,a) -> Term.app_cstor c (Array.map aux a)
+        | App (f,a) ->
+          Term.app (aux f) (Array.map aux a)
         | If (a,b,c) -> Term.if_ (aux a)(aux b)(aux c)
         | Match (u,m) ->
           let m = ID.Map.map (fun (tys,rhs) -> tys, aux rhs) m in
