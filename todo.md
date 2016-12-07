@@ -4,6 +4,57 @@
 
 ## Narrowing
 
+- [ ] no hashconsing branch:
+  * reinforce a bit
+  * write a better interpreter (separate program and runtime thunks)
+    + `thunk =
+       par_and|true|false|not|cstor(thunks)|ref(thunk*expl)|suspend(program,const,env)`
+       (unknowns should only occur in suspensions, I think, since otherwise
+        we can always reduce?)
+    + `program = fun/match/if/value/const/switch/let/…`
+      (maybe `value` should be flat and nested values would require "let")
+    + `env = thunk list` (non-sparse env) or RAL
+  * introduce `Term.Ref` case that forwards to another term (a pointer),
+    but "carries over" on values (true/false/constructors). In other words,
+    `Ref t -->_e Ref nf` when `t -->_e nf`, except when `nf = c u1…uk`
+    where it becomes `Ref t -->_e c (Ref u1)…(Ref uk)`
+  * `let x=t in u` should be converted into `u[x := Ref t]` where the `t`
+    is shared (use an actual pointer/wrapper with
+    backtrackable memoization in there?)
+  * use this mechanism in literals, instead of memoizing literals themselves.
+
+- [ ] hashconsing branch:
+  * use `n`-ary functions
+  * expand unknowns on the fly during computation
+    (instead of computing dependencies)
+  * use environments and local closures instead of instantiation
+    + can keep `let`
+    + a closure is always closed (
+    + only create closures at points where evaluation blocks
+      (or for cstor arguments, i.e. thunks)
+    + should allocate a lot less. Closures are part of identity/hashconsing
+  * design: this should be usable in a SMT
+
+- [x] memory profiling
+
+- experiment to remove uninterpreted types in core, and replace them
+  with the following (amounts to replacing finite model finding with
+  computational narrowing)
+  * For a type τ, `Conv`-time declarations of:
+    + `τ = 0 | S card_τ` types
+    + a `card_τ` value of type `card_τ` with constraint `card_τ != 0`
+    + two recursive function `forall_τ` and `exists_τ` (taking as param
+      the `card_τ` value… or do closures support that? and some predicate `τ → prop`
+      that will be applied to all elements from `0` to `card-1`)
+    + (maybe) a special builtin pred `<` that can be used on all those types
+      (mostly for symmetry breaking: if `a`, `b` are symmetric, add `a<b`)
+  * a translation of axioms so they use `forall_τ` and `exists_τ`
+  * model building that uses `card_τ` to compute the actual domain of
+    the type. (the domain of `τ`
+    is the set of values `{x:τ | x < card_τ}`)
+
+- add `default` in matching (makes for smaller terms)
+
 - replace iterative increment of `depth` by `size`: should explore
   the search space in a much more interesting way
   * each constant `c` lazily maps to a set of literals `size(c)≤n`
@@ -22,22 +73,6 @@
       enumerate all clauses `size(c)≤n+2 ⇒ size(c1)≤a ∧ size(c2)≤b`
       for each `{ (a,b) | a>0,b>0,a+b=n+1 }`.
     + then flag `c` as constrained for the new size.
-
-- experiment to remove uninterpreted types in core, and replace them
-  with the following (amounts to replacing finite model finding with
-  computational narrowing)
-  * For a type τ, `Conv`-time declarations of:
-    + `τ = 0 | S card_τ` types
-    + a `card_τ` value of type `card_τ` with constraint `card_τ != 0`
-    + two recursive function `forall_τ` and `exists_τ` (taking as param
-      the `card_τ` value… or do closures support that? and some predicate `τ → prop`
-      that will be applied to all elements from `0` to `card-1`)
-    + (maybe) a special builtin pred `<` that can be used on all those types
-      (mostly for symmetry breaking: if `a`, `b` are symmetric, add `a<b`)
-  * a translation of axioms so they use `forall_τ` and `exists_τ`
-  * model building that uses `card_τ` to compute the actual domain of
-    the type. (the domain of `τ`
-    is the set of values `{x:τ | x < card_τ}`)
 
 - discuss how to narrow HOF arguments with Koen (they can only be used
   on finite set of values, therefore simulate them by a finite dispatch
@@ -91,7 +126,12 @@
 - generic "parallel" operator (to be used by and, or, but also
   other functions such as +_nat — maybe if they are detected to be symmetric?)
 
-## On Hold
+### Fix
+
+- model building for uninterpreted values
+  `./smbc.native --debug 1 -t 30 --check examples/ty_infer2_unin.lisp --depth-step 5`
+
+### On Hold
 
 - simultaneous match (make and/or/imply based on that)
   * also need to convert inputs that perform match on arguments (e.g. `less`)
@@ -131,7 +171,7 @@
     with if/case provides the guards that lead to blocked calls)
 - start testing on simple examples
 
-## FIX
+### FIX
 ./smbc.native --backtrace --debug 5 --check examples/uf3.smt2
 (should be unsat)
 
