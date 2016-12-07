@@ -66,6 +66,8 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     mutable term_deps: term_dep list;
     (* set of undefined constants
        that can make evaluation go further *)
+    mutable term_closure_size: int;
+    (* number of open De Bruijn indices in the term *)
   }
 
   (* term shallow structure *)
@@ -86,6 +88,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     | Builtin of builtin
     | Check_assign of cst * term (* check a literal *)
     | Check_empty_uty of ty_uninterpreted_slice (* check it's empty *)
+    | Closure of term * int * term db_env (* closure + shift (always closed) *)
 
   and db = int * ty_h
 
@@ -187,7 +190,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
   and cst_exist_conds = lit lazy_t list ref
 
   and 'a db_env = {
-    db_st: 'a option list;
+    db_st: 'a list;
     db_size: int;
   }
 
@@ -335,18 +338,25 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
   module DB_env = struct
     type 'a t = 'a db_env
 
-    let push x env = { db_size=env.db_size+1; db_st=Some x :: env.db_st }
+    let push (x:'a) (env:'a t):'a t =
+      { db_size=env.db_size+1; db_st=x :: env.db_st; }
     let push_l l env = List.fold_left (fun e x -> push x e) env l
     let push_a a env = Array.fold_left (fun e x -> push x e) env a
-    let push_none env =
-      { db_size=env.db_size+1; db_st=None::env.db_st }
-    let push_none_l l env = List.fold_left (fun e _ -> push_none e) env l
-    let push_none_a a env = Array.fold_left (fun e _ -> push_none e) env a
-    let empty = {db_st=[]; db_size=0}
-    let singleton x = {db_st=[Some x]; db_size=1}
+    let empty = {db_st=[]; db_size=0; }
+    let is_empty e = e.db_size=0
+    let singleton (x:'a): 'a t = {db_st=[x]; db_size=1; }
     let size env = env.db_size
-    let get ((n,_):DB.t) env : _ option =
-      if n < env.db_size then List.nth env.db_st n else None
+    let equal f a b = a.db_size=b.db_size && CCList.equal f a.db_st b.db_st
+    let hash f a = Hash.combine2 a.db_size (Hash.list f a.db_st)
+    let map f a = {a with db_st=List.map f a.db_st}
+    let get ((n,_):DB.t) (env:'a t) : 'a =
+      if n < env.db_size
+      then List.nth env.db_st n
+      else invalid_arg "db_env.get: invalid index"
+    let append a b: _ t = {db_size=a.db_size+b.db_size; db_st=a.db_st @ b.db_st}
+    let to_list a = a.db_st
+    let pp pp_x out a =
+      Format.fprintf out "(@[<hv>%a@])" (Utils.pp_list pp_x) a.db_st
   end
 
   let term_equal_ (a:term) b = a==b
@@ -567,6 +577,8 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
             Hash.combine3 33 (Typed_cst.hash c) (sub_hash t)
           | Check_empty_uty uty ->
             Hash.combine2 34 (hash_uty uty)
+          | Closure (t,_,e) ->
+            Hash.combine3 40 (sub_hash t) (DB_env.hash sub_hash e)
 
         (* equality that relies on physical equality of subterms *)
         let equal t1 t2 : bool = match t1.term_cell, t2.term_cell with
@@ -612,6 +624,8 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
             Typed_cst.equal c1 c2 && term_equal_ t1 t2
           | Check_empty_uty u1, Check_empty_uty u2 ->
             equal_uty u1 u2
+          | Closure (t1,i1,e1), Closure (t2,i2,e2) ->
+            i1=i2 && t1==t2 && DB_env.equal (==) e1 e2
           | True, _
           | False, _
           | DB _, _
@@ -627,6 +641,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           | Quant _, _
           | Check_assign _, _
           | Check_empty_uty _, _
+          | Closure _, _
             -> false
 
         let set_id t i = t.term_id <- i
@@ -639,6 +654,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         term_cell=if b then True else False;
         term_nf=None;
         term_deps=[];
+        term_closure_size=0;
       } in
       H.hashcons t
 
@@ -652,9 +668,11 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       | Term_dep_sub2 of term * term
       | Term_dep_uty of ty_uninterpreted_slice
 
-    type delayed_ty =
-      | DTy_direct of ty_h
-      | DTy_lazy of (unit -> ty_h)
+    type 'a delayed =
+      | D_direct of 'a
+      | D_lazy of (unit -> 'a)
+
+    type delayed_closure
 
     let sorted_merge_ l1 l2 = CCList.sorted_merge_uniq ~cmp:compare l1 l2
 
@@ -675,20 +693,21 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
 
     (* build a term. If it's new, add it to the watchlist
        of every member of [watching] *)
-    let mk_term_ ~(deps:deps) cell ~(ty:delayed_ty) : term =
+    let mk_term_ ~(deps:deps) ~(cl_size: int delayed) cell ~(ty:ty_h delayed) : term =
       let t = {
         term_id= -1;
         term_ty=Ty.prop; (* will be changed *)
         term_cell=cell;
         term_nf=None;
         term_deps=[];
+        term_closure_size= -1;
       } in
       let t' = H.hashcons t in
       if t==t' then (
         (* compute ty *)
         t.term_ty <- begin match ty with
-          | DTy_direct ty -> ty
-          | DTy_lazy f -> f ()
+          | D_direct ty -> ty
+          | D_lazy f -> f ()
         end;
         (* compute evaluation dependencies *)
         let deps = match deps with
@@ -700,12 +719,19 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
               ~cmp:cmp_term_dep_ a.term_deps b.term_deps
           | Term_dep_uty uty -> [Dep_uty uty]
         in
-        t'.term_deps <- deps
+        t'.term_deps <- deps;
+        (* compute closure size *)
+        t'.term_closure_size <- begin match cl_size with
+          | D_direct n -> n
+          | D_lazy f -> f()
+        end;
       );
       t'
 
-    let db d =
-      mk_term_ ~deps:Term_dep_none (DB d) ~ty:(DTy_direct (DB.ty d))
+    let db d : t =
+      mk_term_ (DB d)
+        ~deps:Term_dep_none ~ty:(D_direct (DB.ty d))
+        ~cl_size:(D_direct (fst d+1))
 
     (* type of an application *)
     let app_ty_a ty (a:term array) : Ty.t =
@@ -717,17 +743,21 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
            | Prop | Atomic _ -> assert false)
         ty a
 
+    let max_arr_ a =
+      Array.fold_left (fun acc x -> max acc x.term_closure_size) 0 a
+
     let app_cstor c a =
       assert (Cstor.arity c = Array.length a);
-      let ty = DTy_lazy (fun () -> app_ty_a (Cstor.ty c) a) in
-      mk_term_ ~deps:Term_dep_none (App_cstor (c, a)) ~ty
+      let ty = D_lazy (fun () -> app_ty_a (Cstor.ty c) a) in
+      mk_term_ (App_cstor (c, a)) ~deps:Term_dep_none ~ty
+        ~cl_size:(D_lazy (fun () -> max_arr_ a))
 
-    let const c =
+    let const c : t =
       let deps = match c.cst_kind with
         | Cst_undef _ -> Term_dep_cst c (* depends on evaluation! *)
         | Cst_defined _ | Cst_uninterpreted_dom_elt _ -> Term_dep_none
       in
-      mk_term_ ~deps (Const c) ~ty:(DTy_direct (Typed_cst.ty c))
+      mk_term_ ~deps (Const c) ~ty:(D_direct (Typed_cst.ty c)) ~cl_size:(D_direct 0)
 
     let append_arr a1 a2 =
       let n1 = Array.length a1 in
@@ -741,7 +771,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         res
       )
 
-    let app f a = match a with
+    let app f a : t = match a with
       | [||] -> f
       | _ ->
         (* watch head, not arguments *)
@@ -749,38 +779,52 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           | App (f1, a1) ->
             let a' = append_arr a1 a in
             mk_term_ ~deps:(Term_dep_sub f1) (App (f1, a'))
-              ~ty:(DTy_lazy (fun () -> app_ty_a f1.term_ty a'))
+              ~ty:(D_lazy (fun () -> app_ty_a f1.term_ty a'))
+              ~cl_size:(D_lazy (fun () -> max_arr_ a'))
           | _ ->
             mk_term_ ~deps:(Term_dep_sub f) (App (f,a))
-              ~ty:(DTy_lazy (fun () -> app_ty_a f.term_ty a))
+              ~ty:(D_lazy (fun () -> app_ty_a f.term_ty a))
+              ~cl_size:(D_lazy (fun () -> max_arr_ a))
         in
         t
 
     let app_cst f l = app (const f) l
 
-    let rec fun_ tys body = match tys, body.term_cell with
+    let rec fun_ tys body : t = match tys, body.term_cell with
       | [||], _ -> body
       | _, Fun (tys', body') ->
         fun_ (append_arr tys tys') body'
       | _ ->
         (* do not add watcher: propagation under λ forbidden *)
+        let cl_size =
+          D_lazy (fun () -> max 0 (body.term_closure_size - Array.length tys))
+        in
         mk_term_ ~deps:Term_dep_none (Fun (tys, body))
-          ~ty:(DTy_lazy (fun () -> Ty.arrow_a tys body.term_ty))
+          ~ty:(D_lazy (fun () -> Ty.arrow_a tys body.term_ty)) ~cl_size
 
     let fun_l args f = fun_ (Array.of_list args) f
 
-    let mu t =
-      mk_term_ ~deps:Term_dep_none (Mu t) ~ty:(DTy_direct t.term_ty)
+    let mu t : t =
+      mk_term_ ~deps:Term_dep_none (Mu t) ~ty:(D_direct t.term_ty)
+        ~cl_size:(D_lazy (fun () -> max 0 (t.term_closure_size-1)))
 
     (* TODO: check types *)
 
-    let match_ u m =
+    let match_ u m : t =
       (* propagate only from [u] *)
       let t =
         mk_term_ ~deps:(Term_dep_sub u) (Match (u,m))
-          ~ty:(DTy_lazy (fun () ->
+          ~ty:(D_lazy (fun () ->
               let _, (_,rhs) = ID.Map.choose m in
               rhs.term_ty
+            ))
+          ~cl_size:(D_lazy (fun () ->
+              let lev_of_branch (tys,rhs) =
+                max 0 (rhs.term_closure_size - Array.length tys)
+              in
+              ID.Map.fold
+                (fun _ branch acc -> max acc (lev_of_branch branch))
+                m u.term_closure_size
             ))
       in
       t
@@ -788,7 +832,8 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     let switch u m =
       let t =
         mk_term_ ~deps:(Term_dep_sub u) (Switch (u,m))
-          ~ty:(DTy_direct m.switch_ty_ret)
+          ~ty:(D_direct m.switch_ty_ret)
+          ~cl_size:(D_direct u.term_closure_size)
       in
       t
 
@@ -796,11 +841,17 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       assert (Ty.equal b.term_ty c.term_ty);
       (* propagate under test only *)
       let t =
-        mk_term_ ~deps:(Term_dep_sub a)
-          (If (a,b,c)) ~ty:(DTy_direct b.term_ty) in
+        mk_term_ (If (a,b,c))
+          ~deps:(Term_dep_sub a)
+          ~ty:(D_direct b.term_ty)
+          ~cl_size:(D_lazy (fun () ->
+              max a.term_closure_size
+                (max b.term_closure_size c.term_closure_size))
+          )
+      in
       t
 
-    let builtin_ ~deps b =
+    let builtin_ ~deps ~cl_size b =
       (* normalize a bit *)
       let b = match b with
         | B_eq (a,b) when a.term_id > b.term_id -> B_eq (b,a)
@@ -808,31 +859,37 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         | B_or (a,b) when a.term_id > b.term_id -> B_or (b,a)
         | _ -> b
       in
-      let t = mk_term_ ~deps (Builtin b) ~ty:(DTy_direct Ty.prop) in
+      let t = mk_term_ ~deps ~cl_size (Builtin b) ~ty:(D_direct Ty.prop) in
       t
 
     let check_assign c t : term =
       mk_term_ (Check_assign (c, t))
-        ~deps:(Term_dep_cst c) ~ty:(DTy_direct Ty.prop)
+        ~deps:(Term_dep_cst c) ~ty:(D_direct Ty.prop)
+        ~cl_size:(D_direct t.term_closure_size)
 
     let check_empty_uty (uty:ty_uninterpreted_slice): term =
       mk_term_ (Check_empty_uty uty)
-        ~deps:(Term_dep_uty uty) ~ty:(DTy_direct Ty.prop)
+        ~deps:(Term_dep_uty uty) ~ty:(D_direct Ty.prop)
+        ~cl_size:(D_direct 0)
 
     let builtin b =
-      let deps = match b with
-        | B_not u -> Term_dep_sub u
+      let deps, cl_size = match b with
+        | B_not u -> Term_dep_sub u, D_direct u.term_closure_size
         | B_and (_,_,a,b)
         | B_or (a,b)
-        | B_eq (a,b) | B_imply (a,b) -> Term_dep_sub2 (a,b)
+        | B_eq (a,b) | B_imply (a,b) ->
+          Term_dep_sub2 (a,b),
+          D_lazy (fun () -> max a.term_closure_size b.term_closure_size)
       in
-      builtin_ ~deps b
+      builtin_ ~deps ~cl_size b
 
     let not_ t = match t.term_cell with
       | True -> false_
       | False -> true_
       | Builtin (B_not t') -> t'
-      | _ -> builtin_ ~deps:(Term_dep_sub t) (B_not t)
+      | _ ->
+        builtin_ (B_not t)
+          ~deps:(Term_dep_sub t) ~cl_size:(D_direct t.term_closure_size)
 
     (* might need to tranfer the negation from [t] to [sign] *)
     let abs t : t * bool = match t.term_cell with
@@ -844,19 +901,40 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       assert (Ty.is_prop body.term_ty);
       (* evaluation is blocked by the uninterpreted type *)
       let deps = Term_dep_uty uty in
-      mk_term_ ~deps ~ty:(DTy_direct Ty.prop) (Quant (q,uty,body))
+      mk_term_  (Quant (q,uty,body))
+        ~deps ~ty:(D_direct Ty.prop)
+        ~cl_size:(D_lazy (fun () -> max 0 (body.term_closure_size-1)))
 
     let forall = quant Forall
     let exists = quant Exists
 
-    let and_ a b = builtin_ ~deps:(Term_dep_sub2 (a,b)) (B_and (a,b,a,b))
-    let or_ a b = builtin_ ~deps:(Term_dep_sub2 (a,b)) (B_or (a,b))
-    let imply a b = builtin_ ~deps:(Term_dep_sub2 (a,b)) (B_imply (a,b))
-    let eq a b = builtin_ ~deps:(Term_dep_sub2 (a,b)) (B_eq (a,b))
+    let mk_closure_ t shift e =
+      mk_term_ (Closure (t,shift,e))
+        ~deps:(Term_dep_sub t) ~ty:(D_direct t.term_ty)
+        ~cl_size:(D_direct 0)
+
+    let closure ?(shift=0) t e =
+      match t.term_cell with
+        | _ when (DB_env.size e=0 && shift=0) || t.term_closure_size=0 ->
+          t (* no need for closure here *)
+        | DB d when shift=0 ->
+          (* deref immediately *)
+          assert (DB.level d < DB_env.size e);
+          DB_env.get d e
+        | _ ->
+          (* a closure must always be "total", so the result is really closed *)
+          assert (DB_env.size e + shift >= t.term_closure_size);
+          mk_closure_ t shift e
+
+    let closure' ?shift e t = closure ?shift t e
+
+    let and_ a b = builtin (B_and (a,b,a,b))
+    let or_ a b = builtin (B_or (a,b))
+    let imply a b = builtin (B_imply (a,b))
+    let eq a b = builtin (B_eq (a,b))
     let neq a b = not_ (eq a b)
 
-    let and_par a b c d =
-      builtin_ ~deps:(Term_dep_sub2 (c,d)) (B_and (a,b,c,d))
+    let and_par a b c d = builtin (B_and (a,b,c,d))
 
     (* "eager" and, evaluating [a] first *)
     let and_eager a b = if_ a b false_
@@ -945,6 +1023,9 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           | Quant (_, _, body)
           | Mu body
           | Fun (_, body) -> aux (k+1) body
+          | Closure (t,_,e) ->
+            aux k t;
+            List.iter (aux 0) (DB_env.to_list e) (* all closed *)
           | Check_assign _
           | Check_empty_uty _ -> ()
       in
@@ -1002,6 +1083,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         | DB d -> DB.pp out d
         | Const c ->
           if ids then Typed_cst.pp out c else ID.pp_name out c.cst_id
+        | App_cstor (c,[||]) -> Cstor.pp out c
         | App_cstor (c,l) ->
           fpf out "(@[<1>%a@ %a@])" Cstor.pp c (Utils.pp_array pp) l
         | App (f,l) ->
@@ -1043,6 +1125,10 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         | Check_assign (c,t) ->
           fpf out "(@[<hv1>:=?@ %a@ %a@])" Typed_cst.pp c pp t
         | Check_empty_uty uty -> fpf out "(@[check_empty %a@])" pp_uty uty
+        | Closure (t, shift, e) ->
+          let pp_shift out i = if i=0 then () else fpf out "/%d" i in
+          fpf out "(@[<hv1>closure%a@ %a@ in %a@])"
+            pp_shift shift pp t (DB_env.pp pp) e
       in
       pp out t
 
@@ -1097,6 +1183,9 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
             let l' = aux_a depth a in
             if f==f' && CCArray.equal (==) a l' then t else app f' l'
           | Builtin b -> builtin (map_builtin (aux depth) b)
+          | Closure (u, shift, env) ->
+            (* [env] is closed, but we need to shift it again *)
+            closure ~shift:(shift+k) (aux depth u) env
           | Check_assign _
           | Check_empty_uty _
             -> t (* closed *)
@@ -1104,66 +1193,6 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           Array.map (aux d) l
         in
         aux 0 t
-      )
-
-    (* just evaluate the De Bruijn indices, and return
-       the explanations used to evaluate subterms *)
-    let eval_db (env:eval_env) (t:term) : term =
-      if DB_env.size env = 0
-      then t (* trivial *)
-      else (
-        let rec aux env t : term = match t.term_cell with
-          | DB d ->
-            begin match DB_env.get d env with
-              | None -> t
-              | Some t' -> t'
-            end
-          | Const _ -> t
-          | True
-          | False -> t
-          | Fun (tys, body) ->
-            let body' = aux (DB_env.push_none_a tys env) body in
-            if body==body' then t else fun_ tys body'
-          | Mu body ->
-            let body' = aux (DB_env.push_none env) body in
-            if body==body' then t else mu body'
-          | Quant (q, uty, body) ->
-            let body' = aux (DB_env.push_none env) body in
-            if body==body' then t else quant q uty body'
-          | Match (u, m) ->
-            let u = aux env u in
-            let m =
-              ID.Map.map
-                (fun (tys,rhs) ->
-                   tys, aux (DB_env.push_none_a tys env) rhs)
-                m
-            in
-            match_ u m
-          | Switch (u, m) ->
-            let u = aux env u in
-            (* NOTE: [m] should not contain De Bruijn indices at all *)
-            switch u m
-          | If (a,b,c) ->
-            let a' = aux env a in
-            let b' = aux env b in
-            let c' = aux env c in
-            if a==a' && b==b' && c==c' then t else if_ a' b' c'
-          | App (_,[||]) -> assert false
-          | App (f, a) ->
-            let f' = aux env f in
-            let a' = aux_a env a in
-            if f==f' && CCArray.equal (==) a a' then t else app f' a'
-          | App_cstor (c, a) ->
-            let a' = aux_a env a in
-            if CCArray.equal (==) a a' then t else app_cstor c a'
-          | Builtin b -> builtin (map_builtin (aux env) b)
-          | Check_assign _
-          | Check_empty_uty _
-            -> t (* closed *)
-        and aux_a env l =
-          Array.map (aux env) l
-        in
-        aux env t
       )
   end
 
@@ -1952,6 +1981,8 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
 
   (** {2 Reduction to Normal Form} *)
   module Reduce = struct
+    type eval_env = term db_env
+
     let cycle_check_tbl : unit Term.Tbl.t = Term.Tbl.create 32
 
     (* [cycle_check sub into] checks whether [sub] occurs in [into] under
@@ -1978,9 +2009,8 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       cycle_check_a ~sub [|into|]
 
     (* set the normal form of [t], propagate to watchers *)
-    let set_nf_ t new_t (e:explanation) : unit =
-      if Term.equal t new_t then ()
-      else (
+    let set_nf_ ~env t new_t (e:explanation) : unit =
+      if DB_env.is_empty env && not (Term.equal t new_t) then (
         Backtrack.push_set_nf_ t;
         t.term_nf <- Some (new_t, e);
         Log.debugf 5
@@ -1999,56 +2029,69 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         | Const {cst_kind=Cst_uninterpreted_dom_elt _; cst_id; _} -> Some cst_id
         | _ -> None
 
-    (* compute the normal form of this term. We know at least one of its
-       subterm(s) has been reduced *)
-    let rec compute_nf (t:term) : explanation * term =
-      (* follow the "normal form" pointer *)
+    let rec compute_nf (t:term): explanation * term =
+      (* follow the "normal form" pointer, if any *)
       match t.term_nf with
         | Some (t', e) ->
           let exp, nf = compute_nf_add e t' in
           (* path compression here *)
           if not (Term.equal t' nf) then (
-            set_nf_ t nf exp;
+            set_nf_ ~env:DB_env.empty t nf exp;
           );
           exp, nf
-        | None -> compute_nf_noncached t
+        | None -> compute_nf_noncached DB_env.empty t
 
-    and compute_nf_noncached t =
-      assert (t.term_nf = None);
+    and compute_nf_env (env:eval_env) (t:term) : explanation * term =
+      if DB_env.is_empty env
+      then compute_nf t (* with cache *)
+      else compute_nf_noncached env t
+
+    and compute_nf_noncached (env:eval_env) (t:term) : explanation * term =
       match t.term_cell with
-        | DB _ -> Explanation.empty, t
+        | DB d ->
+          (* dereference De Bruijn index *)
+          assert (DB.level d < DB_env.size env); (* closed! *)
+          let t' = DB_env.get d env in
+          compute_nf t' (* t' closed, too *)
         | True | False ->
           Explanation.empty, t (* always trivial *)
         | Const c ->
           begin match c.cst_kind with
             | Cst_defined rhs ->
-              (* expand defined constants *)
+              (* expand defined constants. Always closed. *)
               compute_nf (Lazy.force rhs)
             | Cst_undef ({cst_cur_case=Some (e,new_t); _}, _) ->
-              (* c := new_t, we can reduce *)
+              (* c := new_t, we can reduce. [new_t] always closed. *)
               compute_nf_add e new_t
             | Cst_undef _ | Cst_uninterpreted_dom_elt _ ->
               Explanation.empty, t
           end
-        | App_cstor _ -> Explanation.empty, t
+        | App_cstor (c, args) ->
+          let t' =
+            if DB_env.is_empty env then t
+            else
+              (* push closure into the arguments *)
+              Term.app_cstor c (Array.map (Term.closure' env) args)
+          in
+          Explanation.empty, t'
         | Fun _ -> Explanation.empty, t (* no eval under lambda *)
         | Mu body ->
           (* [mu x. body] becomes [body[x := mu x. body]] *)
-          let env = DB_env.singleton t in
-          Explanation.empty, Term.eval_db env body
+          let env = DB_env.push t env in
+          compute_nf_env env body
         | Quant (q,uty,body) ->
           begin match uty.uty_status with
-            | None -> Explanation.empty, t
+            | None -> Explanation.empty, Term.closure' env t
             | Some (e, status) ->
               let c_head, uty_tail = match uty.uty_pair with
                 | Lazy_none -> assert false
                 | Lazy_some tup -> tup
               in
               let t1() =
-                Term.eval_db (DB_env.singleton (Term.const c_head)) body
+                Term.closure' (DB_env.push (Term.const c_head) env) body
               in
               let t2() =
-                Term.quant q uty_tail body
+                Term.closure' env (Term.quant q uty_tail body)
               in
               begin match q, status with
                 | Forall, Uty_empty -> e, Term.true_
@@ -2066,28 +2109,41 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           end
         | Builtin b ->
           (* try boolean reductions *)
-          let e, t' = compute_builtin ~old:t b in
-          set_nf_ t t' e;
+          let e, t' = compute_builtin ~old:t env b in
+          set_nf_ ~env t t' e;
           e, t'
         | If (a,b,c) ->
-          let e_a, a' = compute_nf a in
+          let e_a, a' = compute_nf_env env a in
           let default() =
-            if a==a' then t else Term.if_ a' b c
+            if DB_env.is_empty env && a==a'
+            then t
+            else Term.if_ a' (Term.closure' env b) (Term.closure' env c)
           in
           let e_branch, t' = match a'.term_cell with
-            | True -> compute_nf b
-            | False -> compute_nf c
+            | True -> compute_nf_env env b
+            | False -> compute_nf_env env c
             | _ -> Explanation.empty, default()
           in
           (* merge evidence from [a]'s normal form and [b/c]'s
              normal form *)
           let e = Explanation.append e_a e_branch in
-          set_nf_ t t' e;
+          set_nf_ ~env t t' e;
           e, t'
         | Match (u, m) ->
-          let e_u, u' = compute_nf u in
+          let e_u, u' = compute_nf_env env u in
           let default() =
-            if u==u' then t else Term.match_ u' m
+            if DB_env.is_empty env && u==u'
+            then t
+            else if DB_env.is_empty env then Term.match_ u' m
+            else
+              (* push closure into each branch of [m], after shifting by
+                 the number of arguments of each pattern *)
+              let m' =
+                m |> ID.Map.map
+                  (fun (tys,rhs) ->
+                     tys, Term.closure rhs env ~shift:(Array.length tys))
+              in
+              Term.match_ u' m'
           in
           let e_branch, t' = match Term.as_cstor_app u' with
             | Some (c, _, a) ->
@@ -2098,18 +2154,16 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
               (* should match, by construction *)
               assert (Array.length tys = Array.length a);
               (* push arguments into a local env *)
-              let env = DB_env.push_a a DB_env.empty in
-              (* replace in [rhs] *)
-              let rhs = Term.eval_db env rhs in
-              (* evaluate new [rhs] *)
-              compute_nf rhs
+              let env = DB_env.push_a a env in
+              (* evaluate [rhs] in new env *)
+              compute_nf_env env rhs
             | None -> Explanation.empty, default()
           in
           let e = Explanation.append e_u e_branch in
-          set_nf_ t t' e;
+          set_nf_ ~env t t' e;
           e, t'
         | Switch (u, m) ->
-          let e_u, u' = compute_nf u in
+          let e_u, u' = compute_nf_env env u in
           begin match as_uninterpreted_dom_elt u' with
             | Some u_id ->
               (* do a lookup for this value! *)
@@ -2130,14 +2184,14 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
               e_u, t'
           end
         | App (f, l) ->
-          let e_f, f' = compute_nf f in
+          let e_f, f' = compute_nf_env env f in
           (* now beta-reduce if needed *)
           let e_reduce, new_t =
-            compute_nf_app Explanation.empty f' l
+            compute_nf_app Explanation.empty env f' l
           in
           (* merge explanations *)
           let e = Explanation.append e_reduce e_f in
-          set_nf_ t new_t e;
+          set_nf_ ~env t new_t e;
           e, new_t
         | Check_assign (c, case) ->
           begin match c.cst_kind with
@@ -2163,49 +2217,70 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
             | Some (e, Uty_empty) -> e, Term.true_
             | Some (e, Uty_nonempty) -> e, Term.false_
           end
+        | Closure (u, shift, env') ->
+          (* check consistency *)
+          if shift <> DB_env.size env then (
+            errorf "(@[<2>in compute@ `@[%a@]`@ in env %a@ \
+                    shift doesn't match (get %d, expect %d)@])"
+              Term.pp t (DB_env.pp Term.pp) env shift (DB_env.size env);
+          );
+          (* proceed in combined environments *)
+          let env = DB_env.append env env' in
+          compute_nf_env env u
+
 
     (* apply [f] to [a], until no beta-redex is found *)
-    and compute_nf_app e f a = match f.term_cell with
+    and compute_nf_app e env_a f a = match f.term_cell with
       | Const {cst_kind=Cst_defined (lazy def_f); _} ->
         (* reduce [f l] into [def_f l] when [f := def_f] *)
-        compute_nf_app e def_f a
+        compute_nf_app e env_a def_f a
       | Fun (tys, body) ->
         let n = Array.length tys in
         assert (n>0);
         if Array.length a = n then (
-          (* beta-reduce *)
-          let env = DB_env.push_a a DB_env.empty in
-          let body = Term.eval_db env body in
-          compute_nf_add e body
+          (* beta-reduce: eval [body] with an environment composed of [a],
+             all closed over [env_a] *)
+          let env_f =
+            DB_env.push_a (Array.map (Term.closure' env_a) a) DB_env.empty
+          in
+          compute_nf_add_env e env_f body
         ) else if Array.length a >= n then (
           (* too many arguments, reduce for the [n] first ones *)
           let args = Array.sub a 0 n in
-          let e', f' = compute_nf_app e f args in
+          let e', f' = compute_nf_app e env_a f args in
           (* apply to remaining args *)
           let n' = Array.length a - n in
           assert (n' > 0);
           let other_args = Array.sub a n n' in
-          compute_nf_app e' f' other_args
+          compute_nf_app e' env_a f' other_args
         ) else (
           (* no reduction is possible *)
-          let t' = Term.app f a in
+          let t' =
+            Term.app f (Array.map (Term.closure' env_a) a)
+          in
           Explanation.empty, t'
         )
       | _ ->
         (* cannot reduce, since [f] is already reduced *)
-        let t' = Term.app f a in
+        let t' =
+          Term.app f (Array.map (Term.closure' env_a) a)
+        in
         e, t'
 
     (* compute nf of [t], append [e] to the explanation *)
-    and compute_nf_add (e : explanation) (t:term) : explanation * term =
+    and compute_nf_add (e : explanation)(t:term) : explanation * term =
       let e', t' = compute_nf t in
+      Explanation.append e e', t'
+
+    and compute_nf_add_env e env t =
+      let e', t' = compute_nf_env env t in
       Explanation.append e e', t'
 
     (* compute the builtin, assuming its components are
        already reduced *)
-    and compute_builtin ~(old:term) (bu:builtin): explanation * term = match bu with
+    and compute_builtin ~(old:term) (env:eval_env)(bu:builtin): explanation * term = match bu with
       | B_not a ->
-        let e_a, a' = compute_nf a in
+        let e_a, a' = compute_nf_env env a in
         begin match a'.term_cell with
           | True -> e_a, Term.false_
           | False -> e_a, Term.true_
@@ -2217,14 +2292,14 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         (* [a or b] becomes [not (not a and not b)] *)
         let a' = Term.not_ a in
         let b' = Term.not_ b in
-        compute_nf (Term.not_ (Term.and_par a' b' a' b'))
+        compute_nf_env env (Term.not_ (Term.and_par a' b' a' b'))
       | B_imply (a,b) ->
         (* [a => b] becomes [not [a and not b]] *)
         let b' = Term.not_ b in
-        compute_nf (Term.not_ (Term.and_par a b' a b'))
+        compute_nf_env env (Term.not_ (Term.and_par a b' a b'))
       | B_eq (a,b) when Ty.is_prop a.term_ty ->
-        let e_a, a' = compute_nf a in
-        let e_b, b' = compute_nf b in
+        let e_a, a' = compute_nf_env env a in
+        let e_b, b' = compute_nf_env env b in
         let e_ab = Explanation.append e_a e_b in
         begin match a'.term_cell, b'.term_cell with
           | True, True
@@ -2241,8 +2316,8 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       | B_and (a,b,c,d) ->
         (* evaluate [c] and [d], but only provide some explanation
            once their conjunction reduces to [true] or [false]. *)
-        let e_a, c' = compute_nf a in
-        let e_b, d' = compute_nf b in
+        let e_a, c' = compute_nf_env env a in
+        let e_b, d' = compute_nf_env env b in
         begin match c'.term_cell, d'.term_cell with
           | False, False ->
             (* combine explanations here *)
@@ -2256,15 +2331,19 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
             e_ab, Term.true_
           | _ ->
             let t' =
-              if c==c' && d==d' then old else Term.and_par a b c' d'
+              let a' = Term.closure' env a in
+              let b' = Term.closure' env b in
+              if a == a' && b==b' && c==c' && d==d'
+              then old
+              else Term.and_par a' b' c' d'
             in
             (* keep the explanations for when the value is true/false *)
             Explanation.empty, t'
         end
       | B_eq (a,b) ->
         assert (not (Ty.is_prop a.term_ty));
-        let e_a, a' = compute_nf a in
-        let e_b, b' = compute_nf b in
+        let e_a, a' = compute_nf_env env a in
+        let e_b, b' = compute_nf_env env b in
         let e_ab = Explanation.append e_a e_b in
         let default() =
           if a==a' && b==b' then old else Term.eq a' b'
@@ -3074,15 +3153,18 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     let cstor_to_ast c = A.const (Cstor.id c) (Cstor.ty c |> ty_to_ast)
     let cst_to_ast c = A.const (Typed_cst.id c) (Typed_cst.ty c |> ty_to_ast)
 
-    let term_to_ast (t:term): Ast.term =
+    (* convert and dereference at the same time *)
+    let term_to_ast (doms:cst list Ty.Tbl.t) (t:term): Ast.term =
       let rec aux env t = match t.term_cell with
         | True -> A.true_
         | False -> A.false_
         | DB d ->
-          begin match DB_env.get d env with
-            | Some t' -> t'
-            | None -> errorf "cannot find DB %a in env" Term.pp t
-          end
+          if fst d >= DB_env.size env then (
+            errorf "cannot find DB %a in env" Term.pp t
+          );
+          DB_env.get d env
+        | Const {cst_kind=Cst_undef ({cst_cur_case=Some (_,case);_},_); _} ->
+          aux env case
         | Const cst -> cst_to_ast cst
         | App_cstor (c,a) -> A.app_a (cstor_to_ast c) (Array.map (aux env) a)
         | App (f,l) -> A.app_a (aux env f) (Array.map (aux env) l)
@@ -3103,12 +3185,32 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           A.match_ u m
         | Switch (u,m) ->
           let u = aux env u in
-          let m =
+          (* convert table *)
+          let dom =
+            try Ty.Tbl.find doms m.switch_ty_arg
+            with Not_found ->
+              errorf "could not find domain of type %a" Ty.pp m.switch_ty_arg
+          in
+          let m' =
             ID.Tbl.to_seq m.switch_tbl
-            |> Sequence.map (fun (c,rhs) -> c, aux env rhs)
+            |> Sequence.filter_map
+              (fun (id,rhs) ->
+                 (* only keep this case if [member id dom] *)
+                 if List.exists (fun c -> ID.equal id c.cst_id) dom
+                 then Some (id, aux env rhs)
+                 else None)
             |> ID.Map.of_seq
           in
-          A.switch u m
+          if ID.Map.cardinal m' = 0
+          then (
+            (* make a new unknown constant of the proper type *)
+            let c =
+              ID.makef "?default_%s" (Ty.mangle m.switch_ty_ret)
+            in
+            A.const c (ty_to_ast m.switch_ty_ret)
+          ) else (
+            A.switch u m'
+          )
         | Quant (q,uty,bod) ->
           let lazy ty = uty.uty_self in
           with_var ty env
@@ -3128,6 +3230,10 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         | Check_assign (c,t) ->
           aux env (Term.eq (Term.const c) t) (* becomes a mere equality *)
         | Check_empty_uty _ -> assert false
+        | Closure (u, shift, env') ->
+          assert (DB_env.size env  = shift);
+          let env' = DB_env.map (aux DB_env.empty) env' in
+          aux (DB_env.append env env') u
       in aux DB_env.empty t
   end
 
@@ -3145,63 +3251,6 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     | Sat of model
     | Unsat (* TODO: proof *)
     | Unknown of unknown
-
-  (* follow "normal form" pointers deeply in the term *)
-  let deref_deep (doms:cst list Ty.Tbl.t) (t:term) : term =
-    let rec aux t =
-      let _, t = Reduce.compute_nf t in
-      match t.term_cell with
-        | True | False | DB _ -> t
-        | Const _ -> t
-        | App_cstor (c,a) -> Term.app_cstor c (Array.map aux a)
-        | App (f,a) ->
-          Term.app (aux f) (Array.map aux a)
-        | If (a,b,c) -> Term.if_ (aux a)(aux b)(aux c)
-        | Match (u,m) ->
-          let m = ID.Map.map (fun (tys,rhs) -> tys, aux rhs) m in
-          Term.match_ (aux u) m
-        | Switch (u,m) ->
-          let dom =
-            try Ty.Tbl.find doms m.switch_ty_arg
-            with Not_found ->
-              errorf "could not find domain of type %a" Ty.pp m.switch_ty_arg
-          in
-          let switch_tbl=
-            ID.Tbl.to_seq m.switch_tbl
-            |> Sequence.filter_map
-              (fun (id,rhs) ->
-                 (* only keep this case if [member id dom] *)
-                 if List.exists (fun c -> ID.equal id c.cst_id) dom
-                 then Some (id, aux rhs)
-                 else None)
-            |> ID.Tbl.of_seq
-          in
-          if ID.Tbl.length switch_tbl = 0
-          then (
-            (* make a new unknown constant of the proper type *)
-            let c =
-              Typed_cst.make_undef ~depth:0
-                (ID.makef "?default_%s" (Ty.mangle m.switch_ty_ret))
-                m.switch_ty_ret
-            in
-            Term.const c
-          ) else (
-            let m =
-                 { m with
-                     switch_tbl;
-                     switch_id=new_switch_id_();
-                 } in
-            Term.switch (aux u) m
-          )
-        | Quant (q,uty,body) -> Term.quant q uty (aux body)
-        | Fun (ty,body) -> Term.fun_ ty (aux body)
-        | Mu body -> Term.mu (aux body)
-        | Builtin b -> Term.builtin (Term.map_builtin aux b)
-        | Check_assign _
-        | Check_empty_uty _
-          -> assert false
-    in
-    aux t
 
   let rec find_domain_ (uty:ty_uninterpreted_slice): cst list =
     match uty.uty_status, uty.uty_pair with
@@ -3231,9 +3280,13 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         (fun c ->
            (* find normal form of [c] *)
            let t = Term.const c in
-           let t = deref_deep doms t |> Conv.term_to_ast in
+           let t = Conv.term_to_ast doms t in
            c.cst_id, t)
       |> ID.Map.of_seq
+    and goals =
+      Top_goals.to_seq
+      |> Sequence.map (Conv.term_to_ast doms)
+      |> Sequence.to_list
     in
     (* now we can convert domains *)
     let domains =
@@ -3242,17 +3295,12 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         (fun (ty,dom) -> Conv.ty_to_ast ty, List.map Typed_cst.id dom)
       |> Ast.Ty.Map.of_seq
     in
-    Model.make ~env ~consts ~domains
+    Model.make ~env ~consts ~domains ~goals
 
   let model_check m =
     Log.debugf 1 (fun k->k "checking model…");
     Log.debugf 5 (fun k->k "(@[<1>candidate model: %a@])" Model.pp m);
-    let goals =
-      Top_goals.to_seq
-      |> Sequence.map Conv.term_to_ast
-      |> Sequence.to_list
-    in
-    Model.check m ~goals
+    Model.check m
 
   let clause_of_mclause (c:M.St.clause): Clause.t =
     M.Proof.to_list c |> List.map (fun a -> a.M.St.lit) |> Clause.make

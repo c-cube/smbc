@@ -16,9 +16,11 @@ type t = {
   (* uninterpreted type -> its domain *)
   consts: term ID.Map.t;
   (* constant -> its value *)
+  goals: term list;
+  (* toplevel goals *)
 }
 
-let make ~env ~consts ~domains =
+let make ~env ~consts ~domains ~goals =
   (* also add domains to [env] *)
   let env =
     A.Ty.Map.to_seq domains
@@ -27,7 +29,7 @@ let make ~env ~consts ~domains =
       (fun env (_,cst) -> A.env_add_def env cst A.E_uninterpreted_cst)
       env
   in
-  {env; consts; domains}
+  {env; consts; domains; goals}
 
 type entry =
   | E_ty of ty * domain
@@ -332,9 +334,9 @@ and eval_whnf_app' m subst_f subst_l f l =
 let eval (m:t) (t:term) = eval_whnf m empty_subst t
 
 (* check model *)
-let check (m:t) ~goals =
+let check (m:t) =
   let bad =
-    goals
+    m.goals
     |> CCList.find_map
       (fun t ->
          let t' = eval m t in

@@ -16,12 +16,15 @@ type t = private {
   (* uninterpreted type -> its domain *)
   consts: term ID.Map.t;
   (* constant -> its value *)
+  goals: term list;
+  (* toplevel goals *)
 }
 
 val make :
   env:A.env ->
   consts:term ID.Map.t ->
   domains:domain A.Ty.Map.t ->
+  goals:term list ->
   t
 
 val pp : t CCFormat.printer
@@ -32,5 +35,5 @@ val eval : t -> term -> term
 
 exception Bad_model of t * term * term
 
-val check : t -> goals:term list -> unit
+val check : t -> unit
 (** @raise Bad_model if some goal is not satisfied *)
