@@ -1,0 +1,32 @@
+# perf comparison
+
+provers = [ "smbc", "smbc-normal" ]
+
+[smbc]
+
+binary = "./smbc.native"
+cmd = "./smbc.native --check -t $timeout -nc $file"
+unsat = "result UNSAT"
+sat = "result SAT"
+unknown = "TIMEOUT|UNKNOWN"
+timeout = "TIMEOUT"
+version = "git:."
+
+[smbc-normal]
+
+binary = "smbc-normal"
+cmd = "smbc-normal --check -t $timeout -nc $file"
+unsat = "result UNSAT"
+sat = "result SAT"
+unknown = "TIMEOUT|UNKNOWN"
+timeout = "TIMEOUT"
+
+[test]
+
+timeout=30
+problems = ".*.(lisp|smt2)"
+default_expect = "sat"
+provers = [ "smbc", "smbc-normal" ]
+dir = [ "examples" ]
+
+
