@@ -137,14 +137,15 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
 
   and cst = {
     cst_id: ID.t;
+    cst_ty: ty_h;
     cst_kind: cst_kind;
   }
 
   and cst_kind =
-    | Cst_undef of ty_h * cst_info * ty_uninterpreted_slice option
-    | Cst_cstor of ty_h
-    | Cst_uninterpreted_dom_elt of ty_h * ty_uninterpreted (* uninterpreted domain constant *)
-    | Cst_defined of ty_h * term lazy_t
+    | Cst_undef of cst_info * ty_uninterpreted_slice option
+    | Cst_cstor
+    | Cst_uninterpreted_dom_elt of ty_uninterpreted (* uninterpreted domain constant *)
+    | Cst_defined of term lazy_t
 
   and cst_info = {
     cst_depth: int;
@@ -326,25 +327,18 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     type t = cst
 
     let id t = t.cst_id
+    let ty t = t.cst_ty
 
-    let ty_of_kind = function
-      | Cst_defined (ty, _)
-      | Cst_undef (ty, _, _)
-      | Cst_uninterpreted_dom_elt (ty,_)
-      | Cst_cstor ty -> ty
-
-    let ty t = ty_of_kind t.cst_kind
-
-    let make cst_id cst_kind = {cst_id; cst_kind}
+    let make cst_id ty cst_kind = {cst_id; cst_ty=ty; cst_kind}
     let make_cstor id ty =
       let _, ret = Ty.unfold ty in
       assert (Ty.is_data ret);
-      make id (Cst_cstor ty)
-    let make_defined id ty t = make id (Cst_defined (ty, t))
-    let make_uty_dom_elt id ty uty = make id (Cst_uninterpreted_dom_elt (ty,uty))
+      make id ty Cst_cstor
+    let make_defined id ty t = make id ty (Cst_defined t)
+    let make_uty_dom_elt id ty uty = make id ty (Cst_uninterpreted_dom_elt uty)
 
     let depth (c:t): int = match c.cst_kind with
-      | Cst_undef (_, i, _) -> i.cst_depth
+      | Cst_undef (i, _) -> i.cst_depth
       | _ -> assert false
 
     let make_undef ?parent ?exist_if ?slice ~depth:cst_depth id ty =
@@ -358,18 +352,18 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           cst_cur_case=None;
         }
       in
-      make id (Cst_undef (ty, info, slice))
+      make id ty (Cst_undef (info, slice))
 
     let as_undefined (c:t)
       : (t * Ty.t * cst_info * ty_uninterpreted_slice option) option =
       match c.cst_kind with
-        | Cst_undef (ty,i,slice) -> Some (c,ty,i,slice)
-        | Cst_defined _ | Cst_cstor _ | Cst_uninterpreted_dom_elt _ -> None
+        | Cst_undef (i,slice) -> Some (c,c.cst_ty,i,slice)
+        | Cst_defined _ | Cst_cstor | Cst_uninterpreted_dom_elt _ -> None
 
     let as_undefined_exn (c:t): t * Ty.t * cst_info * ty_uninterpreted_slice option=
       match c.cst_kind with
-        | Cst_undef (ty,i,slice) -> c,ty,i,slice
-        | Cst_defined _ | Cst_cstor _ | Cst_uninterpreted_dom_elt _ -> assert false
+        | Cst_undef (i,slice) -> c,c.cst_ty,i,slice
+        | Cst_defined _ | Cst_cstor | Cst_uninterpreted_dom_elt _ -> assert false
 
     let equal a b = ID.equal a.cst_id b.cst_id
     let compare a b = ID.compare a.cst_id b.cst_id
@@ -848,18 +842,18 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
        applied to some arguments *)
     let as_cstor_app (t:term): (cst * Ty.t * term list) option =
       match t.term_cell with
-        | Const ({cst_kind=Cst_cstor ty; _} as c) -> Some (c,ty,[])
+        | Const ({cst_kind=Cst_cstor; _} as c) -> Some (c,c.cst_ty,[])
         | App (f, l) ->
           begin match f.term_cell with
-            | Const ({cst_kind=Cst_cstor ty; _} as c) -> Some (c,ty,l)
+            | Const ({cst_kind=Cst_cstor; _} as c) -> Some (c,c.cst_ty,l)
             | _ -> None
           end
         | _ -> None
 
     let as_domain_elt (t:term): (cst * Ty.t * ty_uninterpreted_slice) option =
       match t.term_cell with
-        | Const ({cst_kind=Cst_uninterpreted_dom_elt (ty,uty); _} as c) ->
-          Some (c,ty,uty)
+        | Const ({cst_kind=Cst_uninterpreted_dom_elt uty; _} as c) ->
+          Some (c,c.cst_ty,uty)
         | _ -> None
 
     (* typical view for unification/equality *)
@@ -870,14 +864,14 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       | Unif_none
 
     let as_unif (t:term): unif_form = match t.term_cell with
-      | Const ({cst_kind=Cst_uninterpreted_dom_elt (ty,uty); _} as c) ->
-        Unif_dom_elt (c,ty,uty)
-      | Const ({cst_kind=Cst_undef (ty,info,slice); _} as c) ->
-        Unif_cst (c,ty,info,slice)
-      | Const ({cst_kind=Cst_cstor ty; _} as c) -> Unif_cstor (c,ty,[])
+      | Const ({cst_kind=Cst_uninterpreted_dom_elt uty; _} as c) ->
+        Unif_dom_elt (c,c.cst_ty,uty)
+      | Const ({cst_kind=Cst_undef (info,slice); _} as c) ->
+        Unif_cst (c,c.cst_ty,info,slice)
+      | Const ({cst_kind=Cst_cstor; _} as c) -> Unif_cstor (c,c.cst_ty,[])
       | App (f, l) ->
         begin match f.term_cell with
-          | Const ({cst_kind=Cst_cstor ty; _} as c) -> Unif_cstor  (c,ty,l)
+          | Const ({cst_kind=Cst_cstor; _} as c) -> Unif_cstor (c,c.cst_ty,l)
           | _ -> Unif_none
         end
       | _ -> Unif_none
@@ -1497,8 +1491,8 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       Term.to_seq t
       |> Sequence.filter_map
         (fun sub -> match sub.term_cell with
-           | Const {cst_kind=Cst_undef (_,info,_); _} -> Some info.cst_depth
-           | Switch (_,{switch_cst={cst_kind=Cst_undef (_,info,_); _}; _}) ->
+           | Const {cst_kind=Cst_undef (info,_); _} -> Some info.cst_depth
+           | Switch (_,{switch_cst={cst_kind=Cst_undef (info,_); _}; _}) ->
              (* in this case, the map will contain metas of depth
                 [info.cst_depth+1], even though they might not
                 exist already *)
@@ -1644,9 +1638,9 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         | Atomic (_, Uninterpreted uty_root) ->
           assert (Ty.equal ty (Lazy.force uty_root.uty_self));
           (* find the proper uninterpreted slice *)
-          let uty = match cst.cst_kind with
-            | Cst_undef (_, _, Some u) -> u
-            | Cst_undef ({ty_cell=Atomic (_,Uninterpreted uty); _}, _, _) -> uty
+          let uty = match cst.cst_ty, cst.cst_kind with
+            | _, Cst_undef (_, Some u) -> u
+            | {ty_cell=Atomic (_,Uninterpreted uty);_}, Cst_undef (_, _) -> uty
             | _ -> assert false
           in
           (* first, expand slice if required *)
@@ -1763,8 +1757,8 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
        assigned a value by the SAT solver *)
     let expand_cst (c:cst): unit =
       let ty, info = match c.cst_kind with
-        | Cst_undef (ty,i,_) -> ty,i
-        | Cst_defined _ | Cst_cstor _ | Cst_uninterpreted_dom_elt _ ->
+        | Cst_undef (i,_) -> c.cst_ty,i
+        | Cst_defined _ | Cst_cstor | Cst_uninterpreted_dom_elt _ ->
           assert false
       in
       let depth = info.cst_depth in
@@ -1881,16 +1875,16 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           Explanation.empty, t (* always trivial *)
         | Const c ->
           begin match c.cst_kind with
-            | Cst_defined (_, rhs) ->
+            | Cst_defined rhs ->
               (* expand defined constants *)
               compute_nf (Lazy.force rhs)
-            | Cst_undef (_, {cst_cur_case=Some (e,new_t); _}, _) ->
+            | Cst_undef ({cst_cur_case=Some (e,new_t); _}, _) ->
               (* c := new_t, we can reduce *)
               compute_nf_add e new_t
             | Cst_undef _ ->
               Expand.expand_cst c; (* expand [c] *)
               Explanation.empty, t
-            | Cst_uninterpreted_dom_elt _ | Cst_cstor _ ->
+            | Cst_uninterpreted_dom_elt _ | Cst_cstor ->
               Explanation.empty, t
           end
         | Fun _ -> Explanation.empty, t (* no eval under lambda *)
@@ -1996,7 +1990,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
               let t' = if u==u' then t else Term.switch u' m in
               e_u, t'
           end
-        | App ({term_cell=Const {cst_kind=Cst_cstor _; _}; _}, _) ->
+        | App ({term_cell=Const {cst_kind=Cst_cstor; _}; _}, _) ->
           Explanation.empty, t (* do not reduce under cstors *)
         | App (f, l) ->
           let e_f, f' = compute_nf f in
@@ -2010,10 +2004,10 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           e, new_t
         | Check_assign (c, case) ->
           begin match c.cst_kind with
-            | Cst_undef (_, {cst_cur_case=None;_}, _) ->
+            | Cst_undef ({cst_cur_case=None;_}, _) ->
               Expand.expand_cst c;
               Explanation.empty, t
-            | Cst_undef (_, ({cst_cur_case=Some (_,case');_} as info), _) ->
+            | Cst_undef (({cst_cur_case=Some (_,case');_} as info), _) ->
               assert (match info.cst_cases with
                 | Lazy_some l -> List.memq case l | Lazy_none -> false);
               (* NOTE: instead of saying [c=c10 --> false] because [c:=c1],
@@ -2024,7 +2018,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
               then Explanation.return lit, Term.true_
               else Explanation.return (Lit.neg lit), Term.false_
             | Cst_uninterpreted_dom_elt _
-            | Cst_cstor _ | Cst_defined _ ->
+            | Cst_cstor | Cst_defined _ ->
               assert false
           end
         | Check_empty_uty uty ->
@@ -2038,7 +2032,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
 
     (* apply [f] to [l], until no beta-redex is found *)
     and compute_nf_app env e f l = match f.term_cell, l with
-      | Const {cst_kind=Cst_defined (_, lazy def_f); _}, l ->
+      | Const {cst_kind=Cst_defined (lazy def_f); _}, l ->
         (* reduce [f l] into [def_f l] when [f := def_f] *)
         compute_nf_app env e def_f l
       | Fun (_ty, body), arg :: other_args ->
@@ -2225,7 +2219,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
                   |> compute_nf_add e_c
                 ) else (
                   begin match c.cst_kind with
-                    | Cst_undef (_, {cst_cases=Lazy_some cases; _}, _) ->
+                    | Cst_undef ({cst_cases=Lazy_some cases; _}, _) ->
                       (* [c=dom_elt' OR c=c'] *)
                       let c' = match cases with
                         | [a;b] ->
@@ -2242,7 +2236,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
                            (Term.check_assign c (Term.const c'))
                            (Term.eq (Term.const c') (Term.const dom_elt)))
                       |> compute_nf_add e_c
-                    | Cst_undef (_, {cst_cases=Lazy_none; _}, _) ->
+                    | Cst_undef ({cst_cases=Lazy_none; _}, _) ->
                       (* blocked: could not expand *)
                       e_c, Term.eq (Term.const c) (Term.const dom_elt)
                     | _ -> assert false
@@ -2250,7 +2244,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
                 )
             in
             let uty_root = match c.cst_kind, uty_dom_elt.uty_self with
-              | Cst_undef (_, _, Some uty), _ -> uty
+              | Cst_undef (_, Some uty), _ -> uty
               | _, lazy {ty_cell=Atomic (_, Uninterpreted uty); _} -> uty
               | _ -> assert false
             in
@@ -2832,7 +2826,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
             (fun (id,_,_) ->
                let c = ID.Tbl.find decl_ty_ id |> Lazy.force in
                begin match c.cst_kind with
-                 | Cst_defined  (_, lazy _) -> () (* also force definition *)
+                 | Cst_defined (lazy _) -> () (* also force definition *)
                  | _ -> assert false
                end;
                (* also register the constant for expansion *)
@@ -3134,7 +3128,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
             (fun lit -> match Lit.view lit with
                | Lit_assign (c,_) ->
                  begin match c.cst_kind with
-                   | Cst_undef (_, i, _) when not i.cst_complete -> true
+                   | Cst_undef (i, _) when not i.cst_complete -> true
                    | _ -> false
                  end
                | _ -> false)

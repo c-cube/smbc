@@ -797,7 +797,7 @@ let id_to_tip : ID.t -> string =
   fun id ->
     try ID.Tbl.find id_to_tip_tbl id
     with Not_found ->
-      let prefix = 
+      let prefix =
         let p = ID.to_string id |> sanitize_name in
         if CCString.for_all (function '-'|'0'..'9'->true | _ -> false) p
         then "num_" ^ p (* TODO: option to control that, once nunchaku parses it *)
