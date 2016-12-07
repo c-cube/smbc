@@ -26,7 +26,7 @@ watch:
 
 PERF_CONF = test_perf.toml
 perf_compare: build $(PERF_CONF)
-	frogtest run -c $(PERF_CONF) --no-caching
+	frogtest run -c $(PERF_CONF) # --no-caching
 	frogtest plot -c $(PERF_CONF) -o perf.pdf
 	frogtest csv -o perf.csv
 
