@@ -18,6 +18,9 @@ module type CONFIG = sig
   val deepening_step : int option
   (** Increment between two successive max depths in iterative deepening *)
 
+  val uniform_depth : bool
+  (** Depth increases uniformly *)
+
   val progress: bool
   (** progress display progress bar *)
 
@@ -1620,8 +1623,13 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
                  let args =
                    List.map
                      (fun ty_arg ->
-                        (* depth increases linearly in the number of arguments *)
-                        let depth = info.cst_depth + List.length ty_args in
+                        let depth =
+                          if Config.uniform_depth
+                          then info.cst_depth + 1
+                          else
+                            (* depth increases linearly in the number of arguments *)
+                            info.cst_depth + List.length ty_args
+                        in
                         assert (depth > info.cst_depth);
                         let c, plist =
                           get_or_create_cst ty_arg ~parent:cst ~used ~depth

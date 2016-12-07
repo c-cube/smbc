@@ -10,6 +10,7 @@ type config = {
   progress : bool;
   dimacs: string option;
   deepening_step: int option;
+  uniform_depth: bool;
   check: bool;
 }
 
@@ -34,6 +35,7 @@ let solve ~config (ast:Ast.statement list) : unit =
     let pp_hashcons = config.pp_hashcons
     let progress = config.progress
     let deepening_step = config.deepening_step
+    let uniform_depth = config.uniform_depth
     let dimacs_file = config.dimacs
   end in
   let module S = Solver.Make(Conf)(struct end) in
@@ -64,6 +66,7 @@ let depth_step_ = ref 1
 let check_ = ref false
 let timeout_ = ref ~-1
 let syntax_ = ref Ast.Auto
+let uniform_depth_ = ref false
 let dimacs_ = ref "" (* file to put sat problem in *)
 
 let file = ref `None
@@ -108,6 +111,8 @@ let options =
     "--stats", Arg.Set stats_, " print stats";
     "--backtrace", Arg.Unit (fun () -> Printexc.record_backtrace true), " enable backtrace";
     "--depth-step", Arg.Set_int depth_step_, " increment for iterative deepening";
+    "--uniform-depth", Arg.Set uniform_depth_, " uniform depth";
+    "--no-uniform-depth", Arg.Clear uniform_depth_, " non-uniform depth";
     "--timeout", Arg.Set_int timeout_, " timeout (in s)";
     "--dimacs", Arg.Set_string dimacs_, " file to output dimacs problem into";
     "-t", Arg.Set_int timeout_, " alias to --timeout";
@@ -148,6 +153,7 @@ let () =
     print_stat = !stats_;
     progress = !progress_;
     pp_hashcons = !pp_hashcons_;
+    uniform_depth = !uniform_depth_;
     dimacs = (if !dimacs_ = "" then None else Some !dimacs_);
     deepening_step =
       (if !depth_step_ = 0 then None else Some !depth_step_);

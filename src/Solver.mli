@@ -11,6 +11,9 @@ module type CONFIG = sig
   val deepening_step : int option
   (** Increment between two successive max depths in iterative deepening *)
 
+  val uniform_depth : bool
+  (** Depth increases uniformly *)
+
   val progress: bool
   (** progress display progress bar *)
 
