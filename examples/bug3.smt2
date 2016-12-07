@@ -58,3 +58,5 @@
     (not (and
           (and (= (length l_5) num_2) (= (sum l_5) (plus num_10 num_5))) 
           (= (rev l_5) l_5)))))(check-sat)
+
+;expect: unsat
