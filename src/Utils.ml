@@ -5,3 +5,6 @@
 
 let pp_list ?(sep=" ") pp out l =
   CCFormat.list ~start:"" ~stop:"" ~sep pp out l
+
+let pp_array ?(sep=" ") pp out l =
+  CCFormat.array ~start:"" ~stop:"" ~sep pp out l

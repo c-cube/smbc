@@ -116,12 +116,14 @@ val term_view : term -> term_cell
 val var : var -> term
 val const : ID.t -> Ty.t -> term
 val app : term -> term list -> term
+val app_a : term -> term array -> term
 val if_ : term -> term -> term -> term
 val match_ : term -> (var list * term) ID.Map.t -> term
 val switch : term -> term ID.Map.t -> term
 val let_ : var -> term -> term -> term
 val fun_ : var -> term -> term
 val fun_l : var list -> term -> term
+val fun_a : var array -> term -> term
 val forall : var -> term -> term
 val forall_l : var list -> term -> term
 val exists : var -> term -> term
@@ -137,6 +139,8 @@ val or_l : term list -> term
 val imply : term -> term -> term
 val true_ : term
 val false_ : term
+
+val unfold_fun : term -> var list * term
 
 (** {2 Printing} *)
 

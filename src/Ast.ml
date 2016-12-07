@@ -270,6 +270,8 @@ let app f l = match f.term, l with
     let ty = app_ty_ f.ty l in
     mk_ (App (f, l)) ty
 
+let app_a f a = app f (Array.to_list a)
+
 let if_ a b c =
   if a.ty <> Ty.Prop
   then Ty.ill_typed "if: test  must have type prop, not `@[%a@]`" Ty.pp a.ty;
@@ -335,6 +337,7 @@ let mu v t =
   mk_ (Fun (v,t)) ty
 
 let fun_l = List.fold_right fun_
+let fun_a = Array.fold_right fun_
 let forall_l = List.fold_right forall
 let exists_l = List.fold_right exists
 
