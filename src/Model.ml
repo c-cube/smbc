@@ -84,7 +84,7 @@ let empty_subst : subst = VarMap.empty
 
 let rename_var subst v =
   let v' = A.Var.copy v in
-  VarMap.add v (Lazy.from_val (A.var v')) subst, v
+  VarMap.add v (Lazy.from_val (A.var v')) subst, v'
 
 let rename_vars = CCList.fold_map rename_var
 
