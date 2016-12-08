@@ -39,7 +39,9 @@ module Var = struct
   let equal a b = ID.equal a.id b.id
   let compare a b = ID.compare a.id b.id
   let pp out v = ID.pp out v.id
-  let to_sexp f v = S.of_list [ID.to_sexp v.id; f v.ty]
+  let to_sexp v = S.atom (ID.to_string_full v.id)
+  (* let Var.to_sexp v = ID.to_sexp v.Var.id *)
+  let to_sexp_typed f v = S.of_list [to_sexp v; f v.ty]
 end
 
 module Ty = struct
@@ -163,11 +165,10 @@ type statement =
 
 (** {2 Printing} *)
 
-let var_sexp_ v = ID.to_sexp v.Var.id
-let typed_var_to_sexp = Var.to_sexp Ty.to_sexp
+let typed_var_to_sexp = Var.to_sexp_typed Ty.to_sexp
 
 let rec term_to_sexp t = match t.term with
-  | Var v -> var_sexp_ v
+  | Var v -> Var.to_sexp v
   | Const id -> ID.to_sexp id
   | App (f,l) -> S.of_list (term_to_sexp f :: List.map term_to_sexp l)
   | If (a,b,c) ->
@@ -180,7 +181,7 @@ let rec term_to_sexp t = match t.term with
             | [] -> S.of_list [S.atom "case"; ID.to_sexp c; term_to_sexp rhs]
             | _::_ ->
               S.of_list
-                [ S.of_list (S.atom "case" :: ID.to_sexp c :: List.map var_sexp_ vars);
+                [ S.of_list (S.atom "case" :: ID.to_sexp c :: List.map Var.to_sexp vars);
                   term_to_sexp rhs]
          )))
     |> S.of_list
@@ -193,7 +194,7 @@ let rec term_to_sexp t = match t.term with
          ))
     |> S.of_list
   | Let (v,t,u) ->
-    S.of_list [S.atom "let"; var_sexp_ v; term_to_sexp t; term_to_sexp u]
+    S.of_list [S.atom "let"; Var.to_sexp v; term_to_sexp t; term_to_sexp u]
   | Fun (v,t) ->
     S.of_list [S.atom "fun"; typed_var_to_sexp v; term_to_sexp t]
   | Forall (v,t) ->

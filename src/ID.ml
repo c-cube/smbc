@@ -26,6 +26,7 @@ let compare a b = CCOrd.int_ a.id b.id
 let hash a = Hash.int a.id
 let pp out a = Format.fprintf out "%s/%d" a.name a.id
 let pp_name out a = CCFormat.string out a.name
+let to_string_full a = Printf.sprintf "%s/%d" a.name a.id
 
 module AsKey = struct
   type t_ = t

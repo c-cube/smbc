@@ -13,6 +13,7 @@ val id : t -> int
 
 val to_string : t -> string
 val to_sexp : t -> CCSexp.t
+val to_string_full : t -> string
 
 include Intf.EQ with type t := t
 include Intf.ORD with type t := t

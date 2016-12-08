@@ -26,7 +26,8 @@ module Var : sig
   val equal : 'a t -> 'a t -> bool
   val compare : 'a t -> 'a t -> int
   val pp : _ t CCFormat.printer
-  val to_sexp : 'ty to_sexp -> 'ty t to_sexp
+  val to_sexp : _ t to_sexp
+  val to_sexp_typed : 'ty to_sexp -> 'ty t to_sexp
 end
 
 module Ty : sig
