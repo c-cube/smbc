@@ -67,6 +67,7 @@ let check_ = ref false
 let timeout_ = ref ~-1
 let syntax_ = ref Ast.Auto
 let uniform_depth_ = ref false
+let version_ = ref false
 let dimacs_ = ref "" (* file to put sat problem in *)
 
 let file = ref `None
@@ -116,6 +117,7 @@ let options =
     "--timeout", Arg.Set_int timeout_, " timeout (in s)";
     "--dimacs", Arg.Set_string dimacs_, " file to output dimacs problem into";
     "-t", Arg.Set_int timeout_, " alias to --timeout";
+    "--version", Arg.Set version_, " display version info";
   ]
 
 let setup_timeout_ t =
@@ -138,6 +140,10 @@ let () =
     \n\
     Usage: smbc [options] (file | --stdin).\n";
   CCFormat.set_color_default !color_;
+  if !version_ then (
+    Format.printf "version: %s@." GitVersion.id;
+    exit 0;
+  );
   if !timeout_ >= 1 then setup_timeout_ !timeout_;
   setup_gc ();
   (* parse *)
