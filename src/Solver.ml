@@ -349,7 +349,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     let equal f a b = a.db_size=b.db_size && CCList.equal f a.db_st b.db_st
     let hash f a = Hash.combine2 a.db_size (Hash.list f a.db_st)
     let map f a = {a with db_st=List.map f a.db_st}
-    let get ((n,_):DB.t) (env:'a t) : 'a =
+    let get n (env:'a t) : 'a =
       if n < env.db_size
       then List.nth env.db_st n
       else invalid_arg "db_env.get: invalid index"
@@ -917,10 +917,15 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       match t.term_cell with
         | _ when (DB_env.size e=0 && shift=0) || t.term_closure_size=0 ->
           t (* no need for closure here *)
-        | DB d when shift=0 ->
+        | DB (d,_) when shift=0 ->
           (* deref immediately *)
-          assert (DB.level d < DB_env.size e);
+          assert (d < DB_env.size e);
           DB_env.get d e
+        | DB (d,_) when shift>0 && d >= shift ->
+          (* can deref now, even after the shift *)
+          let d' = d - shift in
+          assert (d' < DB_env.size e);
+          DB_env.get d' e
         | _ ->
           (* a closure must always be "total", so the result is really closed *)
           assert (DB_env.size e + shift >= t.term_closure_size);
@@ -2048,9 +2053,9 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
 
     and compute_nf_noncached (env:eval_env) (t:term) : explanation * term =
       match t.term_cell with
-        | DB d ->
+        | DB (d,_) ->
           (* dereference De Bruijn index *)
-          assert (DB.level d < DB_env.size env); (* closed! *)
+          assert (d < DB_env.size env); (* closed! *)
           let t' = DB_env.get d env in
           compute_nf t' (* t' closed, too *)
         | True | False ->
@@ -3158,8 +3163,8 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       let rec aux env t = match t.term_cell with
         | True -> A.true_
         | False -> A.false_
-        | DB d ->
-          if fst d >= DB_env.size env then (
+        | DB (d,_) ->
+          if d >= DB_env.size env then (
             errorf "cannot find DB %a in env" Term.pp t
           );
           DB_env.get d env
