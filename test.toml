@@ -21,21 +21,11 @@ unknown = "TIMEOUT|UNKNOWN"
 timeout = "TIMEOUT"
 version = "git:."
 
-[smbc-30]
-
-binary = "./smbc.native"
-cmd = "./smbc.native --check --depth-step 30 -t $timeout -nc $file"
-unsat = "result UNSAT"
-sat = "result SAT"
-unknown = "TIMEOUT|UNKNOWN"
-timeout = "TIMEOUT"
-version = "git:."
-
 [test]
 
 timeout=30
 problems = ".*.lisp"
-provers = [ "smbc-1", "smbc-5", "smbc-30" ]
+provers = [ "smbc-1", "smbc-5" ]
 dir = [ "examples" ]
 
 
