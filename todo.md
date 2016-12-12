@@ -22,18 +22,35 @@
     is shared (use an actual pointer/wrapper with
     backtrackable memoization in there?)
   * use this mechanism in literals, instead of memoizing literals themselves.
+  * see https://gist.github.com/aspiwack/fd8d441734f9d4661555fb025ddead59
+    for a basic implem of STG
 
 - [ ] hashconsing branch:
-  * use `n`-ary functions
-  * expand unknowns on the fly during computation
-    (instead of computing dependencies)
-  * use environments and local closures instead of instantiation
-    + can keep `let`
-    + a closure is always closed (
-    + only create closures at points where evaluation blocks
+  * [x] expand unknowns on the fly during computation
+        (instead of computing dependencies)
+  * [x] use `n`-ary functions
+  * [x] fully applied cstors
+  * [x] use environments and local closures instead of instantiation
+    + [ ] can keep `let`, as an optim
+    + [x] only create closures at points where evaluation blocks
       (or for cstor arguments, i.e. thunks)
+    + [x] tag terms with "closed" flag
     + should allocate a lot less. Closures are part of identity/hashconsing
+    + a closure is always closed(!)
   * design: this should be usable in a SMT
+
+- [ ] rewriting branch:
+  * remove `match` (and forall/exists?), replace by toplevel named symbols
+    with shallow rewriting rules. Perform closure conversion, so that
+    each symbol's definition is closed
+  * see what is done in zipperposition (should be very similar)
+  * notion of unification becomes stronger: `f(t_i) = cstor(u_j)` can
+    reduce to the disjunction of rules `f(x) → rhs` where `rhs` has
+    the same constructor as `cstor`, or is a subcall.
+    + do it only when it excludes at least one case
+    + fast failure: if no such rule exist!
+    + possible issue: termination
+  * parallel `or` critical for unification problems
 
 - [x] memory profiling
 
