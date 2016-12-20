@@ -2357,8 +2357,8 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
 
     val to_lit : t -> Lit.t
     val pp : t CCFormat.printer
-    val watch : term -> unit
     val update : t -> unit (** re-check value, maybe propagate *)
+    val add : term -> unit
     val is_top_term : term -> bool
     val size : unit -> int
     val to_seq : t Sequence.t
@@ -2391,14 +2391,14 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     let expand_cst_ (t:t)(c:cst) : unit =
       assert (Ty.is_prop t.term_ty);
       Log.debugf 2
-        (fun k->k "(@[<1>watch_cst@ %a@ %a@])" Typed_cst.pp c Term.pp t);
+        (fun k->k "(@[<1>expand_cst@ %a@ %a@])" Typed_cst.pp c Term.pp t);
       Expand.expand_cst c;
       ()
 
     let expand_uty_ (t:t)(uty:ty_uninterpreted_slice) : unit =
       assert (Ty.is_prop t.term_ty);
       Log.debugf 2
-        (fun k->k "(@[<1>watch_uty@ %a@ %a@])" pp_uty uty Term.pp t);
+        (fun k->k "(@[<1>expand_uty@ %a@ %a@])" pp_uty uty Term.pp t);
       Expand.expand_uty uty;
       ()
 
@@ -2434,18 +2434,18 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     let mem_top_ (t:term): bool =
       List.exists (Term.equal t) !top_
 
-    let watch (lit:term) =
-      let lit, _ = Term.abs lit in
+    let add (t:term) =
+      let lit, _ = Term.abs t in
       if not (mem_top_ lit) then (
         Log.debugf 3
-          (fun k->k "(@[<1>@{<green>watch_lit@}@ %a@])" pp lit);
+          (fun k->k "(@[<1>@{<green>Top_terms.add@}@ %a@])" pp lit);
         top_ := lit :: !top_;
         (* also ensure it is watched properly *)
         update lit;
       )
 
-    let is_top_term (lit:t) : bool =
-      let lit, _ = Term.abs lit in
+    let is_top_term (t:t) : bool =
+      let lit, _ = Term.abs t in
       mem_top_ lit
 
     let to_seq yield = List.iter yield !top_
@@ -2683,7 +2683,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     Clause.to_seq c
       |> Sequence.filter_map Lit.as_atom
       |> Sequence.map fst
-      |> Sequence.iter Top_terms.watch;
+      |> Sequence.iter Top_terms.add;
     incr stat_num_clause_push;
     M.assume [Clause.lits c]
 
