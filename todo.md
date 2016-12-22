@@ -4,6 +4,19 @@
 
 ## Narrowing
 
+- add `default` in matching (makes for smaller terms)
+
+- support for selectors (in TIP), with failure if ill-applied
+  and evaluation blocked as long as argument not a value
+
+- remove field `term_blocking` (and special "parallel and") and use
+  big-step semantics everywhere.
+  Instead, evaluation should return the list of blocking unknowns that
+  it met, so the SMT theory can use that directly.
+
+- CLI flag + internal mechanism for generating `n` solutions instead
+  of just one (add negation of solution to get the next one).
+
 - [ ] no hashconsing branch:
   * reinforce a bit
   * write a better interpreter (separate program and runtime thunks)
@@ -70,8 +83,6 @@
     the type. (the domain of `τ`
     is the set of values `{x:τ | x < card_τ}`)
 
-- add `default` in matching (makes for smaller terms)
-
 - replace iterative increment of `depth` by `size`: should explore
   the search space in a much more interesting way
   * each constant `c` lazily maps to a set of literals `size(c)≤n`
@@ -130,8 +141,6 @@
     `a ≤ b` to true using lexico ordering.
     use this for breaking symmetry, e.g. if problem is symmetric w.r.t `{c1,…,cn}`
     add constraints `c1 ≤ … ≤ cn`, preserves satisfiability
-
-- support for selectors/testers?
 
 - add "purely boolean expressions" (composed of connectives/Τ/⊥/literals),
   that can be normal forms (e.g. in unification)
