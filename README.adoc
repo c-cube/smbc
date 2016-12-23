@@ -1,22 +1,54 @@
 = SMBC
+:toc: macro
+:toclevels: 4
+:source-highlighter: pygments
 
 Experimental model finder/SMT solver for functional programming.
 
+== Use
+
+run on a problem (timeout 30s)::
++
+----
+smbc examples/regex_2.smt2 -t 30
+----
++
+get a list of options::
++
+----
+smbc --help
+----
++
+verbose mode::
++
+----
+smbc examples/regex_0.smt2 --debug 2
+----
++
+specify depth/depth-step::
++
+----
+smbc examples/regex_0.smt2 --depth-step 3 --max-depth 200
+----
+
+
 == Build
+
+The recommended way is to use http://opam.ocaml.org/[opam].
 
 ----
 opam pin add smbc 'https://github.com/c-cube/smbc.git#master'
 opam install smbc
 ----
 
-Or manually using
+Or manually, using
 
 ----
-opam install msat containers sequence
+opam install msat containers sequence tip-parser menhir
 make
 ----
 
-== Memory Profiling
+=== Memory Profiling
 
 ----
 opam sw 4.04.0+spacetime
@@ -25,7 +57,7 @@ OCAML_SPACETIME_INTERVAL=100 ./smbc.native --debug 1 --check examples/ty_infer.l
 prof_spacetime serve spacetime-<PID> -e smbc.native
 ----
 
-== Name
+== Why the name?
 
 "Sat Modulo Bounded Checking"
 
