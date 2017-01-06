@@ -21,7 +21,7 @@ depends: [
   "menhir"
 ]
 available: [
-    ocaml-version >= "4.00.1"
+    ocaml-version >= "4.01"
 ]
 tags: [ "logic" "narrowing" "model" "smt" ]
 bug-reports: "https://github.com/c-cube/smbc/issues"
