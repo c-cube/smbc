@@ -3,30 +3,28 @@
 
 (** {1 Model} *)
 
-module A = Ast
-
-type term = A.term
-type ty = A.Ty.t
+type term = Ast.term
+type ty = Ast.Ty.t
 type domain = ID.t list
 
 type t = private {
-  env: A.env;
+  env: Ast.env;
   (* environment, defining symbols *)
-  domains: domain A.Ty.Map.t;
+  domains: domain Ast.Ty.Map.t;
   (* uninterpreted type -> its domain *)
   consts: term ID.Map.t;
   (* constant -> its value *)
 }
 
 val make :
-  env:A.env ->
+  env:Ast.env ->
   consts:term ID.Map.t ->
-  domains:domain A.Ty.Map.t ->
+  domains:domain Ast.Ty.Map.t ->
   t
 
 val pp : t CCFormat.printer
 val pp_tip : t CCFormat.printer
-val pp_syn : A.syntax -> t CCFormat.printer
+val pp_syn : Ast.syntax -> t CCFormat.printer
 
 val eval : t -> term -> term
 
