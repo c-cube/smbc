@@ -1502,7 +1502,10 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
 
   let declare_defined_cst _ = ()
 
-  module Expand = struct
+  module Expand : sig
+    val expand_cst : cst -> unit
+    val expand_uty : ty_uninterpreted_slice -> unit
+  end = struct
     (* make a fresh constant, with a unique name *)
     let new_cst_ =
       let n = ref 0 in
@@ -1510,11 +1513,6 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         let id = ID.makef "?%s_%d" name !n in
         incr n;
         Typed_cst.make_undef ?slice ?exist_if ~parent ~depth id ty
-
-    (* [imply_opt g cs] returns [F => cs] if [g=Some F], or [cs] otherwise *)
-    let imply_opt g (c:Lit.t list): Lit.t list = match g with
-      | None -> c
-      | Some g -> Lit.neg g :: c
 
     (* [imply_product l cs] builds the list of
        [F => cs] for each [F] in [l], or returns [cs] if [l] is empty *)
@@ -1664,6 +1662,197 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       in
       cs_possible_depth @ cs_limit @ cs_choose @ cs_once
 
+    (* make a sub-constant with given type *)
+    let mk_sub_cst ?slice ?exist_if ~parent ~depth ty_arg =
+      let basename = Ty.mangle ty_arg in
+      new_cst_ ?slice ?exist_if basename ty_arg ~parent ~depth
+
+    type state = {
+      cst: cst;
+      info: cst_info;
+      ty: Ty.t;
+      memo: (cst * cst_exist_conds) list Ty.Tbl.t;
+      (* table of already built constants, by type *)
+    }
+
+    let mk_state cst ty info : state = {
+      cst; info; ty;
+      memo = Ty.Tbl.create 16;
+    }
+
+    (* get or create a constant that has this type *)
+    let get_or_create_cst
+        ~(st:state) ~(parent:cst) ~(used:cst list ref) ~depth ty_arg
+      : cst * cst_exist_conds =
+      let usable =
+        Ty.Tbl.get_or ~or_:[] st.memo ty_arg
+        |> List.filter
+          (fun (c',_) -> not (List.exists (Typed_cst.equal c') !used))
+      in
+      begin match usable with
+        | [] ->
+          (* make a new constant and remember it *)
+          let plist = ref [] in
+          let cst = mk_sub_cst ~exist_if:plist ~parent ~depth ty_arg in
+          Ty.Tbl.add_list st.memo ty_arg (cst,plist);
+          used := cst :: !used; (* cannot use it in the same case *)
+          cst, plist
+        | (cst,plist) :: _ ->
+          (* [cst] has the proper type, and is not used yet *)
+          used := cst :: !used;
+          cst, plist
+      end
+
+    (* expand [cst : data] where [data] has given [cstors] *)
+    let expand_cases_data st cstors =
+      (* datatype: refine by picking the head constructor *)
+      List.map
+        (fun (lazy c) ->
+           let rec case = lazy (
+             let ty_args, _ = Typed_cst.ty c |> Ty.unfold in
+             (* elements of [memo] already used when generating the
+                arguments of this particular case,
+                so we do not use a constant twice *)
+             let used = ref [] in
+             let args =
+               List.map
+                 (fun ty_arg ->
+                    let depth =
+                      if Config.uniform_depth
+                      then st.info.cst_depth + 1
+                      else
+                        (* depth increases linearly in the number of arguments *)
+                        st.info.cst_depth + List.length ty_args
+                    in
+                    assert (depth > st.info.cst_depth);
+                    let c, plist =
+                      get_or_create_cst ~st ty_arg ~parent:st.cst ~used ~depth
+                    in
+                    let cond = lazy (Lit.cst_choice st.cst (Lazy.force case)) in
+                    plist := cond :: !plist;
+                    Term.const c)
+                 ty_args
+             in
+             Term.app_cst c args
+           ) in
+           Lazy.force case)
+        cstors, []
+
+    (* expand [cst : ty] when [ty] is an uninterpreted type *)
+    let expand_cases_uninterpreted st =
+      (* find the proper uninterpreted slice *)
+      let uty = match st.cst.cst_ty, st.cst.cst_kind with
+        | _, Cst_undef (_, Some u) -> u
+        | {ty_cell=Atomic (_,Uninterpreted uty);_}, Cst_undef (_, _) -> uty
+        | _ -> assert false
+      in
+      (* first, expand slice if required *)
+      let c_head, uty_tail, cs = expand_uninterpreted_slice uty in
+      (* two cases: either [c_head], or some new, deeper constant somewhere
+         in the slice [uty_tail] *)
+      let case1 = Term.const c_head in
+      let case2 =
+        let cond = lazy (Lit.uty_choice_nonempty uty) in
+        let plist = ref [cond] in
+        (* [cst = cst'], but [cst'] is deeper and belongs to the next slice *)
+        let depth = st.info.cst_depth+1 in
+        let cst' =
+          mk_sub_cst st.ty ~slice:uty_tail ~exist_if:plist ~parent:st.cst ~depth
+        in
+        Term.const cst'
+      in
+      (* additional clause to specify that [is_empty uty_tail => cst = case1] *)
+      let c_not_empty =
+        [Lit.neg (Lit.uty_choice_empty uty_tail); Lit.cst_choice st.cst case1]
+        |> Clause.make
+      in
+      [case1; case2], c_not_empty :: cs
+
+    (* synthesize a function [fun x:ty_arg. body]
+       where [body] will destruct [x] depending on its type,
+       or [fun _:ty_arg. constant] *)
+    let expand_cases_arrow st ty_arg ty_ret =
+      let the_param = Term.db (DB.make 0 ty_arg) in
+      let rec body = lazy (
+        (* only one parent in any case *)
+        let exist_if = ref [lazy (Lit.cst_choice st.cst (Lazy.force fun_destruct))] in
+        match Ty.view ty_arg with
+          | Prop ->
+            (* make a test on [the_param] *)
+            let depth = st.info.cst_depth+1 in
+            let then_ = mk_sub_cst ty_ret ~depth ~parent:st.cst ~exist_if |> Term.const in
+            let else_ = mk_sub_cst ty_ret ~depth ~parent:st.cst ~exist_if |> Term.const in
+            Term.if_ the_param then_ else_
+          | Atomic (_, Data cstors) ->
+            (* we cannot enumerate all functions on datatypes *)
+            st.info.cst_complete <- false;
+            (* match without recursion on some parameter *)
+            let m =
+              cstors
+              |> List.map
+                (fun (lazy cstor) ->
+                   let ty_cstor_args, _ =
+                     Typed_cst.ty cstor |> Ty.unfold
+                   in
+                   let n_ty_args = List.length ty_cstor_args in
+                   (* build a function over the cstor arguments *)
+                   let ty_sub_f = Ty.arrow_l ty_cstor_args ty_ret in
+                   let depth = st.info.cst_depth+1 in
+                   let sub_f =
+                     mk_sub_cst ty_sub_f ~parent:st.cst ~exist_if ~depth
+                   in
+                   (* apply [sub_f] to the cstor's arguments *)
+                   let sub_params =
+                     List.mapi
+                       (fun i ty_arg ->
+                          let db_arg = DB.make (n_ty_args-i-1) ty_arg in
+                          Term.db db_arg)
+                       ty_cstor_args
+                   in
+                   let rhs = Term.app_cst sub_f sub_params in
+                   cstor.cst_id, (ty_cstor_args, rhs)
+                )
+              |> ID.Map.of_list
+            in
+            Term.match_ the_param m
+          | Atomic (_, Uninterpreted _) ->
+            (* by case. We make a flat table from values to new
+               meta-variables of type [ty_ret] *)
+            let switch_make_new () =
+              let depth = st.info.cst_depth+1 in
+              let sub = mk_sub_cst ty_ret ~depth ~parent:st.cst ~exist_if in
+              Term.const sub
+            in
+            let m = {
+              switch_tbl=ID.Tbl.create 16;
+              switch_ty_arg=ty_arg;
+              switch_ty_ret=ty_ret;
+              switch_cst=st.cst;
+              switch_id=new_switch_id_();
+              switch_make_new;
+            } in
+            Term.switch the_param m
+          | Arrow _ ->
+            errorf
+              "@[<hv2>Unsupported:@ cannot synthesize meta `%a`@ of HO type `@[%a@]`@]"
+              Typed_cst.pp st.cst Ty.pp st.ty
+              (* TODO: support HO? *)
+      )
+      and fun_destruct =
+        lazy (Term.fun_ ty_arg (Lazy.force body))
+      (* constant function that does not look at input *)
+      and body_const = lazy (
+        let exist_if = ref [lazy (Lit.cst_choice st.cst (Lazy.force fun_const))] in
+        (* only one parent in any case *)
+        let depth = st.info.cst_depth+1 in
+        let c' = mk_sub_cst ty_ret ~depth ~parent:st.cst ~exist_if in
+        Term.const c'
+      )
+      and fun_const =
+        lazy (Term.fun_ ty_arg (Lazy.force body_const))
+      in
+      [Lazy.force fun_destruct; Lazy.force fun_const], []
+
     (* build the disjunction [l] of cases for [info]. Might expand other
        objects, such as uninterpreted slices. *)
     let expand_cases
@@ -1672,183 +1861,16 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         (info:cst_info)
         : term list * Clause.t list  =
       assert (info.cst_cases = Lazy_none);
-      (* make a sub-constant with given type *)
-      let mk_sub_cst ?slice ?exist_if ~parent ~depth ty_arg =
-        let basename = Ty.mangle ty_arg in
-        new_cst_ ?slice ?exist_if basename ty_arg ~parent ~depth
-      in
-      (* table of already built constants, by type *)
-      let memo : (cst * cst_exist_conds) list Ty.Tbl.t = Ty.Tbl.create 16 in
-      (* get or create a constant that has this type *)
-      let get_or_create_cst
-          ~(parent:cst) ~(used:cst list ref) ~depth ty_arg
-          : cst * cst_exist_conds =
-        let usable =
-          Ty.Tbl.get_or ~or_:[] memo ty_arg
-          |> List.filter
-            (fun (c',_) -> not (List.exists (Typed_cst.equal c') !used))
-        in
-        match usable with
-          | [] ->
-            (* make a new constant and remember it *)
-            let plist = ref [] in
-            let cst = mk_sub_cst ~exist_if:plist ~parent ~depth ty_arg in
-            Ty.Tbl.add_list memo ty_arg (cst,plist);
-            used := cst :: !used; (* cannot use it in the same case *)
-            cst, plist
-          | (cst,plist) :: _ ->
-            (* [cst] has the proper type, and is not used yet *)
-            used := cst :: !used;
-            cst, plist
-      in
       (* expand constant depending on its type *)
+      let st = mk_state cst ty info in
       let by_ty, other_clauses = match Ty.view ty with
         | Atomic (_, Data cstors) ->
-          (* datatype: refine by picking the head constructor *)
-          List.map
-            (fun (lazy c) ->
-               let rec case = lazy (
-                 let ty_args, _ = Typed_cst.ty c |> Ty.unfold in
-                 (* elements of [memo] already used when generating the
-                    arguments of this particular case,
-                    so we do not use a constant twice *)
-                 let used = ref [] in
-                 let args =
-                   List.map
-                     (fun ty_arg ->
-                        let depth =
-                          if Config.uniform_depth
-                          then info.cst_depth + 1
-                          else
-                            (* depth increases linearly in the number of arguments *)
-                            info.cst_depth + List.length ty_args
-                        in
-                        assert (depth > info.cst_depth);
-                        let c, plist =
-                          get_or_create_cst ty_arg ~parent:cst ~used ~depth
-                        in
-                        let cond = lazy (Lit.cst_choice cst (Lazy.force case)) in
-                        plist := cond :: !plist;
-                        Term.const c)
-                     ty_args
-                 in
-                 Term.app_cst c args
-               ) in
-               Lazy.force case)
-            cstors, []
+          expand_cases_data st cstors
         | Atomic (_, Uninterpreted uty_root) ->
           assert (Ty.equal ty (Lazy.force uty_root.uty_self));
-          (* find the proper uninterpreted slice *)
-          let uty = match cst.cst_ty, cst.cst_kind with
-            | _, Cst_undef (_, Some u) -> u
-            | {ty_cell=Atomic (_,Uninterpreted uty);_}, Cst_undef (_, _) -> uty
-            | _ -> assert false
-          in
-          (* first, expand slice if required *)
-          let c_head, uty_tail, cs = expand_uninterpreted_slice uty in
-          (* two cases: either [c_head], or some new, deeper constant somewhere
-             in the slice [uty_tail] *)
-          let case1 = Term.const c_head in
-          let case2 =
-            let cond = lazy (Lit.uty_choice_nonempty uty) in
-            let plist = ref [cond] in
-            (* [cst = cst'], but [cst'] is deeper and belongs to the next slice *)
-            let depth = info.cst_depth+1 in
-            let cst' =
-              mk_sub_cst ty ~slice:uty_tail ~exist_if:plist ~parent:cst ~depth
-            in
-            Term.const cst'
-          in
-          (* additional clause to specify that [is_empty uty_tail => cst = case1] *)
-          let c_not_empty =
-            [Lit.neg (Lit.uty_choice_empty uty_tail); Lit.cst_choice cst case1]
-            |> Clause.make
-          in
-          [case1; case2], c_not_empty :: cs
+          expand_cases_uninterpreted st
         | Arrow (ty_arg, ty_ret) ->
-          (* synthesize a function [fun x:ty_arg. body]
-             where [body] will destruct [x] depending on its type,
-             or [fun _:ty_arg. constant] *)
-          let the_param = Term.db (DB.make 0 ty_arg) in
-          let rec body = lazy (
-            (* only one parent in any case *)
-            let exist_if = ref [lazy (Lit.cst_choice cst (Lazy.force fun_destruct))] in
-            match Ty.view ty_arg with
-            | Prop ->
-              (* make a test on [the_param] *)
-              let depth = info.cst_depth+1 in
-              let then_ = mk_sub_cst ty_ret ~depth ~parent:cst ~exist_if |> Term.const in
-              let else_ = mk_sub_cst ty_ret ~depth ~parent:cst ~exist_if |> Term.const in
-              Term.if_ the_param then_ else_
-            | Atomic (_, Data cstors) ->
-              (* we cannot enumerate all functions on datatypes *)
-              info.cst_complete <- false;
-              (* match without recursion on some parameter *)
-              let m =
-                cstors
-                |> List.map
-                  (fun (lazy cstor) ->
-                     let ty_cstor_args, _ =
-                       Typed_cst.ty cstor |> Ty.unfold
-                     in
-                     let n_ty_args = List.length ty_cstor_args in
-                     (* build a function over the cstor arguments *)
-                     let ty_sub_f = Ty.arrow_l ty_cstor_args ty_ret in
-                     let depth = info.cst_depth+1 in
-                     let sub_f =
-                       mk_sub_cst ty_sub_f ~parent:cst ~exist_if ~depth
-                     in
-                     (* apply [sub_f] to the cstor's arguments *)
-                     let sub_params =
-                       List.mapi
-                         (fun i ty_arg ->
-                            let db_arg = DB.make (n_ty_args-i-1) ty_arg in
-                            Term.db db_arg)
-                         ty_cstor_args
-                     in
-                     let rhs = Term.app_cst sub_f sub_params in
-                     cstor.cst_id, (ty_cstor_args, rhs)
-                  )
-                |> ID.Map.of_list
-              in
-              Term.match_ the_param m
-            | Atomic (_, Uninterpreted _) ->
-              (* by case. We make a flat table from values to new
-                 meta-variables of type [ty_ret] *)
-              let switch_make_new () =
-                let depth = info.cst_depth+1 in
-                let sub = mk_sub_cst ty_ret ~depth ~parent:cst ~exist_if in
-                Term.const sub
-              in
-              let m = {
-                switch_tbl=ID.Tbl.create 16;
-                switch_ty_arg=ty_arg;
-                switch_ty_ret=ty_ret;
-                switch_cst=cst;
-                switch_id=new_switch_id_();
-                switch_make_new;
-              } in
-              Term.switch the_param m
-            | Arrow _ ->
-              errorf
-                "@[<hv2>Unsupported:@ cannot synthesize meta `%a`@ of HO type `@[%a@]`@]"
-                Typed_cst.pp cst Ty.pp ty
-              (* TODO: support HO? *)
-          )
-          and fun_destruct =
-            lazy (Term.fun_ ty_arg (Lazy.force body))
-          (* constant function that does not look at input *)
-          and body_const = lazy (
-            let exist_if = ref [lazy (Lit.cst_choice cst (Lazy.force fun_const))] in
-            (* only one parent in any case *)
-            let depth = info.cst_depth+1 in
-            let c' = mk_sub_cst ty_ret ~depth ~parent:cst ~exist_if in
-            Term.const c'
-          )
-          and fun_const =
-            lazy (Term.fun_ ty_arg (Lazy.force body_const))
-          in
-          [Lazy.force fun_destruct; Lazy.force fun_const], []
+          expand_cases_arrow st ty_arg ty_ret
         | Prop ->
           (* simply try true/false *)
           [Term.true_; Term.false_], []
