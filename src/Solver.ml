@@ -1768,6 +1768,86 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       in
       [case1; case2], c_not_empty :: cs
 
+    (* [deconstruct_ty arg ty_arg ty_ret k] builds the [body:ty_ret]
+       of a function [lambda arg:ty_arg. body] by "deconstructing" arg.
+
+       - if [ty_arg = bool], [body = if arg then k [] ty_ret else k [] ty_ret]
+       - if [ty_arg = datatype], [body = match arg with … | ci xi -> k xi … end]
+       - if [ty_arg = a->b], more magic happens (TODO explain)
+
+       [k newvars ty_ret] is called to produce sub-meta-variables
+         of type [newvars -> ty_ret] in each "case" of the deconstruction
+      *)
+    let deconstruct_ty
+        (st:state)
+        ~(exist_if:lit lazy_t list ref)
+        (arg:term)
+        (ty_arg:Ty.t)
+        (ty_ret:Ty.t)
+        (k:depth:int -> Ty.t -> cst): term =
+      (* only one parent in any case *)
+      begin match Ty.view ty_arg with
+        | Prop ->
+          (* make a test on [the_param] *)
+          let depth = st.info.cst_depth+1 in
+          let then_ = k ~depth ty_ret |> Term.const in
+          let else_ = k ~depth ty_ret |> Term.const in
+          Term.if_ arg then_ else_
+        | Atomic (_, Data cstors) ->
+          (* we cannot enumerate all functions on datatypes *)
+          st.info.cst_complete <- false;
+          (* match without recursion on some parameter *)
+          let m =
+            cstors
+            |> List.map
+              (fun (lazy cstor) ->
+                 let ty_cstor_args, _ =
+                   Typed_cst.ty cstor |> Ty.unfold
+                 in
+                 let n_ty_args = List.length ty_cstor_args in
+                 (* build a function over the cstor arguments *)
+                 let ty_sub_f = Ty.arrow_l ty_cstor_args ty_ret in
+                 let depth = st.info.cst_depth+1 in
+                 let sub_f = k ~depth ty_sub_f in
+                 (* apply [sub_f] to the cstor's arguments *)
+                 let sub_params =
+                   List.mapi
+                     (fun i ty_arg ->
+                        let db_arg = DB.make (n_ty_args-i-1) ty_arg in
+                        Term.db db_arg)
+                     ty_cstor_args
+                 in
+                 let rhs = Term.app_cst sub_f sub_params in
+                 cstor.cst_id, (ty_cstor_args, rhs)
+              )
+            |> ID.Map.of_list
+          in
+          Term.match_ arg m
+        | Atomic (_, Uninterpreted _) ->
+          (* by case. We make a flat table from values to new
+             meta-variables of type [ty_ret] *)
+          let switch_make_new () =
+            let depth = st.info.cst_depth+1 in
+            let sub = k ~depth ty_ret in
+            Term.const sub
+          in
+          let m = {
+            switch_tbl=ID.Tbl.create 16;
+            switch_ty_arg=ty_arg;
+            switch_ty_ret=ty_ret;
+            switch_cst=st.cst;
+            switch_id=new_switch_id_();
+            switch_make_new;
+          } in
+          Term.switch arg m
+        | Arrow _  ->
+          (* TODO: support HO by taking a parameter [g:a->b],
+             creating [?x:a], and deconstructing [g ?x] *)
+          errorf
+            "@[<hv2>Unsupported:@ cannot synthesize meta `%a`@ of HO type `@[%a@]`@]"
+            Typed_cst.pp st.cst Ty.pp st.ty
+      end
+
     (* synthesize a function [fun x:ty_arg. body]
        where [body] will destruct [x] depending on its type,
        or [fun _:ty_arg. constant] *)
@@ -1776,67 +1856,9 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       let rec body = lazy (
         (* only one parent in any case *)
         let exist_if = ref [lazy (Lit.cst_choice st.cst (Lazy.force fun_destruct))] in
-        match Ty.view ty_arg with
-          | Prop ->
-            (* make a test on [the_param] *)
-            let depth = st.info.cst_depth+1 in
-            let then_ = mk_sub_cst ty_ret ~depth ~parent:st.cst ~exist_if |> Term.const in
-            let else_ = mk_sub_cst ty_ret ~depth ~parent:st.cst ~exist_if |> Term.const in
-            Term.if_ the_param then_ else_
-          | Atomic (_, Data cstors) ->
-            (* we cannot enumerate all functions on datatypes *)
-            st.info.cst_complete <- false;
-            (* match without recursion on some parameter *)
-            let m =
-              cstors
-              |> List.map
-                (fun (lazy cstor) ->
-                   let ty_cstor_args, _ =
-                     Typed_cst.ty cstor |> Ty.unfold
-                   in
-                   let n_ty_args = List.length ty_cstor_args in
-                   (* build a function over the cstor arguments *)
-                   let ty_sub_f = Ty.arrow_l ty_cstor_args ty_ret in
-                   let depth = st.info.cst_depth+1 in
-                   let sub_f =
-                     mk_sub_cst ty_sub_f ~parent:st.cst ~exist_if ~depth
-                   in
-                   (* apply [sub_f] to the cstor's arguments *)
-                   let sub_params =
-                     List.mapi
-                       (fun i ty_arg ->
-                          let db_arg = DB.make (n_ty_args-i-1) ty_arg in
-                          Term.db db_arg)
-                       ty_cstor_args
-                   in
-                   let rhs = Term.app_cst sub_f sub_params in
-                   cstor.cst_id, (ty_cstor_args, rhs)
-                )
-              |> ID.Map.of_list
-            in
-            Term.match_ the_param m
-          | Atomic (_, Uninterpreted _) ->
-            (* by case. We make a flat table from values to new
-               meta-variables of type [ty_ret] *)
-            let switch_make_new () =
-              let depth = st.info.cst_depth+1 in
-              let sub = mk_sub_cst ty_ret ~depth ~parent:st.cst ~exist_if in
-              Term.const sub
-            in
-            let m = {
-              switch_tbl=ID.Tbl.create 16;
-              switch_ty_arg=ty_arg;
-              switch_ty_ret=ty_ret;
-              switch_cst=st.cst;
-              switch_id=new_switch_id_();
-              switch_make_new;
-            } in
-            Term.switch the_param m
-          | Arrow _ ->
-            errorf
-              "@[<hv2>Unsupported:@ cannot synthesize meta `%a`@ of HO type `@[%a@]`@]"
-              Typed_cst.pp st.cst Ty.pp st.ty
-              (* TODO: support HO? *)
+        deconstruct_ty st ~exist_if the_param ty_arg ty_ret
+          (fun ~depth ty_ret ->
+             mk_sub_cst ty_ret ~depth ~parent:st.cst ~exist_if)
       )
       and fun_destruct =
         lazy (Term.fun_ ty_arg (Lazy.force body))
