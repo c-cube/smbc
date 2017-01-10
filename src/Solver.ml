@@ -1830,7 +1830,10 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
               } in
               Term.switch the_param m
             | Arrow _ ->
-              assert false (* TODO: support HO? *)
+              errorf
+                "@[<hv2>Unsupported:@ cannot synthesize meta `%a`@ of HO type `@[%a@]`@]"
+                Typed_cst.pp cst Ty.pp ty
+              (* TODO: support HO? *)
           )
           and fun_destruct =
             lazy (Term.fun_ ty_arg (Lazy.force body))
