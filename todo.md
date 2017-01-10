@@ -6,8 +6,14 @@
 
 - add `default` in matching (makes for smaller terms)
 
-- support for selectors (in TIP), with failure if ill-applied
-  and evaluation blocked as long as argument not a value
+- add a `Failure` term (poison pill) that propagates through application
+  and builtins, and makes the solver backtrack immediately
+  if `goal -> failure`.
+  This can be used to:
+  * add pre/post conditions
+  * forbid some branches in matches
+  * enforce proper use of selectors
+
 
 - remove field `term_blocking` (and special "parallel and") and use
   big-step semantics everywhere.
