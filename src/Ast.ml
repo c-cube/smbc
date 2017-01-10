@@ -141,6 +141,7 @@ and term_cell =
   | Const of ID.t
   | App of term * term list
   | If of term * term * term
+  | Select of select * term
   | Match of term * (var list * term) ID.Map.t
   | Switch of term * term ID.Map.t (* switch on constants *)
   | Let of var * term * term
@@ -152,6 +153,12 @@ and term_cell =
   | Binop of binop * term * term
   | True
   | False
+
+and select = {
+  select_name: ID.t lazy_t;
+  select_cstor: ID.t;
+  select_i: int;
+}
 
 type definition = ID.t * Ty.t * term
 
@@ -171,6 +178,8 @@ let rec term_to_sexp t = match t.term with
   | Var v -> Var.to_sexp v
   | Const id -> ID.to_sexp id
   | App (f,l) -> S.of_list (term_to_sexp f :: List.map term_to_sexp l)
+  | Select ({select_name=lazy id; select_i=i; _}, t) ->
+    S.of_list [S.atom "select"; ID.to_sexp id; S.of_int i; term_to_sexp t]
   | If (a,b,c) ->
     S.of_list [S.atom "if"; term_to_sexp a; term_to_sexp b; term_to_sexp c]
   | Match (t, m) ->
@@ -261,6 +270,8 @@ let false_ = mk_ False Ty.prop
 let var v = mk_ (Var v) (Var.ty v)
 
 let const id ty = mk_ (Const id) ty
+
+let select (s:select) (t:term) ty = mk_ (Select (s,t)) ty
 
 let app f l = match f.term, l with
   | _, [] -> f
@@ -399,6 +410,7 @@ module Ctx = struct
     | K_ty of ty_kind
     | K_fun of Ty.t
     | K_cstor of Ty.t
+    | K_select of Ty.t * select
     | K_var of var (* local *)
 
   and ty_kind =
@@ -467,6 +479,9 @@ module Ctx = struct
     | K_ty _ -> Format.fprintf out "type"
     | K_cstor ty ->
       Format.fprintf out "(@[cstor : %a@])" Ty.pp ty
+    | K_select (ty,s) ->
+      Format.fprintf out "(@[select-%a-%d : %a@])"
+        ID.pp s.select_cstor s.select_i Ty.pp ty
     | K_fun ty ->
       Format.fprintf out "(@[fun : %a@])" Ty.pp ty
     | K_var v ->
@@ -506,7 +521,7 @@ let rec conv_term ctx (t:A.term) : term =
   with Ill_typed msg ->
     Ty.ill_typed "at %a:@ %s" A.Loc.pp_opt (Ctx.loc ctx) msg
 
-and conv_term_aux ctx t = match t with
+and conv_term_aux ctx t : term = match t with
   | A.True -> true_
   | A.False -> false_
   | A.Const s ->
@@ -515,6 +530,7 @@ and conv_term_aux ctx t = match t with
       | Ctx.K_var v -> var v
       | Ctx.K_fun ty
       | Ctx.K_cstor ty -> const id ty
+      | Ctx.K_select _ -> errorf_ctx ctx "unapplied `select` not supported"
       | Ctx.K_ty _ ->
         errorf_ctx ctx "expected term, not type; got `%a`" ID.pp id
     end
@@ -650,6 +666,20 @@ and conv_term_aux ctx t = match t with
           cases all_cstors
     in
     match_ lhs cases
+  | A.App (A.Const s, args) ->
+    let id = find_id_ ctx s in
+    let args = List.map (conv_term ctx) args in
+    begin match Ctx.find_kind ctx id, args with
+      | Ctx.K_var v, _ -> app (var v) args
+      | Ctx.K_fun ty, _
+      | Ctx.K_cstor ty, _ -> app (const id ty) args
+      | Ctx.K_select (ty, sel), [arg] -> select sel arg ty
+      | Ctx.K_select _, _ ->
+        errorf_ctx ctx "select `%a`@ should be applied to exactly one arg"
+          A.pp_term t
+      | Ctx.K_ty _, _ ->
+        errorf_ctx ctx "expected term, not type; got `%a`" ID.pp id
+    end
   | A.App (f, args) ->
     let f = conv_term ctx f in
     let args = List.map (conv_term ctx) args in
@@ -702,10 +732,28 @@ and conv_statement_aux ctx syn (t:A.statement) : statement list = match A.view t
         (fun (data_id, cstors) ->
            let data_ty = Ty.const data_id in
            let parse_case (c, ty_args) =
-             let ty_args = List.map (conv_ty_fst ctx) ty_args in
+             let selectors =
+               List.map (fun (n,ty) -> n, conv_ty_fst ctx ty) ty_args
+             in
+             let ty_args = List.map snd selectors in
+             (* declare cstor *)
              let ty_c = Ty.arrow_l ty_args data_ty in
-             let id = Ctx.add_id ctx c (Ctx.K_cstor ty_c) in
-             id, ty_c
+             let id_c = Ctx.add_id ctx c (Ctx.K_cstor ty_c) in
+             (* now declare selectors *)
+             List.iteri
+               (fun i (name_opt,ty) -> match name_opt with
+                  | None -> ()
+                  | Some select_str ->
+                    (* declare this selector *)
+                    let rec select_name = lazy
+                      (Ctx.add_id ctx select_str
+                         (Ctx.K_select (ty,
+                            {select_name; select_cstor=id_c; select_i=i})))
+                    in
+                    ignore (Lazy.force select_name))
+               selectors;
+             (* return cstor *)
+             id_c, ty_c
            in
            let cstors = List.map parse_case cstors in
            (* update info on [data] *)
@@ -829,6 +877,8 @@ let typed_var_to_tip v = var_to_tip v, ty_to_tip (Var.ty v)
 let rec term_to_tip (t:term): TA.term = match t.term with
   | Var v -> TA.const (var_to_tip v)
   | Const c -> TA.const (id_to_tip c)
+  | Select ({select_name=lazy n; _}, arg) ->
+    TA.app (id_to_tip n) [term_to_tip arg]
   | App (f,l) ->
     let f = term_to_tip f in
     let l = List.map term_to_tip l in

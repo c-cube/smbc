@@ -78,6 +78,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     | Fun of ty_h * term
     | Mu of term
     | If of term * term * term
+    | Select of select * term
     | Match of term * (ty_h list * term) ID.Map.t
     | Switch of term * switch_cell (* function table *)
     | Quant of quant * ty_uninterpreted_slice * term
@@ -87,6 +88,12 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     | Check_empty_uty of ty_uninterpreted_slice (* check it's empty *)
 
   and db = int * ty_h
+
+  and select = {
+    select_name: ID.t; (* "name" of the selector *)
+    select_cstor: cst;
+    select_i: int; (* select the i-th argument *)
+  }
 
   and quant =
     | Forall
@@ -541,6 +548,9 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
             Hash.combine3 33 (Typed_cst.hash c) (sub_hash t)
           | Check_empty_uty uty ->
             Hash.combine2 34 (hash_uty uty)
+          | Select (sel,t) ->
+            Hash.combine4 35 (Typed_cst.hash sel.select_cstor)
+              sel.select_i (sub_hash t)
 
         (* equality that relies on physical equality of subterms *)
         let equal t1 t2 : bool = match t1.term_cell, t2.term_cell with
@@ -576,6 +586,10 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
               | B_not _, _ | B_and _, _ | B_eq _, _
               | B_or _, _ | B_imply _, _ -> false
             end
+          | Select (s1,t1), Select(s2,t2) ->
+            t1==t2 &&
+            Typed_cst.equal s1.select_cstor s2.select_cstor &&
+            s1.select_i = s2.select_i
           | Mu t1, Mu t2 -> t1==t2
           | Quant (q1,ty1,bod1), Quant (q2,ty2,bod2) ->
             q1=q2 && equal_uty ty1 ty2 && bod1==bod2
@@ -592,6 +606,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           | If _, _
           | Match _, _
           | Builtin _, _
+          | Select _, _
           | Mu _, _
           | Switch _, _
           | Quant _, _
@@ -759,6 +774,14 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       let t = mk_term_ ~deps (Builtin b) ~ty:(DTy_direct Ty.prop) in
       t
 
+    let select (sel:select) (t:term): term =
+      let ty_ () =
+        let ty_args, _ = Ty.unfold sel.select_cstor.cst_ty in
+        assert (List.length ty_args > sel.select_i);
+        List.nth ty_args sel.select_i
+      in
+      mk_term_ (Select (sel, t)) ~ty:(DTy_lazy ty_) ~deps:(Term_dep_sub t)
+
     let check_assign c t : term =
       mk_term_ (Check_assign (c, t))
         ~deps:(Term_dep_cst c) ~ty:(DTy_direct Ty.prop)
@@ -885,6 +908,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           | Match (t, m) ->
             aux k t;
             ID.Map.iter (fun _ (tys,rhs) -> aux (k+List.length tys) rhs) m
+          | Select (_,u)
           | Switch (u,_) -> aux k u (* ignore the table *)
           | Builtin b -> builtin_to_seq b (aux k)
           | Quant (_, _, body)
@@ -984,6 +1008,9 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           in
           fpf out "(@[switch %a@ (@[<hv>%a@])@])"
             pp t print_map (ID.Tbl.to_seq m.switch_tbl)
+        | Select (sel,u) ->
+          fpf out "(@[select-%a-%d@ %a@])" ID.pp_name sel.select_cstor.cst_id
+            sel.select_i pp u
         | Builtin (B_not t) -> fpf out "(@[<hv1>not@ %a@])" pp t
         | Builtin (B_and (_, _, a,b)) ->
           fpf out "(@[<hv1>and@ %a@ %a@])" pp a pp b
@@ -1036,6 +1063,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
             let u = aux depth u in
             (* NOTE: [m] should not contain De Bruijn indices at all *)
             switch u m
+          | Select (sel, u) -> select sel (aux depth u)
           | If (a,b,c) ->
             let a' = aux depth a in
             let b' = aux depth b in
@@ -1093,6 +1121,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
             let u = aux env u in
             (* NOTE: [m] should not contain De Bruijn indices at all *)
             switch u m
+          | Select (sel, u) -> select sel (aux env u)
           | If (a,b,c) ->
             let a' = aux env a in
             let b' = aux env b in
@@ -2057,6 +2086,28 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           let e = Explanation.append e_u e_branch in
           set_nf_ t t' e;
           e, t'
+        | Select (sel, u) ->
+          let e_u, u' = compute_nf u in
+          let default() =
+            if u==u' then t else Term.select sel u'
+          in
+          let e_branch, t' = match Term.as_cstor_app u' with
+            | Some (c, _, l) ->
+              if Typed_cst.equal c sel.select_cstor then (
+                (* same cstor, take [i]-th argument and reduce *)
+                assert (List.length l > sel.select_i);
+                let arg = List.nth l sel.select_i in
+                compute_nf arg
+              ) else (
+                errorf "term `@[%a@]`@ is ill-formed: wrong constructor"
+                  Term.pp (default())
+              )
+            | None ->
+              Explanation.empty, default() (* does not reduce *)
+          in
+          let e = Explanation.append e_u e_branch in
+          set_nf_ t t' e;
+          e, t'
         | Switch (u, m) ->
           let e_u, u' = compute_nf u in
           begin match as_uninterpreted_dom_elt u' with
@@ -2774,6 +2825,19 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         let body = conv_term_rec env' body in
         let ty = Ast.Var.ty v |> conv_ty in
         Term.fun_ ty body
+      | Ast.Select (sel, u) ->
+        let u = conv_term_rec env u in
+        let sel =
+          let select_cstor = match ID.Tbl.get decl_ty_ sel.Ast.select_cstor with
+            | Some (lazy c) ->
+              assert (c.cst_kind = Cst_cstor);
+              c
+            | _ -> assert false
+          in
+          { select_name=Lazy.force sel.Ast.select_name;
+            select_cstor; select_i=sel.Ast.select_i }
+        in
+        Term.select sel u
       | Ast.Forall (v,body) ->
         let env' = add_bound env v in
         let body = conv_term_rec env' body in
@@ -3018,6 +3082,16 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
               m
           in
           A.match_ u m
+        | Select (sel, u) ->
+          let u' = aux env u in
+          let sel' = {
+            Ast.
+            select_name=Lazy.from_val sel.select_name;
+            select_cstor=sel.select_cstor.cst_id;
+            select_i=sel.select_i;
+          }
+          in
+          Ast.select sel' u' (ty_to_ast t.term_ty)
         | Switch (u,m) ->
           let u = aux env u in
           let m =
@@ -3076,6 +3150,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         | Match (u,m) ->
           let m = ID.Map.map (fun (tys,rhs) -> tys, aux rhs) m in
           Term.match_ (aux u) m
+        | Select (sel,u) -> Term.select sel (aux u)
         | Switch (u,m) ->
           let dom =
             try Ty.Tbl.find doms m.switch_ty_arg

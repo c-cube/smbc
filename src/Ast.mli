@@ -86,6 +86,7 @@ and term_cell =
   | Const of ID.t
   | App of term * term list
   | If of term * term * term
+  | Select of select * term
   | Match of term * (var list * term) ID.Map.t
   | Switch of term * term ID.Map.t (* switch on constants *)
   | Let of var * term * term
@@ -97,6 +98,12 @@ and term_cell =
   | Binop of binop * term * term
   | True
   | False
+
+and select = {
+  select_name: ID.t lazy_t;
+  select_cstor: ID.t;
+  select_i: int;
+}
 
 (* TODO: records? *)
 
@@ -118,6 +125,7 @@ val var : var -> term
 val const : ID.t -> Ty.t -> term
 val app : term -> term list -> term
 val app_a : term -> term array -> term
+val select : select -> term -> Ty.t -> term
 val if_ : term -> term -> term -> term
 val match_ : term -> (var list * term) ID.Map.t -> term
 val switch : term -> term ID.Map.t -> term

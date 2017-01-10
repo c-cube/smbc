@@ -47,7 +47,7 @@ and stmt =
   | Stmt_ty_decl of string
   | Stmt_decl of string * ty
   | Stmt_def of (string * ty * term) list
-  | Stmt_data of (string * (string * ty list) list) list
+  | Stmt_data of (string * (string * (string option * ty) list) list) list
   | Stmt_assert of term
   | Stmt_goal of typed_var list * term (* satisfy this *)
 
@@ -144,9 +144,13 @@ let pp_stmt out (st:statement) = match view st with
     in
     fpf out "(@[<hv1>define@ %a@])" (Utils.pp_list pp_def) l
   | Stmt_data l ->
+    let pp_arg out (name_opt,ty) = match name_opt with
+      | None -> pp_ty out ty
+      | Some n -> fpf out "(%s:%a)" n pp_ty ty
+    in
     let pp_cstor out (s,ty_args) =
       if ty_args=[] then CCFormat.string out s
-      else fpf out "(@[<1>%s@ %a@])" s (Utils.pp_list pp_ty) ty_args
+      else fpf out "(@[<1>%s@ %a@])" s (Utils.pp_list pp_arg) ty_args
     in
     let pp_data out (s,cstors) =
       fpf out "(@[<hv1>%s@ (@[<v>%a@]@])" s (Utils.pp_list pp_cstor) cstors
@@ -259,7 +263,10 @@ module Tip = struct
           let cstors =
             List.map
               (fun c ->
-                 c.A.cstor_name, List.map (fun (_,ty) -> conv_ty ty) c.A.cstor_args)
+                 c.A.cstor_name,
+                 List.map
+                   (fun (select,ty) -> Some select,conv_ty ty)
+                   c.A.cstor_args)
               cstors
           in
           s, cstors

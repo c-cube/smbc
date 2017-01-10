@@ -54,7 +54,8 @@ parse: t=stmt EOI { t }
 
 cstor:
   | c=IDENT { c, [] }
-  | LEFT_PAREN c=IDENT l=ty+ RIGHT_PAREN { c, l }
+  | LEFT_PAREN c=IDENT l=ty+ RIGHT_PAREN
+    { c, List.map (fun ty -> None, ty) l }
 
 data:
   | LEFT_PAREN

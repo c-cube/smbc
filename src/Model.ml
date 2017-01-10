@@ -123,6 +123,7 @@ let apply_subst (subst:subst) t =
     | A.True
     | A.False
     | A.Const _ -> t
+    | A.Select (sel, t) -> A.select sel (aux subst t) t.A.ty
     | A.App (f,l) -> A.app (aux subst f) (List.map (aux subst) l)
     | A.If (a,b,c) -> A.if_ (aux subst a) (aux subst b) (aux subst c)
     | A.Match (u,m) ->
@@ -212,6 +213,22 @@ let rec eval_whnf (m:t) (subst:subst) (t:term): term = match A.term_view t with
         | _ -> assert false
     in
     eval_whnf m subst t'
+  | A.Select (sel, u) ->
+    let u = eval_whnf m subst u in
+    let t' = A.select sel u t.A.ty in
+    begin match as_cstor_app m.env u with
+      | None -> t'
+      | Some (cstor, _, args) ->
+        if ID.equal cstor sel.A.select_cstor then (
+          (* cstors match, take the argument *)
+          assert (List.length args > sel.A.select_i);
+          let new_t = List.nth args sel.A.select_i in
+          eval_whnf m subst new_t
+        ) else (
+          errorf "invalid constructor `%a`@ in `@[%a@]`"
+            ID.pp cstor A.pp_term t'
+        )
+    end
   | A.Match (u, branches) ->
     let u = eval_whnf m subst u in
     begin match as_cstor_app m.env u with
