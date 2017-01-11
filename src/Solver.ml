@@ -1861,7 +1861,10 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
             let x = fresh ~depth a in
             let old_shift_by = shift_by in
             let new_arg = Term.app arg [Term.const x] in (* type: b *)
-            aux ~depth:(depth+1) ~shift_by
+            (* heavy penalty for HO synthesis *)
+            let new_depth = depth + 1 + depth lsr 1 in
+            (* recursive call to build the destruct tree *)
+            aux ~depth:new_depth ~shift_by
               new_arg b ty_ret
               ~k:(fun ~depth ~shift_by ty' ->
                 (* make a meta of type [(a -> b) -> ty'], instead of just [ty'],
