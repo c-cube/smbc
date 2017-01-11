@@ -1872,8 +1872,8 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           (* [c] is blocking, not too deep, but not expanded *)
           let l, clauses = expand_cases c ty info in
           Log.debugf 2
-            (fun k->k "(@[<1>expand_cst@ @[%a@]@ :into (@[%a@])@ :depth %d@])"
-                Typed_cst.pp c (Utils.pp_list Term.pp) l depth);
+            (fun k->k "(@[<1>expand_cst@ `@[%a:@,%a@]`@ :into (@[%a@])@ :depth %d@])"
+                Typed_cst.pp c Ty.pp ty (Utils.pp_list Term.pp) l depth);
           info.cst_cases <- Lazy_some l;
           incr stat_num_cst_expanded;
           Clause.push_new_l clauses
