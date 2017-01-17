@@ -2,18 +2,15 @@
 
 ## Now
 
+- update readme to add some docs and example in there
+
+- remove `lisp` format, its parser, and convert the examples (careful with comments)
+
+- rename `cst` into `unknown`?
+
 ## Narrowing
 
-- add `default` in matching (makes for smaller terms)
-
-- add a `Failure` term (poison pill) that propagates through application
-  and builtins, and makes the solver backtrack immediately
-  if `goal -> failure`.
-  This can be used to:
-  * add pre/post conditions
-  * forbid some branches in matches
-  * enforce proper use of selectors
-
+- add `default` in matching (makes for smaller terms)?
 
 - remove field `term_blocking` (and special "parallel and") and use
   big-step semantics everywhere.
@@ -207,3 +204,17 @@
 ./smbc.native --backtrace --debug 5 --check examples/uf3.smt2
 (should be unsat)
 
+## Done
+
+- [x] add a `Undefined` term (poison pill) that propagates through application
+    and builtins, and makes the solver backtrack immediately
+    if `goal -> undefined`.
+    Three valued logic: `false && undefined --> false`
+    This can be used to:
+    * add pre/post conditions
+    * forbid some branches in matches
+    * enforce proper use of selectors
+    * use it for selectors, too (selector on wrong cstor -> fail)
+  **NOTE** a more aggressive version, `unreachable`, could be added
+    to totally remove models that reach it (e.g. for typing conditions),
+    with `false && unreachable --> unreachable`
