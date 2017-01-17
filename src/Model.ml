@@ -120,9 +120,7 @@ let apply_subst (subst:subst) t =
         | None -> t
         | Some (lazy t') -> t'
       end
-    | A.True
-    | A.False
-    | A.Const _ -> t
+    | A.Undefined_value | A.True | A.False | A.Const _ -> t
     | A.Select (sel, t) -> A.select sel (aux subst t) t.A.ty
     | A.App (f,l) -> A.app (aux subst f) (List.map (aux subst) l)
     | A.If (a,b,c) -> A.if_ (aux subst a) (aux subst b) (aux subst c)
@@ -156,6 +154,7 @@ let apply_subst (subst:subst) t =
 
 (* Weak Head Normal Form *)
 let rec eval_whnf (m:t) (subst:subst) (t:term): term = match A.term_view t with
+  | A.Undefined_value
   | A.True
   | A.False -> t
   | A.Var v ->
@@ -227,8 +226,7 @@ let rec eval_whnf (m:t) (subst:subst) (t:term): term = match A.term_view t with
           let new_t = List.nth args sel.A.select_i in
           eval_whnf m subst new_t
         ) else (
-          errorf "invalid constructor `%a`@ in `@[%a@]`"
-            ID.pp cstor A.pp_term t'
+          A.undefined_value t.A.ty
         )
     end
   | A.Match (u, branches) ->
@@ -282,7 +280,8 @@ let rec eval_whnf (m:t) (subst:subst) (t:term): term = match A.term_view t with
     let g' = eval_whnf m subst g in
     begin match A.term_view g' with
       | A.True -> eval_whnf m subst t
-      | A.False -> assert false (* !!! *)
+      | A.False ->
+        A.undefined_value t.A.ty (* assertion failed, uncharted territory! *)
       | _ -> A.asserting t g'
     end
   | A.Binop (op, a, b) ->

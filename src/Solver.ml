@@ -56,11 +56,11 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     | Lazy_some of 'a
     | Lazy_none
 
-  (* option with a special case for "Fail" *)
+  (* option with a special case for "Undefined_value" *)
   type 'a option_or_fail =
     | OF_some of 'a
     | OF_none
-    | OF_fail
+    | OF_undefined_value
 
   (* main term cell *)
   type term = {
@@ -92,7 +92,10 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     | Builtin of builtin
     | Check_assign of cst * term (* check a literal *)
     | Check_empty_uty of ty_uninterpreted_slice (* check it's empty *)
-    | Fail of ty_h (* prune the whole model. argument needed for typing *)
+    | Undefined_value of ty_h
+    (* Value that is not defined. On booleans it corresponds to
+       the middle case of https://en.wikipedia.org/wiki/Three-valued_logic.
+       The [ty] argument is needed for typing *)
 
   and db = int * ty_h
 
@@ -558,7 +561,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           | Select (sel,t) ->
             Hash.combine4 35 (Typed_cst.hash sel.select_cstor)
               sel.select_i (sub_hash t)
-          | Fail ty -> Hash.combine2 36 (Ty.hash ty)
+          | Undefined_value ty -> Hash.combine2 36 (Ty.hash ty)
 
         (* equality that relies on physical equality of subterms *)
         let equal t1 t2 : bool = match t1.term_cell, t2.term_cell with
@@ -605,7 +608,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
             Typed_cst.equal c1 c2 && term_equal_ t1 t2
           | Check_empty_uty u1, Check_empty_uty u2 ->
             equal_uty u1 u2
-          | Fail ty1, Fail ty2 -> Ty.equal ty1 ty2
+          | Undefined_value ty1, Undefined_value ty2 -> Ty.equal ty1 ty2
           | True, _
           | False, _
           | DB _, _
@@ -621,7 +624,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           | Quant _, _
           | Check_assign _, _
           | Check_empty_uty _, _
-          | Fail _, _
+          | Undefined_value _, _
             -> false
 
         let set_id t i = t.term_id <- i
@@ -800,11 +803,11 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       mk_term_ (Check_empty_uty uty)
         ~deps:(Term_dep_uty uty) ~ty:(DTy_direct Ty.prop)
 
-    let fail ty =
-      mk_term_ (Fail ty)
+    let undefined_value ty =
+      mk_term_ (Undefined_value ty)
         ~deps:Term_dep_none ~ty:(DTy_direct ty)
 
-    let fail_prop = fail Ty.prop
+    let undefined_value_prop = undefined_value Ty.prop
 
     let builtin b =
       let deps = match b with
@@ -818,7 +821,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     let not_ t = match t.term_cell with
       | True -> false_
       | False -> true_
-      | Fail _ -> fail_prop (* shortcut *)
+      | Undefined_value _ -> undefined_value_prop (* shortcut *)
       | Builtin (B_not t') -> t'
       | _ -> builtin_ ~deps:(Term_dep_sub t) (B_not t)
 
@@ -931,7 +934,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           | Quant (_, _, body)
           | Mu body
           | Fun (_, body) -> aux (k+1) body
-          | Fail _
+          | Undefined_value _
           | Check_assign _
           | Check_empty_uty _ -> ()
       in
@@ -944,7 +947,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       (cst * Ty.t * cst_info * ty_uninterpreted_slice option) option_or_fail
       =
       match t.term_cell with
-        | Fail _ -> OF_fail
+        | Undefined_value _ -> OF_undefined_value
         | Const c ->
           begin match Typed_cst.as_undefined c with
             | Some res -> OF_some res
@@ -956,7 +959,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
        applied to some arguments *)
     let as_cstor_app (t:term): (cst * Ty.t * term list) option_or_fail =
       match t.term_cell with
-        | Fail _ -> OF_fail
+        | Undefined_value _ -> OF_undefined_value
         | Const ({cst_kind=Cst_cstor; _} as c) -> OF_some (c,c.cst_ty,[])
         | App (f, l) ->
           begin match f.term_cell with
@@ -967,7 +970,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
 
     let as_domain_elt (t:term): (cst * Ty.t * ty_uninterpreted_slice) option_or_fail =
       match t.term_cell with
-        | Fail _ -> OF_fail
+        | Undefined_value _ -> OF_undefined_value
         | Const ({cst_kind=Cst_uninterpreted_dom_elt uty; _} as c) ->
           OF_some (c,c.cst_ty,uty)
         | _ -> OF_none
@@ -981,7 +984,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       | Unif_none
 
     let as_unif (t:term): unif_form = match t.term_cell with
-      | Fail _ -> Unif_fail
+      | Undefined_value _ -> Unif_fail
       | Const ({cst_kind=Cst_uninterpreted_dom_elt uty; _} as c) ->
         Unif_dom_elt (c,c.cst_ty,uty)
       | Const ({cst_kind=Cst_undef (info,slice); _} as c) ->
@@ -1050,7 +1053,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         | Check_assign (c,t) ->
           fpf out "(@[<hv1>:=?@ %a@ %a@])" Typed_cst.pp c pp t
         | Check_empty_uty uty -> fpf out "(@[check_empty %a@])" pp_uty uty
-        | Fail _ -> fpf out "(assert-false)"
+        | Undefined_value _ -> fpf out "(assert-false)"
       in
       pp out t
 
@@ -1103,7 +1106,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
             let l' = aux_l depth l in
             if f==f' && CCList.equal (==) l l' then t else app f' l'
           | Builtin b -> builtin (map_builtin (aux depth) b)
-          | Fail _
+          | Undefined_value _
           | Check_assign _
           | Check_empty_uty _
             -> t (* closed *)
@@ -1162,7 +1165,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
             let l' = aux_l env l in
             if f==f' && CCList.equal (==) l l' then t else app f' l'
           | Builtin b -> builtin (map_builtin (aux env) b)
-          | Fail _
+          | Undefined_value _
           | Check_assign _
           | Check_empty_uty _
             -> t (* closed *)
@@ -2054,7 +2057,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           else (
             Term.Tbl.add tbl_ u ();
             match Term.as_cstor_app u with
-              | OF_fail | OF_none -> false
+              | OF_undefined_value | OF_none -> false
               | OF_some (_, _, l) -> List.exists aux l
           )
         end
@@ -2157,9 +2160,9 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           let e_branch, t' = match a'.term_cell with
             | True -> compute_nf b
             | False -> compute_nf c
-            | Fail _ ->
+            | Undefined_value _ ->
               (* [if fail _ _ ---> fail] *)
-              compute_nf (Term.fail t.term_ty)
+              compute_nf (Term.undefined_value t.term_ty)
             | _ -> Explanation.empty, default()
           in
           (* merge evidence from [a]'s normal form and [b/c]'s
@@ -2189,9 +2192,9 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
                   else Explanation.empty, Term.match_ u' m
                 with Not_found -> assert false
               end
-            | OF_fail ->
+            | OF_undefined_value ->
               (* [match fail with _ end ---> fail] *)
-              compute_nf (Term.fail t.term_ty)
+              compute_nf (Term.undefined_value t.term_ty)
             | OF_none ->
               Explanation.empty, default()
           in
@@ -2211,12 +2214,12 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
                 let arg = List.nth l sel.select_i in
                 compute_nf arg
               ) else (
-                errorf "term `@[%a@]`@ is ill-formed: wrong constructor"
-                  Term.pp (default())
+                (* not defined in this model *)
+                Explanation.empty, Term.undefined_value t.term_ty
               )
-            | OF_fail ->
+            | OF_undefined_value ->
               (* [select fail _ ---> fail] *)
-              compute_nf (Term.fail t.term_ty)
+              Explanation.empty, Term.undefined_value t.term_ty
             | OF_none ->
               Explanation.empty, default() (* does not reduce *)
           in
@@ -2240,9 +2243,9 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
               in
               (* continue evaluation *)
               compute_nf_add e_u rhs
-            | OF_fail ->
+            | OF_undefined_value ->
               (* [switch fail _ ---> fail] *)
-              compute_nf (Term.fail t.term_ty)
+              compute_nf (Term.undefined_value t.term_ty)
             | OF_none ->
               (* block again *)
               let t' = if u==u' then t else Term.switch u' m in
@@ -2284,15 +2287,15 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
             | Some (e, Uty_empty) -> e, Term.true_
             | Some (e, Uty_nonempty) -> e, Term.false_
           end
-        | Fail _ ->
+        | Undefined_value _ ->
           Explanation.empty, t (* already a normal form *)
 
     (* apply [f] to [l], until no beta-redex is found *)
     and compute_nf_app env e f l = match f.term_cell, l with
-      | Fail _, _ ->
+      | Undefined_value _, _ ->
         (* applying [fail] just fails *)
         let ty = (Term.app f l).term_ty in
-        compute_nf (Term.fail ty)
+        compute_nf (Term.undefined_value ty)
       | Const {cst_kind=Cst_defined (lazy def_f); _}, l ->
         (* reduce [f l] into [def_f l] when [f := def_f] *)
         compute_nf_app env e def_f l
@@ -2327,7 +2330,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       | B_not a ->
         let e_a, a' = compute_nf a in
         begin match a'.term_cell with
-          | Fail _ -> e_a, a' (* [not fail ---> fail] *)
+          | Undefined_value _ -> e_a, a' (* [not fail ---> fail] *)
           | True -> e_a, Term.false_
           | False -> e_a, Term.true_
           | _ ->
@@ -2348,10 +2351,10 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         let e_b, b' = compute_nf b in
         let e_ab = Explanation.append e_a e_b in
         begin match a'.term_cell, b'.term_cell with
-          | Fail _, Fail _ ->
-            Explanation.or_ e_a e_b, Term.fail_prop
-          | Fail _, _ -> e_a, Term.fail_prop
-          | _, Fail _ -> e_b, Term.fail_prop
+          | Undefined_value _, Undefined_value _ ->
+            Explanation.or_ e_a e_b, Term.undefined_value_prop
+          | Undefined_value _, _ -> e_a, Term.undefined_value_prop
+          | _, Undefined_value _ -> e_b, Term.undefined_value_prop
           | True, True
           | False, False -> e_ab, Term.true_
           | True, False
@@ -2369,12 +2372,8 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         let e_a, c' = compute_nf a in
         let e_b, d' = compute_nf b in
         begin match c'.term_cell, d'.term_cell with
-          | Fail _, Fail _ ->
-            Explanation.or_ e_a e_b, Term.fail_prop
-          | Fail _, _ -> e_a, Term.fail_prop
-          | _, Fail _ -> e_b, Term.fail_prop
           | False, False ->
-            (* combine explanations here *)
+            (* combine explanations here, 2 conflicts at the same time *)
             Explanation.or_ e_a e_b, Term.false_
           | False, _ ->
             e_a, Term.false_
@@ -2383,6 +2382,10 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           | True, True ->
             let e_ab = Explanation.append e_a e_b in
             e_ab, Term.true_
+          | Undefined_value _, Undefined_value _ ->
+            Explanation.or_ e_a e_b, Term.undefined_value_prop
+          | Undefined_value _, _ -> e_a, Term.undefined_value_prop
+          | _, Undefined_value _ -> e_b, Term.undefined_value_prop
           | _ ->
             let t' =
               if c==c' && d==d' then old else Term.and_par a b c' d'
@@ -2401,9 +2404,9 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         (* check first for failures, then try to unify *)
         begin match Term.as_unif a', Term.as_unif b' with
           | Term.Unif_fail, Term.Unif_fail ->
-            Explanation.or_ e_a e_b, Term.fail_prop
-          | Term.Unif_fail, _ -> e_a, Term.fail_prop
-          | _, Term.Unif_fail -> e_b, Term.fail_prop
+            Explanation.or_ e_a e_b, Term.undefined_value_prop
+          | Term.Unif_fail, _ -> e_a, Term.undefined_value_prop
+          | _, Term.Unif_fail -> e_b, Term.undefined_value_prop
           | _ when Term.equal a' b' ->
             e_ab, Term.true_ (* physical equality *)
           | Term.Unif_cstor (c1,ty1,l1), Term.Unif_cstor (c2,_,l2) ->
@@ -2454,7 +2457,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
                          if Typed_cst.equal cstor cstor'
                          then Some (t,sub_metas)
                          else None
-                       | OF_fail | OF_none -> assert false)
+                       | OF_undefined_value | OF_none -> assert false)
                     cases
                   |> (function | Some x->x | None -> assert false)
                 in
@@ -2619,7 +2622,10 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       begin match new_t.term_cell with
         | True -> propagate_lit_ t e
         | False -> propagate_lit_ (Term.not_ t) e
-        | Fail _ -> trigger_conflict e
+        | Undefined_value _ ->
+          (* there is no chance that this goal evaluates to a boolean anymore,
+             we must try something else *)
+          trigger_conflict e
         | _ ->
           Log.debugf 4
             (fun k->k
@@ -2851,8 +2857,9 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         | Lit_atom {term_cell=False; _} ->
           (* conflict, the goal reduces to [false]! *)
           trigger_conflict lit e
-        | Lit_atom {term_cell=Fail ty; _} ->
-          (* failure in some subterm, conflict! *)
+        | Lit_atom {term_cell=Undefined_value ty; _} ->
+          (* the literal will never be a boolean, we must try
+             something else *)
           assert (Ty.equal Ty.prop ty);
           trigger_conflict lit e
         | Lit_atom _ -> ()
@@ -3090,11 +3097,13 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           | Ast.Imply -> Term.imply a b
           | Ast.Eq -> Term.eq a b
         end
+      | Ast.Undefined_value ->
+        Term.undefined_value (conv_ty t.Ast.ty)
       | Ast.Asserting (t, g) ->
         (* [t asserting g] becomes  [if g t fail] *)
         let t = conv_term_rec env t in
         let g = conv_term_rec env g in
-        Term.if_ g t (Term.fail t.term_ty)
+        Term.if_ g t (Term.undefined_value t.term_ty)
 
     let conv_term t =
       let t' = conv_term_rec empty_env t in
@@ -3239,7 +3248,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           with_var ty env
             ~f:(fun v env -> A.fun_ v (aux env bod))
         | Mu _ -> assert false
-        | If (g,t,{term_cell=Fail _;_}) ->
+        | If (g,t,{term_cell=Undefined_value _;_}) ->
           A.asserting (aux env t) (aux env g)
         | If (a,b,c) -> A.if_ (aux env a)(aux env b) (aux env c)
         | Match (u,m) ->
@@ -3288,7 +3297,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         | Check_assign (c,t) ->
           aux env (Term.eq (Term.const c) t) (* becomes a mere equality *)
         | Check_empty_uty _ -> assert false
-        | Fail _ -> assert false
+        | Undefined_value _ -> assert false
       in aux DB_env.empty t
   end
 
@@ -3358,7 +3367,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         | Fun (ty,body) -> Term.fun_ ty (aux body)
         | Mu body -> Term.mu (aux body)
         | Builtin b -> Term.builtin (Term.map_builtin aux b)
-        | Fail _ -> t
+        | Undefined_value _ -> t
         | Check_assign _
         | Check_empty_uty _
           -> assert false

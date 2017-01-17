@@ -97,6 +97,7 @@ and term_cell =
   | Not of term
   | Binop of binop * term * term
   | Asserting of term * term
+  | Undefined_value
   | True
   | False
 
@@ -149,6 +150,7 @@ val or_l : term list -> term
 val imply : term -> term -> term
 val true_ : term
 val false_ : term
+val undefined_value : Ty.t -> term
 val asserting : term -> term -> term
 
 val unfold_fun : term -> var list * term

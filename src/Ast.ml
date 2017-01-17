@@ -152,6 +152,7 @@ and term_cell =
   | Not of term
   | Binop of binop * term * term
   | Asserting of term * term
+  | Undefined_value
   | True
   | False
 
@@ -225,6 +226,7 @@ let rec term_to_sexp t = match t.term with
   | Asserting (t,g)-> S.of_list [S.atom "asserting"; term_to_sexp t; term_to_sexp g]
   | True -> S.atom "true"
   | False -> S.atom "false"
+  | Undefined_value -> S.atom "undefined_value"
 
 let statement_to_sexp st = match st with
   | Data l ->
@@ -268,6 +270,7 @@ let mk_ term ty = {term; ty}
 
 let true_ = mk_ True Ty.prop
 let false_ = mk_ False Ty.prop
+let undefined_value ty = mk_ Undefined_value ty
 
 let asserting t g =
   if not (Ty.equal Ty.prop g.ty) then (
@@ -963,6 +966,7 @@ let rec term_to_tip (t:term): TA.term = match t.term with
       | Eq -> TA.eq a b
     end
   | Asserting(t,g) -> TA.app "asserting" [term_to_tip t; term_to_tip g]
+  | Undefined_value -> failwith "cannot translate `undefined-value` to TIP"
   | Mu (_,_) -> assert false (* TODO? *)
 
 let mk_tip_decl id ty =
