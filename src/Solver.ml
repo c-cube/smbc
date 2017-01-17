@@ -56,6 +56,12 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     | Lazy_some of 'a
     | Lazy_none
 
+  (* option with a special case for "Fail" *)
+  type 'a option_or_fail =
+    | OF_some of 'a
+    | OF_none
+    | OF_fail
+
   (* main term cell *)
   type term = {
     mutable term_id: int; (* unique ID *)
@@ -86,6 +92,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     | Builtin of builtin
     | Check_assign of cst * term (* check a literal *)
     | Check_empty_uty of ty_uninterpreted_slice (* check it's empty *)
+    | Fail of ty_h (* prune the whole model. argument needed for typing *)
 
   and db = int * ty_h
 
@@ -551,6 +558,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           | Select (sel,t) ->
             Hash.combine4 35 (Typed_cst.hash sel.select_cstor)
               sel.select_i (sub_hash t)
+          | Fail ty -> Hash.combine2 36 (Ty.hash ty)
 
         (* equality that relies on physical equality of subterms *)
         let equal t1 t2 : bool = match t1.term_cell, t2.term_cell with
@@ -597,6 +605,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
             Typed_cst.equal c1 c2 && term_equal_ t1 t2
           | Check_empty_uty u1, Check_empty_uty u2 ->
             equal_uty u1 u2
+          | Fail ty1, Fail ty2 -> Ty.equal ty1 ty2
           | True, _
           | False, _
           | DB _, _
@@ -612,6 +621,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           | Quant _, _
           | Check_assign _, _
           | Check_empty_uty _, _
+          | Fail _, _
             -> false
 
         let set_id t i = t.term_id <- i
@@ -790,6 +800,12 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       mk_term_ (Check_empty_uty uty)
         ~deps:(Term_dep_uty uty) ~ty:(DTy_direct Ty.prop)
 
+    let fail ty =
+      mk_term_ (Fail ty)
+        ~deps:Term_dep_none ~ty:(DTy_direct ty)
+
+    let fail_prop = fail Ty.prop
+
     let builtin b =
       let deps = match b with
         | B_not u -> Term_dep_sub u
@@ -802,6 +818,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     let not_ t = match t.term_cell with
       | True -> false_
       | False -> true_
+      | Fail _ -> fail_prop (* shortcut *)
       | Builtin (B_not t') -> t'
       | _ -> builtin_ ~deps:(Term_dep_sub t) (B_not t)
 
@@ -914,6 +931,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           | Quant (_, _, body)
           | Mu body
           | Fun (_, body) -> aux (k+1) body
+          | Fail _
           | Check_assign _
           | Check_empty_uty _ -> ()
       in
@@ -923,38 +941,47 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
 
     (* return [Some] iff the term is an undefined constant *)
     let as_cst_undef (t:term):
-      (cst * Ty.t * cst_info * ty_uninterpreted_slice option) option
+      (cst * Ty.t * cst_info * ty_uninterpreted_slice option) option_or_fail
       =
       match t.term_cell with
-        | Const c -> Typed_cst.as_undefined c
-        | _ -> None
+        | Fail _ -> OF_fail
+        | Const c ->
+          begin match Typed_cst.as_undefined c with
+            | Some res -> OF_some res
+            | None -> OF_none
+          end
+        | _ -> OF_none
 
     (* return [Some (cstor,ty,args)] if the term is a constructor
        applied to some arguments *)
-    let as_cstor_app (t:term): (cst * Ty.t * term list) option =
+    let as_cstor_app (t:term): (cst * Ty.t * term list) option_or_fail =
       match t.term_cell with
-        | Const ({cst_kind=Cst_cstor; _} as c) -> Some (c,c.cst_ty,[])
+        | Fail _ -> OF_fail
+        | Const ({cst_kind=Cst_cstor; _} as c) -> OF_some (c,c.cst_ty,[])
         | App (f, l) ->
           begin match f.term_cell with
-            | Const ({cst_kind=Cst_cstor; _} as c) -> Some (c,c.cst_ty,l)
-            | _ -> None
+            | Const ({cst_kind=Cst_cstor; _} as c) -> OF_some (c,c.cst_ty,l)
+            | _ -> OF_none
           end
-        | _ -> None
+        | _ -> OF_none
 
-    let as_domain_elt (t:term): (cst * Ty.t * ty_uninterpreted_slice) option =
+    let as_domain_elt (t:term): (cst * Ty.t * ty_uninterpreted_slice) option_or_fail =
       match t.term_cell with
+        | Fail _ -> OF_fail
         | Const ({cst_kind=Cst_uninterpreted_dom_elt uty; _} as c) ->
-          Some (c,c.cst_ty,uty)
-        | _ -> None
+          OF_some (c,c.cst_ty,uty)
+        | _ -> OF_none
 
     (* typical view for unification/equality *)
     type unif_form =
       | Unif_cst of cst * Ty.t * cst_info * ty_uninterpreted_slice option
       | Unif_cstor of cst * Ty.t * term list
       | Unif_dom_elt  of cst * Ty.t * ty_uninterpreted_slice
+      | Unif_fail
       | Unif_none
 
     let as_unif (t:term): unif_form = match t.term_cell with
+      | Fail _ -> Unif_fail
       | Const ({cst_kind=Cst_uninterpreted_dom_elt uty; _} as c) ->
         Unif_dom_elt (c,c.cst_ty,uty)
       | Const ({cst_kind=Cst_undef (info,slice); _} as c) ->
@@ -1023,6 +1050,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         | Check_assign (c,t) ->
           fpf out "(@[<hv1>:=?@ %a@ %a@])" Typed_cst.pp c pp t
         | Check_empty_uty uty -> fpf out "(@[check_empty %a@])" pp_uty uty
+        | Fail _ -> fpf out "(assert-false)"
       in
       pp out t
 
@@ -1075,6 +1103,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
             let l' = aux_l depth l in
             if f==f' && CCList.equal (==) l l' then t else app f' l'
           | Builtin b -> builtin (map_builtin (aux depth) b)
+          | Fail _
           | Check_assign _
           | Check_empty_uty _
             -> t (* closed *)
@@ -1133,6 +1162,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
             let l' = aux_l env l in
             if f==f' && CCList.equal (==) l l' then t else app f' l'
           | Builtin b -> builtin (map_builtin (aux env) b)
+          | Fail _
           | Check_assign _
           | Check_empty_uty _
             -> t (* closed *)
@@ -1784,7 +1814,6 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       *)
     let deconstruct_ty
         (st:state)
-        ~(exist_if:lit lazy_t list ref)
         ~(depth:int)
         (arg:term)
         (ty_arg:Ty.t)
@@ -1892,7 +1921,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         let fresh ~depth ty' =
           mk_sub_cst ty' ~depth ~parent:st.cst ~exist_if
         in
-        deconstruct_ty st the_param ty_arg ty_ret ~depth ~exist_if ~fresh
+        deconstruct_ty st the_param ty_arg ty_ret ~depth ~fresh
       )
       and fun_destruct =
         lazy (Term.fun_ ty_arg (Lazy.force body))
@@ -2025,8 +2054,8 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           else (
             Term.Tbl.add tbl_ u ();
             match Term.as_cstor_app u with
-              | None -> false
-              | Some (_, _, l) -> List.exists aux l
+              | OF_fail | OF_none -> false
+              | OF_some (_, _, l) -> List.exists aux l
           )
         end
       in
@@ -2051,11 +2080,6 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       match t.term_nf with
         | None -> Explanation.empty, t
         | Some (new_t,e) -> e, new_t
-
-    let as_uninterpreted_dom_elt (t:term): ID.t option =
-      match t.term_cell with
-        | Const {cst_kind=Cst_uninterpreted_dom_elt _; cst_id; _} -> Some cst_id
-        | _ -> None
 
     (* compute the normal form of this term. We know at least one of its
        subterm(s) has been reduced *)
@@ -2133,6 +2157,9 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           let e_branch, t' = match a'.term_cell with
             | True -> compute_nf b
             | False -> compute_nf c
+            | Fail _ ->
+              (* [if fail _ _ ---> fail] *)
+              compute_nf (Term.fail t.term_ty)
             | _ -> Explanation.empty, default()
           in
           (* merge evidence from [a]'s normal form and [b/c]'s
@@ -2146,7 +2173,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
             if u==u' then t else Term.match_ u' m
           in
           let e_branch, t' = match Term.as_cstor_app u' with
-            | Some (c, _, l) ->
+            | OF_some (c, _, l) ->
               begin
                 try
                   let tys, rhs = ID.Map.find (Typed_cst.id c) m in
@@ -2162,7 +2189,11 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
                   else Explanation.empty, Term.match_ u' m
                 with Not_found -> assert false
               end
-            | None -> Explanation.empty, default()
+            | OF_fail ->
+              (* [match fail with _ end ---> fail] *)
+              compute_nf (Term.fail t.term_ty)
+            | OF_none ->
+              Explanation.empty, default()
           in
           let e = Explanation.append e_u e_branch in
           set_nf_ t t' e;
@@ -2173,7 +2204,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
             if u==u' then t else Term.select sel u'
           in
           let e_branch, t' = match Term.as_cstor_app u' with
-            | Some (c, _, l) ->
+            | OF_some (c, _, l) ->
               if Typed_cst.equal c sel.select_cstor then (
                 (* same cstor, take [i]-th argument and reduce *)
                 assert (List.length l > sel.select_i);
@@ -2183,7 +2214,10 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
                 errorf "term `@[%a@]`@ is ill-formed: wrong constructor"
                   Term.pp (default())
               )
-            | None ->
+            | OF_fail ->
+              (* [select fail _ ---> fail] *)
+              compute_nf (Term.fail t.term_ty)
+            | OF_none ->
               Explanation.empty, default() (* does not reduce *)
           in
           let e = Explanation.append e_u e_branch in
@@ -2191,8 +2225,9 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           e, t'
         | Switch (u, m) ->
           let e_u, u' = compute_nf u in
-          begin match as_uninterpreted_dom_elt u' with
-            | Some u_id ->
+          begin match Term.as_domain_elt u' with
+            | OF_some (cst,_,_) ->
+              let u_id = cst.cst_id in
               (* do a lookup for this value! *)
               let rhs =
                 match ID.Tbl.get m.switch_tbl u_id with
@@ -2205,7 +2240,10 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
               in
               (* continue evaluation *)
               compute_nf_add e_u rhs
-            | None ->
+            | OF_fail ->
+              (* [switch fail _ ---> fail] *)
+              compute_nf (Term.fail t.term_ty)
+            | OF_none ->
               (* block again *)
               let t' = if u==u' then t else Term.switch u' m in
               e_u, t'
@@ -2246,9 +2284,15 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
             | Some (e, Uty_empty) -> e, Term.true_
             | Some (e, Uty_nonempty) -> e, Term.false_
           end
+        | Fail _ ->
+          Explanation.empty, t (* already a normal form *)
 
     (* apply [f] to [l], until no beta-redex is found *)
     and compute_nf_app env e f l = match f.term_cell, l with
+      | Fail _, _ ->
+        (* applying [fail] just fails *)
+        let ty = (Term.app f l).term_ty in
+        compute_nf (Term.fail ty)
       | Const {cst_kind=Cst_defined (lazy def_f); _}, l ->
         (* reduce [f l] into [def_f l] when [f := def_f] *)
         compute_nf_app env e def_f l
@@ -2283,6 +2327,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       | B_not a ->
         let e_a, a' = compute_nf a in
         begin match a'.term_cell with
+          | Fail _ -> e_a, a' (* [not fail ---> fail] *)
           | True -> e_a, Term.false_
           | False -> e_a, Term.true_
           | _ ->
@@ -2303,6 +2348,10 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         let e_b, b' = compute_nf b in
         let e_ab = Explanation.append e_a e_b in
         begin match a'.term_cell, b'.term_cell with
+          | Fail _, Fail _ ->
+            Explanation.or_ e_a e_b, Term.fail_prop
+          | Fail _, _ -> e_a, Term.fail_prop
+          | _, Fail _ -> e_b, Term.fail_prop
           | True, True
           | False, False -> e_ab, Term.true_
           | True, False
@@ -2320,6 +2369,10 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         let e_a, c' = compute_nf a in
         let e_b, d' = compute_nf b in
         begin match c'.term_cell, d'.term_cell with
+          | Fail _, Fail _ ->
+            Explanation.or_ e_a e_b, Term.fail_prop
+          | Fail _, _ -> e_a, Term.fail_prop
+          | _, Fail _ -> e_b, Term.fail_prop
           | False, False ->
             (* combine explanations here *)
             Explanation.or_ e_a e_b, Term.false_
@@ -2345,9 +2398,14 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         let default() =
           if a==a' && b==b' then old else Term.eq a' b'
         in
-        if Term.equal a' b'
-        then e_ab, Term.true_ (* syntactic *)
-        else begin match Term.as_unif a', Term.as_unif b' with
+        (* check first for failures, then try to unify *)
+        begin match Term.as_unif a', Term.as_unif b' with
+          | Term.Unif_fail, Term.Unif_fail ->
+            Explanation.or_ e_a e_b, Term.fail_prop
+          | Term.Unif_fail, _ -> e_a, Term.fail_prop
+          | _, Term.Unif_fail -> e_b, Term.fail_prop
+          | _ when Term.equal a' b' ->
+            e_ab, Term.true_ (* physical equality *)
           | Term.Unif_cstor (c1,ty1,l1), Term.Unif_cstor (c2,_,l2) ->
             if not (Typed_cst.equal c1 c2)
             then
@@ -2392,11 +2450,11 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
                 let case,sub_metas =
                   CCList.find_map
                     (fun t -> match Term.as_cstor_app t with
-                       | Some (cstor', _, sub_metas) ->
+                       | OF_some (cstor', _, sub_metas) ->
                          if Typed_cst.equal cstor cstor'
                          then Some (t,sub_metas)
                          else None
-                       | None -> assert false)
+                       | OF_fail | OF_none -> assert false)
                     cases
                   |> (function | Some x->x | None -> assert false)
                 in
@@ -2441,7 +2499,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
                       let c' = match cases with
                         | [a;b] ->
                           begin match Term.as_cst_undef a, Term.as_cst_undef b with
-                            | Some (c',_,_,_), _ | _, Some (c',_,_,_) -> c'
+                            | OF_some (c',_,_,_), _ | _, OF_some (c',_,_,_) -> c'
                             | _ -> assert false
                           end
                         | _ -> assert false
@@ -2520,6 +2578,20 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       Clause.push_new_l cs;
       ()
 
+    let trigger_conflict (e:explanation): unit =
+      let cs =
+        clause_guard_of_exp_ e
+        |> Sequence.map Clause.make
+        |> Sequence.to_rev_list
+      in
+      Log.debugf 4
+        (fun k->k
+            "(@[<hv1>@{<>conflict@}@ clauses: (@[%a@])@])"
+            (Utils.pp_list Clause.pp) cs);
+      incr stat_num_propagations;
+      Clause.push_new_l cs;
+      ()
+
     let expand_cst_ (t:t)(c:cst) : unit =
       assert (Ty.is_prop t.term_ty);
       Log.debugf 2
@@ -2547,6 +2619,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       begin match new_t.term_cell with
         | True -> propagate_lit_ t e
         | False -> propagate_lit_ (Term.not_ t) e
+        | Fail _ -> trigger_conflict e
         | _ ->
           Log.debugf 4
             (fun k->k
@@ -2757,6 +2830,15 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           assert (s = status)
       end
 
+    (* signal to the SAT solver that [lit --e--> false] *)
+    let trigger_conflict (lit:lit) (e:explanation): unit =
+      let cs =
+        clause_guard_of_exp_ e
+        |> Sequence.map
+          (fun guard -> Lit.neg lit :: guard |> Clause.make)
+      in
+      Sequence.iter Clause.push_new cs
+
     (* handle a literal assumed by the SAT solver *)
     let assume_lit (lit:Lit.t) : unit =
       Log.debugf 2
@@ -2767,13 +2849,12 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         | Lit_fresh _ -> ()
         | Lit_atom {term_cell=True; _} -> ()
         | Lit_atom {term_cell=False; _} ->
-          (* conflict! *)
-          let cs =
-            clause_guard_of_exp_ e
-            |> Sequence.map
-              (fun guard -> Lit.neg lit :: guard |> Clause.make)
-          in
-          Sequence.iter Clause.push_new cs
+          (* conflict, the goal reduces to [false]! *)
+          trigger_conflict lit e
+        | Lit_atom {term_cell=Fail ty; _} ->
+          (* failure in some subterm, conflict! *)
+          assert (Ty.equal Ty.prop ty);
+          trigger_conflict lit e
         | Lit_atom _ -> ()
         | Lit_assign(c, t) ->
           if Lit.sign lit then assert_choice ~lit c t
@@ -3009,6 +3090,11 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           | Ast.Imply -> Term.imply a b
           | Ast.Eq -> Term.eq a b
         end
+      | Ast.Asserting (t, g) ->
+        (* [t asserting g] becomes  [if g t fail] *)
+        let t = conv_term_rec env t in
+        let g = conv_term_rec env g in
+        Term.if_ g t (Term.fail t.term_ty)
 
     let conv_term t =
       let t' = conv_term_rec empty_env t in
@@ -3153,6 +3239,8 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           with_var ty env
             ~f:(fun v env -> A.fun_ v (aux env bod))
         | Mu _ -> assert false
+        | If (g,t,{term_cell=Fail _;_}) ->
+          A.asserting (aux env t) (aux env g)
         | If (a,b,c) -> A.if_ (aux env a)(aux env b) (aux env c)
         | Match (u,m) ->
           let u = aux env u in
@@ -3200,6 +3288,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         | Check_assign (c,t) ->
           aux env (Term.eq (Term.const c) t) (* becomes a mere equality *)
         | Check_empty_uty _ -> assert false
+        | Fail _ -> assert false
       in aux DB_env.empty t
   end
 
@@ -3269,6 +3358,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         | Fun (ty,body) -> Term.fun_ ty (aux body)
         | Mu body -> Term.mu (aux body)
         | Builtin b -> Term.builtin (Term.map_builtin aux b)
+        | Fail _ -> t
         | Check_assign _
         | Check_empty_uty _
           -> assert false

@@ -96,6 +96,7 @@ and term_cell =
   | Mu of var * term
   | Not of term
   | Binop of binop * term * term
+  | Asserting of term * term
   | True
   | False
 
@@ -148,6 +149,7 @@ val or_l : term list -> term
 val imply : term -> term -> term
 val true_ : term
 val false_ : term
+val asserting : term -> term -> term
 
 val unfold_fun : term -> var list * term
 

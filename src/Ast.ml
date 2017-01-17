@@ -151,6 +151,7 @@ and term_cell =
   | Mu of var * term
   | Not of term
   | Binop of binop * term * term
+  | Asserting of term * term
   | True
   | False
 
@@ -221,6 +222,7 @@ let rec term_to_sexp t = match t.term with
     S.of_list [S.atom "or"; term_to_sexp a; term_to_sexp b]
   | Binop (Imply, a, b) ->
     S.of_list [S.atom "=>"; term_to_sexp a; term_to_sexp b]
+  | Asserting (t,g)-> S.of_list [S.atom "asserting"; term_to_sexp t; term_to_sexp g]
   | True -> S.atom "true"
   | False -> S.atom "false"
 
@@ -266,6 +268,12 @@ let mk_ term ty = {term; ty}
 
 let true_ = mk_ True Ty.prop
 let false_ = mk_ False Ty.prop
+
+let asserting t g =
+  if not (Ty.equal Ty.prop g.ty) then (
+    Ty.ill_typed "asserting: test  must have type prop, not `@[%a@]`" Ty.pp g.ty;
+  );
+  mk_ (Asserting (t,g)) t.ty
 
 let var v = mk_ (Var v) (Var.ty v)
 
@@ -705,6 +713,10 @@ and conv_term_aux ctx t : term = match t with
     let f = conv_term ctx f in
     let args = List.map (conv_term ctx) args in
     app f args
+  | A.Asserting (t,g) ->
+    let t = conv_term ctx t in
+    let g = conv_term ctx g in
+    asserting t g
 
 let find_file_ name ~dir : string option =
   Log.debugf 2 (fun k->k "search A.%sA. in A.%sA." name dir);
@@ -950,6 +962,7 @@ let rec term_to_tip (t:term): TA.term = match t.term with
       | Imply -> TA.imply a b
       | Eq -> TA.eq a b
     end
+  | Asserting(t,g) -> TA.app "asserting" [term_to_tip t; term_to_tip g]
   | Mu (_,_) -> assert false (* TODO? *)
 
 let mk_tip_decl id ty =

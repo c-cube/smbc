@@ -149,6 +149,8 @@ let apply_subst (subst:subst) t =
     | A.Mu (_,_) -> assert false
     | A.Not f -> A.not_ (aux subst f)
     | A.Binop (op,a,b) -> A.binop op (aux subst a)(aux subst b)
+    | A.Asserting (t,g) ->
+      A.asserting (aux subst t)(aux subst g)
   in
   if VarMap.is_empty subst then t else aux subst t
 
@@ -275,6 +277,13 @@ let rec eval_whnf (m:t) (subst:subst) (t:term): term = match A.term_view t with
       | A.True -> A.false_
       | A.False -> A.true_
       | _ -> A.not_ f
+    end
+  | A.Asserting (t, g) ->
+    let g' = eval_whnf m subst g in
+    begin match A.term_view g' with
+      | A.True -> eval_whnf m subst t
+      | A.False -> assert false (* !!! *)
+      | _ -> A.asserting t g'
     end
   | A.Binop (op, a, b) ->
     let a = eval_whnf m subst a in
