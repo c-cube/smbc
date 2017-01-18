@@ -1466,7 +1466,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
 
     (* get the literal correspond to depth [d], if any *)
     let rec lit_of_depth d : Lit.t option =
-      if d < step_ || (d mod step_ <> 0) || d > max_depth
+      if d < step_ || (d mod step_ <> 0)
       then None
       else match CCHashtbl.get lits_ d with
         | Some l -> Some l
