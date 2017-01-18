@@ -373,6 +373,12 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
 
     let make_undef ?parent ?exist_if ?slice ~depth:cst_depth id ty =
       assert (CCOpt.for_all (fun p -> cst_depth > depth p) parent);
+      (* undefined on an uninterpreted type always have a slice *)
+      let slice = match slice, ty.ty_cell with
+        | Some _ as s, _ -> s
+        | None, Atomic (_, Uninterpreted uty) -> Some uty
+        | None, _ -> None
+      in
       let info =
         { cst_depth;
           cst_parent=parent;
@@ -851,6 +857,11 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
 
     (* "eager" and, evaluating [a] first *)
     let and_eager a b = if_ a b false_
+
+    let rec and_eager_l = function
+      | [] -> true_
+      | [a] -> a
+      | a :: tail -> and_eager a (and_eager_l tail)
 
     let rec and_l = function
       | [] -> true_
@@ -2471,62 +2482,77 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
                 compute_nf_add e_ab
                   (Term.if_ check_case check_subs Term.false_)
             end
-          | Term.Unif_dom_elt (dom_elt,_, uty_dom_elt), Term.Unif_cst (c, _, _, _)
-          | Term.Unif_cst (c, _, _, _), Term.Unif_dom_elt (dom_elt,_,uty_dom_elt) ->
+          | Term.Unif_dom_elt (dom_elt,_, uty_dom_elt), Term.Unif_cst (c0, _, _, c_slice0)
+          | Term.Unif_cst (c0, _, _, c_slice0), Term.Unif_dom_elt (dom_elt,_,uty_dom_elt) ->
             let dom_elt_offset = uty_dom_elt.uty_offset in
             (* we know that [uty] is expanded deep enough that [dom_elt]
                exists, so we can simply reduce [?c = dom_elt_n] into
-               [¬empty(uty[0:]) & .. & ¬empty(uty[:n]) & ?c := dom_elt_n] *)
-            let traverse e_c c uty = match uty.uty_pair with
-              | Lazy_none ->
-                (* we are too deep in [uty], cannot hold *)
-                assert (dom_elt_offset < uty.uty_offset);
-                Explanation.empty, Term.false_
-              | Lazy_some _ when dom_elt_offset < uty.uty_offset ->
-                (* we are too deep in [uty], cannot hold *)
-                Explanation.empty, Term.false_
-              | Lazy_some (dom_elt', _) ->
-                Expand.expand_cst c;
-                let check_uty = Term.check_empty_uty uty |> Term.not_ in
-                if Typed_cst.equal dom_elt dom_elt'
-                then (
-                  incr stat_num_unif;
-                  (* check assignment *)
-                  Term.and_eager check_uty
-                    (Term.check_assign c (Term.const dom_elt))
-                  |> compute_nf_add e_c
-                ) else (
-                  begin match c.cst_kind with
-                    | Cst_undef ({cst_cases=Lazy_some cases; _}, _) ->
-                      (* [c=dom_elt' OR c=c'] *)
-                      let c' = match cases with
-                        | [a;b] ->
-                          begin match Term.as_cst_undef a, Term.as_cst_undef b with
-                            | OF_some (c',_,_,_), _ | _, OF_some (c',_,_,_) -> c'
-                            | _ -> assert false
-                          end
-                        | _ -> assert false
-                      in
-                      assert (c != c');
-                      Term.and_eager
-                        check_uty
-                        (Term.and_
-                           (Term.check_assign c (Term.const c'))
-                           (Term.eq (Term.const c') (Term.const dom_elt)))
-                      |> compute_nf_add e_c
-                    | Cst_undef ({cst_cases=Lazy_none; _}, _) ->
-                      (* blocked: could not expand *)
-                      e_c, Term.eq (Term.const c) (Term.const dom_elt)
-                    | _ -> assert false
-                  end
-                )
+               [¬empty(uty[0:]) & .. & ¬empty(uty[n:]) & ?c := dom_elt_n] *)
+            let traverse e_c c uty =
+              Expand.expand_cst c;
+              Expand.expand_uty uty;
+              match uty.uty_pair with
+                | Lazy_none -> assert false
+                | Lazy_some _ when dom_elt_offset < uty.uty_offset ->
+                  (* [c] is too deep in [uty], it cannot be equal to [dom_elt]
+                     [dom_elt] is not in the slice of [c]. *)
+                  Explanation.empty, Term.false_
+                | Lazy_some (dom_elt', uty') ->
+                  Expand.expand_cst c;
+                  let check_uty_not_empty = Term.check_empty_uty uty |> Term.not_ in
+                  (* FIXME:
+                     in the case [c := c'] we also need to check eagerly
+                     that [c'] lives in a non-empty type.
+                     Otherwise: assume [a != b, tau={tau0}, a := tau0],
+                     we would conclude [b=b' != tau0] before checking that
+                     there is a value for [b']
+                     NOTE: it would be nice to be SURE that [c] has a
+                       concret value, in addition to its type not
+                       being empty! *)
+                  if Typed_cst.equal dom_elt dom_elt'
+                  then (
+                    (* [c] belongs in [uty[n:]], check assignment *)
+                    incr stat_num_unif;
+                    Term.and_eager check_uty_not_empty
+                      (Term.check_assign c (Term.const dom_elt))
+                    |> compute_nf_add e_c
+                  ) else (
+                    (* [c] belongs in [uty[k:]] with [k<n], so to be
+                       equal to [dom_elt] it must not be [uty_k] *)
+                    assert (dom_elt_offset > uty.uty_offset);
+                    Expand.expand_cst c;
+                    begin match c.cst_kind with
+                      | Cst_undef ({cst_cases=Lazy_some cases; _},Some _) ->
+                        (* [c=dom_elt' OR c=c'] *)
+                        let c' = match cases with
+                          | [a;b] ->
+                            begin match Term.as_cst_undef a, Term.as_cst_undef b with
+                              | OF_some (c',_,_,_), _ | _, OF_some (c',_,_,_) -> c'
+                              | _ -> assert false
+                            end
+                          | _ -> assert false
+                        in
+                        assert (c != c');
+                        (* [c = dom_elt -->
+                            not-empty(uty) && c=c' && not-empty(uty')],
+                           with [c' in uty'] *)
+                        Term.and_eager_l
+                          [ check_uty_not_empty;
+                            Term.not_ (Term.check_empty_uty uty');
+                            Term.and_
+                              (Term.check_assign c (Term.const c'))
+                              (Term.eq (Term.const c') (Term.const dom_elt));
+                          ]
+                        |> compute_nf_add e_c
+                      | _ -> assert false
+                    end
+                  )
             in
-            let uty_root = match c.cst_kind, uty_dom_elt.uty_self with
-              | Cst_undef (_, Some uty), _ -> uty
-              | _, lazy {ty_cell=Atomic (_, Uninterpreted uty); _} -> uty
-              | _ -> assert false
+            let uty0 = match c_slice0 with
+              | None -> assert false
+              | Some c->c
             in
-            traverse e_ab c uty_root
+            traverse e_ab c0 uty0
           | _ -> e_ab, default()
         end
 
@@ -3320,9 +3346,21 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
   let deref_deep (doms:cst list Ty.Tbl.t) (t:term) : term =
     let rec aux t =
       let _, t = Reduce.compute_nf t in
-      match t.term_cell with
+      begin match t.term_cell with
         | True | False | DB _ -> t
-        | Const _ -> t
+        | Const c ->
+          begin match c.cst_kind with
+            | Cst_undef (_, Some {
+                uty_status=Some (_, Uty_nonempty);
+                uty_pair=Lazy_some(dom_elt,_); _}) ->
+              (* unassigned unknown of some non-empty slice of
+                 an uninterpreted type:
+                 assign it to the first element of its slice.
+                 This should introduce no conflict: any conflict would have
+                 blocked evaluation of at least one goal earlier *)
+              Term.const dom_elt
+            | _ -> t
+          end
         | App (f,l) ->
           Term.app (aux f) (List.map aux l)
         | If (a,b,c) -> Term.if_ (aux a)(aux b)(aux c)
@@ -3357,10 +3395,10 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
             Term.const c
           ) else (
             let m =
-                 { m with
-                     switch_tbl;
-                     switch_id=new_switch_id_();
-                 } in
+              { m with
+                  switch_tbl;
+                  switch_id=new_switch_id_();
+              } in
             Term.switch (aux u) m
           )
         | Quant (q,uty,body) -> Term.quant q uty (aux body)
@@ -3371,6 +3409,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         | Check_assign _
         | Check_empty_uty _
           -> assert false
+      end
     in
     aux t
 
