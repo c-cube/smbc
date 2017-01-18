@@ -47,6 +47,9 @@ module Make(C:CONFIG)(Dummy : sig end) : sig
     | U_timeout
     | U_max_depth
     | U_incomplete
+    | U_non_terminating (* stack overflow *)
+
+  val pp_unknown : unknown CCFormat.printer
 
   type res =
     | Sat of Model.t

@@ -50,8 +50,8 @@ let solve ~config (ast:Ast.statement list) : unit =
         (Model.pp_syn config.syntax) m;
     | S.Unsat ->
       Format.printf "(result @{<Yellow>UNSAT@})@."
-    | S.Unknown _ ->
-      Format.printf "(result @{<blue>UNKNOWN@})@."
+    | S.Unknown u  ->
+      Format.printf "(result @{<blue>UNKNOWN@} :reason %a)@." S.pp_unknown u
 
 (** {2 Main} *)
 

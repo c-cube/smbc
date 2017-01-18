@@ -3350,6 +3350,13 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     | U_timeout
     | U_max_depth
     | U_incomplete
+    | U_non_terminating
+
+  let pp_unknown out = function
+    | U_timeout -> CCFormat.string out "timeout"
+    | U_max_depth -> CCFormat.string out "max_depth"
+    | U_incomplete -> CCFormat.string out "incomplete"
+    | U_non_terminating -> CCFormat.string out "non_terminating"
 
   type model = Model.t
   let pp_model = Model.pp
@@ -3633,7 +3640,10 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
                 do_on_exit ~on_exit;
                 Unsat
     in
-    ID.reset ();
-    iter (ID.current ())
+    try
+      ID.reset ();
+      iter (ID.current ())
+    with Stack_overflow ->
+      Unknown U_non_terminating
 end
 
