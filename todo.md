@@ -2,6 +2,26 @@
 
 ## Now
 
+- [ ] non termination:
+  * when evaluating `t`, set `t.nf <- sinkhole` (3rd case);
+    once we get the new normal form `u`,
+    set `t.nf <- u`
+  * when evaluating `t` (inside), if `t.nf = sinkhole`, we have
+    a loop, so we can (first approximation) return `undefined`
+    **OR** emit a warning.
+  * [ ] better possibility:
+    create a fresh unknown `?t` for `t` (and cache it
+    for re-use) and add toplevel constraint `?t = t`.
+    Then, when we evaluate `t` in contexts where `t.nf = sinkhole`,
+    we just return `?t` instead, so the SAT solver
+    has to do some guessing.
+    → This is sometimes necessary,
+      e.g. `f () := ?x asserting (f () = 0)`
+      will translate to `f() := if f() = 0 then … else *`.
+  * [ ] even better: have `?t` have a shallow expansion,
+    unlike regular unknowns. E.g. for nat:
+    `?t = 0 || ?t = succ (pred t)` (notice that we fall back to `t`)
+
 - update readme to add some docs and example in there
 
 - remove `lisp` format, its parser, and convert the examples (careful with comments)
