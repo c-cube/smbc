@@ -223,7 +223,7 @@ let rec term_to_sexp t = match t.term with
     S.of_list [S.atom "or"; term_to_sexp a; term_to_sexp b]
   | Binop (Imply, a, b) ->
     S.of_list [S.atom "=>"; term_to_sexp a; term_to_sexp b]
-  | Asserting (t,g)-> S.of_list [S.atom "asserting"; term_to_sexp t; term_to_sexp g]
+  | Asserting (t,g)-> S.of_list [S.atom ":asserting"; term_to_sexp t; term_to_sexp g]
   | True -> S.atom "true"
   | False -> S.atom "false"
   | Undefined_value -> S.atom "undefined_value"

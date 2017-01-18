@@ -128,7 +128,7 @@ let rec pp_term out (t:term) = match t with
   | And l -> fpf out "(@[<hv>and@ %a@])" (Utils.pp_list pp_term) l
   | Or l -> fpf out "(@[<hv>or@ %a@])" (Utils.pp_list pp_term) l
   | Not t -> fpf out "(not %a)" pp_term t
-  | Asserting (t,g) -> fpf out "(@[asserting@ %a@ %a@])" pp_term t pp_term g
+  | Asserting (t,g) -> fpf out "(@[:asserting@ %a@ %a@])" pp_term t pp_term g
 and pp_typed_var out (v,ty) =
   fpf out "(@[%s@ %a@])" v pp_ty ty
 
@@ -186,7 +186,8 @@ module Tip = struct
       | A.True -> true_
       | A.False -> false_
       | A.Const s -> const s
-      | A.App ("asserting", [t;g]) -> asserting (aux t) (aux g)
+      | A.App ((":asserting" | "asserting"), [t;g]) ->
+        asserting (aux t) (aux g)
       | A.App (f, l) ->
         app (aux (A.Const f)) (List.map aux l)
       | A.HO_app (a,b) -> app (aux a) [aux b]
