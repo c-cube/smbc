@@ -3131,11 +3131,27 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         let g = conv_term_rec env g in
         Term.if_ g t (Term.undefined_value t.term_ty)
 
-    let conv_term t =
-      let t' = conv_term_rec empty_env t in
+    let conv_term ?(env=empty_env) t =
+      let u = conv_term_rec env t in
       Log.debugf 2
-        (fun k->k "(@[conv_term@ @[%a@]@ yields: %a@])" Ast.pp_term t Term.pp t');
-      t'
+        (fun k->k "(@[conv_term@ @[%a@]@ yields: %a@])" Ast.pp_term t Term.pp u);
+      u
+
+    (* simple prefix skolemization: if [t = exists x1...xn. u],
+       declare [x1...xn] as new unknowns (not to be in the final model)
+       and return [u] instead, as well as an environment
+       that maps [x_i] to their corresponding new unknowns *)
+    let skolemize t : conv_env * Ast.term =
+      let rec aux env t = match Ast.term_view t with
+        | Ast.Exists (v, u) ->
+          let ty = conv_ty (Ast.Var.ty v) in
+          let c_id = ID.makef "?%s" (Ast.Var.id v |> ID.to_string) in
+          let c = Typed_cst.make_undef ~depth:0 c_id ty in
+          let env = add_let_bound env v (Term.const c) in
+          aux env u
+        | _ -> env, t
+      in
+      aux empty_env t
 
     let add_statement st =
       Log.debugf 2
@@ -3143,7 +3159,8 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       model_env_ := Ast.env_add_statement !model_env_ st;
       match st with
         | Ast.Assert t ->
-          let t = conv_term t in
+          let env, t = skolemize t in
+          let t = conv_term ~env t in
           Top_goals.push t;
           push_clause (Clause.make [Lit.atom t])
         | Ast.Goal (vars, t) ->
