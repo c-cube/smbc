@@ -21,6 +21,9 @@ module type CONFIG = sig
 
   val dimacs_file : string option
   (** File for dumping the SAT problem *)
+
+  val computation_limit : int option
+  (** Maximum number of computation steps for a single term *)
 end
 
 module Make(C:CONFIG)(Dummy : sig end) : sig

@@ -9,6 +9,9 @@ type term = A.term
 type ty = A.Ty.t
 type domain = ID.t list
 
+type fuel = int
+(* maximum number of steps allowed *)
+
 type t = {
   env: A.env;
   (* environment, defining symbols *)
@@ -16,6 +19,8 @@ type t = {
   (* uninterpreted type -> its domain *)
   consts: term ID.Map.t;
   (* constant -> its value *)
+  mutable local_fuel: fuel;
+  (* used for computations. only use if you know what you are doing *)
 }
 
 let make ~env ~consts ~domains =
@@ -27,7 +32,7 @@ let make ~env ~consts ~domains =
       (fun env (_,cst) -> A.env_add_def env cst A.E_uninterpreted_cst)
       env
   in
-  {env; consts; domains}
+  { env; consts; domains; local_fuel=0; }
 
 type entry =
   | E_ty of ty * domain
@@ -152,11 +157,13 @@ let apply_subst (subst:subst) t =
   in
   if VarMap.is_empty subst then t else aux subst t
 
-(* Weak Head Normal Form *)
+(* Weak Head Normal Form.
+   @param fuel number of steps allowed before returning [Undefined_value] *)
 let rec eval_whnf (m:t) (subst:subst) (t:term): term = match A.term_view t with
   | A.Undefined_value
   | A.True
   | A.False -> t
+  | _ when m.local_fuel <= 0 -> A.undefined_value t.A.ty
   | A.Var v ->
     begin match VarMap.get v subst with
       | None -> t
@@ -354,15 +361,21 @@ and eval_whnf_app' m subst_f subst_l f l =
   end
 
 (* eval term [t] under model [m] *)
-let eval (m:t) (t:term) = eval_whnf m empty_subst t
+let eval ?computation_limit (m:t) (t:term) =
+  let fuel = match computation_limit with
+    | Some f -> min (f * 10) max_int
+    | None -> max_int
+  in
+  m.local_fuel <- fuel; (* put some fuel in it! *)
+  eval_whnf m empty_subst t
 
 (* check model *)
-let check (m:t) ~goals =
+let check ?computation_limit (m:t) ~goals =
   let bad =
     goals
     |> CCList.find_map
       (fun t ->
-         let t' = eval m t in
+         let t' = eval ?computation_limit m t in
          match A.term_view t' with
            | A.True -> None
            | _ -> Some (t, t'))

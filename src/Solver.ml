@@ -28,6 +28,9 @@ module type CONFIG = sig
 
   val dimacs_file : string option
   (** File for dumping the SAT problem *)
+
+  val computation_limit : int option
+  (** Maximum number of computation steps for a single term *)
 end
 
 (** {2 The Main Solver} *)
@@ -3462,7 +3465,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       |> Sequence.map Conv.term_to_ast
       |> Sequence.to_list
     in
-    Model.check m ~goals
+    Model.check ?computation_limit:Config.computation_limit m ~goals
 
   let clause_of_mclause (c:M.St.clause): Clause.t =
     M.Proof.to_list c |> List.map (fun a -> a.M.St.lit) |> Clause.make

@@ -11,6 +11,7 @@ type config = {
   dimacs: string option;
   deepening_step: int option;
   uniform_depth: bool;
+  computation_limit: int option;
   check: bool;
 }
 
@@ -37,6 +38,7 @@ let solve ~config (ast:Ast.statement list) : unit =
     let deepening_step = config.deepening_step
     let uniform_depth = config.uniform_depth
     let dimacs_file = config.dimacs
+    let computation_limit = config.computation_limit
   end in
   let module S = Solver.Make(Conf)(struct end) in
   let on_exit = [] in
@@ -68,6 +70,7 @@ let timeout_ = ref ~-1
 let syntax_ = ref Ast.Auto
 let uniform_depth_ = ref false
 let version_ = ref false
+let computation_limit_ = ref ~-1
 let dimacs_ = ref "" (* file to put sat problem in *)
 
 let file = ref `None
@@ -116,6 +119,7 @@ let options =
     "--no-uniform-depth", Arg.Clear uniform_depth_, " non-uniform depth";
     "--timeout", Arg.Set_int timeout_, " timeout (in s)";
     "--dimacs", Arg.Set_string dimacs_, " file to output dimacs problem into";
+    "--computation-limit", Arg.Set_int computation_limit_, " max number of steps during evaluation";
     "-t", Arg.Set_int timeout_, " alias to --timeout";
     "--version", Arg.Set version_, " display version info";
   ]
@@ -165,6 +169,8 @@ let () =
       (if !depth_step_ = 0 then None else Some !depth_step_);
     dot_term_graph =
       (if !dot_term_graph_ = "" then None else Some !dot_term_graph_);
+    computation_limit=
+      (if !computation_limit_ > 0 then Some !computation_limit_ else None);
     check= !check_;
   } in
   solve ~config ast
