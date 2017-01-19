@@ -72,7 +72,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     mutable term_id: int; (* unique ID *)
     mutable term_ty: ty_h;
     term_cell: term_cell;
-    mutable term_nf: (term * explanation) option;
+    mutable term_nf: term_nf;
       (* normal form + explanation of why *)
     mutable term_deps: term_dep list;
     (* set of undefined constants
@@ -101,6 +101,11 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     (* Value that is not defined. On booleans it corresponds to
        the middle case of https://en.wikipedia.org/wiki/Three-valued_logic.
        The [ty] argument is needed for typing *)
+
+  (* pointer to a term to its (current) normal form, updated during evaluation *)
+  and term_nf =
+    | NF_some of term * explanation
+    | NF_none
 
   and db = int * ty_h
 
@@ -481,7 +486,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
 
     type stack_cell =
       | S_set_nf of
-          term * (term * explanation) option
+          term * term_nf
           (* t1.nf <- t2 *)
       | S_set_cst_case of
           cst_info * (explanation * term) option
@@ -646,7 +651,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         term_id= -1;
         term_ty=Ty.prop;
         term_cell=if b then True else False;
-        term_nf=None;
+        term_nf=NF_none;
         term_deps=[];
       } in
       H.hashcons t
@@ -689,7 +694,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         term_id= -1;
         term_ty=Ty.prop; (* will be changed *)
         term_cell=cell;
-        term_nf=None;
+        term_nf=NF_none;
         term_deps=[];
       } in
       let t' = H.hashcons t in
@@ -2088,7 +2093,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       if Term.equal t new_t then ()
       else (
         Backtrack.push_set_nf_ t;
-        t.term_nf <- Some (new_t, e);
+        t.term_nf <- NF_some (new_t, e);
         Log.debugf 5
           (fun k->k
               "(@[<hv1>set_nf@ @[%a@]@ @[%a@]@ :explanation @[<hv>%a@]@])"
@@ -2097,24 +2102,26 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
 
     let get_nf t : explanation * term =
       match t.term_nf with
-        | None -> Explanation.empty, t
-        | Some (new_t,e) -> e, new_t
+        | NF_none -> Explanation.empty, t
+        | NF_some (new_t,e) -> e, new_t
 
     (* compute the normal form of this term. We know at least one of its
        subterm(s) has been reduced *)
     let rec compute_nf (t:term) : explanation * term =
       (* follow the "normal form" pointer *)
       match t.term_nf with
-        | Some (t', e) ->
+        | NF_some (t', e) ->
           let exp, nf = compute_nf_add e t' in
           (* path compression here *)
-          if not (Term.equal t' nf)
-          then set_nf_ t nf exp;
+          if not (Term.equal t' nf) then (
+            assert (not (Term.equal t nf));
+            set_nf_ t nf exp;
+          );
           exp, nf
-        | None -> compute_nf_noncached t
+        | NF_none -> compute_nf_noncached t
 
     and compute_nf_noncached t =
-      assert (t.term_nf = None);
+      assert (t.term_nf = NF_none);
       match t.term_cell with
         | DB _ -> Explanation.empty, t
         | True | False ->
