@@ -51,6 +51,11 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
   let stat_num_propagations = ref 0
   let stat_num_unif = ref 0
 
+  (* if [true], it means that at least once, a goal was reduced to
+     [Undefined_value], meaning we lost precision.
+     This means that we are not refutationnally complete. *)
+  let has_met_undefined : bool ref = ref false
+
   (* for objects that are expanded on demand only *)
   type 'a lazily_expanded =
     | Lazy_some of 'a
@@ -2651,6 +2656,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         | Undefined_value _ ->
           (* there is no chance that this goal evaluates to a boolean anymore,
              we must try something else *)
+          has_met_undefined := true;
           trigger_conflict e
         | _ ->
           Log.debugf 4
@@ -2887,6 +2893,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           (* the literal will never be a boolean, we must try
              something else *)
           assert (Ty.equal Ty.prop ty);
+          has_met_undefined := true; (* incomplete *)
           trigger_conflict lit e
         | Lit_atom _ -> ()
         | Lit_assign(c, t) ->
@@ -3350,13 +3357,13 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     | U_timeout
     | U_max_depth
     | U_incomplete
-    | U_non_terminating
+    | U_undefined_values
 
   let pp_unknown out = function
     | U_timeout -> CCFormat.string out "timeout"
     | U_max_depth -> CCFormat.string out "max_depth"
     | U_incomplete -> CCFormat.string out "incomplete"
-    | U_non_terminating -> CCFormat.string out "non_terminating"
+    | U_undefined_values  -> CCFormat.string out "undefined_values"
 
   type model = Model.t
   let pp_model = Model.pp
@@ -3547,12 +3554,14 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
   type proof_status =
     | PS_depth_limited of Lit.t
     | PS_complete
+    | PS_undefined_values
     | PS_incomplete
 
   let pp_proof_status out = function
     | PS_depth_limited lit ->
       Format.fprintf out "(@[depth_limited@ by: %a@])" Lit.pp lit
     | PS_complete -> CCFormat.string out "complete"
+    | PS_undefined_values -> CCFormat.string out "undefined_values"
     | PS_incomplete -> CCFormat.string out "incomplete"
 
   (* precondition: solving under assumption [depth_lit] returned unsat *)
@@ -3572,7 +3581,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
            incomplete choices *)
         let p = us.SI.get_proof () in
         let core = p |> M.unsat_core in
-        let incomplete =
+        let incomplete_expansion = lazy (
           clauses_of_unsat_core core
           |> Sequence.flat_map Clause.to_seq
           |> Sequence.exists
@@ -3583,8 +3592,12 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
                    | _ -> false
                  end
                | _ -> false)
-        in
-        if incomplete then PS_incomplete else PS_complete
+        ) in
+        if !has_met_undefined
+        then PS_undefined_values
+        else if Lazy.force incomplete_expansion
+        then PS_incomplete
+        else PS_complete
     end
 
   let dump_dimacs () = match Config.dimacs_file with
@@ -3617,8 +3630,10 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
             Sat m
           | M.Unsat us ->
             (* check if [max depth] literal involved in proof;
-               - if not, truly UNSAT
                - if yes, try next level
+               - if not but [has_met_undefined=true] or some expansion
+                 was not exhaustive (e.g. functions), UNKNOWN
+               - else, truly UNSAT
             *)
             let p = us.SI.get_proof () in
             Log.debugf 4 (fun k->k "proof: @[%a@]@." pp_proof p);
@@ -3628,22 +3643,23 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
                   "@{<Yellow>** found Unsat@} at depth %a;@ \
                    status: %a"
                   ID.pp cur_depth pp_proof_status status);
-            match status with
+            begin match status with
               | PS_depth_limited _ ->
                 (* negation of the previous limit *)
                 push_clause (Clause.make [Lit.neg cur_lit]);
                 iter (ID.next ()) (* deeper! *)
+              | PS_undefined_values ->
+                do_on_exit ~on_exit;
+                Unknown U_undefined_values
               | PS_incomplete ->
                 do_on_exit ~on_exit;
                 Unknown U_incomplete
               | PS_complete ->
                 do_on_exit ~on_exit;
                 Unsat
+             end
     in
-    try
-      ID.reset ();
-      iter (ID.current ())
-    with Stack_overflow ->
-      Unknown U_non_terminating
+    ID.reset ();
+    iter (ID.current ())
 end
 

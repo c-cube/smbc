@@ -47,7 +47,7 @@ module Make(C:CONFIG)(Dummy : sig end) : sig
     | U_timeout
     | U_max_depth
     | U_incomplete
-    | U_non_terminating (* stack overflow *)
+    | U_undefined_values (* non-terminating functions, ill-applied selector, etc. *)
 
   val pp_unknown : unknown CCFormat.printer
 
