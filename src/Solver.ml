@@ -71,6 +71,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
   type term = {
     mutable term_id: int; (* unique ID *)
     mutable term_ty: ty_h;
+    mutable term_being_evaled: bool; (* true if currently being evaluated *)
     term_cell: term_cell;
     mutable term_nf: term_nf;
       (* normal form + explanation of why *)
@@ -649,6 +650,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     let mk_bool_ (b:bool) : term =
       let t = {
         term_id= -1;
+        term_being_evaled = false;
         term_ty=Ty.prop;
         term_cell=if b then True else False;
         term_nf=NF_none;
@@ -693,6 +695,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       let t = {
         term_id= -1;
         term_ty=Ty.prop; (* will be changed *)
+        term_being_evaled=false;
         term_cell=cell;
         term_nf=NF_none;
         term_deps=[];
@@ -2108,17 +2111,30 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     (* compute the normal form of this term. We know at least one of its
        subterm(s) has been reduced *)
     let rec compute_nf (t:term) : explanation * term =
-      (* follow the "normal form" pointer *)
-      match t.term_nf with
-        | NF_some (t', e) ->
-          let exp, nf = compute_nf_add e t' in
-          (* path compression here *)
-          if not (Term.equal t' nf) then (
-            assert (not (Term.equal t nf));
-            set_nf_ t nf exp;
-          );
-          exp, nf
-        | NF_none -> compute_nf_noncached t
+      if t.term_being_evaled then (
+        (* [t] is already being evaluated, this means there is
+             an evaluation in the loop.
+             We must approximate and return [Undefined_value] *)
+        Explanation.empty, Term.undefined_value t.term_ty
+      ) else (
+        (* follow the "normal form" pointer *)
+        match t.term_nf with
+          | NF_some (t', e) ->
+            t.term_being_evaled <- true;
+            let exp, nf = compute_nf_add e t' in
+            (* path compression here *)
+            if not (Term.equal t' nf) then (
+              assert (not (Term.equal t nf));
+              set_nf_ t nf exp;
+            );
+            t.term_being_evaled <- false;
+            exp, nf
+          | NF_none ->
+            t.term_being_evaled <- true;
+            let res = compute_nf_noncached t in
+            t.term_being_evaled <- false;
+            res
+      )
 
     and compute_nf_noncached t =
       assert (t.term_nf = NF_none);
