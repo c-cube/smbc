@@ -2643,7 +2643,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       in
       Log.debugf 4
         (fun k->k
-            "(@[<hv1>@{<>conflict@}@ clauses: (@[%a@])@])"
+            "(@[<hv1>@{<green>conflict@}@ clauses: (@[%a@])@])"
             (Utils.pp_list Clause.pp) cs);
       incr stat_num_propagations;
       Clause.push_new_l cs;
