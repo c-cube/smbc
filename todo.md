@@ -2,7 +2,19 @@
 
 ## Now
 
-- [ ] non termination:
+- update readme to add some docs and example in there
+
+- remove `lisp` format, its parser, and convert the examples (careful with comments)
+
+- rename `cst` into `unknown`?
+
+## Narrowing
+
+- [ ] some basic proof output:
+    * recover the resolution graph
+    * theory lemmas are `e |- goal -> false`
+
+- [x] non termination:
   * when evaluating `t`, set `t.nf <- sinkhole` (3rd case);
     once we get the new normal form `u`,
     set `t.nf <- u`
@@ -18,17 +30,16 @@
     → This is sometimes necessary,
       e.g. `f () := ?x asserting (f () = 0)`
       will translate to `f() := if f() = 0 then … else *`.
+    **NOTE** this might be unsound (e.g. if `t:=s(t),u:=s(u)`, `t=u`
+      might evaluate to `true` or `false` depending on the initial sat choice)
   * [ ] even better: have `?t` have a shallow expansion,
     unlike regular unknowns. E.g. for nat:
     `?t = 0 || ?t = succ (pred t)` (notice that we fall back to `t`)
 
-- update readme to add some docs and example in there
-
-- remove `lisp` format, its parser, and convert the examples (careful with comments)
-
-- rename `cst` into `unknown`?
-
-## Narrowing
+- [ ] depth limit on computations (in a single round).
+    If `t -> t_1 -> … -> t_N` with `N` the limit, then `t -> undefined`
+    with the combination of all explanations
+  * CLI option to set the limit
 
 - add `default` in matching (makes for smaller terms)?
 
@@ -36,6 +47,11 @@
   big-step semantics everywhere.
   Instead, evaluation should return the list of blocking unknowns that
   it met, so the SMT theory can use that directly.
+
+- [ ] use meta-variables for evaluating `exists x:tau. F`
+  * `exists x:tau. F` becomes `new c. F[c / x]`? what about polarities?
+    maybe this goal should become toplevel, so we try to satisfy it?
+  * encode `forall x:tau. F` into `not (exists x:tau. not F)`
 
 - CLI flag + internal mechanism for generating `n` solutions instead
   of just one (add negation of solution to get the next one).
