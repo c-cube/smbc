@@ -3,7 +3,7 @@
 ; simple QF_UF test
 ; (set-logic QF_UF)
 
-; expect: unsat
+; expect: sat
 
 (declare-sort i 0)
 (declare-fun a () i)

@@ -1,6 +1,6 @@
 
 OCAMLBUILD=ocamlbuild -use-ocamlfind -tag debug
-TARGETS=src/smbc.native src/smbc.byte
+TARGETS=src/smbc.byte src/smbc.native
 BINDIR ?= /usr/bin/
 
 all: build

@@ -1,4 +1,4 @@
-; expect SAT
+; expect: SAT
 
 (declare-sort iota 0)
 (declare-datatypes

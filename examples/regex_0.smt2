@@ -1,3 +1,5 @@
+; expect: sat
+
 (declare-datatypes ()
   ((list3 (Nil3) (Cons3 (Cons_03 Bool) (Cons_13 list3)))))
 (declare-datatypes () ((T (A) (B) (C))))
