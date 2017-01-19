@@ -1786,8 +1786,9 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         | {ty_cell=Atomic (_,Uninterpreted uty);_}, Cst_undef (_, _) -> uty
         | _ -> assert false
       in
-      (* first, expand slice if required *)
+      (* first, expand slice and the next slice itself *)
       let c_head, uty_tail, cs = expand_uninterpreted_slice uty in
+      let _, _, cs' = expand_uninterpreted_slice uty_tail in
       (* two cases: either [c_head], or some new, deeper constant somewhere
          in the slice [uty_tail] *)
       let case1 = Term.const c_head in
@@ -1809,7 +1810,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         ]
         |> Clause.make
       in
-      [case1; case2], c_not_empty :: cs
+      [case1; case2], c_not_empty :: List.rev_append cs cs'
 
     (* [deconstruct_ty arg ty_arg ty_ret ~fresh ~k] builds the [body:ty_ret]
        of a function [lambda arg:ty_arg. body] by "deconstructing" arg.
