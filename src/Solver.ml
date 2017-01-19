@@ -1677,24 +1677,6 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
              lit, guard)
           l
       in
-      (* NOTE: still needed? *)
-      let cs_possible_depth = [] in
-      (*
-      (* if all cases go over the depth limit, then we must revert the
-         choice of [parent] *)
-      let all_need_guard = List.for_all (fun (_,g) -> CCOpt.is_some g) lits in
-      let cs_possible_depth = match lit_guard, guard_parent, all_need_guard with
-        | _, [], true -> assert false (* depth 0 ?! *)
-        | Some guard, _::_, true ->
-          (* each [parent=parent_case] that leads to [c] is incompatible
-             with [guard] because it would use too deep constants *)
-          List.map
-            (fun parent ->
-               [Lit.neg guard; Lit.neg parent] |> Clause.make)
-            guard_parent
-        | _ -> []
-      in
-      *)
       (* at least one case. We only enforce that if the
          parent constant has the proper case *)
       let cs_choose : Clause.t list =
@@ -1717,7 +1699,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
                | _ -> [])
           lits
       in
-      cs_possible_depth @ cs_limit @ cs_choose @ cs_once
+      cs_limit @ cs_choose @ cs_once
 
     (* make a sub-constant with given type *)
     let mk_sub_cst ?slice ?exist_if ~parent ~depth ty_arg =
