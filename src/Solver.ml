@@ -193,7 +193,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     (* refinement depth, used for iterative deepening *)
     cst_parent: cst option;
     (* if const was created as a parameter to some cases of some other constant *)
-    cst_exist_conds: cst_exist_conds;
+    mutable cst_exist_conds: cond_list;
     (* disjunction of possible conditions for cst to exist/be relevant *)
     mutable cst_cases: term list lazily_expanded;
     (* cover set (lazily evaluated) *)
@@ -204,9 +204,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     (* current choice of normal form *)
   }
 
-  (* this is a disjunction of sufficient conditions for the existence of
-     some meta (cst). Each condition is a literal *)
-  and cst_exist_conds = lit lazy_t list ref
+  and cond_list = lit lazy_t list
 
   and 'a db_env = {
     db_st: 'a option list;
@@ -382,7 +380,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       | Cst_undef (i, _) -> i.cst_depth
       | _ -> assert false
 
-    let make_undef ?parent ?exist_if ?slice ~depth:cst_depth id ty =
+    let make_undef ?parent ?(exist_if=[]) ?slice ~depth:cst_depth id ty =
       assert (CCOpt.for_all (fun p -> cst_depth > depth p) parent);
       (* undefined on an uninterpreted type always have a slice *)
       let slice = match slice, ty.ty_cell with
@@ -393,7 +391,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       let info =
         { cst_depth;
           cst_parent=parent;
-          cst_exist_conds=CCOpt.get_lazy (fun ()->ref []) exist_if;
+          cst_exist_conds=exist_if;
           cst_cases=Lazy_none;
           cst_complete=true;
           cst_cur_case=None;
@@ -406,6 +404,9 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       match c.cst_kind with
         | Cst_undef (i,slice) -> Some (c,c.cst_ty,i,slice)
         | Cst_defined _ | Cst_cstor | Cst_uninterpreted_dom_elt _ -> None
+
+    let add_exists_if (i:cst_info) cond =
+      i.cst_exist_conds <- cond :: i.cst_exist_conds
 
     let as_undefined_exn (c:t): t * Ty.t * cst_info * ty_uninterpreted_slice option=
       match c.cst_kind with
@@ -1658,12 +1659,11 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         | None -> assert false
         | Some (_,_,info,_) -> info
       in
+      (* disjunction of ways for [cst] to exist *)
       let guard_parent =
-        List.map
-          (fun (lazy lits) -> lits)
-          !(info.cst_exist_conds)
+        List.map (fun (lazy lit) -> lit) info.cst_exist_conds
       in
-      (* lits with the corresponding depth guard, if any *)
+      (* lits with the corresponding depth and specific guards, if any *)
       let lits =
         List.map
           (fun rhs ->
@@ -1710,7 +1710,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       cst: cst;
       info: cst_info;
       ty: Ty.t;
-      memo: (cst * cst_exist_conds) list Ty.Tbl.t;
+      memo: cst list Ty.Tbl.t;
       (* table of already built constants, by type *)
     }
 
@@ -1722,25 +1722,26 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     (* get or create a constant that has this type *)
     let get_or_create_cst
         ~(st:state) ~(parent:cst) ~(used:cst list ref) ~depth ty_arg
-      : cst * cst_exist_conds =
+      : cst * (lit lazy_t -> unit) =
       let usable =
         Ty.Tbl.get_or ~or_:[] st.memo ty_arg
         |> List.filter
-          (fun (c',_) -> not (List.exists (Typed_cst.equal c') !used))
+          (fun c' -> not (List.exists (Typed_cst.equal c') !used))
       in
-      begin match usable with
+      let cst = match usable with
         | [] ->
           (* make a new constant and remember it *)
-          let plist = ref [] in
-          let cst = mk_sub_cst ~exist_if:plist ~parent ~depth ty_arg in
-          Ty.Tbl.add_list st.memo ty_arg (cst,plist);
+          let cst = mk_sub_cst ~exist_if:[] ~parent ~depth ty_arg in
+          Ty.Tbl.add_list st.memo ty_arg cst;
           used := cst :: !used; (* cannot use it in the same case *)
-          cst, plist
-        | (cst,plist) :: _ ->
+          cst
+        | cst :: _ ->
           (* [cst] has the proper type, and is not used yet *)
           used := cst :: !used;
-          cst, plist
-      end
+          cst
+      in
+      let _, _, info, _ = Typed_cst.as_undefined_exn cst in
+      cst, (Typed_cst.add_exists_if info)
 
     (* expand [cst : data] where [data] has given [cstors] *)
     let expand_cases_data st cstors =
@@ -1764,11 +1765,11 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
                         st.info.cst_depth + List.length ty_args
                     in
                     assert (depth > st.info.cst_depth);
-                    let c, plist =
+                    let c, add_exist_if =
                       get_or_create_cst ~st ty_arg ~parent:st.cst ~used ~depth
                     in
                     let cond = lazy (Lit.cst_choice st.cst (Lazy.force case)) in
-                    plist := cond :: !plist;
+                    add_exist_if cond; (* [cond] is sufficient for [c] to exist *)
                     Term.const c)
                  ty_args
              in
@@ -1778,7 +1779,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         cstors, []
 
     (* expand [cst : ty] when [ty] is an uninterpreted type *)
-    let expand_cases_uninterpreted st =
+    let expand_cases_uninterpreted st : term list * Clause.t list =
       (* find the proper uninterpreted slice *)
       let uty = match st.cst.cst_ty, st.cst.cst_kind with
         | _, Cst_undef (_, Some u) -> u
@@ -1791,18 +1792,21 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
          in the slice [uty_tail] *)
       let case1 = Term.const c_head in
       let case2 =
-        let cond = lazy (Lit.uty_choice_nonempty uty) in
-        let plist = ref [cond] in
-        (* [cst = cst'], but [cst'] is deeper and belongs to the next slice *)
+        let exist_if = [lazy (Lit.uty_choice_nonempty uty)] in
+        (* [cst = cst'], but [cst'] is deeper and belongs to the
+           next slice [uty_tail].
+           The case [cst = cst'] is only possible if [uty_tail] is non-empty. *)
         let depth = st.info.cst_depth+1 in
         let cst' =
-          mk_sub_cst st.ty ~slice:uty_tail ~exist_if:plist ~parent:st.cst ~depth
+          mk_sub_cst st.ty ~slice:uty_tail ~exist_if ~parent:st.cst ~depth
         in
         Term.const cst'
       in
-      (* additional clause to specify that [is_empty uty_tail => cst = case1] *)
+      (* additional clause to specify that [is_empty uty_tail => not (cst = case2)] *)
       let c_not_empty =
-        [Lit.neg (Lit.uty_choice_empty uty_tail); Lit.cst_choice st.cst case1]
+        [ Lit.neg (Lit.uty_choice_empty uty_tail);
+          Lit.neg (Lit.cst_choice st.cst case2);
+        ]
         |> Clause.make
       in
       [case1; case2], c_not_empty :: cs
@@ -1925,7 +1929,9 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       let the_param = Term.db (DB.make 0 ty_arg) in
       let rec body = lazy (
         (* only one parent in any case *)
-        let exist_if = ref [lazy (Lit.cst_choice st.cst (Lazy.force fun_destruct))] in
+        let exist_if =
+          [lazy (Lit.cst_choice st.cst (Lazy.force fun_destruct))]
+        in
         let depth = st.info.cst_depth+1 in
         let fresh ~depth ty' =
           mk_sub_cst ty' ~depth ~parent:st.cst ~exist_if
@@ -1936,7 +1942,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         lazy (Term.fun_ ty_arg (Lazy.force body))
       (* constant function that does not look at input *)
       and body_const = lazy (
-        let exist_if = ref [lazy (Lit.cst_choice st.cst (Lazy.force fun_const))] in
+        let exist_if = [lazy (Lit.cst_choice st.cst (Lazy.force fun_const))] in
         (* only one parent in any case *)
         let depth = st.info.cst_depth+1 in
         let c' = mk_sub_cst ty_ret ~depth ~parent:st.cst ~exist_if in
