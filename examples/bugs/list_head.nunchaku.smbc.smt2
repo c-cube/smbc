@@ -5,16 +5,24 @@
 (declare-datatypes
    ()
    ((list_tau
-       (Nil_tau) 
+       (Nil_tau)
        (Cons_tau (select-Cons_tau-0 tau) (select-Cons_tau-1 list_tau)))))
+(define-fun-rec
+   is_empty_tau ((v_0 list_tau)) Bool
+     (match v_0 (case Nil_tau true)
+                (case default false)))
 (declare-fun list_tau_to_tau (list_tau) tau)
 (define-fun-rec
    head_tau ((list_tau_0 list_tau)) tau
      (match list_tau_0
-       (case (Cons_tau tau_0 list_tau_1) tau_0) 
+       (case (Cons_tau tau_0 list_tau_1) tau_0)
        (case default (list_tau_to_tau list_tau_0))))
 (declare-fun l10 () list_tau)
 (declare-fun l21 () list_tau)
-(assert-not (= (head_tau l10) (head_tau l21)))
+(assert-not
+ (or
+  (not (is_empty_tau l10))
+  (not (is_empty_tau l21))
+  (= (head_tau l10) (head_tau l21))))
 (check-sat)
 
