@@ -30,6 +30,9 @@ module type CONFIG = sig
   (** File for dumping the SAT problem *)
 end
 
+(* TODO: move it to config *)
+let check_proof = false
+
 (** {2 The Main Solver} *)
 
 module Make(Config : CONFIG)(Dummy : sig end) = struct
@@ -3592,6 +3595,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         (* really unsat, now we need to know if it involves some
            incomplete choices *)
         let p = us.SI.get_proof () in
+        if check_proof then M.Proof.check p;
         let core = p |> M.unsat_core in
         let incomplete_expansion = lazy (
           clauses_of_unsat_core core
@@ -3649,6 +3653,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
             *)
             let p = us.SI.get_proof () in
             Log.debugf 4 (fun k->k "proof: @[%a@]@." pp_proof p);
+            if check_proof then M.Proof.check p;
             let status = proof_status cur_lit in
             Log.debugf 1
               (fun k->k
