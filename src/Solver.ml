@@ -54,6 +54,11 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
   let stat_num_propagations = ref 0
   let stat_num_unif = ref 0
 
+  (* did we perform at least one expansion on an unknown that is
+     of a type that cannot support exhaustive expansion (e.g. functions)?
+  If true, it means that "unsat" might be wrong, so we'll answer "unknown" *)
+  let incomplete_expansion : bool ref = ref false
+
   (* if [true], it means that at least once, a goal was reduced to
      [Undefined_value], meaning we lost precision.
      This means that we are not refutationnally complete. *)
@@ -200,9 +205,6 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     (* disjunction of possible conditions for cst to exist/be relevant *)
     mutable cst_cases: term list lazily_expanded;
     (* cover set (lazily evaluated) *)
-    mutable cst_complete: bool;
-    (* does [cst_cases] cover all possible cases, or only
-       a subset? Affects completeness *)
     mutable cst_cur_case: (explanation * term) option;
     (* current choice of normal form *)
   }
@@ -396,7 +398,6 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           cst_parent=parent;
           cst_exist_conds=exist_if;
           cst_cases=Lazy_none;
-          cst_complete=true;
           cst_cur_case=None;
         }
       in
@@ -1856,7 +1857,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
             Term.if_ arg then_ else_
           | Atomic (_, Data cstors) ->
             (* we cannot enumerate all functions on datatypes *)
-            st.info.cst_complete <- false;
+            incomplete_expansion := true;
             (* match without recursion on some parameter *)
             let m =
               cstors
@@ -1889,6 +1890,8 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
             (* by case. We make a flat table from values to new
                meta-variables of type [ty_ret] *)
             let switch_make_new () = k ~shift_by ~depth ty_ret in
+            (* we cannot enumerate all functions on finite types *)
+            incomplete_expansion := true;
             let m = {
               switch_tbl=ID.Tbl.create 16;
               switch_ty_arg=ty_arg;
@@ -2477,7 +2480,6 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
             begin match info.cst_cases with
               | Lazy_none -> assert false
               | Lazy_some cases ->
-                assert info.cst_complete;
                 (* unification: use the literal [c := case] for
                    the [case in cases] that matches [cstor].
                    Reduce to [:= c case & case.i=args.i] *)
@@ -3596,22 +3598,9 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
            incomplete choices *)
         let p = us.SI.get_proof () in
         if check_proof then M.Proof.check p;
-        let core = p |> M.unsat_core in
-        let incomplete_expansion = lazy (
-          clauses_of_unsat_core core
-          |> Sequence.flat_map Clause.to_seq
-          |> Sequence.exists
-            (fun lit -> match Lit.view lit with
-               | Lit_assign (c,_) ->
-                 begin match c.cst_kind with
-                   | Cst_undef (i, _) when not i.cst_complete -> true
-                   | _ -> false
-                 end
-               | _ -> false)
-        ) in
         if !has_met_undefined
         then PS_undefined_values
-        else if Lazy.force incomplete_expansion
+        else if !incomplete_expansion
         then PS_incomplete
         else PS_complete
     end
