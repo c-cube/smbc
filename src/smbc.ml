@@ -12,6 +12,7 @@ type config = {
   deepening_step: int option;
   uniform_depth: bool;
   check: bool;
+  check_proof: bool;
 }
 
 let parse_file (syn:Ast.syntax) (file:string) : Ast.statement list Ast.or_error =
@@ -37,6 +38,7 @@ let solve ~config (ast:Ast.statement list) : unit =
     let deepening_step = config.deepening_step
     let uniform_depth = config.uniform_depth
     let dimacs_file = config.dimacs
+    let check_proof = config.check_proof
   end in
   let module S = Solver.Make(Conf)(struct end) in
   let on_exit = [] in
@@ -69,6 +71,7 @@ let syntax_ = ref Ast.Auto
 let uniform_depth_ = ref false
 let version_ = ref false
 let dimacs_ = ref "" (* file to put sat problem in *)
+let check_proof_ = ref false
 
 let file = ref `None
 
@@ -115,6 +118,8 @@ let options =
     "--no-uniform-depth", Arg.Clear uniform_depth_, " non-uniform depth";
     "--timeout", Arg.Set_int timeout_, " timeout (in s)";
     "--dimacs", Arg.Set_string dimacs_, " file to output dimacs problem into";
+    "--check-proof", Arg.Set check_proof_, " check propositional proofs";
+    "--no-check-proof", Arg.Clear check_proof_, " do not check propositional proofs";
     "-t", Arg.Set_int timeout_, " alias to --timeout";
     "--version", Arg.Set version_, " display version info";
   ]
@@ -165,5 +170,6 @@ let () =
     dot_term_graph =
       (if !dot_term_graph_ = "" then None else Some !dot_term_graph_);
     check= !check_;
+    check_proof= !check_proof_;
   } in
   solve ~config ast

@@ -21,6 +21,9 @@ module type CONFIG = sig
 
   val dimacs_file : string option
   (** File for dumping the SAT problem *)
+
+  val check_proof : bool
+  (** Check proofs given by MSat? *)
 end
 
 module Make(C:CONFIG)(Dummy : sig end) : sig
