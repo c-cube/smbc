@@ -1,8 +1,7 @@
 
 ; find `f` where: `map (f plus) [1,2,3] = [2,4,6], f 10=20`,
 
-; actual status is SAT, but here it's out of fragment
-; expect: ERROR
+; expect: SAT
 (declare-datatypes () ((nat_3 (s_3 (select_s_3_0 nat_3)) 
                               (z_3))))
 (define-funs-rec
