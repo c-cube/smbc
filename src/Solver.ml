@@ -1633,7 +1633,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
             uty_status=None;
           } in
           Log.debugf 5
-            (fun k->k "expand slice %a@ into (@[%a,@ %a@])"
+            (fun k->k "(@[expand-slice %a@ :into (@[%a,@ %a@])@])"
                 pp_uty uty Typed_cst.pp c_head pp_uty uty_tail);
           (* memoize *)
           uty.uty_pair <- Lazy_some (c_head, uty_tail);
@@ -2646,7 +2646,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     let expand_cst_ (t:t)(c:cst) : unit =
       assert (Ty.is_prop t.term_ty);
       Log.debugf 2
-        (fun k->k "(@[<1>expand_cst@ %a@ %a@])" Typed_cst.pp c Term.pp t);
+        (fun k->k "(@[<1>expand_cst@ %a@ :because-of %a@])" Typed_cst.pp c Term.pp t);
       Expand.expand_cst c;
       ()
 
