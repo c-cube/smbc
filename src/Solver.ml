@@ -1807,10 +1807,10 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         in
         Term.const cst'
       in
-      (* additional clause to specify that [is_empty uty_tail => not (cst = case2)] *)
+      (* additional clause to specify that [is_empty uty_tail => cst = case1] *)
       let c_not_empty =
         [ Lit.neg (Lit.uty_choice_empty uty_tail);
-          Lit.neg (Lit.cst_choice st.cst case2);
+          Lit.cst_choice st.cst case1;
         ]
         |> Clause.make
       in
