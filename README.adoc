@@ -57,9 +57,44 @@ OCAML_SPACETIME_INTERVAL=100 ./smbc.native --debug 1 --check examples/ty_infer.l
 prof_spacetime serve spacetime-<PID> -e smbc.native
 ----
 
+== A Few Examples
+
+We show a few example input files for smbc, along with the result.
+
+examples/append.smt::
+A wrong conjecture stating that `append l1 l2 = append l2 l1`
+holds for every lists `l1` and `l2`.
+----
+(declare-datatypes ()
+ ((nat (s (select_s_0 nat)) (z))))
+(declare-datatypes
+   ()
+   ((list (cons (select_cons_0 nat) (select_cons_1 list))
+          (nil))))
+(define-funs-rec
+   ((append ((x list) (y list)) list))
+   ((match x (case (cons n tail) (cons n (append tail y)))
+             (case nil y))))
+(assert-not
+ (forall ((l1 list) (l2 list)) (= (append l1 l2) (append l2 l1))))
+
+(check-sat)
+----
+Running smbc gives us a counter-example, the lists `l1 = [s _]` and `l2 = [0]`.
+Note that `l1` is not fully defined, the `?nat_8` object is an unknown
+that can take any value of type `nat`. Whatever its value is,
+the counter-example holds because `append l1 l2 != append l2 l1`.
+----
+$ smbc examples/append.smt2
+(result SAT :model ((val l2 (cons z nil))
+                    (val l1 (cons (s ?nat_8) nil))))
+----
+
+
 == Why the name?
 
 "Sat Modulo Bounded Checking"
 
 (and a reference to http://smbc-comics.com[the awesome webcomics])
+
 
