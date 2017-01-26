@@ -178,8 +178,6 @@ end
 type syntax =
   | Auto
   (** Guess based on file extension *)
-  | Smbc
-  (** Native syntax *)
   | Tip
   (** Syntax for Tip (https://github.com/tip-org/)
 

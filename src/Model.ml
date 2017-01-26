@@ -35,8 +35,8 @@ type entry =
 
 let pp_syn (syn:A.syntax) out (m:t) =
   let pp_cst_name out c = ID.pp_name out c in
-  let pp_ty = match syn with A.Auto | A.Tip -> A.pp_ty_tip | A.Smbc -> A.Ty.pp in
-  let pp_term = match syn with A.Auto | A.Tip -> A.pp_term_tip | A.Smbc -> A.pp_term in
+  let pp_ty = match syn with A.Auto | A.Tip -> A.pp_ty_tip in
+  let pp_term = match syn with A.Auto | A.Tip -> A.pp_term_tip in
   let pp_entry out = function
     | E_ty (ty,l) ->
       Format.fprintf out "(@[<1>type@ %a@ (@[<hv>%a@])@])"
@@ -52,8 +52,7 @@ let pp_syn (syn:A.syntax) out (m:t) =
   in
   Format.fprintf out "(@[<v>%a@])" (Utils.pp_list pp_entry) es
 
-let pp = pp_syn A.Smbc
-let pp_tip = pp_syn A.Tip
+let pp = pp_syn A.Tip
 
 exception Bad_model of t * term * term
 exception Error of string

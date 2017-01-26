@@ -402,12 +402,10 @@ module A = Parse_ast
 
 type syntax =
   | Auto
-  | Smbc
   | Tip
 
 let string_of_syntax = function
   | Auto -> "auto"
-  | Smbc -> "smbc"
   | Tip -> "tip"
 
 module StrTbl = CCHashtbl.Make(struct
@@ -833,10 +831,8 @@ and conv_statement_aux ctx syn (t:A.statement) : statement list = match A.view t
 
 and parse_file_exn ctx (syn:syntax) ~file : statement list =
   let syn = match syn with
-    | Tip | Smbc -> syn
-    | Auto ->
-      (* try to guess *)
-      if CCString.suffix ~suf:".smt2" file then Tip else Smbc
+    | Tip -> syn
+    | Auto -> Tip
   in
   Log.debugf 2 (fun k->k "use syntax: %s" (string_of_syntax syn));
   let l = match syn with
@@ -845,12 +841,6 @@ and parse_file_exn ctx (syn:syntax) ~file : statement list =
       (* delegate parsing to [Tip_parser] *)
       Tip_util.parse_file_exn file
       |> CCList.filter_map A.Tip.conv_stmt
-    | Smbc ->
-      CCIO.with_in file
-        (fun ic ->
-           let lexbuf = Lexing.from_channel ic in
-           A.Loc.set_file lexbuf file;
-           Parser_smbc.parse_list Lexer_smbc.token lexbuf)
   in
   CCList.flat_map (conv_statement ctx syn) l
 
@@ -861,7 +851,6 @@ let parse ~include_dir ~file syn =
 
 let parse_stdin syn = match syn with
   | Auto -> errorf "impossible to guess input format with <stdin>"
-  | Smbc -> errorf "impossible to parse <stdin> with sbmc format"
   | Tip ->
     let ctx = Ctx.create ~include_dir:"." () in
     try

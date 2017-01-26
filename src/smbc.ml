@@ -85,7 +85,6 @@ let set_stdin () = match !file with
 let set_syntax_ s =
   syntax_ :=
     begin match CCString.uncapitalize_ascii s with
-      | "smbc" -> Ast.Smbc
       | "tip" -> Ast.Tip
       | _ -> failwith ("unknown syntax " ^ s) (* TODO list *)
     end
