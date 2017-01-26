@@ -64,6 +64,7 @@ We show a few example input files for smbc, along with the result.
 examples/append.smt::
 A wrong conjecture stating that `append l1 l2 = append l2 l1`
 holds for every lists `l1` and `l2`.
++
 ----
 (declare-datatypes ()
  ((nat (s (select_s_0 nat)) (z))))
@@ -80,15 +81,55 @@ holds for every lists `l1` and `l2`.
 
 (check-sat)
 ----
++
 Running smbc gives us a counter-example, the lists `l1 = [s _]` and `l2 = [0]`.
 Note that `l1` is not fully defined, the `?nat_8` object is an unknown
 that can take any value of type `nat`. Whatever its value is,
 the counter-example holds because `append l1 l2 != append l2 l1`.
++
 ----
 $ smbc examples/append.smt2
 (result SAT :model ((val l2 (cons z nil))
                     (val l1 (cons (s ?nat_8) nil))))
 ----
+
+examples/pigeon4.smt::
+The instance of the classic
+https://en.wikipedia.org/wiki/Pigeonhole_principle[pigeon-hole problem]
+with 4 holes and 5 pigeons
++
+----
+(declare-sort hole 0)
+(declare-fun h1 () hole)
+(declare-fun h2 () hole)
+(declare-fun h3 () hole)
+(declare-fun h4 () hole)
+(declare-fun p1 () hole)
+(declare-fun p2 () hole)
+(declare-fun p3 () hole)
+(declare-fun p4 () hole)
+(declare-fun p5 () hole)
+(assert
+ (and
+  (not (= h1 h2)) (not (= h1 h3)) (not (= h1 h4))
+  (not (= h2 h3)) (not (= h2 h4)) (not (= h3 h4))))
+(assert
+ (and
+  (not (= p1 p2)) (not (= p1 p3)) (not (= p1 p4))
+  (not (= p1 p5))
+  (not (= p2 p3))
+  (not (= p2 p4))
+  (not (= p2 p5))
+  (not (= p3 p4))
+  (not (= p3 p5))
+  (not (= p4 p5))))
+(assert
+  (forall ((p hole)) (or (= p h1) (= p h2) (= p h3) (= p h4))))
+(check-sat)
+----
++
+We obtain `(result UNSAT)` since there is no way of satisfying
+the constraints.
 
 
 == Why the name?
