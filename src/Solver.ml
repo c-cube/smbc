@@ -1674,6 +1674,9 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
              let lit = Lit.cst_choice c rhs in
              let guard = match depth_of_term rhs with
                | None -> None
+               | Some depth_rhs
+                 when depth_rhs <= (Iterative_deepening.current_depth():>int) ->
+                 None (* no need to guard *)
                | Some depth_rhs ->
                  let _, guard = Iterative_deepening.lit_max_smaller_than depth_rhs in
                  Some guard
@@ -1797,7 +1800,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
          in the slice [uty_tail] *)
       let case1 = Term.const c_head in
       let case2 =
-        let exist_if = [lazy (Lit.uty_choice_nonempty uty)] in
+        let exist_if = [lazy (Lit.uty_choice_nonempty uty_tail)] in
         (* [cst = cst'], but [cst'] is deeper and belongs to the
            next slice [uty_tail].
            The case [cst = cst'] is only possible if [uty_tail] is non-empty. *)
