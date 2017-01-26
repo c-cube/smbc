@@ -2,13 +2,9 @@
 
 ## Now
 
-- update readme to add some docs and example in there
-
-- remove `lisp` format, its parser, and convert the examples (careful with comments)
+## Narrowing
 
 - rename `cst` into `unknown`?
-
-## Narrowing
 
 - [ ] some basic proof output:
     * recover the resolution graph
@@ -41,7 +37,7 @@
     with the combination of all explanations
   * CLI option to set the limit
 
-- add `default` in matching (makes for smaller terms)?
+- [ ] add `default` in matching in `Solver` (makes for smaller terms)?
 
 - remove field `term_blocking` (and special "parallel and") and use
   big-step semantics everywhere.
@@ -242,6 +238,7 @@
 
 ## Done
 
+- [x] remove `lisp` format, its parser, and convert the examples (careful with comments)
 - [x] add a `Undefined` term (poison pill) that propagates through application
     and builtins, and makes the solver backtrack immediately
     if `goal -> undefined`.
