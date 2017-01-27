@@ -99,7 +99,7 @@ let rec pp_ty out (ty:ty) = match ty with
   | Ty_bool -> CCFormat.string out "prop"
   | Ty_const s -> CCFormat.string out s
   | Ty_arrow (args,ret) ->
-    fpf out "(@[->@ %a@ %a@])" (Utils.pp_list pp_ty) args pp_ty ret
+    fpf out "(@[=>@ %a@ %a@])" (Utils.pp_list pp_ty) args pp_ty ret
 
 let rec pp_term out (t:term) = match t with
   | True -> CCFormat.string out "true"
@@ -118,8 +118,8 @@ let rec pp_term out (t:term) = match t with
     fpf out "(@[<1>match %a@ (@[<hv>%a@])@])" pp_term lhs
       (Utils.pp_list pp_case) cases
   | Let (v,t,u) -> fpf out "(@[<hv1>let %s@ %a@ %a@])" v pp_term t pp_term u
-  | If (a,b,c) -> fpf out "(@[<hv1>if %a@ %a@ %a@])" pp_term a pp_term b pp_term c
-  | Fun (v,body) -> fpf out "(@[<1>fun@ (%a)@ %a@])" pp_typed_var v pp_term body
+  | If (a,b,c) -> fpf out "(@[<hv1>ite %a@ %a@ %a@])" pp_term a pp_term b pp_term c
+  | Fun (v,body) -> fpf out "(@[<1>lambda@ (%a)@ %a@])" pp_typed_var v pp_term body
   | Forall (v,body) -> fpf out "(@[<1>forall@ (%a)@ %a@])" pp_typed_var v pp_term body
   | Exists (v,body) -> fpf out "(@[<1>exists@ (%a)@ %a@])" pp_typed_var v pp_term body
   | Mu (v,body) -> fpf out "(@[<1>mu@ (%a)@ %a@])" pp_typed_var v pp_term body
@@ -138,9 +138,9 @@ let pp_stmt out (st:statement) = match view st with
   | Stmt_goal (vars,t) ->
     fpf out "(@[goal@ (@[%a@])@ %a@])" (Utils.pp_list pp_typed_var) vars pp_term t
   | Stmt_ty_decl s ->
-    fpf out "(@[ty-decl@ %s@])" s
+    fpf out "(@[declare-sort@ %s 0@])" s
   | Stmt_decl (s, ty) ->
-    fpf out "(@[decl@ %s@ %a@])" s pp_ty ty
+    fpf out "(@[declare-const@ %s@ %a@])" s pp_ty ty
   | Stmt_def l ->
     let pp_def out (s,ty,rhs) =
       fpf out "(@[<1>%s@ %a@ %a@])" s pp_ty ty pp_term rhs
@@ -300,7 +300,6 @@ module Tip = struct
       | A.Stmt_lemma _ ->
         tip_error ?loc "smbc does not know how to handle `lemma` statements"
       | A.Stmt_check_sat -> None
-
 end
 
 (** {2 Errors} *)

@@ -157,9 +157,6 @@ val unfold_fun : term -> var list * term
 
 (** {2 Printing} *)
 
-val term_to_sexp : term to_sexp
-val statement_to_sexp : statement to_sexp
-
 val pp_term : term CCFormat.printer
 val pp_statement : statement CCFormat.printer
 

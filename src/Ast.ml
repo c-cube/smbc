@@ -172,85 +172,183 @@ type statement =
   | Assert of term
   | Goal of var list * term
 
-(** {2 Printing} *)
+(** {2 Helper} *)
 
-let typed_var_to_sexp = Var.to_sexp_typed Ty.to_sexp
+let unfold_fun t =
+  let rec aux acc t = match t.term with
+    | Fun (v, t') -> aux (v::acc) t'
+    | _ -> List.rev acc, t
+  in
+  aux [] t
 
-let rec term_to_sexp t = match t.term with
-  | Var v -> Var.to_sexp v
-  | Const id -> ID.to_sexp id
-  | App (f,l) -> S.of_list (term_to_sexp f :: List.map term_to_sexp l)
-  | Select ({select_name=lazy id; select_i=i; _}, t) ->
-    S.of_list [S.atom "select"; ID.to_sexp id; S.of_int i; term_to_sexp t]
-  | If (a,b,c) ->
-    S.of_list [S.atom "if"; term_to_sexp a; term_to_sexp b; term_to_sexp c]
-  | Match (t, m) ->
-    (S.atom "match" :: term_to_sexp t ::
-      (ID.Map.to_list m
+(** {2 To TIP} *)
+
+module TA = Tip_ast
+
+let id_to_tip : ID.t -> string =
+  let id_to_tip_tbl = ID.Tbl.create 64 in
+  let str_id : (string, ID.t) Hashtbl.t = Hashtbl.create 32 in
+  let sanitize_name =
+    CCString.map
+      (function '\'' -> '_' | '/' -> '_' | c -> c)
+  in
+  fun id ->
+    try ID.Tbl.find id_to_tip_tbl id
+    with Not_found ->
+      let prefix =
+        let p = ID.to_string id |> sanitize_name in
+        if CCString.for_all (function '-'|'0'..'9'->true | _ -> false) p
+        then "num_" ^ p (* TODO: option to control that, once nunchaku parses it *)
+        else p
+      in
+      let n = ref 0 in
+      let s = ref prefix in
+      while Hashtbl.mem str_id !s do
+        incr n;
+        s := prefix ^ "_" ^ string_of_int !n
+      done;
+      let name = !s in
+      Hashtbl.add str_id name id;
+      ID.Tbl.add id_to_tip_tbl id name;
+      name
+
+let rec ty_to_tip ty: TA.ty = match ty with
+  | Ty.Prop -> TA.ty_bool
+  | Ty.Const id -> TA.ty_const (id_to_tip id)
+  | Ty.Arrow (a,b) -> TA.ty_arrow (ty_to_tip a)(ty_to_tip b)
+
+let var_to_tip v : TA.var = id_to_tip (Var.id v)
+let typed_var_to_tip v = var_to_tip v, ty_to_tip (Var.ty v)
+
+let rec term_to_tip (t:term): TA.term = match t.term with
+  | Var v -> TA.const (var_to_tip v)
+  | Const c -> TA.const (id_to_tip c)
+  | Select ({select_name=lazy n; _}, arg) ->
+    TA.app (id_to_tip n) [term_to_tip arg]
+  | App (f,l) ->
+    let f = term_to_tip f in
+    let l = List.map term_to_tip l in
+    begin match f with
+      | TA.Const f_id -> TA.app f_id l
+      | _ -> List.fold_left TA.ho_app f l
+    end
+  | If (a,b,c) -> TA.if_ (term_to_tip a)(term_to_tip b)(term_to_tip c)
+  | Match (t,m) ->
+    let m =
+      ID.Map.to_list m
        |> List.map
-         (fun (c,(vars, rhs)) -> match vars with
-            | [] -> S.of_list [S.atom "case"; ID.to_sexp c; term_to_sexp rhs]
-            | _::_ ->
-              S.of_list
-                [ S.of_list (S.atom "case" :: ID.to_sexp c :: List.map Var.to_sexp vars);
-                  term_to_sexp rhs]
-         )))
-    |> S.of_list
-  | Switch (t, m) ->
-    (S.atom "switch" :: term_to_sexp t ::
-      (ID.Map.to_list m
-       |> List.map
-         (fun (c, rhs) ->
-            S.of_list [S.atom "case"; ID.to_sexp c; term_to_sexp rhs])
-         ))
-    |> S.of_list
-  | Let (v,t,u) ->
-    S.of_list [S.atom "let"; Var.to_sexp v; term_to_sexp t; term_to_sexp u]
-  | Fun (v,t) ->
-    S.of_list [S.atom "fun"; typed_var_to_sexp v; term_to_sexp t]
-  | Forall (v,t) ->
-    S.of_list [S.atom "forall"; typed_var_to_sexp v; term_to_sexp t]
-  | Exists (v,t) ->
-    S.of_list [S.atom "exists"; typed_var_to_sexp v; term_to_sexp t]
-  | Mu (v,t) ->
-    S.of_list [S.atom "mu"; typed_var_to_sexp v; term_to_sexp t]
-  | Not t -> S.of_list [S.atom "not"; term_to_sexp t]
-  | Binop (Eq, a, b) ->
-    S.of_list [S.atom "="; term_to_sexp a; term_to_sexp b]
-  | Binop (And, a, b) ->
-    S.of_list [S.atom "and"; term_to_sexp a; term_to_sexp b]
-  | Binop (Or, a, b) ->
-    S.of_list [S.atom "or"; term_to_sexp a; term_to_sexp b]
-  | Binop (Imply, a, b) ->
-    S.of_list [S.atom "=>"; term_to_sexp a; term_to_sexp b]
-  | Asserting (t,g)-> S.of_list [S.atom ":asserting"; term_to_sexp t; term_to_sexp g]
-  | True -> S.atom "true"
-  | False -> S.atom "false"
-  | Undefined_value -> S.atom "undefined_value"
-
-let statement_to_sexp st = match st with
-  | Data l ->
-    S.of_list
-      (S.atom "data" :: List.map Ty.data_to_sexp l)
-  | TyDecl id ->
-    S.of_list [S.atom "type"; ID.to_sexp id]
-  | Decl (id,ty) ->
-    S.of_list [S.atom "decl"; ID.to_sexp id; Ty.to_sexp ty]
-  | Define defs ->
-    let def_to_sexp (id,ty,t) =
-      S.of_list [ID.to_sexp id; Ty.to_sexp ty; term_to_sexp t]
+         (fun (c,(vars,rhs)) ->
+            TA.Match_case (
+              id_to_tip c,
+              List.map var_to_tip vars,
+              term_to_tip rhs))
     in
-    S.of_list (S.atom "define" :: List.map def_to_sexp defs)
-  | Assert t ->
-    S.of_list [S.atom "assert"; term_to_sexp t]
-  | Goal (vars,t) ->
-    S.of_list
-      [S.atom "goal";
-       S.of_list (List.map typed_var_to_sexp vars);
-       term_to_sexp t]
+    TA.match_ (term_to_tip t) m
+  | Switch (t,m) ->
+    let t = term_to_tip t in
+    begin match ID.Map.to_list m with
+      | [] -> assert false
+      | (_, last_rhs) :: tail ->
+        List.fold_left
+          (fun else_ (c, rhs) ->
+             let test = TA.eq t (TA.const (id_to_tip c)) in
+             TA.if_ test (term_to_tip rhs) else_)
+          (term_to_tip last_rhs) tail
+    end
+  | True -> TA.true_
+  | False -> TA.false_
+  | Let (v,t,u) ->
+    TA.let_ [var_to_tip v, term_to_tip t] (term_to_tip u)
+  | Fun (v,t) ->
+    TA.fun_ (typed_var_to_tip v) (term_to_tip t)
+  | Forall (v,t) ->
+    TA.forall [typed_var_to_tip v] (term_to_tip t)
+  | Exists (v,t) ->
+    TA.exists [typed_var_to_tip v] (term_to_tip t)
+  | Not t -> TA.not_ (term_to_tip t)
+  | Binop (op,a,b) ->
+    let a = term_to_tip a in
+    let b = term_to_tip b in
+    begin match op with
+      | And -> TA.and_ [a;b]
+      | Or -> TA.or_ [a;b]
+      | Imply -> TA.imply a b
+      | Eq -> TA.eq a b
+    end
+  | Asserting(t,g) -> TA.app "asserting" [term_to_tip t; term_to_tip g]
+  | Undefined_value -> failwith "cannot translate `undefined-value` to TIP"
+  | Mu (_,_) -> assert false (* TODO? *)
 
-let pp_term out t = CCSexpM.print out (term_to_sexp t)
-let pp_statement out t = CCSexpM.print out (statement_to_sexp t)
+let mk_tip_decl id ty =
+  let args, ret = Ty.unfold ty in
+  let args = List.map ty_to_tip args in
+  let ret = ty_to_tip ret in
+  TA.mk_fun_decl ~ty_vars:[] (id_to_tip id) args ret
+
+let mk_tip_def id ty rhs =
+  let args, body = unfold_fun rhs in
+  let ty_args, ty_ret = Ty.unfold ty in
+  assert (List.length ty_args = List.length args);
+  let args = List.map (fun {Var.id=v;ty} -> id_to_tip v, ty_to_tip ty) args in
+  let ty_ret = ty_to_tip ty_ret in
+  let body = term_to_tip body in
+  TA.mk_fun_decl ~ty_vars:[] (id_to_tip id) args ty_ret, body
+
+let statement_to_tip (t:statement) : TA.statement list = match t with
+  | TyDecl id -> [TA.decl_sort (id_to_tip id) ~arity:0]
+  | Decl (id,ty) ->
+    let args, ret = Ty.unfold ty in
+    let args = List.map ty_to_tip args in
+    let ret = ty_to_tip ret in
+    [TA.decl_fun ~tyvars:[] (id_to_tip id) args ret]
+  | Data l ->
+    let l =
+      List.map
+        (fun {Ty.data_id; data_cstors} ->
+           let cstors =
+             ID.Map.to_list data_cstors
+             |> List.map
+               (fun (id, ty) ->
+                  let c = id_to_tip id in
+                  let ty_args, _ = Ty.unfold ty in
+                  let ty_args =
+                    List.mapi
+                      (fun i ty_arg ->
+                         Printf.sprintf "select_%s_%d" c i, ty_to_tip ty_arg)
+                      ty_args
+                  in
+                  TA.mk_cstor c ty_args)
+           in
+           id_to_tip data_id, cstors)
+        l
+    in
+    [TA.data [] l]
+  | Define l ->
+    let l =
+      List.map
+        (fun (id,ty,rhs) -> mk_tip_def id ty rhs)
+        l
+    in
+    let decls, bodies = List.split l in
+    [TA.funs_rec decls bodies]
+  | Assert t ->
+    [TA.assert_ (term_to_tip t)]
+  | Goal (vars,e) ->
+    let vars = List.map typed_var_to_tip vars in
+    let e = term_to_tip e in
+    [TA.assert_not ~ty_vars:[] (TA.forall vars (TA.not_ e));
+     TA.check_sat ();
+    ]
+
+let pp_term_tip out t = TA.pp_term out (term_to_tip t)
+let pp_term = pp_term_tip
+
+let pp_ty_tip out ty = TA.pp_ty out (ty_to_tip ty)
+let pp_ty = pp_ty_tip
+
+let pp_statement_tip out stmt =
+  List.iter (TA.pp_stmt out) (statement_to_tip stmt)
+let pp_statement = pp_statement_tip
 
 (** {2 Constructors} *)
 
@@ -333,13 +431,6 @@ let let_ v t u =
 let fun_ v t =
   let ty = Ty.arrow (Var.ty v) t.ty in
   mk_ (Fun (v,t)) ty
-
-let unfold_fun t =
-  let rec aux acc t = match t.term with
-    | Fun (v, t') -> aux (v::acc) t'
-    | _ -> List.rev acc, t
-  in
-  aux [] t
 
 let quant_ q v t =
   if not (Ty.equal t.ty Ty.prop)
@@ -859,172 +950,6 @@ let parse_stdin syn = match syn with
       |> CCList.flat_map (conv_statement ctx syn)
       |> CCResult.return
     with e -> Result.Error (Printexc.to_string e)
-
-(** {2 To TIP} *)
-
-module TA = Tip_ast
-
-let id_to_tip : ID.t -> string =
-  let id_to_tip_tbl = ID.Tbl.create 64 in
-  let str_id : (string, ID.t) Hashtbl.t = Hashtbl.create 32 in
-  let sanitize_name =
-    CCString.map
-      (function '\'' -> '_' | '/' -> '_' | c -> c)
-  in
-  fun id ->
-    try ID.Tbl.find id_to_tip_tbl id
-    with Not_found ->
-      let prefix =
-        let p = ID.to_string id |> sanitize_name in
-        if CCString.for_all (function '-'|'0'..'9'->true | _ -> false) p
-        then "num_" ^ p (* TODO: option to control that, once nunchaku parses it *)
-        else p
-      in
-      let n = ref 0 in
-      let s = ref prefix in
-      while Hashtbl.mem str_id !s do
-        incr n;
-        s := prefix ^ "_" ^ string_of_int !n
-      done;
-      let name = !s in
-      Hashtbl.add str_id name id;
-      ID.Tbl.add id_to_tip_tbl id name;
-      name
-
-let rec ty_to_tip ty: TA.ty = match ty with
-  | Ty.Prop -> TA.ty_bool
-  | Ty.Const id -> TA.ty_const (id_to_tip id)
-  | Ty.Arrow (a,b) -> TA.ty_arrow (ty_to_tip a)(ty_to_tip b)
-
-let var_to_tip v : TA.var = id_to_tip (Var.id v)
-let typed_var_to_tip v = var_to_tip v, ty_to_tip (Var.ty v)
-
-let rec term_to_tip (t:term): TA.term = match t.term with
-  | Var v -> TA.const (var_to_tip v)
-  | Const c -> TA.const (id_to_tip c)
-  | Select ({select_name=lazy n; _}, arg) ->
-    TA.app (id_to_tip n) [term_to_tip arg]
-  | App (f,l) ->
-    let f = term_to_tip f in
-    let l = List.map term_to_tip l in
-    begin match f with
-      | TA.Const f_id -> TA.app f_id l
-      | _ -> List.fold_left TA.ho_app f l
-    end
-  | If (a,b,c) -> TA.if_ (term_to_tip a)(term_to_tip b)(term_to_tip c)
-  | Match (t,m) ->
-    let m =
-      ID.Map.to_list m
-       |> List.map
-         (fun (c,(vars,rhs)) ->
-            TA.Match_case (
-              id_to_tip c,
-              List.map var_to_tip vars,
-              term_to_tip rhs))
-    in
-    TA.match_ (term_to_tip t) m
-  | Switch (t,m) ->
-    let t = term_to_tip t in
-    begin match ID.Map.to_list m with
-      | [] -> assert false
-      | (_, last_rhs) :: tail ->
-        List.fold_left
-          (fun else_ (c, rhs) ->
-             let test = TA.eq t (TA.const (id_to_tip c)) in
-             TA.if_ test (term_to_tip rhs) else_)
-          (term_to_tip last_rhs) tail
-    end
-  | True -> TA.true_
-  | False -> TA.false_
-  | Let (v,t,u) ->
-    TA.let_ [var_to_tip v, term_to_tip t] (term_to_tip u)
-  | Fun (v,t) ->
-    TA.fun_ (typed_var_to_tip v) (term_to_tip t)
-  | Forall (v,t) ->
-    TA.forall [typed_var_to_tip v] (term_to_tip t)
-  | Exists (v,t) ->
-    TA.exists [typed_var_to_tip v] (term_to_tip t)
-  | Not t -> TA.not_ (term_to_tip t)
-  | Binop (op,a,b) ->
-    let a = term_to_tip a in
-    let b = term_to_tip b in
-    begin match op with
-      | And -> TA.and_ [a;b]
-      | Or -> TA.or_ [a;b]
-      | Imply -> TA.imply a b
-      | Eq -> TA.eq a b
-    end
-  | Asserting(t,g) -> TA.app "asserting" [term_to_tip t; term_to_tip g]
-  | Undefined_value -> failwith "cannot translate `undefined-value` to TIP"
-  | Mu (_,_) -> assert false (* TODO? *)
-
-let mk_tip_decl id ty =
-  let args, ret = Ty.unfold ty in
-  let args = List.map ty_to_tip args in
-  let ret = ty_to_tip ret in
-  TA.mk_fun_decl ~ty_vars:[] (id_to_tip id) args ret
-
-let mk_tip_def id ty rhs =
-  let args, body = unfold_fun rhs in
-  let ty_args, ty_ret = Ty.unfold ty in
-  assert (List.length ty_args = List.length args);
-  let args = List.map (fun {Var.id=v;ty} -> id_to_tip v, ty_to_tip ty) args in
-  let ty_ret = ty_to_tip ty_ret in
-  let body = term_to_tip body in
-  TA.mk_fun_decl ~ty_vars:[] (id_to_tip id) args ty_ret, body
-
-let statement_to_tip (t:statement) : TA.statement list = match t with
-  | TyDecl id -> [TA.decl_sort (id_to_tip id) ~arity:0]
-  | Decl (id,ty) ->
-    let args, ret = Ty.unfold ty in
-    let args = List.map ty_to_tip args in
-    let ret = ty_to_tip ret in
-    [TA.decl_fun ~tyvars:[] (id_to_tip id) args ret]
-  | Data l ->
-    let l =
-      List.map
-        (fun {Ty.data_id; data_cstors} ->
-           let cstors =
-             ID.Map.to_list data_cstors
-             |> List.map
-               (fun (id, ty) ->
-                  let c = id_to_tip id in
-                  let ty_args, _ = Ty.unfold ty in
-                  let ty_args =
-                    List.mapi
-                      (fun i ty_arg ->
-                         Printf.sprintf "select_%s_%d" c i, ty_to_tip ty_arg)
-                      ty_args
-                  in
-                  TA.mk_cstor c ty_args)
-           in
-           id_to_tip data_id, cstors)
-        l
-    in
-    [TA.data [] l]
-  | Define l ->
-    let l =
-      List.map
-        (fun (id,ty,rhs) -> mk_tip_def id ty rhs)
-        l
-    in
-    let decls, bodies = List.split l in
-    [TA.funs_rec decls bodies]
-  | Assert t ->
-    [TA.assert_ (term_to_tip t)]
-  | Goal (vars,e) ->
-    let vars = List.map typed_var_to_tip vars in
-    let e = term_to_tip e in
-    [TA.assert_not ~ty_vars:[] (TA.forall vars (TA.not_ e));
-     TA.check_sat ();
-    ]
-
-let pp_term_tip out t = TA.pp_term out (term_to_tip t)
-
-let pp_ty_tip out ty = TA.pp_ty out (ty_to_tip ty)
-
-let pp_statement_tip out stmt =
-  List.iter (TA.pp_stmt out) (statement_to_tip stmt)
 
 (** {2 Environment} *)
 
