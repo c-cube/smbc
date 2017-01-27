@@ -465,13 +465,14 @@ let check_prop_ t =
   if not (Ty.equal t.ty Ty.prop)
   then Ty.ill_typed "expected prop, got `@[%a : %a@]`" pp_term t Ty.pp t.ty
 
-let binop op a b =
+let binop op a b = mk_ (Binop (op, a, b)) Ty.prop
+let binop_prop op a b =
   check_prop_ a; check_prop_ b;
-  mk_ (Binop (op, a, b)) Ty.prop
+  binop op a b
 
-let and_ = binop And
-let or_ = binop Or
-let imply = binop Imply
+let and_ = binop_prop And
+let or_ = binop_prop Or
+let imply = binop_prop Imply
 
 let and_l = function
   | [] -> true_
