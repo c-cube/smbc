@@ -179,11 +179,15 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
   }
 
   and lit_view =
-    | Lit_default_depth
-    | Lit_depth_limit of ty_h * int (* depth limit for this type *)
+    | Lit_depth_limit of lit_depth_arg * int (* depth limit for this type *)
     | Lit_atom of term
     | Lit_assign of cst * term
     | Lit_uty_empty of ty_uninterpreted_slice
+
+  and lit_depth_arg =
+    | Depth_prop
+    | Depth_fun
+    | Depth_ty of ty_h
 
   and cst = {
     cst_id: ID.t;
@@ -303,11 +307,9 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     let arrow a b = hashcons_ (Arrow (a,b))
     let arrow_l = List.fold_right arrow
 
-    let is_prop t =
-      match t.ty_cell with | Prop -> true | _ -> false
-
-    let is_data t =
-      match t.ty_cell with | Atomic (_, Data _) -> true | _ -> false
+    let is_prop t = match t.ty_cell with | Prop -> true | _ -> false
+    let is_data t = match t.ty_cell with | Atomic (_, Data _) -> true | _ -> false
+    let is_arrow t = match t.ty_cell with | Arrow _ -> true | _ -> false
 
     let unfold ty : t list * t =
       let rec aux acc ty = match ty.ty_cell with
@@ -339,6 +341,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
 
     module Tbl = CCHashtbl.Make(As_key)
     module Map = CCMap.Make(As_key)
+    module Set = CCSet.Make(As_key)
   end
 
   (** {2 Typed De Bruijn indices} *)
@@ -443,38 +446,47 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
   let hash_uty uty =
     Hash.combine3 104 (Ty.hash (Lazy.force uty.uty_self)) uty.uty_offset
 
+  let cmp_depth_arg a b =
+    let to_int = function Depth_prop -> 0 | Depth_fun -> 1 | Depth_ty _ -> 2 in
+    match a, b with
+      | Depth_prop, Depth_prop
+      | Depth_fun, Depth_fun -> 0
+      | Depth_ty ty1, Depth_ty ty2 -> Ty.compare ty1 ty2
+      | _ -> CCOrd.int_ (to_int a)(to_int b)
+
   let cmp_lit a b =
     let c = CCOrd.bool_ a.lit_sign b.lit_sign in
     if c<>0 then c
     else
       let int_of_cell_ = function
-        | Lit_default_depth -> 0
         | Lit_depth_limit _ -> 1
         | Lit_atom _ -> 2
         | Lit_assign _ -> 3
         | Lit_uty_empty _ -> 4
       in
       match a.lit_view, b.lit_view with
-        | Lit_default_depth, Lit_default_depth -> 0
         | Lit_depth_limit (ty1,i1), Lit_depth_limit (ty2,i2) ->
-          CCOrd.(Ty.compare ty1 ty2 <?> (int_, i1, i2))
+          CCOrd.(cmp_depth_arg ty1 ty2 <?> (int_, i1, i2))
         | Lit_atom t1, Lit_atom t2 -> term_cmp_ t1 t2
         | Lit_assign (c1,t1), Lit_assign (c2,t2) ->
           CCOrd.(Typed_cst.compare c1 c2 <?> (term_cmp_, t1, t2))
         | Lit_uty_empty u1, Lit_uty_empty u2 -> cmp_uty u1 u2
-        | Lit_default_depth, _
         | Lit_depth_limit _, _
         | Lit_atom _, _
         | Lit_assign _, _
         | Lit_uty_empty _, _ ->
           CCOrd.int_ (int_of_cell_ a.lit_view) (int_of_cell_ b.lit_view)
 
+  let hash_depth_arg = function
+    | Depth_prop -> 0
+    | Depth_fun -> 1
+    | Depth_ty ty -> Hash.combine2 42 (Ty.hash ty)
+
   let hash_lit a =
     let sign = a.lit_sign in
     match a.lit_view with
-      | Lit_default_depth -> 0
       | Lit_depth_limit (ty,i) ->
-        Hash.combine4 1 (Hash.bool sign) (Ty.hash ty) (Hash.int i)
+        Hash.combine4 1 (Hash.bool sign) (hash_depth_arg ty) (Hash.int i)
       | Lit_atom t -> Hash.combine3 2 (Hash.bool sign) (term_hash_ t)
       | Lit_assign (c,t) ->
         Hash.combine4 3 (Hash.bool sign) (Typed_cst.hash c) (term_hash_ t)
@@ -1216,10 +1228,15 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       )
   end
 
+  let pp_depth_arg out = function
+    | Depth_prop -> CCFormat.string out "prop"
+    | Depth_fun -> CCFormat.string out "fun"
+    | Depth_ty ty -> Ty.pp out ty
+
   let pp_lit out l =
     let pp_lit_view out = function
-      | Lit_default_depth -> CCFormat.string out "default_depth"
-      | Lit_depth_limit (ty,i) -> Format.fprintf out "[depth(%a)≤%d]" Ty.pp ty i
+      | Lit_depth_limit (ty,i) ->
+        Format.fprintf out "[depth(%a)≤%d]" pp_depth_arg ty i
       | Lit_atom t -> Term.pp out t
       | Lit_assign (c,t) ->
         Format.fprintf out "(@[:= %a@ %a@])" Typed_cst.pp c Term.pp t
@@ -1237,8 +1254,9 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     val view : t -> lit_view
     val as_atom : t -> (term * bool) option
     val dummy : t
+    val true_: t
+    val depth_limit_fun : int -> t
     val depth_limit : Ty.t -> int -> t
-    val default_depth : t
     val atom : ?sign:bool -> term -> t
     val eq : term -> term -> t
     val neq : term -> term -> t
@@ -1266,15 +1284,20 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
 
     let make ~sign v = {lit_sign=sign; lit_view=v}
 
-    let default_depth = make ~sign:true Lit_default_depth
-    let depth_limit ty i = make ~sign:true (Lit_depth_limit(ty,i))
-
     let atom ?(sign=true) (t:term) : t =
       let t, sign' = Term.abs t in
       let sign = if not sign' then not sign else sign in
       make ~sign (Lit_atom t)
 
-    let dummy = atom Term.true_
+    let true_ = atom Term.true_
+    let dummy = true_
+
+    let depth_limit_fun i = make ~sign:true (Lit_depth_limit(Depth_fun,i))
+
+    let depth_limit ty i = match ty.ty_cell with
+      | Prop -> dummy
+      | Atomic _ -> make ~sign:true (Lit_depth_limit(Depth_ty ty,i))
+      | Arrow _ -> depth_limit_fun i
 
     let eq a b = atom ~sign:true (Term.eq a b)
     let neq a b = atom ~sign:false (Term.eq a b)
@@ -1440,6 +1463,16 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     val max_depth : t
 
    (* FIXME:
+      When a type appears, it has a new [depth(ty)<=step] literal.
+
+      ??? PROBLEM: cannot add it to assumptions on-the-fly…
+        and some types are created dynamically (or just have one limit for
+        all functions?)
+
+      OR: TODO: gather all types at the beginning (uninterpreted, datatypes,
+      + the generic "function" limit)
+      and add them to the map from the start. Make "default" redundant.
+
       need some "default" depth literal for types that have not been seen yet.
       [lit_of_depth step ty] should return a literal [depth(ty)<=step]
       such that [default_lit => depth(ty)<=step].
@@ -1448,25 +1481,32 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       (but it's ignored by [next]).
    *)
 
+    type at_state = {
+      atomic: Lit.t Ty.Map.t;
+      funs: Lit.t;
+    }
+
     type state =
-      | At of Lit.t Ty.Map.t
+      | At of at_state
       | Exhausted
 
-    val reset : unit -> unit
+    val start : Ty.Set.t -> unit
     val current : unit -> state
 
     val current_depth : Ty.t -> int
     (** Current depth for this type *)
 
-    val next : Ty.t list -> state
+    val next : lit_depth_arg list -> state
     (** Increment given types.
         If all of them are exhausted, return [Exhausted]  *)
 
-    val lit_as_depth : lit -> (Ty.t * int) option
+    val lit_as_depth : lit -> (lit_depth_arg * int) option
 
-    val lit_of_depth : int -> Ty.t -> Lit.t option
-    val lit_max_smaller_than : int -> Ty.t -> int * Lit.t
+    val lit_of_depth : int -> lit_depth_arg -> Lit.t option
+    val lit_max_smaller_than : int -> lit_depth_arg -> int * Lit.t
     (** maximal literal strictly smaller than the given depth *)
+
+    val depth_arg_of_ty : Ty.t -> lit_depth_arg
 
     val pp: t CCFormat.printer
   end = struct
@@ -1492,17 +1532,30 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       res
 
     (* invariant: all literals are of the form [Lit_depth_limit] *)
+    type at_state = {
+      atomic: Lit.t Ty.Map.t;
+      funs: Lit.t;
+    }
+
     type state =
-      | At of Lit.t Ty.Map.t
+      | At of at_state
       | Exhausted
 
     let lits_ : (int, Lit.t Ty.Map.t) Hashtbl.t = Hashtbl.create 32
 
+    let empty_state : at_state = {
+      atomic=Ty.Map.empty;
+      funs=Lit.depth_limit_fun step_;
+    }
+
     (* get the literal correspond to depth [d], if any *)
-    let rec lit_of_depth d ty : Lit.t option =
-      if d < step_ || (d mod step_ <> 0)
-      then None
-      else (
+    let rec lit_of_depth d arg : Lit.t option = match arg with
+      | _ when d < step_ || (d mod step_ <> 0) -> None
+      | Depth_prop -> Some Lit.true_
+      | Depth_fun ->
+        Some (Lit.depth_limit_fun d) (* all functions have same depth *)
+      | Depth_ty ty ->
+        assert (not (Ty.is_prop ty) && not (Ty.is_arrow ty));
         let map = CCHashtbl.get_or ~or_:Ty.Map.empty lits_ d in
         begin match Ty.Map.get ty map with
           | Some l -> Some l
@@ -1510,20 +1563,14 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
             let lit = Lit.depth_limit ty d in
             Hashtbl.replace lits_ d (Ty.Map.add ty lit map);
             (* relation with previous lit: [prev_lit => lit] *)
-            begin match prev d ty with
+            begin match prev d arg with
               | None -> assert (d=step_); ()
               | Some prev_lit ->
                 let c = Clause.make [Lit.neg prev_lit; lit] in
                 Clause.push_new c;
             end;
-            (* if [d = step_], add [Lit.default_depth => lit] *)
-            if d = step_ then (
-              let c = Clause.make [Lit.neg Lit.default_depth; lit] in
-              Clause.push_new c;
-            );
             Some lit
         end
-      )
 
     (* previous literal *)
     and prev d ty : Lit.t option =
@@ -1544,11 +1591,29 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       end
 
     (* initial state *)
-    let start_ = At Ty.Map.empty
+    let cur_ = ref (At empty_state)
 
-    let cur_ = ref start_
-    let reset () = cur_ := start_
     let current () = !cur_
+
+    let depth_arg_of_ty ty = match Ty.view ty with
+      | Prop -> assert false
+      | Atomic _ -> Depth_ty ty
+      | Arrow _ -> Depth_fun
+
+    (* start/reset, with the given set of (atomic) types *)
+    let start tys =
+      let atomic =
+        Ty.Set.to_seq tys
+        |> Sequence.filter
+          (fun ty -> match Ty.view ty with
+             | Atomic _ -> true | Prop | Arrow _ -> false)
+        |> Sequence.map
+          (fun ty -> match lit_of_depth step_ (Depth_ty ty) with
+             | None -> assert false
+             | Some lit -> ty, lit)
+        |> Ty.Map.of_seq
+      in
+      cur_ := At {empty_state with atomic}
 
     let lit_as_depth l = match Lit.view l with
       | Lit_depth_limit (ty,d) -> Some (ty,d)
@@ -1556,59 +1621,75 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
 
     let current_depth ty = match !cur_ with
       | Exhausted -> max_depth
-      | At map ->
-        begin match Ty.Map.get ty map with
+      | At at_state when Ty.is_arrow ty ->
+        begin match lit_as_depth at_state.funs with
+          | Some (_,d) -> d
+          | None -> assert false
+        end
+      | At at_state ->
+        begin match Ty.Map.get ty at_state.atomic with
           | Some {lit_view=Lit_depth_limit (_,d);_} -> d
-          | Some {lit_view=Lit_default_depth; _} -> step_
           | Some _ -> assert false
           | None ->
             let d = step_ in
-            let lit = match lit_of_depth d ty with
+            let lit = match lit_of_depth d (Depth_ty ty) with
               | None -> assert false
               | Some lit -> lit
             in
-            cur_ := At (Ty.Map.add ty lit map);
+            let at_state =
+              {at_state with atomic=Ty.Map.add ty lit at_state.atomic}
+            in
+            cur_ := At at_state;
             d
         end
 
     (* next state *)
-    let next (ty_l:Ty.t list): state = match !cur_ with
+    let next (ty_l:lit_depth_arg list): state = match !cur_ with
       | Exhausted -> assert false
-      | At map_old ->
+      | At state_old ->
         let all_exhausted = ref true in
-        let map =
+        (* how to bump a depth-limit literal? *)
+        let bump_lit (a:lit_depth_arg) (lit_old:lit): lit =
+          let lev_old = match Lit.view lit_old with
+            | Lit_depth_limit (_, l) -> l
+            | _ -> assert false
+          in
+          (* update level and current lit for [ty] *)
+          let lev_new = lev_old + step_ in
+          if lev_new > max_depth
+          then lit_old
+          else (
+            all_exhausted := false;
+            let lit_new = match lit_of_depth lev_new a with
+              | Some lit -> lit
+              | None -> errorf "increased depth to %d, but not lit" lev_new
+            in
+            Log.debugf 2
+              (fun k->k
+                  "(@[<1>iterative_deepening :level %d :ty %a :lit %a@])"
+                  lev_new pp_depth_arg a Lit.pp lit_new);
+            lit_new
+          )
+        in
+        let funs =
+          if List.exists (function Depth_fun -> true| _ -> false) ty_l
+          then bump_lit Depth_fun state_old.funs
+          else state_old.funs
+        and atomic =
           Ty.Map.mapi
             (fun ty lit_old ->
-               if List.exists (Ty.equal ty) ty_l
-               then (
-                 let lev_old = match Lit.view lit_old with
-                   | Lit_depth_limit (_, l) -> l
-                   | _ -> assert false
-                 in
-                 (* update level and current lit for [ty] *)
-                 let lev_new = lev_old + step_ in
-                 if lev_new > max_depth
-                 then lit_old
-                 else (
-                   all_exhausted := false;
-                   let lit_new = match lit_of_depth lev_new ty with
-                     | Some lit -> lit
-                     | None -> errorf "increased depth to %d, but not lit" lev_new
-                   in
-                   Log.debugf 2
-                     (fun k->k
-                         "(@[<1>iterative_deepening :level %d :ty %a :lit %a@])"
-                         lev_new Ty.pp ty Lit.pp lit_new);
-                   lit_new
-                 )
-               ) else lit_old
-            )
-            map_old
+               if not (Ty.is_arrow ty) &&
+                  List.exists
+                    (function Depth_ty ty' -> Ty.equal ty ty' | _ -> false)
+                    ty_l
+               then bump_lit (Depth_ty ty) lit_old
+               else lit_old)
+            state_old.atomic
         in
         let st =
           if !all_exhausted
           then Exhausted
-          else At map
+          else At {atomic; funs}
         in
         cur_ := st;
         st
@@ -1641,7 +1722,9 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
        [uty = empty] and [uty = c_head : uty_tail] *)
     let clauses_of_uty (uty:ty_uninterpreted_slice) : Clause.t list =
       let n = uty.uty_offset in
-      let guard = Iterative_deepening.lit_of_depth n (Lazy.force uty.uty_self) in
+      let guard =
+        Iterative_deepening.lit_of_depth n (Depth_ty (Lazy.force uty.uty_self))
+      in
       let lit_nonempty = Lit.uty_choice_nonempty uty in
       (* - if we have a parent:
            nonempty => the previous slice must also be nonempty
@@ -1734,7 +1817,8 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
                  None (* no need to guard *)
                | Some depth_rhs ->
                  let _, guard =
-                   Iterative_deepening.lit_max_smaller_than depth_rhs rhs.term_ty
+                   Iterative_deepening.lit_max_smaller_than
+                     depth_rhs (Iterative_deepening.depth_arg_of_ty rhs.term_ty)
                  in
                  Some guard
              in
@@ -2640,7 +2724,6 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
 
     let compute_nf_lit (lit:lit): explanation * lit =
       match Lit.view lit with
-        | Lit_default_depth
         | Lit_depth_limit (_,_)
         | Lit_assign (_,_)
         | Lit_uty_empty _ -> Explanation.empty, lit
@@ -2957,7 +3040,6 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       (* check consistency first *)
       let e, lit' = Reduce.compute_nf_lit lit in
       begin match Lit.view lit' with
-        | Lit_default_depth
         | Lit_depth_limit (_,_) -> ()
         | Lit_atom {term_cell=True; _} -> ()
         | Lit_atom {term_cell=False; _} ->
@@ -3027,6 +3109,9 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
 
   let add_ty_support_ (ty:Ty.t): unit =
     CCList.Ref.push model_utys ty
+
+  (* all atomic types met so far *)
+  let all_atomic_tys : Ty.Set.t ref = ref Ty.Set.empty
 
   module Conv = struct
     (* for converting Ast.Ty into Ty *)
@@ -3271,6 +3356,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           ) in
           (* model should contain domain of [ty] *)
           add_ty_support_ (Lazy.force ty);
+          all_atomic_tys := Ty.Set.add (Lazy.force ty) !all_atomic_tys;
           ID.Tbl.add ty_tbl_ id ty
         | Ast.Decl (id, ty) ->
           assert (not (ID.Tbl.mem decl_ty_ id));
@@ -3300,10 +3386,11 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
                ID.Tbl.add ty_tbl_ data_id ty;
             )
             l;
-          (* force evaluation *)
+          (* force evaluation and register the type *)
           List.iter
             (fun {Ast.Ty.data_id; _} ->
-               ID.Tbl.find ty_tbl_ data_id |> Lazy.force |> ignore)
+               let lazy ty = ID.Tbl.find ty_tbl_ data_id in
+               all_atomic_tys := Ty.Set.add ty !all_atomic_tys)
             l
         | Ast.Define l ->
           (* declare the mutually recursive functions *)
@@ -3645,7 +3732,8 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       |> Sequence.flat_map Clause.to_seq
       |> Sequence.iter
         (fun lit ->
-           if Lit.Set.mem (Lit.abs lit) depth_lits then (
+           let lit = Lit.abs lit in
+           if Lit.Set.mem lit depth_lits then (
              unsat_core_lits := Lit.Set.add lit !unsat_core_lits;
            );
         );
@@ -3682,11 +3770,11 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       | ID.Exhausted ->
         do_on_exit ~on_exit;
         Unknown U_max_depth
-      | ID.At map ->
+      | ID.At at_state ->
         (* restrict depth (for each type) *)
         let assumptions =
-          Lit.default_depth ::
-          (Ty.Map.values map |> Sequence.to_rev_list)
+          at_state.ID.funs ::
+          (Ty.Map.values at_state.ID.atomic |> Sequence.to_rev_list)
         in
         match M.solve ~assumptions () with
           | M.Sat _ ->
@@ -3710,11 +3798,16 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
             if Config.check_proof then M.Proof.check p;
             let status =
               (* refresh map *)
-              let map = match ID.current() with
-                | ID.At map -> map
+              let at_state = match ID.current() with
+                | ID.At at_state -> at_state
                 | ID.Exhausted -> assert false
               in
-              proof_status (Ty.Map.values map |> Lit.Set.of_seq) p
+              let all_lits =
+                Ty.Map.values at_state.ID.atomic
+                |> Sequence.cons at_state.ID.funs
+                |> Lit.Set.of_seq
+              in
+              proof_status all_lits p
             in
             Log.debugf 1
               (fun k->k
@@ -3749,7 +3842,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
                 Unsat
              end
     in
-    ID.reset ();
+    ID.start !all_atomic_tys;
     iter (ID.current ())
 end
 
