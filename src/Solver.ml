@@ -3826,8 +3826,10 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
                 and limiting_tys =
                   Lit.Set.to_seq limiting_lits
                   |> Sequence.filter_map ID.lit_as_depth
-                  |> Sequence.map fst
                   |> Sequence.to_rev_list
+                  |> List.sort (CCOrd.map snd CCOrd.int_) (* sort by depth *)
+                  (* |> CCList.take 1 (* take the smallest limited lit *) *)
+                  |> List.map fst
                 in
                 push_clause c;
                 iter (ID.next limiting_tys) (* deeper! *)
