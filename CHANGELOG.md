@@ -1,5 +1,9 @@
 # Change Log
 
+## 0.3.1
+
+- compatibility with containers 1.0
+
 ## 0.3
 
 - add flag `--check-proof` for checking SAT solver proofs
