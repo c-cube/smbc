@@ -92,7 +92,7 @@ let pp_subst out (s:subst) =
     Format.fprintf out "@[<2>%a@ @<1>→ %a@]" A.Var.pp v A.pp_term t
   in
   Format.fprintf out "[@[%a@]]"
-    (CCFormat.list ~start:"" ~stop:"" ~sep:"," pp_pair) (VarMap.to_list s |> List.rev)
+    CCFormat.(list ~sep:(return ",@ ") pp_pair) (VarMap.to_list s |> List.rev)
 
 let rec as_cstor_app env t = match A.term_view t with
   | A.Const id ->

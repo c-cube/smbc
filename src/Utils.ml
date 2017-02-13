@@ -3,8 +3,12 @@
 
 (** {1 Utils} *)
 
-let pp_list ?(sep=" ") pp out l =
-  CCFormat.list ~start:"" ~stop:"" ~sep pp out l
+module Fmt = CCFormat
 
-let pp_array ?(sep=" ") pp out l =
-  CCFormat.array ~start:"" ~stop:"" ~sep pp out l
+type 'a printer = 'a CCFormat.printer
+
+let pp_list ?(sep=Fmt.return "@ ") pp out l =
+  Fmt.list ~sep pp out l
+
+let pp_array ?(sep=Fmt.return "@ ") pp out l =
+  Fmt.array ~sep pp out l

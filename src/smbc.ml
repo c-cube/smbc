@@ -155,7 +155,7 @@ let () =
   if !print_input_
   then
     Format.printf "@[parsed:@ @[<v>%a@]@]@."
-      (CCFormat.list ~start:"" ~stop:"" ~sep:"" Ast.pp_statement) ast;
+      CCFormat.(list ~sep:(return "@,") Ast.pp_statement) ast;
   (* solve *)
   let config = {
     max_depth = !max_depth_;

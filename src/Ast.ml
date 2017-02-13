@@ -69,7 +69,7 @@ module Ty = struct
       compare a1 b1 <?> (compare, a2,b2)
     | Prop, _
     | Const _, _
-    | Arrow _, _ -> CCOrd.int_ (to_int_ a) (to_int_ b)
+    | Arrow _, _ -> CCInt.compare (to_int_ a) (to_int_ b)
 
   let equal a b = compare a b = 0
 
@@ -89,7 +89,7 @@ module Ty = struct
       let args, ret = unfold ty in
       S.of_list (S.atom "->":: List.map to_sexp args @ [to_sexp ret])
 
-  let pp out t = CCSexpM.print out (to_sexp t)
+  let pp out t = CCSexp.pp out (to_sexp t)
 
   (** {2 Datatypes} *)
 

@@ -3,6 +3,8 @@
 
 (** {1 Utils} *)
 
-val pp_list : ?sep:string -> 'a CCFormat.printer -> 'a list CCFormat.printer
+type 'a printer = 'a CCFormat.printer
 
-val pp_array : ?sep:string -> 'a CCFormat.printer -> 'a array CCFormat.printer
+val pp_list : ?sep:unit printer -> 'a printer -> 'a list printer
+
+val pp_array : ?sep:unit printer -> 'a printer -> 'a array printer

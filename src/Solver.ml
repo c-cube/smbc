@@ -269,7 +269,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     let view t = t.ty_cell
 
     let equal a b = a.ty_id = b.ty_id
-    let compare a b = CCOrd.int_ a.ty_id b.ty_id
+    let compare a b = CCInt.compare a.ty_id b.ty_id
     let hash a = a.ty_id
 
     module H = Hashcons.Make(struct
@@ -365,7 +365,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
 
   let term_equal_ (a:term) b = a==b
   let term_hash_ a = a.term_id
-  let term_cmp_ a b = CCOrd.int_ a.term_id b.term_id
+  let term_cmp_ a b = CCInt.compare a.term_id b.term_id
 
   module Typed_cst = struct
     type t = cst
@@ -431,7 +431,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
   let cmp_uty a b =
     let c = Ty.compare (Lazy.force a.uty_self) (Lazy.force b.uty_self) in
     if c<>0 then c
-    else CCOrd.int_ a.uty_offset b.uty_offset
+    else CCInt.compare a.uty_offset b.uty_offset
 
   let equal_uty a b = cmp_uty a b = 0
 
@@ -439,7 +439,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     Hash.combine3 104 (Ty.hash (Lazy.force uty.uty_self)) uty.uty_offset
 
   let cmp_lit a b =
-    let c = CCOrd.bool_ a.lit_sign b.lit_sign in
+    let c = CCBool.compare a.lit_sign b.lit_sign in
     if c<>0 then c
     else
       let int_of_cell_ = function
@@ -458,7 +458,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         | Lit_atom _, _
         | Lit_assign _, _
         | Lit_uty_empty _, _ ->
-          CCOrd.int_ (int_of_cell_ a.lit_view) (int_of_cell_ b.lit_view)
+          CCInt.compare (int_of_cell_ a.lit_view) (int_of_cell_ b.lit_view)
 
   let hash_lit a =
     let sign = a.lit_sign in
@@ -689,10 +689,10 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       | Dep_uty u1, Dep_uty u2 ->
         let (<?>) = CCOrd.(<?>) in
         Ty.compare (Lazy.force u1.uty_self) (Lazy.force u2.uty_self)
-        <?> (CCOrd.int_, u1.uty_offset, u2.uty_offset)
+        <?> (CCInt.compare, u1.uty_offset, u2.uty_offset)
       | Dep_cst _, _
       | Dep_uty _, _
-        -> CCOrd.int_ (to_int_ a) (to_int_ b)
+        -> CCInt.compare (to_int_ a) (to_int_ b)
 
     (* build a term. If it's new, add it to the watchlist
        of every member of [watching] *)
@@ -935,7 +935,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
 
     let equal = term_equal_
     let hash = term_hash_
-    let compare a b = CCOrd.int_ a.term_id b.term_id
+    let compare a b = CCInt.compare a.term_id b.term_id
 
     module As_key = struct
         type t = term
@@ -1054,7 +1054,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
             fpf out "(@[<1>%a@ %a@])" ID.pp id pp rhs
           in
           let print_map =
-            CCFormat.seq ~start:"" ~stop:"" ~sep:" " pp_bind
+            CCFormat.(seq ~sep:(return "@ ")) pp_bind
           in
           fpf out "(@[match %a@ (@[<hv>%a@])@])"
             pp t print_map (ID.Map.to_seq m)
@@ -1063,7 +1063,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
             fpf out "(@[<1>case@ %a@ %a@])" ID.pp lhs pp rhs
           in
           let print_map =
-            CCFormat.seq ~start:"" ~stop:"" ~sep:" " pp_case
+            CCFormat.(seq ~sep:(return "@ ")) pp_case
           in
           fpf out "(@[switch %a@ (@[<hv>%a@])@])"
             pp t print_map (ID.Tbl.to_seq m.switch_tbl)
@@ -1731,7 +1731,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         ~(st:state) ~(parent:cst) ~(used:cst list ref) ~depth ty_arg
       : cst * (lit lazy_t -> unit) =
       let usable =
-        Ty.Tbl.get_or ~or_:[] st.memo ty_arg
+        Ty.Tbl.get_or ~default:[] st.memo ty_arg
         |> List.filter
           (fun c' -> not (List.exists (Typed_cst.equal c') !used))
       in
