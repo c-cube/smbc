@@ -101,8 +101,8 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     | Select of select * term
     | Match of term * (ty_h list * term) ID.Map.t
     | Switch of term * switch_cell (* function table *)
-    | Quant of quant * ty_uninterpreted_slice * term
-      (* quantification on finite types *)
+    | Quant of quant * quant_range * term
+      (* quantification on finite types or datatypes *)
     | Builtin of builtin
     | Check_assign of cst * term (* check a literal *)
     | Check_empty_uty of ty_uninterpreted_slice (* check it's empty *)
@@ -224,7 +224,10 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
 
   and ty_def =
     | Uninterpreted of ty_uninterpreted (* uninterpreted type, with its domain *)
-    | Data of cst lazy_t list (* set of constructors *)
+    | Data of cstor_list
+
+  (* set of constructors *)
+  and cstor_list = cst lazy_t list
 
   and ty_cell =
     | Prop
@@ -257,6 +260,17 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
        Expanded on demand. *)
     mutable uty_status: (explanation * ty_uninterpreted_status) option;
     (* current status in the model *)
+  }
+
+  and quant_range =
+    | QR_unin of ty_uninterpreted_slice
+    | QR_data of quant_data
+
+  (* TODO: add a "context" to account for path under quantifier *)
+  and quant_data = {
+    q_data_ty: ty_h; (* type *)
+    q_data_cstor: cstor_list; (* constructors *)
+    q_data_depth: int; (* depth, for limiting *)
   }
 
   let pp_quant out = function
@@ -478,6 +492,18 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     | Dep_cst c -> Typed_cst.pp out c
     | Dep_uty uty -> pp_uty out uty
 
+  let hash_q_range = function
+    | QR_unin u -> hash_uty u
+    | QR_data d -> Hash.combine2 (Hash.int d.q_depth) (Ty.hash d.q_data_ty)
+
+  let equal_q_range r1 r2 = match r1, r2 with
+    | QR_unin u1, QR_unin u2 -> equal_uty u1 u2
+    | QR_data d1, QR_data d2 ->
+      Ty.equal d1.q_data_ty d2.q_data_ty &&
+      d1.q_data_depth = d2.q_data_depth
+    | QR_unin _, _
+    | QR_data _, _ -> false
+
   module Backtrack = struct
     type _level = level
     type level = _level
@@ -568,8 +594,8 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           | Mu sub -> Hash.combine sub_hash 30 sub
           | Switch (t, tbl) ->
             Hash.combine3 31 (sub_hash t) tbl.switch_id
-          | Quant (q,ty,bod) ->
-            Hash.combine4 32 (Hash.poly q) (hash_uty ty) (sub_hash bod)
+          | Quant (q,range,bod) ->
+            Hash.combine4 32 (Hash.poly q) (hash_q_range range) (sub_hash bod)
           | Check_assign (c,t) ->
             Hash.combine3 33 (Typed_cst.hash c) (sub_hash t)
           | Check_empty_uty uty ->
@@ -618,8 +644,8 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
             Typed_cst.equal s1.select_cstor s2.select_cstor &&
             s1.select_i = s2.select_i
           | Mu t1, Mu t2 -> t1==t2
-          | Quant (q1,ty1,bod1), Quant (q2,ty2,bod2) ->
-            q1=q2 && equal_uty ty1 ty2 && bod1==bod2
+          | Quant (q1,r1,bod1), Quant (q2,r2,bod2) ->
+            q1=q2 && equal_q_range r1 r2 && bod1==bod2
           | Check_assign (c1,t1), Check_assign (c2,t2) ->
             Typed_cst.equal c1 c2 && term_equal_ t1 t2
           | Check_empty_uty u1, Check_empty_uty u2 ->
