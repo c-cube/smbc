@@ -333,6 +333,8 @@ and eval_whnf_rec m st subst t = match A.term_view t with
           | A.False, A.False -> A.true_
           | A.True, A.False
           | A.False, A.True -> A.false_
+          | A.Var v1, A.Var v2 when A.Var.equal v1 v2 -> A.true_
+          | A.Const id1, A.Const id2 when ID.equal id1 id2 -> A.true_
           | _ ->
             begin match as_cstor_app m.env a, as_cstor_app m.env b with
               | Some (c1,_,l1), Some (c2,_,l2) ->
