@@ -2,6 +2,14 @@
 
 ## Now
 
+- no-hashconsing:
+  * `thunk={mut expl|expl*const|expl*value; mut prgm; mut env:thunk list}`
+    (uniform type, does not change, only mutate fields;
+     return no explanations for partial steps — stores them instead — until
+     it evaluates to a value)
+  * and/eq are just part of programs, and use the environment to store
+    intermediate thunks; ref/lazy are useless and merged with regular thunk type
+
 ## Narrowing
 
 - rename `cst` into `unknown`?
