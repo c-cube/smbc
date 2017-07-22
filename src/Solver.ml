@@ -21,6 +21,9 @@ module type CONFIG = sig
   val uniform_depth : bool
   (** Depth increases uniformly *)
 
+  val quant_unfold_depth : int
+  (** Depth for quantifier unfolding *)
+
   val progress: bool
   (** progress display progress bar *)
 
@@ -101,8 +104,8 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     | Select of select * term
     | Match of term * (ty_h list * term) ID.Map.t
     | Switch of term * switch_cell (* function table *)
-    | Quant of quant * ty_uninterpreted_slice * term
-      (* quantification on finite types *)
+    | Quant of quant * quant_range * term
+      (* quantification on finite types or datatypes *)
     | Builtin of builtin
     | Check_assign of cst * term (* check a literal *)
     | Check_empty_uty of ty_uninterpreted_slice (* check it's empty *)
@@ -224,7 +227,10 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
 
   and ty_def =
     | Uninterpreted of ty_uninterpreted (* uninterpreted type, with its domain *)
-    | Data of cst lazy_t list (* set of constructors *)
+    | Data of cstor_list
+
+  (* set of constructors *)
+  and cstor_list = cst lazy_t list
 
   and ty_cell =
     | Prop
@@ -257,6 +263,18 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
        Expanded on demand. *)
     mutable uty_status: (explanation * ty_uninterpreted_status) option;
     (* current status in the model *)
+  }
+
+  and quant_range =
+    | QR_unin of ty_uninterpreted_slice
+    | QR_data of quant_data
+    | QR_bool
+
+  (* TODO: add a "context" to account for path under quantifier *)
+  and quant_data = {
+    q_data_ty: ty_h; (* type *)
+    q_data_cstor: cstor_list; (* constructors *)
+    q_data_depth: int; (* depth, for limiting *)
   }
 
   let pp_quant out = function
@@ -478,6 +496,27 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     | Dep_cst c -> Typed_cst.pp out c
     | Dep_uty uty -> pp_uty out uty
 
+  let hash_q_range = function
+    | QR_unin u -> hash_uty u
+    | QR_data d -> Hash.combine2 (Hash.int d.q_data_depth) (Ty.hash d.q_data_ty)
+    | QR_bool -> 30
+
+  let equal_q_range r1 r2 = match r1, r2 with
+    | QR_unin u1, QR_unin u2 -> equal_uty u1 u2
+    | QR_data d1, QR_data d2 ->
+      Ty.equal d1.q_data_ty d2.q_data_ty &&
+      d1.q_data_depth = d2.q_data_depth
+    | QR_bool, QR_bool -> true
+    | QR_unin _, _
+    | QR_data _, _
+    | QR_bool, _
+      -> false
+
+  let pp_q_range out = function
+    | QR_unin uty -> pp_uty out uty
+    | QR_data q -> Format.fprintf out "%a[%d]" Ty.pp q.q_data_ty q.q_data_depth
+    | QR_bool -> CCFormat.string out "bool"
+
   module Backtrack = struct
     type _level = level
     type level = _level
@@ -568,8 +607,8 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           | Mu sub -> Hash.combine sub_hash 30 sub
           | Switch (t, tbl) ->
             Hash.combine3 31 (sub_hash t) tbl.switch_id
-          | Quant (q,ty,bod) ->
-            Hash.combine4 32 (Hash.poly q) (hash_uty ty) (sub_hash bod)
+          | Quant (q,range,bod) ->
+            Hash.combine4 32 (Hash.poly q) (hash_q_range range) (sub_hash bod)
           | Check_assign (c,t) ->
             Hash.combine3 33 (Typed_cst.hash c) (sub_hash t)
           | Check_empty_uty uty ->
@@ -618,8 +657,8 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
             Typed_cst.equal s1.select_cstor s2.select_cstor &&
             s1.select_i = s2.select_i
           | Mu t1, Mu t2 -> t1==t2
-          | Quant (q1,ty1,bod1), Quant (q2,ty2,bod2) ->
-            q1=q2 && equal_uty ty1 ty2 && bod1==bod2
+          | Quant (q1,r1,bod1), Quant (q2,r2,bod2) ->
+            q1=q2 && equal_q_range r1 r2 && bod1==bod2
           | Check_assign (c1,t1), Check_assign (c2,t2) ->
             Typed_cst.equal c1 c2 && term_equal_ t1 t2
           | Check_empty_uty u1, Check_empty_uty u2 ->
@@ -845,11 +884,17 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       | Builtin (B_not t) -> t, false
       | _ -> t, true
 
-    let quant q uty body =
+    let quant q qr body =
       assert (Ty.is_prop body.term_ty);
       (* evaluation is blocked by the uninterpreted type *)
-      let deps = Term_dep_uty uty in
-      mk_term_ ~deps ~ty:(DTy_direct Ty.prop) (Quant (q,uty,body))
+      let deps = match qr with
+        | QR_unin uty -> Term_dep_uty uty
+        | QR_data _ | QR_bool -> Term_dep_none
+      in
+      mk_term_ ~deps ~ty:(DTy_direct Ty.prop) (Quant (q,qr,body))
+
+    let quant_uty q uty body = quant q (QR_unin uty) body
+    let quant_data q d body = quant q (QR_data d) body
 
     let forall = quant Forall
     let exists = quant Exists
@@ -1014,7 +1059,6 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         pp_rec out t;
         if Config.pp_hashcons then Format.fprintf out "/%d" t.term_id;
         ()
-
       and pp_rec out t = match t.term_cell with
         | True -> CCFormat.string out "true"
         | False -> CCFormat.string out "false"
@@ -1025,8 +1069,8 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           fpf out "(@[<1>%a@ %a@])" pp f (Utils.pp_list pp) l
         | Fun (ty,f) ->
           fpf out "(@[fun %a@ %a@])" Ty.pp ty pp f
-        | Quant (q,uty,f) ->
-          fpf out "(@[%a %a@ %a@])" pp_quant q pp_uty uty pp f
+        | Quant (q,qr,f) ->
+          fpf out "(@[%a %a@ %a@])" pp_quant q pp_q_range qr pp f
         | Mu sub -> fpf out "(@[mu@ %a@])" pp sub
         | If (a, b, c) ->
           fpf out "(@[if %a@ %a@ %a@])" pp a pp b pp c
@@ -1132,58 +1176,70 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       if DB_env.size env = 0
       then t (* trivial *)
       else (
-        let rec aux env t : term = match t.term_cell with
+        let rec aux depth env t : term = match t.term_cell with
           | DB d ->
             begin match DB_env.get d env with
               | None -> t
-              | Some t' -> t'
+              | Some t' -> shift_db depth t'
             end
           | Const _ -> t
           | True
           | False -> t
           | Fun (ty, body) ->
-            let body' = aux (DB_env.push_none env) body in
+            let body' = aux (depth+1) (DB_env.push_none env) body in
             if body==body' then t else fun_ ty body'
           | Mu body ->
-            let body' = aux (DB_env.push_none env) body in
+            let body' = aux (depth+1) (DB_env.push_none env) body in
             if body==body' then t else mu body'
           | Quant (q, uty, body) ->
-            let body' = aux (DB_env.push_none env) body in
+            let body' = aux (depth+1) (DB_env.push_none env) body in
             if body==body' then t else quant q uty body'
           | Match (u, m) ->
-            let u = aux env u in
+            let u = aux depth env u in
             let m =
               ID.Map.map
                 (fun (tys,rhs) ->
-                   tys, aux (DB_env.push_none_l tys env) rhs)
+                   tys, aux (depth+List.length tys) (DB_env.push_none_l tys env) rhs)
                 m
             in
             match_ u m
           | Switch (u, m) ->
-            let u = aux env u in
+            let u = aux depth env u in
             (* NOTE: [m] should not contain De Bruijn indices at all *)
             switch u m
-          | Select (sel, u) -> select sel (aux env u)
+          | Select (sel, u) -> select sel (aux depth env u)
           | If (a,b,c) ->
-            let a' = aux env a in
-            let b' = aux env b in
-            let c' = aux env c in
+            let a' = aux depth env a in
+            let b' = aux depth env b in
+            let c' = aux depth env c in
             if a==a' && b==b' && c==c' then t else if_ a' b' c'
           | App (_,[]) -> assert false
           | App (f, l) ->
-            let f' = aux env f in
-            let l' = aux_l env l in
+            let f' = aux depth env f in
+            let l' = aux_l depth env l in
             if f==f' && CCList.equal (==) l l' then t else app f' l'
-          | Builtin b -> builtin (map_builtin (aux env) b)
+          | Builtin b -> builtin (map_builtin (aux depth env) b)
           | Undefined_value _
           | Check_assign _
           | Check_empty_uty _
             -> t (* closed *)
-        and aux_l env l =
-          List.map (aux env) l
+        and aux_l d env l =
+          List.map (aux d env) l
         in
-        aux env t
+        aux 0 env t
       )
+
+    (* quantify on variable of given type *)
+    let quant_ty ~depth q (ty_arg:Ty.t) (body:t): t = match Ty.view ty_arg with
+      | Prop -> quant q QR_bool body
+      | Atomic (_, Data cstors) ->
+        let qr =
+          QR_data {q_data_depth=depth; q_data_cstor=cstors; q_data_ty=ty_arg}
+        in
+        quant q qr body
+      | Atomic (_, Uninterpreted uty) -> quant_uty q uty body
+      | Arrow _ ->
+        errorf "cannot quantify on arrow type `%a`" Ty.pp ty_arg (* TODO *)
   end
 
   let pp_lit out l =
@@ -2084,7 +2140,14 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           (* [mu x. body] becomes [body[x := mu x. body]] *)
           let env = DB_env.singleton t in
           Explanation.empty, Term.eval_db env body
-        | Quant (q,uty,body) ->
+        | Quant (q,QR_bool,body) ->
+          let b_true = Term.eval_db (DB_env.singleton Term.true_) body in
+          let b_false = Term.eval_db (DB_env.singleton Term.false_) body in
+          begin match q with
+            | Forall -> compute_nf (Term.and_ b_true b_false)
+            | Exists -> compute_nf (Term.or_ b_true b_false)
+          end
+        | Quant (q,QR_unin uty,body) ->
           begin match uty.uty_status with
             | None -> Explanation.empty, t
             | Some (e, status) ->
@@ -2096,7 +2159,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
                 Term.eval_db (DB_env.singleton (Term.const c_head)) body
               in
               let t2() =
-                Term.quant q uty_tail body
+                Term.quant_uty q uty_tail body
               in
               begin match q, status with
                 | Forall, Uty_empty -> e, Term.true_
@@ -2112,6 +2175,37 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
                   compute_nf_add e t'
               end
           end
+        | Quant (q,QR_data d,body) ->
+          if d.q_data_depth >= Config.quant_unfold_depth then (
+            (* just give up and return undefined *)
+            Explanation.empty, Term.undefined_value_prop
+          ) else (
+            (* turn [forall x:nat. P[x]] into
+               [p 0 && forall x:nat. P[s x]] *)
+            let l =
+              List.map
+                (fun (lazy cstor) ->
+                   let args, _ = Ty.unfold (Typed_cst.ty cstor) in
+                   let db_l =
+                     List.mapi (fun i ty -> Term.db (i,ty)) args
+                   in
+                   (* replace [x] with [cstor args] in [body] *)
+                   let arg = Term.app_cst cstor db_l in
+                   let body' =
+                     Term.eval_db (DB_env.singleton arg) body
+                   in
+                   List.fold_right
+                     (fun ty body ->
+                        Term.quant_ty ~depth:d.q_data_depth q ty body)
+                     args body')
+                d.q_data_cstor
+            in
+            let new_t = match q with
+              | Forall -> Term.and_l l
+              | Exists -> Term.or_l l
+            in
+            compute_nf new_t
+          )
         | Builtin b ->
           (* try boolean reductions *)
           let e, t' = compute_builtin ~old:t b in
@@ -2931,8 +3025,9 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     let rec conv_term_rec
         (env: conv_env)
         (t:Ast.term): term = match Ast.term_view t with
-      | Ast.True -> Term.true_
-      | Ast.False -> Term.false_
+      | Ast.Bool true -> Term.true_
+      | Ast.Bool false -> Term.false_
+      | Ast.Unknown _ -> assert false
       | Ast.Const id ->
         begin
           try ID.Tbl.find decl_ty_ id |> Lazy.force |> Term.const
@@ -2955,7 +3050,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
             Term.db (DB.make level ty)
           | None, None -> errorf "could not find var `%a`" Ast.Var.pp v
         end
-      | Ast.Fun (v,body) ->
+      | Ast.Bind (Ast.Fun,v,body) ->
         let env' = add_bound env v in
         let body = conv_term_rec env' body in
         let ty = Ast.Var.ty v |> conv_ty in
@@ -2973,27 +3068,13 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
             select_cstor; select_i=sel.Ast.select_i }
         in
         Term.select sel u
-      | Ast.Forall (v,body) ->
+      | Ast.Bind((Ast.Forall | Ast.Exists) as q,v,body) ->
         let env' = add_bound env v in
         let body = conv_term_rec env' body in
-        let uty =
-          let ty = Ast.Var.ty v |> conv_ty in
-          match Ty.view ty with
-            | Atomic (_, Uninterpreted uty) -> uty
-            | _ -> errorf "forall: need to quantify on an uninterpreted type, not %a" Ty.pp ty
-        in
-        Term.forall uty body
-      | Ast.Exists (v,body) ->
-        let env' = add_bound env v in
-        let body = conv_term_rec env' body in
-        let uty =
-          let ty = Ast.Var.ty v |> conv_ty in
-          match Ty.view ty with
-            | Atomic (_, Uninterpreted uty) -> uty
-            | _ -> errorf "exists: need to quantify on an uninterpreted type, not %a" Ty.pp ty
-        in
-        Term.exists uty body
-      | Ast.Mu (v,body) ->
+        let q = if q=Ast.Forall then Forall else Exists in
+        let ty = Ast.Var.ty v |> conv_ty in
+        Term.quant_ty ~depth:0 q ty body
+      | Ast.Bind (Ast.Mu,v,body) ->
         let env' = add_bound env v in
         let body = conv_term_rec env' body in
         Term.mu body
@@ -3083,7 +3164,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
        that maps [x_i] to their corresponding new unknowns *)
     let skolemize t : conv_env * Ast.term =
       let rec aux env t = match Ast.term_view t with
-        | Ast.Exists (v, u) ->
+        | Ast.Bind (Ast.Exists, v, u) ->
           let ty = conv_ty (Ast.Var.ty v) in
           let c_id = ID.makef "?%s" (Ast.Var.id v |> ID.to_string) in
           let c = Typed_cst.make_undef ~depth:0 c_id ty in
@@ -3261,8 +3342,12 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
             |> ID.Map.of_seq
           in
           A.switch u m
-        | Quant (q,uty,bod) ->
-          let lazy ty = uty.uty_self in
+        | Quant (q,qr,bod) ->
+          let ty = match qr with
+            | QR_unin uty -> Lazy.force uty.uty_self
+            | QR_bool -> Ty.prop
+            | QR_data d -> d.q_data_ty
+          in
           with_var ty env
             ~f:(fun v env ->
               let bod = aux env bod in

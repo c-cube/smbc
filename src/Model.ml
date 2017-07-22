@@ -123,7 +123,7 @@ let apply_subst (subst:subst) t =
         | None -> t
         | Some (lazy t') -> t'
       end
-    | A.Undefined_value | A.True | A.False | A.Const _ -> t
+    | A.Undefined_value | A.Bool _ | A.Const _ | A.Unknown _ -> t
     | A.Select (sel, t) -> A.select sel (aux subst t) t.A.ty
     | A.App (f,l) -> A.app (aux subst f) (List.map (aux subst) l)
     | A.If (a,b,c) -> A.if_ (aux subst a) (aux subst b) (aux subst c)
@@ -138,16 +138,10 @@ let apply_subst (subst:subst) t =
     | A.Let (x,t,u) ->
       let subst', x' = rename_var subst x in
       A.let_ x' (aux subst t) (aux subst' u)
-    | A.Fun (x,body) ->
+    | A.Bind (A.Mu, _,_) -> assert false
+    | A.Bind (b, x,body) ->
       let subst', x'  = rename_var subst x in
-      A.fun_ x' (aux subst' body)
-    | A.Forall (x,body) ->
-      let subst', x' = rename_var subst x in
-      A.forall x' (aux subst' body)
-    | A.Exists (x,body) ->
-      let subst', x' = rename_var subst x in
-      A.exists x' (aux subst' body)
-    | A.Mu (_,_) -> assert false
+      A.bind ~ty:(A.ty t) b x' (aux subst' body)
     | A.Not f -> A.not_ (aux subst f)
     | A.Binop (op,a,b) -> A.binop op (aux subst a)(aux subst b)
     | A.Asserting (t,g) ->
@@ -170,9 +164,7 @@ let rec eval_whnf (m:t) (st:term list) (subst:subst) (t:term): term =
   with A.Ill_typed msg ->
     errorf "@[<2>Model:@ internal type error `%s`@ in %a@]" msg pp_stack st
 and eval_whnf_rec m st subst t = match A.term_view t with
-  | A.Undefined_value
-  | A.True
-  | A.False -> t
+  | A.Undefined_value | A.Bool _ | A.Unknown _ -> t
   | A.Var v ->
     begin match VarMap.get v subst with
       | None -> t
@@ -193,23 +185,22 @@ and eval_whnf_rec m st subst t = match A.term_view t with
   | A.If (a,b,c) ->
     let a = eval_whnf m st subst a in
     begin match A.term_view a with
-      | A.True -> eval_whnf m st subst b
-      | A.False -> eval_whnf m st subst c
+      | A.Bool true -> eval_whnf m st subst b
+      | A.Bool false -> eval_whnf m st subst c
       | _ ->
         let b = apply_subst subst b in
         let c = apply_subst subst c in
         A.if_ a b c
     end
-  | A.Mu (v,body) ->
+  | A.Bind (A.Mu,v,body) ->
     let subst' = VarMap.add v (lazy t) subst in
     eval_whnf m st subst' body
   | A.Let (x,t,u) ->
     let t = lazy (eval_whnf m st subst t) in
     let subst' = VarMap.add x t subst in
     eval_whnf m st subst' u
-  | A.Fun _ -> apply_subst subst t
-  | A.Forall (v,body)
-  | A.Exists (v,body) ->
+  | A.Bind (A.Fun,_,_) -> apply_subst subst t
+  | A.Bind ((A.Forall | A.Exists) as b,v,body) ->
     let ty = A.Var.ty v in
     let dom =
       try A.Ty.Map.find ty m.domains
@@ -226,10 +217,11 @@ and eval_whnf_rec m st subst t = match A.term_view t with
              eval_whnf m st subst' body)
           dom
       in
-      match A.term_view t with
-        | A.Forall _ -> A.and_l l
-        | A.Exists _ -> A.or_l l
+      begin match b with
+        | A.Forall -> A.and_l l
+        | A.Exists -> A.or_l l
         | _ -> assert false
+      end
     in
     eval_whnf m st subst t'
   | A.Select (sel, u) ->
@@ -290,15 +282,15 @@ and eval_whnf_rec m st subst t = match A.term_view t with
   | A.Not f ->
     let f = eval_whnf m st subst f in
     begin match A.term_view f with
-      | A.True -> A.false_
-      | A.False -> A.true_
+      | A.Bool true -> A.false_
+      | A.Bool false -> A.true_
       | _ -> A.not_ f
     end
   | A.Asserting (u, g) ->
     let g' = eval_whnf m st subst g in
     begin match A.term_view g' with
-      | A.True -> eval_whnf m st subst u
-      | A.False ->
+      | A.Bool true -> eval_whnf m st subst u
+      | A.Bool false ->
         A.undefined_value u.A.ty (* assertion failed, uncharted territory! *)
       | _ -> A.asserting u g'
     end
@@ -308,31 +300,31 @@ and eval_whnf_rec m st subst t = match A.term_view t with
     begin match op with
       | A.And ->
         begin match A.term_view a, A.term_view b with
-          | A.True, A.True -> A.true_
-          | A.False, _
-          | _, A.False -> A.false_
+          | A.Bool true, A.Bool true -> A.true_
+          | A.Bool false, _
+          | _, A.Bool false -> A.false_
           | _ -> A.and_ a b
         end
       | A.Or ->
         begin match A.term_view a, A.term_view b with
-          | A.True, _
-          | _, A.True -> A.true_
-          | A.False, A.False -> A.false_
+          | A.Bool true, _
+          | _, A.Bool true -> A.true_
+          | A.Bool false, A.Bool false -> A.false_
           | _ -> A.or_ a b
         end
       | A.Imply ->
         begin match A.term_view a, A.term_view b with
-          | _, A.True
-          | A.False, _  -> A.true_
-          | A.True, A.False -> A.false_
+          | _, A.Bool true
+          | A.Bool false, _  -> A.true_
+          | A.Bool true, A.Bool false -> A.false_
           | _ -> A.imply a b
         end
       | A.Eq ->
         begin match A.term_view a, A.term_view b with
-          | A.True, A.True
-          | A.False, A.False -> A.true_
-          | A.True, A.False
-          | A.False, A.True -> A.false_
+          | A.Bool true, A.Bool true
+          | A.Bool false, A.Bool false -> A.true_
+          | A.Bool true, A.Bool false
+          | A.Bool false, A.Bool true -> A.false_
           | A.Var v1, A.Var v2 when A.Var.equal v1 v2 -> A.true_
           | A.Const id1, A.Const id2 when ID.equal id1 id2 -> A.true_
           | _ ->
@@ -357,7 +349,7 @@ and eval_whnf_rec m st subst t = match A.term_view t with
     end
 (* beta-reduce [f l] while [f] is a function,constant or variable *)
 and eval_whnf_app m st subst_f subst_l f l = match A.term_view f, l with
-  | A.Fun (v, body), arg :: tail ->
+  | A.Bind (A.Fun,v, body), arg :: tail ->
     let subst_f = VarMap.add v (lazy (apply_subst subst_l arg)) subst_f in
     eval_whnf_app m st subst_f subst_l body tail
   | _ -> eval_whnf_app' m st subst_f subst_l f l
@@ -365,7 +357,7 @@ and eval_whnf_app m st subst_f subst_l f l = match A.term_view f, l with
 and eval_whnf_app' m st subst_f subst_l f l =
   let f' = eval_whnf m st subst_f f in
   begin match A.term_view f', l with
-    | A.Fun _, _::_ ->
+    | A.Bind (A.Fun,_,_), _::_ ->
       eval_whnf_app m st subst_l subst_l f' l (* beta-reduce again *)
     | _ ->
       (* blocked *)
