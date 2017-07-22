@@ -132,6 +132,12 @@ type binop =
   | Imply
   | Eq
 
+type binder =
+  | Fun
+  | Forall
+  | Exists
+  | Mu
+
 type term = {
   term: term_cell;
   ty: Ty.t;
@@ -144,17 +150,13 @@ and term_cell =
   | Select of select * term
   | Match of term * (var list * term) ID.Map.t
   | Switch of term * term ID.Map.t (* switch on constants *)
+  | Bind of binder * var * term
   | Let of var * term * term
-  | Fun of var * term
-  | Forall of var * term
-  | Exists of var * term
-  | Mu of var * term
   | Not of term
   | Binop of binop * term * term
   | Asserting of term * term
   | Undefined_value
-  | True
-  | False
+  | Bool of bool
 
 and select = {
   select_name: ID.t lazy_t;
@@ -176,7 +178,7 @@ type statement =
 
 let unfold_fun t =
   let rec aux acc t = match t.term with
-    | Fun (v, t') -> aux (v::acc) t'
+    | Bind (Fun, v, t') -> aux (v::acc) t'
     | _ -> List.rev acc, t
   in
   aux [] t
@@ -255,15 +257,15 @@ let rec term_to_tip (t:term): TA.term = match t.term with
              TA.if_ test (term_to_tip rhs) else_)
           (term_to_tip last_rhs) tail
     end
-  | True -> TA.true_
-  | False -> TA.false_
+  | Bool true -> TA.true_
+  | Bool false -> TA.false_
   | Let (v,t,u) ->
     TA.let_ [var_to_tip v, term_to_tip t] (term_to_tip u)
-  | Fun (v,t) ->
+  | Bind (Fun,v,t) ->
     TA.fun_ (typed_var_to_tip v) (term_to_tip t)
-  | Forall (v,t) ->
+  | Bind (Forall,v,t) ->
     TA.forall [typed_var_to_tip v] (term_to_tip t)
-  | Exists (v,t) ->
+  | Bind (Exists,v,t) ->
     TA.exists [typed_var_to_tip v] (term_to_tip t)
   | Not t -> TA.not_ (term_to_tip t)
   | Binop (op,a,b) ->
@@ -277,7 +279,7 @@ let rec term_to_tip (t:term): TA.term = match t.term with
     end
   | Asserting(t,g) -> TA.app "asserting" [term_to_tip t; term_to_tip g]
   | Undefined_value -> failwith "cannot translate `undefined-value` to TIP"
-  | Mu (_,_) -> assert false (* TODO? *)
+  | Bind (Mu,_,_) -> assert false (* TODO? *)
 
 let mk_tip_decl id ty =
   let args, ret = Ty.unfold ty in
@@ -366,8 +368,8 @@ let rec app_ty_ ty l : Ty.t = match ty, l with
 
 let mk_ term ty = {term; ty}
 
-let true_ = mk_ True Ty.prop
-let false_ = mk_ False Ty.prop
+let true_ = mk_ (Bool true) Ty.prop
+let false_ = mk_ (Bool false) Ty.prop
 let undefined_value ty = mk_ Undefined_value ty
 
 let asserting t g =
@@ -430,7 +432,7 @@ let let_ v t u =
 
 let fun_ v t =
   let ty = Ty.arrow (Var.ty v) t.ty in
-  mk_ (Fun (v,t)) ty
+  mk_ (Bind (Fun,v,t)) ty
 
 let quant_ q v t =
   if not (Ty.equal t.ty Ty.prop)
@@ -440,15 +442,15 @@ let quant_ q v t =
   let ty = Ty.prop in
   mk_ (q v t) ty
 
-let forall = quant_ (fun v t -> Forall (v,t))
-let exists = quant_ (fun v t -> Exists (v,t))
+let forall = quant_ (fun v t -> Bind (Forall,v,t))
+let exists = quant_ (fun v t -> Bind (Exists,v,t))
 
 let mu v t =
   if not (Ty.equal (Var.ty v) t.ty)
   then Ty.ill_typed "mu-term: var has type %a,@ body %a"
       Ty.pp (Var.ty v) Ty.pp t.ty;
   let ty = Ty.arrow (Var.ty v) t.ty in
-  mk_ (Fun (v,t)) ty
+  mk_ (Bind (Fun,v,t)) ty
 
 let fun_l = List.fold_right fun_
 let fun_a = Array.fold_right fun_

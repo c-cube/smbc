@@ -77,6 +77,12 @@ type binop =
   | Imply
   | Eq
 
+type binder =
+  | Fun
+  | Forall
+  | Exists
+  | Mu
+
 type term = private {
   term: term_cell;
   ty: Ty.t;
@@ -89,17 +95,13 @@ and term_cell =
   | Select of select * term
   | Match of term * (var list * term) ID.Map.t
   | Switch of term * term ID.Map.t (* switch on constants *)
+  | Bind of binder * var * term
   | Let of var * term * term
-  | Fun of var * term
-  | Forall of var * term
-  | Exists of var * term
-  | Mu of var * term
   | Not of term
   | Binop of binop * term * term
   | Asserting of term * term
   | Undefined_value
-  | True
-  | False
+  | Bool of bool
 
 and select = {
   select_name: ID.t lazy_t;
@@ -154,6 +156,8 @@ val undefined_value : Ty.t -> term
 val asserting : term -> term -> term
 
 val unfold_fun : term -> var list * term
+
+val equal : term -> term -> bool
 
 (** {2 Printing} *)
 
