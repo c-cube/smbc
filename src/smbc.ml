@@ -11,6 +11,7 @@ type config = {
   dimacs: string option;
   deepening_step: int option;
   uniform_depth: bool;
+  quant_depth : int;
   check: bool;
   check_proof: bool;
 }
@@ -38,6 +39,7 @@ let solve ~config (ast:Ast.statement list) : unit =
     let deepening_step = config.deepening_step
     let uniform_depth = config.uniform_depth
     let dimacs_file = config.dimacs
+    let quant_unfold_depth = config.quant_depth
     let check_proof = config.check_proof
   end in
   let module S = Solver.Make(Conf)(struct end) in
@@ -69,6 +71,7 @@ let check_ = ref false
 let timeout_ = ref ~-1
 let syntax_ = ref Ast.Auto
 let uniform_depth_ = ref false
+let quant_depth_ = ref 5
 let version_ = ref false
 let dimacs_ = ref "" (* file to put sat problem in *)
 let check_proof_ = ref false
@@ -116,6 +119,7 @@ let options =
     "--depth-step", Arg.Set_int depth_step_, " increment for iterative deepening";
     "--uniform-depth", Arg.Set uniform_depth_, " uniform depth";
     "--no-uniform-depth", Arg.Clear uniform_depth_, " non-uniform depth";
+    "--quant-depth", Arg.Set_int quant_depth_, " unfolding depth for quantifiers";
     "--timeout", Arg.Set_int timeout_, " timeout (in s)";
     "--dimacs", Arg.Set_string dimacs_, " file to output dimacs problem into";
     "--check-proof", Arg.Set check_proof_, " check propositional proofs";
@@ -163,6 +167,7 @@ let () =
     print_stat = !stats_;
     progress = !progress_;
     pp_hashcons = !pp_hashcons_;
+    quant_depth= !quant_depth_;
     uniform_depth = !uniform_depth_;
     dimacs = (if !dimacs_ = "" then None else Some !dimacs_);
     deepening_step =

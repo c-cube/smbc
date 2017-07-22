@@ -14,6 +14,9 @@ module type CONFIG = sig
   val uniform_depth : bool
   (** Depth increases uniformly *)
 
+  val quant_unfold_depth : int
+  (** Depth for quantifier unfolding *)
+
   val progress: bool
   (** progress display progress bar *)
 
