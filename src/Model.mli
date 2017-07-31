@@ -27,4 +27,6 @@ val pp_syn : Ast.syntax -> t CCFormat.printer
 
 val eval : t -> term -> term
 
+(* TODO: snf evaluation for eliminating local definitions from model *)
+
 exception Bad_model of t * term * term

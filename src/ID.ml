@@ -18,6 +18,7 @@ let makef fmt = CCFormat.ksprintf ~f:make fmt
 let copy {name;_} = make name
 
 let id {id;_} = id
+let name {name; _} = name
 let to_string id = id.name
 let to_sexp id = CCSexp.atom id.name
 

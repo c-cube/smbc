@@ -10,6 +10,7 @@ val makef : ('a, Format.formatter, unit, t) format4 -> 'a
 val copy : t -> t
 
 val id : t -> int
+val name : t -> string
 
 val to_string : t -> string
 val to_sexp : t -> CCSexp.t

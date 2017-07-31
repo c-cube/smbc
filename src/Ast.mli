@@ -170,12 +170,6 @@ val pp_statement_tip : statement CCFormat.printer
 
 (** {2 Parsing and Typing} *)
 
-module Ctx : sig
-  type t
-  val create: include_dir:string -> unit -> t
-  include Intf.PRINT with type t := t
-end
-
 type syntax =
   | Auto
   (** Guess based on file extension *)
