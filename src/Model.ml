@@ -375,18 +375,3 @@ and eval_whnf_app' m st subst_f subst_l f l =
 
 (* eval term [t] under model [m] *)
 let eval (m:t) (t:term) = eval_whnf m [] empty_subst t
-
-(* check model *)
-let check (m:t) ~goals =
-  let bad =
-    goals
-    |> CCList.find_map
-      (fun t ->
-         let t' = eval m t in
-         match A.term_view t' with
-           | A.True -> None
-           | _ -> Some (t, t'))
-  in
-  match bad with
-    | None -> ()
-    | Some (t,t') -> raise (Bad_model (m, t, t'))

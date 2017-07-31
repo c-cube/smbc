@@ -341,7 +341,6 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     type t = db
     let level = fst
     let ty = snd
-    let succ (i,ty) = i+1,ty
     let hash (i,ty) = Hash.combine Ty.hash i ty
     let equal x y = level x = level y && Ty.equal (ty x) (ty y)
     let make i ty = i,ty
@@ -421,11 +420,6 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     let compare a b = ID.compare a.cst_id b.cst_id
     let hash t = ID.hash t.cst_id
     let pp out a = ID.pp out a.cst_id
-
-    module Map = CCMap.Make(struct
-        type t = cst
-        let compare = compare
-      end)
   end
 
   let cmp_uty a b =
@@ -677,8 +671,6 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       | DTy_direct of ty_h
       | DTy_lazy of (unit -> ty_h)
 
-    let sorted_merge_ l1 l2 = CCList.sorted_merge_uniq ~cmp:compare l1 l2
-
     let cmp_term_dep_ a b =
       let to_int_ = function
         | Dep_cst _ -> 0
@@ -766,8 +758,6 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       (* do not add watcher: propagation under λ forbidden *)
       mk_term_ ~deps:Term_dep_none (Fun (ty, body))
         ~ty:(DTy_lazy (fun () -> Ty.arrow ty body.term_ty))
-
-    let fun_l = List.fold_right fun_
 
     let mu t =
       mk_term_ ~deps:Term_dep_none (Mu t) ~ty:(DTy_direct t.term_ty)
@@ -868,7 +858,6 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     let or_ a b = builtin_ ~deps:(Term_dep_sub2 (a,b)) (B_or (a,b))
     let imply a b = builtin_ ~deps:(Term_dep_sub2 (a,b)) (B_imply (a,b))
     let eq a b = builtin_ ~deps:(Term_dep_sub2 (a,b)) (B_eq (a,b))
-    let neq a b = not_ (eq a b)
 
     let and_par a b c d =
       builtin_ ~deps:(Term_dep_sub2 (c,d)) (B_and (a,b,c,d))
@@ -916,10 +905,6 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           let acc, a, b = fold_binary acc a b in
           acc, B_imply (a, b)
 
-    let is_const t = match t.term_cell with
-      | Const _ -> true
-      | _ -> false
-
     let map_builtin f b =
       let (), b = fold_map_builtin (fun () t -> (), f t) () b in
       b
@@ -931,20 +916,16 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       | B_eq (a,b) -> yield a; yield b
       | B_and (a,b,c,d) -> yield a; yield b; yield c; yield d
 
-    let ty t = t.term_ty
-
     let equal = term_equal_
     let hash = term_hash_
     let compare a b = CCInt.compare a.term_id b.term_id
 
     module As_key = struct
         type t = term
-        let compare = compare
         let equal = equal
         let hash = hash
     end
 
-    module Map = CCMap.Make(As_key)
     module Tbl = CCHashtbl.Make(As_key)
 
     let to_seq_depth t (yield:t*int ->unit): unit =
@@ -1220,20 +1201,15 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
   module Lit : sig
     type t = lit
     val neg : t -> t
-    val abs : t -> t
     val sign : t -> bool
     val view : t -> lit_view
     val as_atom : t -> (term * bool) option
     val fresh_with : ID.t -> t
-    val fresh : unit -> t
     val dummy : t
     val atom : ?sign:bool -> term -> t
-    val eq : term -> term -> t
-    val neq : term -> term -> t
     val cst_choice : cst -> term -> t
     val uty_choice_empty : ty_uninterpreted_slice -> t
     val uty_choice_nonempty : ty_uninterpreted_slice -> t
-    val uty_choice_status : ty_uninterpreted_slice -> ty_uninterpreted_status -> t
     val hash : t -> int
     val compare : t -> t -> int
     val equal : t -> t -> bool
@@ -1241,7 +1217,6 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     val pp : t CCFormat.printer
     val norm : t -> t * FI.negated
     module Set : CCSet.S with type elt = t
-    module Tbl : CCHashtbl.S with type key = t
   end = struct
     type t = lit
 
@@ -1249,8 +1224,6 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
 
     let sign t = t.lit_sign
     let view (t:t): lit_view = t.lit_view
-
-    let abs t: t = {t with lit_sign=true}
 
     let make ~sign v = {lit_sign=sign; lit_view=v}
 
@@ -1272,14 +1245,9 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       let sign = if not sign' then not sign else sign in
       make ~sign (Lit_atom t)
 
-    let eq a b = atom ~sign:true (Term.eq a b)
-    let neq a b = atom ~sign:false (Term.eq a b)
     let cst_choice c t = make ~sign:true (Lit_assign (c, t))
     let uty_choice_empty uty = make ~sign:true (Lit_uty_empty uty)
     let uty_choice_nonempty uty : t = make ~sign:false (Lit_uty_empty uty)
-    let uty_choice_status uty s : t = match s with
-      | Uty_empty -> uty_choice_empty uty
-      | Uty_nonempty -> uty_choice_nonempty uty
 
     let as_atom (lit:t) : (term * bool) option = match lit.lit_view with
       | Lit_atom t -> Some (t, lit.lit_sign)
@@ -1295,7 +1263,6 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       if l.lit_sign then l, FI.Same_sign else neg l, FI.Negated
 
     module Set = CCSet.Make(struct type t = lit let compare=compare end)
-    module Tbl = CCHashtbl.Make(struct type t = lit let equal=equal let hash=hash end)
   end
 
   module Explanation = struct
@@ -1310,11 +1277,6 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       | E_empty, _ -> s2
       | _, E_empty -> s1
       | _ -> E_append (s1, s2)
-    let cons e s = append (return e) s
-
-    let is_empty = function
-      | E_empty -> true
-      | E_leaf _ | E_or _ | E_append _ -> false (* by smart cstor *)
 
     let to_lists e: lit list Sequence.t =
       let open Sequence.Infix in
@@ -1328,8 +1290,6 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           Sequence.append (aux acc a)(aux acc b)
       in
       aux [] e
-
-    let to_lists_l e: lit list list = to_lists e |> Sequence.to_rev_list
 
     let to_lists_uniq e =
       let f l = Lit.Set.of_list l |> Lit.Set.to_list in
@@ -1363,7 +1323,6 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     val lemma_queue : t Queue.t
     val push_new : t -> unit
     val push_new_l : t list -> unit
-    val iter : (Lit.t -> unit) -> t -> unit
     val to_seq : t -> Lit.t Sequence.t
     val pp : t CCFormat.printer
   end = struct
@@ -1425,7 +1384,6 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
 
     let push_new_l = List.iter push_new
 
-    let iter f c = List.iter f c.lits
     let to_seq c = Sequence.of_list c.lits
   end
 
@@ -1433,7 +1391,6 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
 
   module Iterative_deepening : sig
     type t = private int
-    val max_depth : t
 
     type state =
       | At of t * Lit.t
@@ -1442,7 +1399,6 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     val reset : unit -> unit
     val current : unit -> state
     val current_depth : unit -> t
-    val current_lit : unit -> Lit.t
     val next : unit -> state
     val lit_of_depth : int -> Lit.t option
     val lit_max_smaller_than : int -> int * Lit.t
@@ -1530,10 +1486,6 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     let current_depth () = match !cur_ with
       | Exhausted -> max_depth
       | At (d,_) -> d
-
-    let current_lit () = match !cur_ with
-      | Exhausted -> assert false
-      | At (_,lit) -> lit
 
     (* next state *)
     let next () = match !cur_ with
@@ -2030,27 +1982,6 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       end
   end
 
-  let pp_dep_full out = function
-    | Dep_cst c ->
-      let i = match Typed_cst.as_undefined c with
-        | None -> assert false
-        | Some (_,_,i,_) -> i
-      in
-      let nf = match i.cst_cur_case with
-        | None -> Term.const c
-        | Some (_, t') -> t'
-      in
-      Format.fprintf out
-        "(@[%a@ nf:%a@ :expanded %B@])"
-        Typed_cst.pp c Term.pp nf
-        (match Typed_cst.as_undefined c with
-          | None -> assert false
-          | Some (_,_,i,_) -> i.cst_cases <> Lazy_none)
-    | Dep_uty uty ->
-      Format.fprintf out
-        "(@[%a@ :expanded %B@])"
-        pp_uty uty (uty.uty_pair<>Lazy_none)
-
   (* for each explanation [e1, e2, ..., en] build the guard
          [e1 & e2 & ... & en => …], that is, the clause
          [not e1 | not e2 | ... | not en] *)
@@ -2085,9 +2016,6 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         end
       in
       List.exists aux l
-
-    let cycle_check ~(sub:term) (into:term): bool =
-      cycle_check_l ~sub [into]
 
     (* set the normal form of [t], propagate to watchers *)
     let set_nf_ t new_t (e:explanation) : unit =
@@ -2597,15 +2525,8 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       in the current partial model. *)
 
   module Top_terms : sig
-    type t = private term
-
-    val to_lit : t -> Lit.t
-    val pp : t CCFormat.printer
-    val update : t -> unit (** re-check value, maybe propagate *)
     val add : term -> unit
-    val is_top_term : term -> bool
     val size : unit -> int
-    val to_seq : t Sequence.t
     val update_all : unit -> unit (** update all top terms *)
   end = struct
     type t = term
@@ -2707,10 +2628,6 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         update lit;
       )
 
-    let is_top_term (t:t) : bool =
-      let lit, _ = Term.abs t in
-      mem_top_ lit
-
     let to_seq yield = List.iter yield !top_
 
     let size () = List.length !top_
@@ -2765,7 +2682,6 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
 
   module Top_goals: sig
     val push : term -> unit
-    val to_seq : term Sequence.t
     val check: unit -> unit
   end = struct
     (* list of terms to fully evaluate *)
@@ -2775,8 +2691,6 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     let push (t:term): unit =
       toplevel_goals_ := t :: !toplevel_goals_;
       ()
-
-    let to_seq k = List.iter k !toplevel_goals_
 
     (* check that this term fully evaluates to [true] *)
     let is_true_ (t:term): bool =
@@ -3386,7 +3300,6 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     | U_undefined_values  -> CCFormat.string out "undefined_values"
 
   type model = Model.t
-  let pp_model = Model.pp
 
   type res =
     | Sat of model
@@ -3505,23 +3418,12 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     in
     Model.make ~env ~consts ~domains
 
-  let model_check m =
+  let model_check () =
     Log.debugf 1 (fun k->k "checking model…");
-    Log.debugf 5 (fun k->k "(@[<1>candidate model: %a@])" Model.pp m);
-    let goals =
-      Top_goals.to_seq
-      |> Sequence.map Conv.term_to_ast
-      |> Sequence.to_list
-    in
-    Model.check m ~goals
+    Top_goals.check()
 
   let clause_of_mclause (c:M.St.clause): Clause.t =
     M.Proof.to_list c |> List.map (fun a -> a.M.St.lit) |> Clause.make
-
-  (* convert unsat-core *)
-  let clauses_of_unsat_core (core:M.St.clause list): Clause.t Sequence.t =
-    Sequence.of_list core
-    |> Sequence.map clause_of_mclause
 
   let pp_stats out () : unit =
     Format.fprintf out
@@ -3634,7 +3536,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
               (fun k->k "@{<Yellow>** found SAT@} at depth %a"
                   ID.pp cur_depth);
             do_on_exit ~on_exit;
-            if check then model_check m;
+            if check then model_check ();
             Sat m
           | M.Unsat us ->
             (* check if [max depth] literal involved in proof;

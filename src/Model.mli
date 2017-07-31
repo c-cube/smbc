@@ -28,6 +28,3 @@ val pp_syn : Ast.syntax -> t CCFormat.printer
 val eval : t -> term -> term
 
 exception Bad_model of t * term * term
-
-val check : t -> goals:term list -> unit
-(** @raise Bad_model if some goal is not satisfied *)
