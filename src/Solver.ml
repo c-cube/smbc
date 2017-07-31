@@ -2695,7 +2695,6 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     (* check that this term fully evaluates to [true] *)
     let is_true_ (t:term): bool =
       let _, t' = Reduce.compute_nf t in
-      assert (Term.equal t' (Reduce.get_nf t |> snd));
       match t'.term_cell with
         | True -> true
         | _ -> false
