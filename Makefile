@@ -11,11 +11,14 @@ build:
 clean:
 	$(OCAMLBUILD) -clean
 
+TESTOPTS ?= -j 3
+TESTTOOL=logitest
+
 install: build
 	cp smbc.native $(BINDIR)/smbc
 
 test: build
-	frogtest run -c test.toml --meta `git rev-parse HEAD`
+	$(TESTTOOL) run -c test.toml $(TESTOPTS) --meta `git rev-parse HEAD`
 
 watch:
 	while find src/ -print0 | xargs -0 inotifywait -e delete_self -e modify ; do \
@@ -31,9 +34,9 @@ perf_compare: build $(PERF_CONF)
 	frogtest csv -o perf.csv
 
 benchs: build
-	frogtest run -c benchmarks/smbc.toml --meta `git rev-parse HEAD`
+	$(TESTTOOL) run -c benchmarks/smbc.toml --meta `git rev-parse HEAD`
 
 hbmc_benchs: build
-	frogtest run -c benchs_hbmc/conf.toml
+	$(TESTTOOL) run -c benchs_hbmc/conf.toml
 
 .PHONY: watch benchs clean build test
