@@ -367,6 +367,7 @@ let rec app_ty_ ty l : Ty.t = match ty, l with
     Ty.ill_typed "cannot apply ty `@[%a@]`@ to `@[%a@]`" Ty.pp ty pp_term a
 
 let mk_ term ty = {term; ty}
+let ty t = t.ty
 
 let true_ = mk_ (Bool true) Ty.prop
 let false_ = mk_ (Bool false) Ty.prop
@@ -430,15 +431,18 @@ let let_ v t u =
       Var.pp v Ty.pp (Var.ty v) Ty.pp t.ty;
   mk_ (Let (v,t,u)) u.ty
 
+let bind ~ty b v t = mk_ (Bind(b,v,t)) ty
+
 let fun_ v t =
   let ty = Ty.arrow (Var.ty v) t.ty in
   mk_ (Bind (Fun,v,t)) ty
 
 let quant_ q v t =
-  if not (Ty.equal t.ty Ty.prop)
-  then Ty.ill_typed
+  if not (Ty.equal t.ty Ty.prop) then (
+    Ty.ill_typed
       "quantifier: bounded term : %a@ should have type prop"
       Ty.pp t.ty;
+  );
   let ty = Ty.prop in
   mk_ (q v t) ty
 

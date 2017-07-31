@@ -492,9 +492,12 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     | Dep_cst c -> Typed_cst.pp out c
     | Dep_uty uty -> pp_uty out uty
 
+  let pp_q_data out (q:quant_data): unit =
+    Format.fprintf out "%a[depth %d]" Ty.pp q.q_data_ty q.q_data_depth
+
   let hash_q_range = function
     | QR_unin u -> hash_uty u
-    | QR_data d -> Hash.combine2 (Hash.int d.q_depth) (Ty.hash d.q_data_ty)
+    | QR_data d -> Hash.combine2 (Hash.int d.q_data_depth) (Ty.hash d.q_data_ty)
 
   let equal_q_range r1 r2 = match r1, r2 with
     | QR_unin u1, QR_unin u2 -> equal_uty u1 u2
@@ -503,6 +506,10 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       d1.q_data_depth = d2.q_data_depth
     | QR_unin _, _
     | QR_data _, _ -> false
+
+  let pp_q_range out = function
+    | QR_unin uty -> pp_uty out uty
+    | QR_data d -> pp_q_data out d
 
   module Backtrack = struct
     type _level = level
@@ -871,11 +878,14 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       | Builtin (B_not t) -> t, false
       | _ -> t, true
 
-    let quant q uty body =
+    let quant q (qr:quant_range) body =
       assert (Ty.is_prop body.term_ty);
       (* evaluation is blocked by the uninterpreted type *)
-      let deps = Term_dep_uty uty in
-      mk_term_ ~deps ~ty:(DTy_direct Ty.prop) (Quant (q,uty,body))
+      let deps = match qr with
+        | QR_unin uty -> Term_dep_uty uty
+        | QR_data _ -> Term_dep_none
+      in
+      mk_term_ ~deps ~ty:(DTy_direct Ty.prop) (Quant (q,qr,body))
 
     let forall = quant Forall
     let exists = quant Exists
@@ -1052,7 +1062,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         | Fun (ty,f) ->
           fpf out "(@[fun %a@ %a@])" Ty.pp ty pp f
         | Quant (q,uty,f) ->
-          fpf out "(@[%a %a@ %a@])" pp_quant q pp_uty uty pp f
+          fpf out "(@[%a %a@ %a@])" pp_quant q pp_q_range uty pp f
         | Mu sub -> fpf out "(@[mu@ %a@])" pp sub
         | If (a, b, c) ->
           fpf out "(@[if %a@ %a@ %a@])" pp a pp b pp c
@@ -2110,7 +2120,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           (* [mu x. body] becomes [body[x := mu x. body]] *)
           let env = DB_env.singleton t in
           Explanation.empty, Term.eval_db env body
-        | Quant (q,uty,body) ->
+        | Quant (q,QR_unin uty,body) ->
           begin match uty.uty_status with
             | None -> Explanation.empty, t
             | Some (e, status) ->
@@ -2122,7 +2132,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
                 Term.eval_db (DB_env.singleton (Term.const c_head)) body
               in
               let t2() =
-                Term.quant q uty_tail body
+                Term.quant q (QR_unin uty_tail) body
               in
               begin match q, status with
                 | Forall, Uty_empty -> e, Term.true_
@@ -2138,6 +2148,10 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
                   compute_nf_add e t'
               end
           end
+        | Quant (q,QR_data qrd,body) ->
+          (* at max depth, [forall x:nat. t] becomes [undefined];
+             otherwise it becomes [t[0] ∧ forall y:nat. t[s(y)/x]] *)
+          assert false (* TODO *)
         | Builtin b ->
           (* try boolean reductions *)
           let e, t' = compute_builtin ~old:t b in

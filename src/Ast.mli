@@ -124,6 +124,7 @@ type statement =
 (** {2 Constructors} *)
 
 val term_view : term -> term_cell
+val ty : term -> Ty.t
 
 val var : var -> term
 val const : ID.t -> Ty.t -> term
@@ -134,6 +135,7 @@ val if_ : term -> term -> term -> term
 val match_ : term -> (var list * term) ID.Map.t -> term
 val switch : term -> term ID.Map.t -> term
 val let_ : var -> term -> term -> term
+val bind : ty:Ty.t -> binder -> var -> term -> term
 val fun_ : var -> term -> term
 val fun_l : var list -> term -> term
 val fun_a : var array -> term -> term
@@ -156,8 +158,6 @@ val undefined_value : Ty.t -> term
 val asserting : term -> term -> term
 
 val unfold_fun : term -> var list * term
-
-val equal : term -> term -> bool
 
 (** {2 Printing} *)
 
