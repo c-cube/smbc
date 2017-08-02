@@ -40,11 +40,9 @@ module Make(C:CONFIG)(Dummy : sig end) : sig
     | Atomic of ID.t * ty_def
     | Arrow of ty_h * ty_h
 
-  type 'a db_env
-
   (** {2 Main} *)
 
-  type model = Model.t
+  type model = Rw_model.t
 
   type unknown =
     | U_timeout
@@ -55,13 +53,13 @@ module Make(C:CONFIG)(Dummy : sig end) : sig
   val pp_unknown : unknown CCFormat.printer
 
   type res =
-    | Sat of Model.t
+    | Sat of model
     | Unsat (* TODO: proof *)
     | Unknown of unknown
 
   val pp_stats : unit CCFormat.printer
 
-  val add_statement_l : Ast.statement list -> unit
+  val add_stmt_l : Rw_ast.statement list -> unit
 
   val solve :
     ?on_exit:(unit -> unit) list ->

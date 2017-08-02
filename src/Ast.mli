@@ -10,64 +10,6 @@ type 'a to_sexp = 'a -> sexp
 (** {2 Types} *)
 
 exception Error of string
-exception Ill_typed of string
-
-module Var : sig
-  type 'ty t = private {
-    id: ID.t;
-    ty: 'ty;
-  }
-
-  val make : ID.t -> 'ty -> 'ty t
-  val copy : 'a t -> 'a t
-  val id : _ t -> ID.t
-  val ty : 'a t -> 'a
-
-  val equal : 'a t -> 'a t -> bool
-  val compare : 'a t -> 'a t -> int
-  val pp : _ t CCFormat.printer
-  val to_sexp : _ t to_sexp
-  val to_sexp_typed : 'ty to_sexp -> 'ty t to_sexp
-end
-
-module Ty : sig
-  type t =
-    | Prop
-    | Const of ID.t
-    | Arrow of t * t
-
-  val prop : t
-  val const : ID.t -> t
-  val arrow : t -> t -> t
-  val arrow_l : t list -> t -> t
-
-  include Intf.EQ with type t := t
-  include Intf.ORD with type t := t
-  include Intf.HASH with type t := t
-  include Intf.PRINT with type t := t
-
-  val unfold : t -> t list * t
-  (** [unfold ty] will get the list of arguments, and the return type
-      of any function. An atomic type is just a function with no arguments *)
-
-  val to_sexp : t to_sexp
-
-  (** {2 Datatypes} *)
-
-  (** Mutually recursive datatypes *)
-  type data = {
-    data_id: ID.t;
-    data_cstors: t ID.Map.t;
-  }
-
-  val data_to_sexp : data -> sexp
-
-  module Map : CCMap.S with type key = t
-
-  (** {2 Error Handling} *)
-
-  val ill_typed : ('a, Format.formatter, unit, 'b) format4 -> 'a
-end
 
 type var = Ty.t Var.t
 

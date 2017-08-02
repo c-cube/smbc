@@ -43,11 +43,14 @@ let solve ~config (ast:Ast.statement list) : unit =
   let module S = Solver.Make(Conf)(struct end) in
   let on_exit = [] in
   (* solve *)
-  S.add_statement_l ast;
+  let compile_state = Compile.create() in
+  let st_l = CCList.flat_map (Compile.compile compile_state) ast in
+  S.add_stmt_l st_l;
   let res = S.solve ~on_exit ~check:config.check () in
   if config.print_stat then Format.printf "%a@." S.pp_stats ();
   match res with
     | S.Sat m ->
+      let m = Compile.translate_model compile_state m in
       Format.printf "(@[<1>result @{<Green>SAT@}@ :model @[%a@]@])@."
         (Model.pp_syn config.syntax) m;
     | S.Unsat ->

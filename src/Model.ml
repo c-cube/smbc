@@ -6,13 +6,13 @@
 module A = Ast
 
 type term = A.term
-type ty = A.Ty.t
+type ty = Ty.t
 type domain = ID.t list
 
 type t = {
   env: A.env;
   (* environment, defining symbols *)
-  domains: domain A.Ty.Map.t;
+  domains: domain Ty.Map.t;
   (* uninterpreted type -> its domain *)
   consts: term ID.Map.t;
   (* constant -> its value *)
@@ -21,7 +21,7 @@ type t = {
 let make ~env ~consts ~domains =
   (* also add domains to [env] *)
   let env =
-    A.Ty.Map.to_seq domains
+    Ty.Map.to_seq domains
     |> Sequence.flat_map_l (fun (ty,l) -> List.map (CCPair.make ty) l)
     |> Sequence.fold
       (fun env (_,cst) -> A.env_add_def env cst A.E_uninterpreted_cst)
@@ -47,7 +47,7 @@ let pp_syn (syn:A.syntax) out (m:t) =
   in
   let es =
     CCList.append
-      (A.Ty.Map.to_list m.domains |> List.map (fun (ty,dom) -> E_ty (ty,dom)))
+      (Ty.Map.to_list m.domains |> List.map (fun (ty,dom) -> E_ty (ty,dom)))
       (ID.Map.to_list m.consts |> List.map (fun (c,t) -> E_const (c,t)))
   in
   Format.fprintf out "(@[<v>%a@])" (Utils.pp_list pp_entry) es
@@ -72,8 +72,8 @@ let () = Printexc.register_printer
 let errorf msg = CCFormat.ksprintf msg ~f:(fun s -> raise (Error s))
 
 module VarMap = CCMap.Make(struct
-    type t = A.Ty.t A.Var.t
-    let compare = A.Var.compare
+    type t = Ty.t Var.t
+    let compare = Var.compare
   end)
 
 (* var -> term in normal form *)
@@ -82,14 +82,14 @@ type subst = A.term lazy_t VarMap.t
 let empty_subst : subst = VarMap.empty
 
 let rename_var subst v =
-  let v' = A.Var.copy v in
+  let v' = Var.copy v in
   VarMap.add v (Lazy.from_val (A.var v')) subst, v'
 
 let rename_vars = CCList.fold_map rename_var
 
 let pp_subst out (s:subst) =
   let pp_pair out (v,lazy t) =
-    Format.fprintf out "@[<2>%a@ @<1>→ %a@]" A.Var.pp v A.pp_term t
+    Format.fprintf out "@[<2>%a@ @<1>→ %a@]" Var.pp v A.pp_term t
   in
   Format.fprintf out "[@[%a@]]"
     CCFormat.(list ~sep:(return ",@ ") pp_pair) (VarMap.to_list s |> List.rev)
@@ -161,7 +161,7 @@ let rec eval_whnf (m:t) (st:term list) (subst:subst) (t:term): term =
   let st = t :: st in
   try
     eval_whnf_rec m st subst t
-  with A.Ill_typed msg ->
+  with Ty.Ill_typed msg ->
     errorf "@[<2>Model:@ internal type error `%s`@ in %a@]" msg pp_stack st
 and eval_whnf_rec m st subst t = match A.term_view t with
   | A.Undefined_value | A.Bool _ -> t
@@ -201,12 +201,12 @@ and eval_whnf_rec m st subst t = match A.term_view t with
     eval_whnf m st subst' u
   | A.Bind (A.Fun,_,_) -> apply_subst subst t
   | A.Bind ((A.Forall | A.Exists) as b,v,body) ->
-    let ty = A.Var.ty v in
+    let ty = Var.ty v in
     let dom =
-      try A.Ty.Map.find ty m.domains
+      try Ty.Map.find ty m.domains
       with Not_found ->
         errorf "@[<2>could not find type %a in model@ stack %a@]"
-          A.Ty.pp ty pp_stack st
+          Ty.pp ty pp_stack st
     in
     (* expand into and/or over the domain *)
     let t' =
@@ -325,7 +325,7 @@ and eval_whnf_rec m st subst t = match A.term_view t with
           | A.Bool false, A.Bool false -> A.true_
           | A.Bool true, A.Bool false
           | A.Bool false, A.Bool true -> A.false_
-          | A.Var v1, A.Var v2 when A.Var.equal v1 v2 -> A.true_
+          | A.Var v1, A.Var v2 when Var.equal v1 v2 -> A.true_
           | A.Const id1, A.Const id2 when ID.equal id1 id2 -> A.true_
           | _ ->
             begin match as_cstor_app m.env a, as_cstor_app m.env b with

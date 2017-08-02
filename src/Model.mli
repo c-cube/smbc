@@ -4,13 +4,13 @@
 (** {1 Model} *)
 
 type term = Ast.term
-type ty = Ast.Ty.t
+type ty = Ty.t
 type domain = ID.t list
 
 type t = private {
   env: Ast.env;
   (* environment, defining symbols *)
-  domains: domain Ast.Ty.Map.t;
+  domains: domain Ty.Map.t;
   (* uninterpreted type -> its domain *)
   consts: term ID.Map.t;
   (* constant -> its value *)
@@ -19,7 +19,7 @@ type t = private {
 val make :
   env:Ast.env ->
   consts:term ID.Map.t ->
-  domains:domain Ast.Ty.Map.t ->
+  domains:domain Ty.Map.t ->
   t
 
 val pp : t CCFormat.printer
