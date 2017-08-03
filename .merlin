@@ -6,4 +6,4 @@ PKG containers.data
 PKG sequence
 PKG tip_parser
 PKG msat
-FLG -w +a-4-44-58@8-60
+FLG -w +a-4-44-58-48@8-60
