@@ -45,6 +45,10 @@ let unfold ty =
   in
   aux [] ty
 
+let is_prop = function Prop -> true | _ -> false
+let is_const = function (Const _) -> true | _ -> false
+let is_arrow = function (Arrow (_,_)) -> true | _ -> false
+
 let rec to_sexp = function
   | Prop -> S.atom "prop"
   | Const id -> S.atom (ID.to_string id)

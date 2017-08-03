@@ -33,13 +33,6 @@ module Make(C:CONFIG)(Dummy : sig end) : sig
 
   type cst_info
 
-  type ty_def
-
-  type ty_cell =
-    | Prop
-    | Atomic of ID.t * ty_def
-    | Arrow of ty_h * ty_h
-
   (** {2 Main} *)
 
   type model = Rw_model.t

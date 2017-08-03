@@ -44,6 +44,7 @@ type term = {
 and term_cell =
   | Var of var
   | Const of ID.t
+  | Unknown of ID.t (* meta var *)
   | App of term * term list
   | If of term * term * term
   | Select of select * term
@@ -123,7 +124,7 @@ let typed_var_to_tip v = var_to_tip v, ty_to_tip (Var.ty v)
 
 let rec term_to_tip (t:term): TA.term = match t.term with
   | Var v -> TA.const (var_to_tip v)
-  | Const c -> TA.const (id_to_tip c)
+  | Const c | Unknown c -> TA.const (id_to_tip c)
   | Select ({select_name=lazy n; _}, arg) ->
     TA.app (id_to_tip n) [term_to_tip arg]
   | App (f,l) ->
@@ -281,6 +282,7 @@ let asserting t g =
 let var v = mk_ (Var v) (Var.ty v)
 
 let const id ty = mk_ (Const id) ty
+let unknown id ty = mk_ (Unknown id) ty
 
 let select (s:select) (t:term) ty = mk_ (Select (s,t)) ty
 
@@ -392,6 +394,128 @@ let or_l = function
 let not_ t =
   check_prop_ t;
   mk_ (Not t) Ty.prop
+
+let map ~bind:f_bind ~f b_acc t : term = match term_view t with
+  | Var _
+  | Const _
+  | Unknown _
+  | Undefined_value
+  | Bool _
+    -> t
+  | App (hd, l) ->
+    let hd = f b_acc hd in
+    let l = List.map (f b_acc) l in
+    app hd l
+  | If (a,b,c) ->
+    let a = f b_acc a in
+    let b = f b_acc b in
+    let c = f b_acc c in
+    if_ a b c
+  | Select _ -> assert false (* TODO *)
+  | Match (t, m) ->
+    let t = f b_acc t in
+    let m =
+      ID.Map.map
+        (fun (vars,rhs) ->
+           let b_acc, vars = CCList.fold_map f_bind b_acc vars in
+           vars, f b_acc rhs)
+        m
+    in
+    match_ t m
+  | Switch _ -> assert false (* TODO *)
+  | Bind (b, v, body) ->
+    let b_acc, v = f_bind b_acc v in
+    bind ~ty:(ty t) b v (f b_acc body)
+  | Let (v,t,u) ->
+    let t = f b_acc t in
+    let b_acc, v = f_bind b_acc v in
+    let_ v t (f b_acc u)
+  | Not t -> not_ (f b_acc t)
+  | Binop (b, t, u) -> binop b (f b_acc t) (f b_acc u)
+  | Asserting (t, u) ->
+    asserting (f b_acc t) (f b_acc u)
+
+let fold ~bind:f_bind ~f b_acc acc t : _ = match term_view t with
+  | Var _
+  | Const _
+  | Unknown _
+  | Undefined_value
+  | Bool _
+    -> acc
+  | App (hd, l) ->
+    let acc = f b_acc acc hd in
+    let acc = List.fold_left (f b_acc) acc l in
+    acc
+  | If (a,b,c) ->
+    let acc = f b_acc acc a in
+    let acc = f b_acc acc b in
+    let acc = f b_acc acc c in
+    acc
+  | Select _ -> assert false (* TODO *)
+  | Match (t, m) ->
+    let acc = f b_acc acc t in
+    let acc =
+      ID.Map.fold
+        (fun _ (vars,rhs) acc ->
+           let b_acc = List.fold_left f_bind b_acc vars in
+           f b_acc acc rhs)
+        m acc
+    in
+    acc
+  | Switch _ -> assert false (* TODO *)
+  | Bind (_, v, body) ->
+    let b_acc = f_bind b_acc v in
+    f b_acc acc body
+  | Let (v,t,u) ->
+    let acc = f b_acc acc t in
+    let b_acc = f_bind b_acc v in
+    f b_acc acc u
+  | Not t -> f b_acc acc t
+  | Binop (_, t, u)
+  | Asserting (t, u) -> f b_acc (f b_acc acc u) t
+
+let free_vars_l ?(bound=Var.Set.empty) l =
+  let rec aux bound free t = match term_view t with
+    | Var v ->
+      if Var.Set.mem v bound then free
+      else Var.Set.add v free
+    | _ ->
+      fold
+        ~bind:(fun bnd v -> Var.Set.add v bnd)
+        ~f:aux
+        bound free
+        t
+  in
+  List.fold_left (aux bound) Var.Set.empty l
+
+let free_vars ?bound t = free_vars_l ?bound [t]
+
+(** {2 Substitutions} *)
+
+module Subst = struct
+  type t = term Var.Map.t
+
+  let empty = Var.Map.empty
+  let is_empty = Var.Map.is_empty
+  let add m v t = Var.Map.add v t m
+  let mem m v = Var.Map.mem v m
+  let find m v = Var.Map.get v m
+  let of_list = Var.Map.of_list
+  let singleton = Var.Map.singleton
+  let merge = Var.Map.merge_disj
+
+  let rename subst v =
+    let v' = Var.copy v in
+    add subst v (var v'), v'
+
+  let rec eval subst (t:term): term = match term_view t with
+    | Var v -> Var.Map.get_or ~default:t v subst
+    | _ -> map ~bind:rename ~f:eval subst t
+
+  let pp out m =
+    let pp_b = CCFormat.(pair ~sep:(return "-> @") Var.pp pp_term) in
+    Format.fprintf out "{@[%a@]}" (Utils.pp_list pp_b) (Var.Map.to_list m)
+end
 
 (** {2 Parsing} *)
 

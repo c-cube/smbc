@@ -145,7 +145,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
   and cst_kind =
     | Cst_undef of cst_info
     | Cst_cstor of ty_h (* the datatype *)
-    | Cst_defined of int * rw_rule list lazy_t (* arity of rules, list of rules *)
+    | Cst_defined of (int * rw_rule list) lazy_t (* arity of rules, list of rules *)
 
   and cst_info = {
     cst_depth: int;
@@ -326,15 +326,23 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       assert (Ty_h.is_data ret);
       make id ty (Cst_cstor ret)
 
-    let make_defined id ty rules =
+    let make_defined id ty rules : t =
       (* check arity *)
-      let ar = match rules with
-        | lazy [] -> assert false
-        | lazy (r1 :: tail) ->
-          List.iter (fun r2 -> assert (r1.rule_arity = r2.rule_arity)) tail;
-          r1.rule_arity
-      in
-      make id ty (Cst_defined (ar,rules))
+      let rules_with_ar = lazy (
+        match rules with
+          | lazy [] -> assert false
+          | lazy (r1 :: tail) ->
+            List.iter (fun r2 -> assert (r1.rule_arity = r2.rule_arity)) tail;
+            r1.rule_arity, r1::tail
+      ) in
+      make id ty (Cst_defined rules_with_ar)
+
+    let make_defined_fix id ty (rules_f : cst -> rw_rule list) : t =
+      let rec c = lazy (
+        let rules = lazy (rules_f (Lazy.force c)) in
+        make_defined id ty rules
+      ) in
+      Lazy.force c
 
     let depth (c:t): int = match c.cst_kind with
       | Cst_undef i -> i.cst_depth
@@ -465,13 +473,13 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
 
   (* the "bool" constructors *)
   let bool_cstors : cst lazy_t list =
-    let rec l =
-      let ty = Ty_h.atomic (ID.make "bool") l in
-      [ lazy (Cst.make_cstor (ID.make "true") ty);
-        lazy (Cst.make_cstor (ID.make "false") ty);
+    let rec l = lazy (
+      let ty () = Ty_h.atomic (ID.make "bool") (Lazy.force l) in
+      [ lazy (Cst.make_cstor (ID.make "true") (ty ()));
+        lazy (Cst.make_cstor (ID.make "false") (ty ()));
       ]
-    in
-    l
+    ) in
+    Lazy.force l
 
   let bool_ty : ty_h = List.hd bool_cstors |> Lazy.force |> Cst.ty
 
@@ -696,40 +704,39 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     let is_true = Term.equal true_
     let is_false = Term.equal false_
 
-    let rec not_c =
-      let rules = lazy (
-        [ mk_rule not_c [true_] false_;
-          mk_rule not_c [false_] true_;
-        ]
-      ) in
-      Cst.make_defined (ID.make "not") (Ty_h.arrow bool_ty bool_ty) rules
+    let not_c =
+      Cst.make_defined_fix (ID.make "not") (Ty_h.arrow bool_ty bool_ty)
+        (fun not_c ->
+           [ mk_rule not_c [true_] false_;
+             mk_rule not_c [false_] true_;
+           ])
 
     let not_ t = Term.app_cst not_c [t]
 
     let v_bool = IVar.mk 0 bool_ty
     let ty_bool2 = Ty_h.arrow_l [bool_ty; bool_ty] bool_ty
 
-    let rec and_c =
-      let rules = lazy (
-        [ mk_rule and_c [true_; true_] true_;
-          mk_rule and_c [false_; Term.var v_bool] false_;
-          mk_rule and_c [Term.var v_bool; false_] false_;
-        ]
-      ) in
-      Cst.make_defined (ID.make "and") bool_ty rules
+    let and_c =
+      Cst.make_defined_fix (ID.make "and") bool_ty
+        (fun and_c ->
+           [ mk_rule and_c [true_; true_] true_;
+             mk_rule and_c [false_; Term.var v_bool] false_;
+             mk_rule and_c [Term.var v_bool; false_] false_;
+           ])
 
     let and_ t u = Term.app_cst and_c [t; u]
 
-    let rec or_c =
-      let rules = lazy (
-        [ mk_rule or_c [false_; false_] false_;
-          mk_rule or_c [true_; Term.var v_bool] true_;
-          mk_rule or_c [Term.var v_bool; true_] true_;
-        ]
-      ) in
-      Cst.make_defined (ID.make "or") bool_ty rules
+    let or_c =
+      Cst.make_defined_fix (ID.make "or") bool_ty
+        (fun or_c ->
+           [ mk_rule or_c [false_; false_] false_;
+             mk_rule or_c [true_; Term.var v_bool] true_;
+             mk_rule or_c [Term.var v_bool; true_] true_;
+           ])
 
     let or_ t u = Term.app_cst or_c [t; u]
+
+    let imply t u = or_ (not_ t) u
 
     let rec and_l = function
       | [] -> true_
@@ -783,27 +790,22 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         | _ -> assert false
       in
       assert (List.exists (fun (lazy c') -> Cst.equal c c') cstors);
-      let rec c_test =
-        let rules = lazy (
-          List.map
-            (fun (lazy c') ->
-               let ty_args, _ = Ty_h.unfold (Cst.ty c') in
-               (* rule [is-c (c' x1…xn) --> δ_{c,c'}] *)
-               let args =
-                 [Term.app_cst c'
-                    (List.mapi (fun i ty -> Term.var (IVar.mk i ty)) ty_args)]
-               in
-               let rhs = Form.bool (Cst.equal c c') in
-               mk_rule c_test args rhs)
-            cstors
-        ) in
-        let _, ty_data = Ty_h.unfold (Cst.ty c) in
-        Cst.make_defined
-          (ID.make ("is-" ^ ID.name (Cst.id c)))
-          (Ty_h.arrow ty_data Ty_h.prop)
-          rules
-      in
-      c_test
+      let _, ty_data = Ty_h.unfold (Cst.ty c) in
+      Cst.make_defined_fix
+        (ID.make ("is-" ^ ID.name (Cst.id c)))
+        (Ty_h.arrow ty_data Ty_h.prop)
+        (fun c_test ->
+           List.map
+             (fun (lazy c') ->
+                let ty_args, _ = Ty_h.unfold (Cst.ty c') in
+                (* rule [is-c (c' x1…xn) --> δ_{c,c'}] *)
+                let args =
+                  [Term.app_cst c'
+                     (List.mapi (fun i ty -> Term.var (IVar.mk i ty)) ty_args)]
+                in
+                let rhs = Form.bool (Cst.equal c c') in
+                mk_rule c_test args rhs)
+             cstors)
 
     (* get or create tester function for this constructor *)
     let test_cstor (c:cst): cst =
@@ -819,18 +821,16 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     let if_c ty =
       try Ty_h.Tbl.find tbl_if_ ty
       with Not_found ->
-        let rec if_c =
+        let if_c =
           let x = IVar.mk 0 ty |> Term.var in
           let y = IVar.mk 1 ty |> Term.var in
-          let rules = lazy (
-            [ mk_rule if_c [Form.true_; x; y] x;
-              mk_rule if_c [Form.false_; x; y] y;
-            ]
-          ) in
-          Cst.make_defined
+          Cst.make_defined_fix
             (ID.make ("if-" ^ Ty_h.mangle ty))
             (Ty_h.arrow_l [bool_ty; ty; ty] ty)
-            rules
+            (fun if_c ->
+               [ mk_rule if_c [Form.true_; x; y] x;
+                 mk_rule if_c [Form.false_; x; y] y;
+               ])
         in
         Ty_h.Tbl.add tbl_if_ ty if_c;
         if_c
@@ -1648,7 +1648,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
             | Cst_undef {cst_cur_case=Some (e,new_t); _} ->
               (* c := new_t, we can reduce *)
               compute_nf_add e new_t
-            | Cst_defined (0, lazy (r :: _)) ->
+            | Cst_defined (lazy (0, r :: _)) ->
               (* nullary rule *)
               assert (r.rule_args=[]);
               compute_nf r.rule_rhs
@@ -1663,7 +1663,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
             assert (Explanation.is_empty e_f); (* termination! *)
             let n = List.length l in
             begin match Term.view f' with
-              | Const {cst_kind=Cst_defined (ar, lazy rules); _} when ar <= n ->
+              | Const {cst_kind=Cst_defined (lazy (ar, rules)); _} when ar <= n ->
                 (* a defined constant, see if we can rewrite *)
                 begin match find_rule rules l with
                   | MR_fail -> assert false
@@ -2164,14 +2164,8 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
   (* list of constants we are interested in *)
   let model_support_ : Cst.t list ref = ref []
 
-  (* list of (uninterpreted) types we are interested in *)
-  let model_utys : Ty_h.t list ref = ref []
-
   let add_cst_support_ (c:cst): unit =
     CCList.Ref.push model_support_ c
-
-  let add_ty_support_ (ty:Ty_h.t): unit =
-    CCList.Ref.push model_utys ty
 
   module Conv = struct
     (* for converting Ty into ty_h *)
@@ -2191,14 +2185,21 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       | Ty.Arrow (a,b) -> Ty_h.arrow (conv_ty a) (conv_ty b)
 
     type state = {
-      var_tbl : IVar.t A.Var_tbl.t lazy_t;
-      mutable var_n : int;
+      var_tbl : IVar.t Var.Tbl.t; (* var -> ivar *)
+      unknown_tbl : cst Var.Tbl.t; (* var -> unknown *)
+      mutable var_n : int; (* to allocate ivars *)
     }
 
     let create() : state = {
-      var_tbl = lazy (A.Var_tbl.create 16);
+      var_tbl = Var.Tbl.create 16;
+      unknown_tbl = Var.Tbl.create 16;
       var_n=0;
     }
+
+    let get_or_create_unknown ~st v : cst =
+      Var.Tbl.get_or_add st.unknown_tbl ~k:v
+        ~f:(fun _ ->
+          Cst.make_undef ~depth:0 (Var.id v) (Var.ty v |> conv_ty))
 
     let rec conv_term_rec (st: state) (t:A.term): term =
       begin match A.T.view t with
@@ -2210,8 +2211,9 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
             with Not_found ->
               errorf "could not find constant `%a`" ID.pp id
           end
-        | A.Unknown _v ->
-          assert false (* TODO !! map var to unknown *)
+        | A.Unknown v ->
+          (* get or find corresponding unknown *)
+          get_or_create_unknown ~st v |> Term.const
         | A.If (a,b,c) ->
           Data_term.if_
             (conv_term_rec st a)
@@ -2223,7 +2225,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           Term.app f l
         | A.Var v ->
           let v =
-            A.Var_tbl.get_or_add (Lazy.force st.var_tbl) ~k:v
+            Var.Tbl.get_or_add st.var_tbl ~k:v
               ~f:(fun v ->
                 let ty = Var.ty v |> conv_ty in
                 st.var_n <- st.var_n + 1;
@@ -2240,6 +2242,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
             | A.B_lt -> Term.lt t u
             | A.B_and -> Form.and_ t u
             | A.B_or -> Form.or_ t u
+            | A.B_imply -> Form.imply t u
           end
         | A.Undefined ty -> Term.undefined_value (conv_ty ty)
       end
@@ -2250,7 +2253,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         (fun k->k "(@[conv_term@ @[%a@]@ yields: %a@])" A.T.pp t Term.pp u);
       u
 
-    let add_statement ~st stmt =
+    let add_stmt ~st stmt =
       Log.debugf 2
         (fun k->k "(@[add_statement@ @[%a@]@])" A.Stmt.pp stmt);
       begin match stmt with
@@ -2284,30 +2287,37 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         | A.St_def (c,_) ->
           (* define the mutually recursive functions *)
           List.iter
-            (fun {A.cst_id=id; cst_ty=ty; cst_def =rules} ->
-               let ty = conv_ty ty in
-               let rec cst =
-                 let rules = lazy (
-                   List.map
-                     (fun (args,rhs) ->
-                        let args = List.map (conv_term ~st) args
-                        and rhs = conv_term ~st rhs in
-                        mk_rule cst args rhs)
-                     rules
-                 ) in
-                 Cst.make_defined id ty rules
+            (fun {A.cst_id=id; cst_ty=ty; cst_def=d} ->
+               let rules = match d with
+                 | A.Cst_def l -> l
+                 | A.Cst_cstor _ -> assert false
                in
-               ID.Tbl.add decl_ty_ id (Lazy.from_val cst))
+               let ty = conv_ty ty in
+               let cst = lazy (
+                 Cst.make_defined_fix id ty
+                   (fun cst ->
+                      List.map
+                        (fun (args,rhs) ->
+                           let args = List.map (conv_term ~st) args
+                           and rhs = conv_term ~st rhs in
+                           mk_rule cst args rhs)
+                        rules)
+               ) in
+               ID.Tbl.add decl_ty_ id cst)
             [c];
         | A.St_goal t ->
           let t = conv_term ~st t in
           Top_goals.push t;
           push_clause (Clause.make [Lit.atom t])
+        | A.St_in_model l ->
+          List.iter
+            (fun v -> add_cst_support_ (get_or_create_unknown ~st v))
+            l
       end
 
-    let add_statement_l l =
+    let add_stmt_l l =
       let st = create() in
-      List.iter (add_statement ~st) l
+      List.iter (add_stmt ~st) l
   end
 
   module To_ast = struct
@@ -2353,7 +2363,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
               let u = A.T.unknown v in
               cst.cst_from <- Some u;
               u
-            | None, Cst_defined (_, lazy rules) ->
+            | None, Cst_defined (lazy (_,rules)) ->
               let rules =
                 List.map
                   (fun {rule_args; rule_rhs; _} ->
@@ -2361,7 +2371,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
                   rules
               in
               let u =
-                A.Cst.mk cst.cst_id (ty_to_ast t.term_ty) rules
+                A.Cst.mk_def cst.cst_id (ty_to_ast t.term_ty) rules
                 |> A.T.const
               in
               cst.cst_from <- Some u;
@@ -2465,7 +2475,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     List.iter (fun f->f()) on_exit;
     ()
 
-  let add_statement_l = Conv.add_statement_l
+  let add_stmt_l = Conv.add_stmt_l
 
   let pp_proof out p =
     let pp_step_res out p =

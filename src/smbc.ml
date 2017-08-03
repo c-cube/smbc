@@ -101,7 +101,7 @@ let set_debug_ d =
   ()
 
 let options =
-  Arg.align [
+  [
     "--print-input", Arg.Set print_input_, " print input";
     "--max-depth", Arg.Set_int max_depth_, " set max depth";
     "--dot-term-graph", Arg.Set_string dot_term_graph_, " print term graph in file";
@@ -126,6 +126,8 @@ let options =
     "-t", Arg.Set_int timeout_, " alias to --timeout";
     "--version", Arg.Set version_, " display version info";
   ]
+  |> List.sort (fun (s1,_,_)(s2,_,_) -> String.compare s1 s2)
+  |> Arg.align
 
 let setup_timeout_ t =
   assert (t >= 1);

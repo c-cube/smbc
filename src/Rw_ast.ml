@@ -8,7 +8,7 @@ module Fmt = CCFormat
 type var = Ty.t Var.t
 
 type unop = U_not
-type binop = B_eq | B_leq | B_lt | B_and | B_or
+type binop = B_eq | B_leq | B_lt | B_and | B_or | B_imply
 
 type term = {
   view: term_view;
@@ -28,8 +28,12 @@ and term_view =
 and cst = {
   cst_id : ID.t;
   cst_ty : Ty.t;
-  cst_def : rule list;
+  cst_def : cst_def;
 }
+
+and cst_def =
+  | Cst_def of rule list
+  | Cst_cstor of ID.t (* datatype *)
 
 (* [cst args --> rhs] *)
 and rule = term list * term
@@ -38,13 +42,19 @@ type statement =
   | St_data of Ty.data list (* declare mutual datatypes *)
   | St_def of cst * Ast.term option (* define constant (with backup value) *)
   | St_goal of term (* boolean term *)
+  | St_in_model of var list (* unknowns that must be in model *)
 
 module Cst = struct
   type t = cst
   let ty c = c.cst_ty
-  let mk id ty rules : t =
+  let mk_ id ty d : t = {cst_id=id; cst_ty=ty; cst_def=d}
+  let mk_def id ty rules : t =
     assert (rules<>[]);
-    {cst_id=id; cst_ty=ty; cst_def=rules}
+    mk_ id ty (Cst_def rules)
+  let mk_cstor id ty =
+    let _, ret = Ty.unfold ty in
+    let ty_id = match ret with Ty.Const id -> id | _ -> assert false in
+    mk_ id ty (Cst_cstor ty_id)
   let pp out (c:t) = ID.pp out c.cst_id
 end
 
@@ -52,8 +62,9 @@ let pp_binop out = function
   | B_eq -> Fmt.string out "="
   | B_leq -> Fmt.string out "<="
   | B_lt -> Fmt.string out "<"
-  | B_and -> Fmt.string out "&"
-  | B_or -> Fmt.string out "|"
+  | B_and -> Fmt.string out "and"
+  | B_or -> Fmt.string out "or"
+  | B_imply -> Fmt.string out "=>"
 
 module T = struct
   type t = term
@@ -104,6 +115,7 @@ module T = struct
   let app_cst c l = app (const c) l
 
   let bool b = mk_ (Bool b) Ty.prop
+  let if_ a b c = mk_ (If (a,b,c)) (ty b)
   let unop o t = mk_ (Unop (o,t)) Ty.prop
   let binop o t u = mk_ (Binop (o,t,u)) Ty.prop
   let undefined ty = mk_ (Undefined ty) ty
@@ -120,6 +132,10 @@ module Stmt = struct
 
   let def ?def c : t = St_def (c,def)
 
+  let in_model l : t =
+    assert (l<>[]);
+    St_in_model l
+
   let pp out = function
     | St_data l ->
       let pp_data out (d:Ty.data) =
@@ -133,6 +149,7 @@ module Stmt = struct
     | St_def (c,Some t) ->
       Fmt.fprintf out "(@[def@ %a@ :as %a@])" Cst.pp c Ast.pp_term t
     | St_goal g -> Fmt.fprintf out "(@[goal %a@])" T.pp g
+    | St_in_model l -> Fmt.fprintf out "(@[in_model@ %a@])" (Utils.pp_list Var.pp) l
 end
 
 module As_key = struct
@@ -142,5 +159,3 @@ module As_key = struct
   let hash = Var.hash
 end
 
-module Var_map = CCMap.Make(As_key)
-module Var_tbl = CCHashtbl.Make(As_key)

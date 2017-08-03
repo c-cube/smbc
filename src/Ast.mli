@@ -32,6 +32,7 @@ type term = private {
 and term_cell =
   | Var of var
   | Const of ID.t
+  | Unknown of ID.t
   | App of term * term list
   | If of term * term * term
   | Select of select * term
@@ -70,6 +71,7 @@ val ty : term -> Ty.t
 
 val var : var -> term
 val const : ID.t -> Ty.t -> term
+val unknown : ID.t -> Ty.t -> term
 val app : term -> term list -> term
 val app_a : term -> term array -> term
 val select : select -> term -> Ty.t -> term
@@ -100,6 +102,47 @@ val undefined_value : Ty.t -> term
 val asserting : term -> term -> term
 
 val unfold_fun : term -> var list * term
+
+val map :
+  bind:('b_acc -> var -> 'b_acc * var) ->
+  f:('b_acc -> term -> term) ->
+  'b_acc ->
+  term ->
+  term
+
+val fold :
+  bind:('b_acc -> var -> 'b_acc) ->
+  f:('b_acc -> 'acc -> term -> 'acc) ->
+  'b_acc ->
+  'acc ->
+  term ->
+  'acc
+
+val free_vars : ?bound:Var.Set.t -> term -> Var.Set.t
+
+val free_vars_l : ?bound:Var.Set.t -> term list -> Var.Set.t
+
+(** {2 Substitutions} *)
+
+module Subst : sig
+  type t = term Var.Map.t
+
+  val empty : t
+  val is_empty : t -> bool
+  val add : t -> var -> term -> t
+  val mem : t -> var -> bool
+  val find : t -> var -> term option
+  val of_list : (var * term) list -> t
+  val singleton : var -> term -> t
+
+  val merge : t -> t -> t
+
+  val rename : t -> var -> t * var
+
+  val eval : t -> term -> term
+
+  val pp : t CCFormat.printer
+end
 
 (** {2 Printing} *)
 

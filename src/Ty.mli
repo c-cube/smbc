@@ -25,6 +25,10 @@ val unfold : t -> t list * t
 (** [unfold ty] will get the list of arguments, and the return type
     of any function. An atomic type is just a function with no arguments *)
 
+val is_prop : t -> bool
+val is_const : t -> bool
+val is_arrow : t -> bool
+
 val to_sexp : t to_sexp
 
 (** {2 Datatypes} *)

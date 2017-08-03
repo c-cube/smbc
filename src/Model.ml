@@ -71,19 +71,14 @@ let () = Printexc.register_printer
 
 let errorf msg = CCFormat.ksprintf msg ~f:(fun s -> raise (Error s))
 
-module VarMap = CCMap.Make(struct
-    type t = Ty.t Var.t
-    let compare = Var.compare
-  end)
-
 (* var -> term in normal form *)
-type subst = A.term lazy_t VarMap.t
+type subst = A.term lazy_t Var.Map.t
 
-let empty_subst : subst = VarMap.empty
+let empty_subst : subst = Var.Map.empty
 
 let rename_var subst v =
   let v' = Var.copy v in
-  VarMap.add v (Lazy.from_val (A.var v')) subst, v'
+  Var.Map.add v (Lazy.from_val (A.var v')) subst, v'
 
 let rename_vars = CCList.fold_map rename_var
 
@@ -92,7 +87,7 @@ let pp_subst out (s:subst) =
     Format.fprintf out "@[<2>%a@ @<1>→ %a@]" Var.pp v A.pp_term t
   in
   Format.fprintf out "[@[%a@]]"
-    CCFormat.(list ~sep:(return ",@ ") pp_pair) (VarMap.to_list s |> List.rev)
+    CCFormat.(list ~sep:(return ",@ ") pp_pair) (Var.Map.to_list s |> List.rev)
 
 let rec as_cstor_app env t = match A.term_view t with
   | A.Const id ->
@@ -119,11 +114,11 @@ let pp_stack out (l:term list) : unit =
 let apply_subst (subst:subst) t =
   let rec aux subst t = match A.term_view t with
     | A.Var v ->
-      begin match VarMap.get v subst with
+      begin match Var.Map.get v subst with
         | None -> t
         | Some (lazy t') -> t'
       end
-    | A.Undefined_value | A.Bool _ | A.Const _ -> t
+    | A.Undefined_value | A.Bool _ | A.Const _ | A.Unknown _ -> t
     | A.Select (sel, t) -> A.select sel (aux subst t) t.A.ty
     | A.App (f,l) -> A.app (aux subst f) (List.map (aux subst) l)
     | A.If (a,b,c) -> A.if_ (aux subst a) (aux subst b) (aux subst c)
@@ -147,7 +142,7 @@ let apply_subst (subst:subst) t =
     | A.Asserting (t,g) ->
       A.asserting (aux subst t)(aux subst g)
   in
-  if VarMap.is_empty subst then t else aux subst t
+  if Var.Map.is_empty subst then t else aux subst t
 
 (* Weak Head Normal Form.
    @param m the model
@@ -164,9 +159,9 @@ let rec eval_whnf (m:t) (st:term list) (subst:subst) (t:term): term =
   with Ty.Ill_typed msg ->
     errorf "@[<2>Model:@ internal type error `%s`@ in %a@]" msg pp_stack st
 and eval_whnf_rec m st subst t = match A.term_view t with
-  | A.Undefined_value | A.Bool _ -> t
+  | A.Undefined_value | A.Bool _ | A.Unknown _ -> t
   | A.Var v ->
-    begin match VarMap.get v subst with
+    begin match Var.Map.get v subst with
       | None -> t
       | Some (lazy t') ->
         eval_whnf m st empty_subst t'
@@ -193,11 +188,11 @@ and eval_whnf_rec m st subst t = match A.term_view t with
         A.if_ a b c
     end
   | A.Bind (A.Mu,v,body) ->
-    let subst' = VarMap.add v (lazy t) subst in
+    let subst' = Var.Map.add v (lazy t) subst in
     eval_whnf m st subst' body
   | A.Let (x,t,u) ->
     let t = lazy (eval_whnf m st subst t) in
-    let subst' = VarMap.add x t subst in
+    let subst' = Var.Map.add x t subst in
     eval_whnf m st subst' u
   | A.Bind (A.Fun,_,_) -> apply_subst subst t
   | A.Bind ((A.Forall | A.Exists) as b,v,body) ->
@@ -213,7 +208,7 @@ and eval_whnf_rec m st subst t = match A.term_view t with
       let l =
         List.map
           (fun c_dom ->
-             let subst' = VarMap.add v (lazy (A.const c_dom ty)) subst in
+             let subst' = Var.Map.add v (lazy (A.const c_dom ty)) subst in
              eval_whnf m st subst' body)
           dom
       in
@@ -260,7 +255,7 @@ and eval_whnf_rec m st subst t = match A.term_view t with
               List.fold_left2
                 (fun s v arg ->
                    let arg' = lazy (apply_subst subst arg) in
-                   VarMap.add v arg' s)
+                   Var.Map.add v arg' s)
                 subst vars cstor_args
             in
             eval_whnf m st subst' rhs
@@ -350,7 +345,7 @@ and eval_whnf_rec m st subst t = match A.term_view t with
 (* beta-reduce [f l] while [f] is a function,constant or variable *)
 and eval_whnf_app m st subst_f subst_l f l = match A.term_view f, l with
   | A.Bind (A.Fun,v, body), arg :: tail ->
-    let subst_f = VarMap.add v (lazy (apply_subst subst_l arg)) subst_f in
+    let subst_f = Var.Map.add v (lazy (apply_subst subst_l arg)) subst_f in
     eval_whnf_app m st subst_f subst_l body tail
   | _ -> eval_whnf_app' m st subst_f subst_l f l
 (* evaluate [f] and try to beta-reduce if [eval_whnf m f] is a function *)
