@@ -143,7 +143,7 @@ let setup_gc () =
   g.Gc.minor_heap_size <- 500_000; (* ×8 to obtain bytes on 64 bits -->  *)
   Gc.set g
 
-let () =
+let main() =
   Arg.parse options set_file
     "experimental SMT solver for datatypes and recursive functions.\n\
     \n\
@@ -178,3 +178,12 @@ let () =
     check_proof= !check_proof_;
   } in
   solve ~config ast
+
+let () =
+  try main()
+  with e ->
+    let bt = Printexc.get_backtrace() in
+    Format.printf "@{<Red>fatal error:@}@.";
+    print_endline (Printexc.to_string e);
+    if bt<>"" then print_endline bt;
+    exit 1

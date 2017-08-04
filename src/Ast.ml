@@ -44,7 +44,7 @@ type term = {
 and term_cell =
   | Var of var
   | Const of ID.t
-  | Unknown of ID.t (* meta var *)
+  | Unknown of var (* meta var *)
   | App of term * term list
   | If of term * term * term
   | Select of select * term
@@ -123,8 +123,8 @@ let var_to_tip v : TA.var = id_to_tip (Var.id v)
 let typed_var_to_tip v = var_to_tip v, ty_to_tip (Var.ty v)
 
 let rec term_to_tip (t:term): TA.term = match t.term with
-  | Var v -> TA.const (var_to_tip v)
-  | Const c | Unknown c -> TA.const (id_to_tip c)
+  | Var v | Unknown v -> TA.const (var_to_tip v)
+  | Const c -> TA.const (id_to_tip c)
   | Select ({select_name=lazy n; _}, arg) ->
     TA.app (id_to_tip n) [term_to_tip arg]
   | App (f,l) ->
@@ -280,9 +280,9 @@ let asserting t g =
   mk_ (Asserting (t,g)) t.ty
 
 let var v = mk_ (Var v) (Var.ty v)
+let unknown v = mk_ (Unknown v) (Var.ty v)
 
 let const id ty = mk_ (Const id) ty
-let unknown id ty = mk_ (Unknown id) ty
 
 let select (s:select) (t:term) ty = mk_ (Select (s,t)) ty
 
@@ -513,7 +513,7 @@ module Subst = struct
     | _ -> map ~bind:rename ~f:eval subst t
 
   let pp out m =
-    let pp_b = CCFormat.(pair ~sep:(return "-> @") Var.pp pp_term) in
+    let pp_b = CCFormat.(within "(" ")" @@ pair ~sep:(return "-> @") Var.pp pp_term) in
     Format.fprintf out "{@[%a@]}" (Utils.pp_list pp_b) (Var.Map.to_list m)
 end
 
@@ -542,6 +542,7 @@ module Ctx = struct
     | K_cstor of Ty.t
     | K_select of Ty.t * select
     | K_var of var (* local *)
+    | K_unknown of var
 
   and ty_kind =
     | K_data (* data type *)
@@ -579,18 +580,18 @@ module Ctx = struct
   let add_data t (id:ID.t) cstors: unit =
     ID.Tbl.add t.data id cstors
 
-  let with_var t (s:string) (ty:Ty.t) (f:Ty.t Var.t -> 'a): 'a =
+  let with_var ?(unknown=false) t (s:string) (ty:Ty.t) (f:Ty.t Var.t -> 'a): 'a =
     let id = ID.make s in
     StrTbl.add t.names s id;
     let v = Var.make id ty in
-    ID.Tbl.add t.kinds id (K_var v);
+    ID.Tbl.add t.kinds id (if unknown then K_unknown v else K_var v);
     CCFun.finally1 f v
       ~h:(fun () -> StrTbl.remove t.names s)
 
-  let with_vars t (l:(string*Ty.t) list) (f:Ty.t Var.t list -> 'a): 'a =
+  let with_vars ?unknown t (l:(string*Ty.t) list) (f:Ty.t Var.t list -> 'a): 'a =
     let rec aux ids l f = match l with
       | [] -> f (List.rev ids)
-      | (s,ty) :: l' -> with_var t s ty (fun id -> aux (id::ids) l' f)
+      | (s,ty) :: l' -> with_var ?unknown t s ty (fun id -> aux (id::ids) l' f)
     in
     aux [] l f
 
@@ -617,6 +618,8 @@ module Ctx = struct
       Format.fprintf out "(@[fun : %a@])" Ty.pp ty
     | K_var v ->
       Format.fprintf out "(@[var : %a@])" Ty.pp (Var.ty v)
+    | K_unknown v ->
+      Format.fprintf out "(@[unknown : %a@])" Ty.pp (Var.ty v)
 
   let pp out t =
     Format.fprintf out "ctx {@[%a@]}"
@@ -659,6 +662,7 @@ and conv_term_aux ctx t : term = match t with
     let id = find_id_ ctx s in
     begin match Ctx.find_kind ctx id with
       | Ctx.K_var v -> var v
+      | Ctx.K_unknown v -> unknown v
       | Ctx.K_fun ty
       | Ctx.K_cstor ty -> const id ty
       | Ctx.K_select _ -> errorf_ctx ctx "unapplied `select` not supported"
@@ -822,6 +826,7 @@ and conv_term_aux ctx t : term = match t with
     let args = List.map (conv_term ctx) args in
     begin match Ctx.find_kind ctx id, args with
       | Ctx.K_var v, _ -> app (var v) args
+      | Ctx.K_unknown v, _ -> app (unknown v) args
       | Ctx.K_fun ty, _
       | Ctx.K_cstor ty, _ -> app (const id ty) args
       | Ctx.K_select (ty, sel), [arg] -> select sel arg ty
@@ -945,7 +950,7 @@ and conv_statement_aux ctx syn (t:A.statement) : statement list = match A.view t
            s, ty)
         vars
     in
-    Ctx.with_vars ctx vars
+    Ctx.with_vars ~unknown:true ctx vars
       (fun vars ->
          let t = conv_term ctx t in
          [Goal (vars, t)])

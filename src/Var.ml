@@ -48,7 +48,7 @@ module Map = struct
       ~f:(fun v o -> match o with
         | `Left v | `Right v -> Some v
         | `Both _ ->
-          Format.printf "conflict on var %a" pp_var_ v;
+          Format.printf "conflict on var %a@." pp_var_ v;
           assert false)
       a b
 end

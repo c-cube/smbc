@@ -35,6 +35,33 @@ module type CONFIG = sig
   (** Check proofs given by MSat? *)
 end
 
+module Bag : sig
+  type +'a t
+  val empty : 'a t
+  val is_empty : _ t -> bool
+  val return : 'a -> 'a t
+  val append : 'a t -> 'a t -> 'a t (* O(1) *)
+  val to_list : 'a t -> 'a list
+  val to_seq : 'a t -> 'a Sequence.t
+end = struct
+  type 'a t =
+    | Empty
+    | Leaf of 'a
+    | Append of 'a t * 'a t
+  let is_empty = function Empty -> true | _ -> false
+  let empty : _ t = Empty
+  let return e = Leaf e
+  let append s1 s2 = match s1, s2 with
+    | Empty, _ -> s2
+    | _, Empty -> s1
+    | _ -> Append (s1, s2)
+  let rec to_seq t yield = match t with
+    | Empty -> ()
+    | Leaf x -> yield x
+    | Append (l,r) -> to_seq l yield; to_seq r yield
+  let to_list t = to_seq t |> Sequence.to_rev_list
+end
+
 (** {2 The Main Solver} *)
 
 module Make(Config : CONFIG)(Dummy : sig end) = struct
@@ -121,8 +148,8 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     | E_append of explanation * explanation
     | E_or of explanation * explanation (* disjunction! *)
 
-  (* what can block evaluation: a list of (undefined) constants *)
-  and blocking = cst list
+  (* what can block evaluation: a bag of (undefined) constants *)
+  and blocking = cst Bag.t
 
   (* boolean literal *)
   and lit = {
@@ -178,7 +205,6 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
   }
 
   and ty_cell =
-    | Prop
     | Atomic of ID.t * cstor_list
     | Arrow of ty_h * ty_h
 
@@ -197,16 +223,13 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     module H = Hashcons.Make(struct
         type t = ty_h
         let equal a b = match a.ty_cell, b.ty_cell with
-          | Prop, Prop -> true
           | Atomic (i1,_), Atomic (i2,_) -> ID.equal i1 i2
           | Arrow (a1,b1), Arrow (a2,b2) ->
             equal a1 a2 && equal b1 b2
-          | Prop, _
           | Atomic _, _
           | Arrow _, _ -> false
 
         let hash t = match t.ty_cell with
-          | Prop -> 1
           | Atomic (i,_) -> Hash.combine2 2 (ID.hash i)
           | Arrow (a,b) -> Hash.combine3 3 (hash a) (hash b)
 
@@ -217,14 +240,11 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     let hashcons_ ty_cell =
       H.hashcons { ty_cell; ty_id = -1; }
 
-    let prop = hashcons_ Prop
-
     let atomic id def = hashcons_ (Atomic (id,def))
 
     let arrow a b = hashcons_ (Arrow (a,b))
     let arrow_l = List.fold_right arrow
 
-    let is_prop t = match t.ty_cell with | Prop -> true | _ -> false
     let is_data t = match t.ty_cell with | Atomic (_, _) -> true | _ -> false
     let is_arrow t = match t.ty_cell with | Arrow (_, _) -> true | _ -> false
 
@@ -236,7 +256,6 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       aux [] ty
 
     let rec pp out t = match t.ty_cell with
-      | Prop -> CCFormat.string out "prop"
       | Atomic (id, _) -> ID.pp out id
       | Arrow _ ->
         let args, ret = unfold t in
@@ -245,7 +264,6 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
 
     (* representation as a single identifier *)
     let rec mangle t : string = match t.ty_cell with
-      | Prop -> "prop"
       | Atomic (id,_) -> ID.to_string id
       | Arrow (a,b) -> mangle a ^ "_" ^ mangle b
 
@@ -256,61 +274,11 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       end)
   end
 
-  (** {2 Free variables} *)
-  module IVar = struct
-    type t = var
-    let mk v_id v_ty : var = {v_id; v_ty}
-
-    let id {v_id; _} = v_id
-    let ty {v_ty; _} = v_ty
-    let equal v1 v2 = v1.v_id = v2.v_id && Ty_h.equal v1.v_ty v2.v_ty
-    let hash v = Hash.combine2 (Hash.int (id v)) (Ty_h.hash (ty v))
-    let compare v1 v2 =
-      if id v1=id v2 then Ty_h.compare (ty v1)(ty v2)
-      else CCInt.compare (id v1)(id v2)
-
-    let pp out {v_id=v; v_ty=ty} =
-      if Ty_h.is_prop ty then Fmt.fprintf out "P%d" v
-      else if Ty_h.is_arrow ty then Fmt.fprintf out "F%d" v
-      else Fmt.fprintf out "X%d" v
-
-
-    module As_key = struct
-      type t = var
-      let compare = compare
-      let hash = hash
-      let equal = equal
-    end
-
-    module Map = CCMap.Make(As_key)
-    module Tbl = CCHashtbl.Make(As_key)
-  end
-
   let cst_pp out (c:cst) = ID.pp out c.cst_id
 
   let term_equal_ (a:term) b = a==b
   let term_hash_ a = a.term_id
   let term_cmp_ a b = CCInt.compare a.term_id b.term_id
-
-  let term_pp =
-    let rec pp out t =
-      pp_rec out t;
-      if Config.pp_hashcons then Format.fprintf out "/%d" t.term_id;
-      ()
-    and pp_rec out t = match t.term_cell with
-      | Var v -> IVar.pp out v
-      | Const c -> cst_pp out c
-      | App (f,l) ->
-        Fmt.fprintf out "(@[<1>%a@ %a@])" pp f (Utils.pp_list pp) l
-      | Binop (op,t,u) ->
-        begin match op with
-          | O_eq -> Fmt.fprintf out "(@[<hv1>=@ %a@ %a@])" pp t pp u
-          | O_leq -> Fmt.fprintf out "(@[<hv1><=@ %a@ %a@])" pp t pp u
-          | O_lt -> Fmt.fprintf out "(@[<hv1><@ %a@ %a@])" pp t pp u
-        end
-      | Undefined_value ty -> Fmt.fprintf out "?__%s" (Ty_h.mangle ty)
-    in
-    pp
 
   module Cst = struct
     type t = cst
@@ -390,13 +358,15 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     val merge : t -> t -> t
     val pp : t Fmt.printer
     val to_seq : t -> cst Sequence.t
+    val to_list : t -> cst list
   end = struct
     type t = blocking
-    let empty = []
-    let is_empty = function [] -> true | _ -> false
-    let merge = List.rev_append
-    let pp out l = Fmt.fprintf out "[@[<2>%a@]]" (Utils.pp_list Cst.pp) l
-    let to_seq = Sequence.of_list
+    let empty = Bag.empty
+    let is_empty = Bag.is_empty
+    let merge = Bag.append
+    let pp out l = Fmt.fprintf out "[@[<2>%a@]]" (Utils.pp_list Cst.pp) (Bag.to_list l)
+    let to_seq = Bag.to_seq
+    let to_list = Bag.to_list
   end
 
   let cmp_lit a b =
@@ -483,6 +453,58 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
 
   let bool_ty : ty_h = List.hd bool_cstors |> Lazy.force |> Cst.ty
 
+  let ty_is_prop t = Ty_h.equal bool_ty t
+
+  (** {2 Free variables} *)
+  module IVar = struct
+    type t = var
+    let mk v_id v_ty : var = {v_id; v_ty}
+
+    let id {v_id; _} = v_id
+    let ty {v_ty; _} = v_ty
+    let equal v1 v2 = v1.v_id = v2.v_id && Ty_h.equal v1.v_ty v2.v_ty
+    let hash v = Hash.combine2 (Hash.int (id v)) (Ty_h.hash (ty v))
+    let compare v1 v2 =
+      if id v1=id v2 then Ty_h.compare (ty v1)(ty v2)
+      else CCInt.compare (id v1)(id v2)
+
+    let pp out {v_id=v; v_ty=ty} =
+      if ty_is_prop ty then Fmt.fprintf out "P%d" v
+      else if Ty_h.is_arrow ty then Fmt.fprintf out "F%d" v
+      else Fmt.fprintf out "X%d" v
+
+
+    module As_key = struct
+      type t = var
+      let compare = compare
+      let hash = hash
+      let equal = equal
+    end
+
+    module Map = CCMap.Make(As_key)
+    module Tbl = CCHashtbl.Make(As_key)
+  end
+
+  let term_pp =
+    let rec pp out t =
+      pp_rec out t;
+      if Config.pp_hashcons then Format.fprintf out "/%d" t.term_id;
+      ()
+    and pp_rec out t = match t.term_cell with
+      | Var v -> IVar.pp out v
+      | Const c -> cst_pp out c
+      | App (f,l) ->
+        Fmt.fprintf out "(@[<1>%a@ %a@])" pp f (Utils.pp_list pp) l
+      | Binop (op,t,u) ->
+        begin match op with
+          | O_eq -> Fmt.fprintf out "(@[<hv1>=@ %a@ %a@])" pp t pp u
+          | O_leq -> Fmt.fprintf out "(@[<hv1><=@ %a@ %a@])" pp t pp u
+          | O_lt -> Fmt.fprintf out "(@[<hv1><@ %a@ %a@])" pp t pp u
+        end
+      | Undefined_value ty -> Fmt.fprintf out "?__%s" (Ty_h.mangle ty)
+    in
+    pp
+
   module Term = struct
     type t = term
 
@@ -535,7 +557,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     let mk_term_ cell ~(ty:delayed_ty) : term =
       let t = {
         term_id= -1;
-        term_ty=Ty_h.prop; (* will be changed *)
+        term_ty=bool_ty; (* will be changed *)
         term_being_evaled=false;
         term_cell=cell;
         term_nf=NF_none;
@@ -561,7 +583,10 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       | Arrow (ty_a,ty_rest), a::tail ->
         assert (Ty_h.equal ty_a a.term_ty);
         app_ty_ ty_rest tail
-      | (Prop | Atomic _), _::_ ->
+      | Atomic _, a::_ ->
+        Log.debugf 5
+          (fun k->k "cannot apply term of type `%a`@ to `%a:%a`"
+              Ty_h.pp ty term_pp a Ty_h.pp a.term_ty);
         assert false
 
     let app f l : t = match l with
@@ -691,7 +716,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         let t = {
           term_id= -1;
           term_being_evaled = false;
-          term_ty=Ty_h.prop;
+          term_ty=bool_ty;
           term_cell=Const c;
           term_nf=NF_none;
         } in
@@ -704,8 +729,12 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     let is_true = Term.equal true_
     let is_false = Term.equal false_
 
+    let v_bool = IVar.mk 0 bool_ty
+    let ty_bool1 = Ty_h.arrow bool_ty bool_ty
+    let ty_bool2 = Ty_h.arrow_l [bool_ty; bool_ty] bool_ty
+
     let not_c =
-      Cst.make_defined_fix (ID.make "not") (Ty_h.arrow bool_ty bool_ty)
+      Cst.make_defined_fix (ID.make "not") ty_bool1
         (fun not_c ->
            [ mk_rule not_c [true_] false_;
              mk_rule not_c [false_] true_;
@@ -713,11 +742,8 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
 
     let not_ t = Term.app_cst not_c [t]
 
-    let v_bool = IVar.mk 0 bool_ty
-    let ty_bool2 = Ty_h.arrow_l [bool_ty; bool_ty] bool_ty
-
     let and_c =
-      Cst.make_defined_fix (ID.make "and") bool_ty
+      Cst.make_defined_fix (ID.make "and") ty_bool2
         (fun and_c ->
            [ mk_rule and_c [true_; true_] true_;
              mk_rule and_c [false_; Term.var v_bool] false_;
@@ -727,7 +753,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     let and_ t u = Term.app_cst and_c [t; u]
 
     let or_c =
-      Cst.make_defined_fix (ID.make "or") bool_ty
+      Cst.make_defined_fix (ID.make "or") ty_bool2
         (fun or_c ->
            [ mk_rule or_c [false_; false_] false_;
              mk_rule or_c [true_; Term.var v_bool] true_;
@@ -793,7 +819,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       let _, ty_data = Ty_h.unfold (Cst.ty c) in
       Cst.make_defined_fix
         (ID.make ("is-" ^ ID.name (Cst.id c)))
-        (Ty_h.arrow ty_data Ty_h.prop)
+        (Ty_h.arrow ty_data bool_ty)
         (fun c_test ->
            List.map
              (fun (lazy c') ->
@@ -1524,9 +1550,6 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           expand_cases_data st cstors
         | Arrow (ty_arg, ty_ret) ->
           expand_cases_arrow st ty_arg ty_ret
-        | Prop ->
-          (* simply try true/false *)
-          [Form.true_; Form.false_], []
       in
       (* build clauses *)
       let case_clauses = clauses_of_cases cst by_ty in
@@ -1898,7 +1921,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       ()
 
     let expand_cst_ (t:t)(c:cst) : unit =
-      assert (Ty_h.is_prop (Term.ty t.root));
+      assert (ty_is_prop (Term.ty t.root));
       Log.debugf 2
         (fun k->k "(@[<1>expand_cst@ %a@ :because-of %a@])" Cst.pp c pp t);
       Expand.expand_cst c;
@@ -1907,7 +1930,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     (* evaluate [t] in current partial model, and expand the constants
        that block it *)
     let update (t:t): unit =
-      assert (Ty_h.is_prop (Term.ty t.root));
+      assert (ty_is_prop (Term.ty t.root));
       let e, block, new_t = Reduce.compute_nf t.root in
       (* if [new_t = true/false], propagate literal *)
       begin match new_t.term_cell with
@@ -1923,11 +1946,10 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
             (fun k->k
                 "(@[<1>update@ %a@ @[<1>:normal_form@ %a@]@ \
                  :deps (@[%a@])@ :exp @[<hv>%a@]@])"
-                Term.pp t.root Term.pp new_t
-                (Utils.pp_list Cst.pp) block
+                Term.pp t.root Term.pp new_t Blocking.pp block
                 Explanation.pp e);
           t.block <- block;
-          List.iter (expand_cst_ t) block;
+          Blocking.to_seq block (expand_cst_ t);
       end;
       ()
 
@@ -1962,7 +1984,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     let update_all () =
       to_seq
       |> Sequence.filter
-        (fun top -> List.exists dep_updated top.block)
+        (fun top -> Blocking.to_seq top.block |> Sequence.exists dep_updated)
       |> Sequence.iter update
   end
 
@@ -2032,8 +2054,8 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
                let e, block, nf = Reduce.compute_nf l in
                Format.fprintf out
                  "(@[<hv1>%a@ nf: %a@ exp: %a@ deps: (@[<hv>%a@])@])"
-                 Term.pp l Term .pp nf Explanation.pp e
-                 (Utils.pp_list pp_dep) block
+                 Term.pp l Term.pp nf Explanation.pp e
+                 (Utils.pp_list pp_dep) (Blocking.to_list block)
              in
              k "(@[<hv1>status_watched_lit@ (@[<v>%a@])@])"
                (Utils.pp_list pp_lit) !toplevel_goals_);
@@ -2114,7 +2136,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         | Lit_atom {term_cell=Undefined_value ty; _} ->
           (* the literal will never be a boolean, we must try
              something else *)
-          assert (Ty_h.equal Ty_h.prop ty);
+          assert (ty_is_prop ty);
           has_met_undefined := true; (* incomplete *)
           trigger_conflict lit e
         | Lit_atom _ -> ()
@@ -2177,7 +2199,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     module A = Rw_ast
 
     let rec conv_ty (ty:Ty.t): Ty_h.t = match ty with
-      | Ty.Prop -> Ty_h.prop
+      | Ty.Prop -> bool_ty
       | Ty.Const id ->
         begin try ID.Tbl.find ty_tbl_ id |> Lazy.force
           with Not_found -> errorf "type %a not in ty_tbl" ID.pp id
@@ -2284,12 +2306,12 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
             (fun {Ty.data_id; _} ->
                ID.Tbl.find ty_tbl_ data_id |> Lazy.force |> ignore)
             l
-        | A.St_def (c,_) ->
+        | A.St_def cs ->
           (* define the mutually recursive functions *)
           List.iter
             (fun {A.cst_id=id; cst_ty=ty; cst_def=d} ->
                let rules = match d with
-                 | A.Cst_def l -> l
+                 | A.Cst_def (lazy l) -> l
                  | A.Cst_cstor _ -> assert false
                in
                let ty = conv_ty ty in
@@ -2304,7 +2326,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
                         rules)
                ) in
                ID.Tbl.add decl_ty_ id cst)
-            [c];
+            cs;
         | A.St_goal t ->
           let t = conv_term ~st t in
           Top_goals.push t;
@@ -2333,8 +2355,8 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       unknown_tbl=Cst.Tbl.create 8;
     }
 
-    let rec ty_to_ast (t:Ty_h.t): Ty.t = match t.ty_cell with
-      | Prop -> Ty.Prop
+    let rec ty_to_ast (ty:Ty_h.t): Ty.t = match ty.ty_cell with
+      | _ when ty_is_prop ty -> Ty.Prop
       | Atomic (id,_) -> Ty.const id
       | Arrow (a,b) -> Ty.arrow (ty_to_ast a) (ty_to_ast b)
 
@@ -2364,12 +2386,12 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
               cst.cst_from <- Some u;
               u
             | None, Cst_defined (lazy (_,rules)) ->
-              let rules =
+              let rules = lazy (
                 List.map
                   (fun {rule_args; rule_rhs; _} ->
                      List.map aux rule_args, aux rule_rhs)
                   rules
-              in
+              ) in
               let u =
                 A.Cst.mk_def cst.cst_id (ty_to_ast t.term_ty) rules
                 |> A.T.const

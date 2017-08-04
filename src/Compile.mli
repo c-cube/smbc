@@ -7,6 +7,8 @@ type state
 
 val create : unit -> state
 
+exception Error of (CCFormat.t -> unit)
+
 val compile : state -> Ast.statement -> Rw_ast.statement list
 (** [compile state st] compiles the statement's terms into rewrite-based
     terms, possibly modifying the state, and returns new statements. *)

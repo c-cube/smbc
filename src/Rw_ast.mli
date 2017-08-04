@@ -30,7 +30,7 @@ and cst = {
 }
 
 and cst_def =
-  | Cst_def of rule list
+  | Cst_def of rule list lazy_t
   | Cst_cstor of ID.t (* datatype *)
 
 (* [cst args --> rhs] *)
@@ -38,17 +38,19 @@ and rule = term list * term
 
 type statement =
   | St_data of Ty.data list (* declare mutual datatypes *)
-  | St_def of cst * Ast.term option (* define constant (with backup value) *)
+  | St_def of cst list (* define constants *)
   | St_goal of term (* boolean term *)
   | St_in_model of var list (* unknowns that must be in model *)
 
 module Cst : sig
   type t = cst
   val ty : t -> Ty.t
-  val mk_def : ID.t -> Ty.t -> rule list -> t
+  val mk_def : ID.t -> Ty.t -> rule list lazy_t -> t
   val mk_cstor : ID.t -> Ty.t -> t
   val pp : t CCFormat.printer
 end
+
+val pp_rule : rule CCFormat.printer
 
 module T : sig
   type t = term
@@ -75,7 +77,7 @@ module Stmt : sig
 
   val goal : term -> t
   val data : Ty.data list -> t
-  val def : ?def:Ast.term -> cst -> t
+  val def : cst list -> t
   val in_model : var list -> t
 
   val pp : t CCFormat.printer

@@ -32,7 +32,7 @@ and cst = {
 }
 
 and cst_def =
-  | Cst_def of rule list
+  | Cst_def of rule list lazy_t
   | Cst_cstor of ID.t (* datatype *)
 
 (* [cst args --> rhs] *)
@@ -40,7 +40,7 @@ and rule = term list * term
 
 type statement =
   | St_data of Ty.data list (* declare mutual datatypes *)
-  | St_def of cst * Ast.term option (* define constant (with backup value) *)
+  | St_def of cst list (* define constants *)
   | St_goal of term (* boolean term *)
   | St_in_model of var list (* unknowns that must be in model *)
 
@@ -48,9 +48,7 @@ module Cst = struct
   type t = cst
   let ty c = c.cst_ty
   let mk_ id ty d : t = {cst_id=id; cst_ty=ty; cst_def=d}
-  let mk_def id ty rules : t =
-    assert (rules<>[]);
-    mk_ id ty (Cst_def rules)
+  let mk_def id ty rules : t = mk_ id ty (Cst_def rules)
   let mk_cstor id ty =
     let _, ret = Ty.unfold ty in
     let ty_id = match ret with Ty.Const id -> id | _ -> assert false in
@@ -81,11 +79,11 @@ module T = struct
       Format.fprintf out "(@[%a@ %a@])" pp f (Utils.pp_list pp) l
     | Unknown v -> Format.fprintf out "?%a" Var.pp v
     | Bool b -> Fmt.bool out b
-    | Unop (U_not,t) -> Fmt.fprintf out "(@[not %a@])" pp t
+    | Unop (U_not,t) -> Fmt.fprintf out "(@[<1>not@ %a@])" pp t
     | Binop (op,t,u) ->
-      Fmt.fprintf out "(@[<hv>%a@ %a@ %a@])" pp_binop op pp t pp u
+      Fmt.fprintf out "(@[<hv1>%a@ %a@ %a@])" pp_binop op pp t pp u
     | If (a,b,c) ->
-      Fmt.fprintf out "(@[<hv>if@ %a@ %a@ %a@])" pp a pp b pp c
+      Fmt.fprintf out "(@[<hv1>if@ %a@ %a@ %a@])" pp a pp b pp c
     | Undefined _ -> Fmt.string out "?__"
 
   let var v = mk_ (Var v) (Var.ty v)
@@ -121,6 +119,10 @@ module T = struct
   let undefined ty = mk_ (Undefined ty) ty
 end
 
+let pp_rule out (r:rule) =
+  let args, rhs = r in
+  Fmt.fprintf out "(@[%a@ --> %a@])" (Utils.pp_list T.pp) args T.pp rhs
+
 module Stmt = struct
   type t = statement
 
@@ -130,7 +132,9 @@ module Stmt = struct
     assert (l<>[]);
     St_data l
 
-  let def ?def c : t = St_def (c,def)
+  let def l : t =
+    assert (l<>[]);
+    St_def l
 
   let in_model l : t =
     assert (l<>[]);
@@ -139,17 +143,23 @@ module Stmt = struct
   let pp out = function
     | St_data l ->
       let pp_data out (d:Ty.data) =
-        Fmt.fprintf out "(@[<hv2>%a@ %a@])"
+        Fmt.fprintf out "(@[<hv1>%a@ %a@])"
           ID.pp d.Ty.data_id
-          (Utils.pp_list Fmt.(pair ID.pp Ty.pp))
+          (Utils.pp_list Fmt.(within "(" ")" @@ pair ~sep:(return "->@ ") ID.pp Ty.pp))
           (ID.Map.to_list d.Ty.data_cstors)
       in
-      Fmt.fprintf out "(@[data@ %a@])" (Utils.pp_list pp_data) l
-    | St_def (c,None) -> Fmt.fprintf out "(@[def@ %a@])" Cst.pp c
-    | St_def (c,Some t) ->
-      Fmt.fprintf out "(@[def@ %a@ :as %a@])" Cst.pp c Ast.pp_term t
-    | St_goal g -> Fmt.fprintf out "(@[goal %a@])" T.pp g
-    | St_in_model l -> Fmt.fprintf out "(@[in_model@ %a@])" (Utils.pp_list Var.pp) l
+      Fmt.fprintf out "(@[<hv1>data@ %a@])" (Utils.pp_list pp_data) l
+    | St_def l ->
+      let pp_c_full out c =
+        let rules = match c.cst_def with
+          | Cst_def (lazy l) -> l | Cst_cstor _ -> assert false
+        in
+        Fmt.fprintf out "(@[<1>%a : %a@ := (@[%a@])@])"
+          Cst.pp c Ty.pp (Cst.ty c) (Utils.pp_list pp_rule) rules
+      in
+      Fmt.fprintf out "(@[<hv1>def@ %a@])" (Utils.pp_list pp_c_full) l
+    | St_goal g -> Fmt.fprintf out "(@[<1>goal %a@])" T.pp g
+    | St_in_model l -> Fmt.fprintf out "(@[<1>in_model@ %a@])" (Utils.pp_list Var.pp) l
 end
 
 module As_key = struct

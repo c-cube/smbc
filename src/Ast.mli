@@ -32,7 +32,7 @@ type term = private {
 and term_cell =
   | Var of var
   | Const of ID.t
-  | Unknown of ID.t
+  | Unknown of var
   | App of term * term list
   | If of term * term * term
   | Select of select * term
@@ -71,7 +71,7 @@ val ty : term -> Ty.t
 
 val var : var -> term
 val const : ID.t -> Ty.t -> term
-val unknown : ID.t -> Ty.t -> term
+val unknown : var -> term
 val app : term -> term list -> term
 val app_a : term -> term array -> term
 val select : select -> term -> Ty.t -> term
