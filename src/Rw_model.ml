@@ -12,6 +12,7 @@ type t = {
   (* constant -> its value *)
 }
 
+let consts t = t.consts
 let make ~consts () = {consts}
 
 let pp out (m:t) =

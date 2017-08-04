@@ -10,6 +10,8 @@ type t = private {
   (* constant -> its value *)
 }
 
+val consts : t -> term ID.Map.t
+
 val make :
   consts:term ID.Map.t ->
   unit ->

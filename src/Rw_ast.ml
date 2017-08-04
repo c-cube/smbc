@@ -46,6 +46,7 @@ type statement =
 
 module Cst = struct
   type t = cst
+  let id c = c.cst_id
   let ty c = c.cst_ty
   let mk_ id ty d : t = {cst_id=id; cst_ty=ty; cst_def=d}
   let mk_def id ty rules : t = mk_ id ty (Cst_def rules)

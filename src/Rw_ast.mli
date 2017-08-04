@@ -44,6 +44,7 @@ type statement =
 
 module Cst : sig
   type t = cst
+  val id : t -> ID.t
   val ty : t -> Ty.t
   val mk_def : ID.t -> Ty.t -> rule list lazy_t -> t
   val mk_cstor : ID.t -> Ty.t -> t

@@ -507,6 +507,44 @@ let compile (st:state) (stmt:A.statement): RA.statement list =
         (Utils.pp_list RA.Stmt.pp) l);
   l
 
-let translate_model _st (_m:RM.t) : M.t =
-  assert false (* TODO *)
+(* convert rw-terms back into {!A.term} *)
+let ra_to_a ~st (t:RA.term): A.term =
+  let rec aux t = match RA.T.view t with
+    | RA.Const c ->
+      begin match ID.Tbl.get st.st_to_expand (RA.Cst.id c) with
+        | Some u -> u (* expand into its def *)
+        | None -> A.const (RA.Cst.id c) (RA.T.ty t)
+      end
+    | RA.Var _ -> assert false (* never outside of rules *)
+    | RA.Bool true -> A.true_
+    | RA.Bool false -> A.false_
+    | RA.App (f, l) -> A.app (aux f) (List.map aux l)
+    | RA.If (a,b,c) -> A.if_ (aux a)(aux b)(aux c)
+    | RA.Unknown v -> A.unknown v
+    | RA.Undefined ty -> A.undefined_value ty
+    | RA.Unop (RA.U_not, t) -> A.not_ (aux t)
+    | RA.Binop (o, t, u) ->
+      let t = aux t and u = aux u in
+      begin match o with
+        | RA.B_eq -> A.eq t u
+        | RA.B_leq | RA.B_lt -> assert false (* internals *)
+        | RA.B_and -> A.and_ t u
+        | RA.B_or -> A.or_ t u
+        | RA.B_imply -> A.imply t u
+      end
+  in
+  aux t
+
+(* translate terms back into {!A.term} in the model *)
+let translate_rw_model st (m:RM.t) : A.term ID.Map.t =
+  RM.consts m
+  |> ID.Map.map (ra_to_a ~st)
+
+(* TODO: unapply translations *)
+let translate_model st (m:RM.t) : M.t =
+  let consts = translate_rw_model st m in
+  M.make
+    ~env:A.env_empty
+    ~consts
+    ~domains:Ty.Map.empty
 
