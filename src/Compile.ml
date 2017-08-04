@@ -46,17 +46,17 @@ let add_unknown ~st v =
   st.st_unknowns <- v :: st.st_unknowns;
   ()
 
-(* TODO: should take 1/ set of RA.term rules  2/ A.term def *)
 (* define a new function with a set of rewrite rules *)
 let define_fun ~st (name:string) (ty:Ty.t) (rules:RA.rule list lazy_t) (def:A.term) : RA.cst =
   let id = ID.make name in
   let c = RA.Cst.mk_def id ty rules in
   Log.debugf 3
-    (fun k->k "(@[define_fun %a@ :ty %a@ :rules %a@ :def-for %a@])"
+    (fun k->k "(@[define_fun %a@ :ty %a@ :rules (@[%a@])@ :def-for %a@])"
         ID.pp id Ty.pp ty
         (Utils.pp_list RA.pp_rule) (Lazy.force rules)
         A.pp_term def);
   ID.Tbl.add st.st_cst_tbl id c;
+  CCVector.push st.st_new_stmt_l (RA.Stmt.def [c]);
   ID.Tbl.add st.st_to_expand id def;
   c
 
@@ -352,7 +352,12 @@ module Flatten = struct
             ) in
             (* term definition *)
             let def = A.fun_l closure t in
-            let cst = define_fun ~st (mk_pat "match") (A.ty def) rules def in
+            let ty =
+              Ty.arrow_l
+                (List.map Var.ty closure)
+                (Ty.arrow (A.ty u) (A.ty t))
+            in
+            let cst = define_fun ~st (mk_pat "match") ty rules def in
             (* now apply definition to [u] *)
             aux Pos_inner vars u >|= fun u ->
             RA.T.app
