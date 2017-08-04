@@ -52,8 +52,7 @@ end = struct
   let empty : _ t = Empty
   let return e = Leaf e
   let append s1 s2 = match s1, s2 with
-    | Empty, _ -> s2
-    | _, Empty -> s1
+    | Empty, s | s, Empty -> s
     | _ -> Append (s1, s2)
   let rec to_seq t yield = match t with
     | Empty -> ()
@@ -289,12 +288,13 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
 
     let make ?from cst_id ty cst_kind =
       {cst_id; cst_ty=ty; cst_kind; cst_from=from; }
-    let make_cstor id ty =
+
+    let make_cstor ?from id ty =
       let _, ret = Ty_h.unfold ty in
       assert (Ty_h.is_data ret);
-      make id ty (Cst_cstor ret)
+      make ?from id ty (Cst_cstor ret)
 
-    let make_defined id ty rules : t =
+    let make_defined ?from id ty rules : t =
       (* check arity *)
       let rules_with_ar = lazy (
         match rules with
@@ -303,12 +303,12 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
             List.iter (fun r2 -> assert (r1.rule_arity = r2.rule_arity)) tail;
             r1.rule_arity, r1::tail
       ) in
-      make id ty (Cst_defined rules_with_ar)
+      make ?from id ty (Cst_defined rules_with_ar)
 
-    let make_defined_fix id ty (rules_f : cst -> rw_rule list) : t =
+    let make_defined_fix ?from id ty (rules_f : cst -> rw_rule list) : t =
       let rec c = lazy (
         let rules = lazy (rules_f (Lazy.force c)) in
-        make_defined id ty rules
+        make_defined ?from id ty rules
       ) in
       Lazy.force c
 
@@ -355,6 +355,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     type t = blocking
     val empty : t
     val is_empty : t -> bool
+    val return : cst -> t
     val merge : t -> t -> t
     val pp : t Fmt.printer
     val to_seq : t -> cst Sequence.t
@@ -363,6 +364,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     type t = blocking
     let empty = Bag.empty
     let is_empty = Bag.is_empty
+    let return = Bag.return
     let merge = Bag.append
     let pp out l = Fmt.fprintf out "[@[<2>%a@]]" (Utils.pp_list Cst.pp) (Bag.to_list l)
     let to_seq = Bag.to_seq
@@ -668,16 +670,23 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         | _ -> OF_none
 
     (* a value is a constructor application or a term of function type *)
-    let rec is_value t =
+    let is_value t =
       Ty_h.is_arrow (ty t) ||
       begin match t.term_cell with
-        | Const c ->
-          begin match Cst.view c with
-            | Cst_cstor _ -> true
-            | Cst_defined _ | Cst_undef _ -> false
-          end
-        | App (f, _) -> is_value f
-        | Binop (_,_,_) | Var _ | Undefined_value _ -> false
+        | App ({term_cell=Const c; _}, _) | Const c -> Cst.is_cstor c
+        | App _ | Binop (_,_,_) | Var _ | Undefined_value _ -> false
+      end
+
+    let is_undefined t = match view t with Undefined_value _ -> true | _ -> false
+
+    (* a pattern is made of cstors and variables. *)
+    let rec is_pattern t =
+      begin match t.term_cell with
+        | Var _ -> true
+        | Const c -> Cst.is_cstor c
+        | App ({term_cell=Const f;_}, l) ->
+          Cst.is_cstor f && List.for_all is_pattern l
+        | App _ | Binop (_,_,_) | Undefined_value _ -> false
       end
 
     (* typical view for unification/equality *)
@@ -700,7 +709,13 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       | _ -> Unif_none
   end
 
+  let pp_rule out (r:rw_rule) =
+    Format.fprintf out "(@[@[%a@ %a@]@ -> %a@])"
+      Cst.pp r.rule_cst (Utils.pp_list term_pp) r.rule_args
+      term_pp r.rule_rhs
+
   let mk_rule c args rule_rhs : rw_rule =
+    assert (List.for_all Term.is_pattern args);
     let rule_arity = List.length args in
     {rule_cst=c; rule_args=args; rule_arity; rule_rhs}
 
@@ -792,8 +807,10 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       | _ -> F_atom t
 
     (* remove sign from term, if any *)
-    let abs t : term * bool = match form_view t with
-      | F_not u -> u, false
+    let rec abs t : term * bool = match form_view t with
+      | F_not u ->
+        let u, sign = abs u in
+        u, not sign
       | F_bool false -> true_, false
       | _ -> t, true
   end
@@ -1051,10 +1068,10 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     | MR_ok of explanation * Subst.t * 'a
     | MR_blocked of Blocking.t (* blocking terms *)
     | MR_fail
+    | MR_undefined of explanation (* some matched term is `undefined` *)
 
   (** {2 Matching} *)
   module Matching : sig
-
     val match_ :
       ?subst:Subst.t ->
       eval:(term -> explanation * Blocking.t * term) ->
@@ -1082,6 +1099,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     module T = Term
 
     exception Fail
+    exception Undefined of explanation
 
     let hd_ t = match T.view t with
       | Const _ | Var _ | Undefined_value _ | Binop _ -> t
@@ -1102,15 +1120,19 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
             if T.equal t u then (
               expls := Explanation.append e_u !expls;
               subst
-            ) else if T.is_value u then raise Fail
-            else (
+            ) else if T.is_value u then (
+              raise Fail
+            ) else if T.is_undefined u then (
+              raise (Undefined e_u)
+            ) else (
               assert (not (Blocking.is_empty block_u));
               deps := Blocking.merge block_u !deps;
               subst
             )
           )
-        | App ({term_cell=Const _;_} as f, l) ->
+        | App ({term_cell=Const c;_} as f, l) ->
           (* see if [u] reduces to a term with same head *)
+          assert (Cst.is_cstor c);
           let e_u, block_u, u = eval u in
           begin match T.view u with
             | App (f', l') when T.equal f f' ->
@@ -1121,6 +1143,8 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
               if T.is_value u then (
                 (* value with the wrong cstor *)
                 raise Fail
+              ) else if T.is_undefined u then (
+                raise (Undefined e_u)
               ) else (
                 assert (not (Blocking.is_empty block_u));
                 deps := Blocking.merge block_u !deps;
@@ -1142,26 +1166,44 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         if Blocking.is_empty !deps
         then MR_ok (!expls,subst,())
         else MR_blocked !deps
-      with Fail -> MR_fail
+      with
+        | Fail -> MR_fail
+        | Undefined e -> MR_undefined e
+
+    type state =
+      | S_all_ok of Explanation.t
+      | S_some_blocked of Blocking.t
 
     let match_l ~eval l1 l2 : _ match_res =
-      let rec aux expl block subst l1 l2 = match l1, l2 with
+      let rec aux ~st subst l1 l2 = match l1, l2 with
         | [], _ ->
-          if Blocking.is_empty block
-          then MR_ok (expl, subst, l2)
-          else MR_blocked block
+          begin match st with
+            | S_all_ok expl -> MR_ok (expl, subst, l2) (* return subst + rest *)
+            | S_some_blocked block ->
+              assert (not (Blocking.is_empty block));
+              MR_blocked block
+          end
         | _::_, [] -> MR_fail (* too few patterns *)
         | t1 :: l1', t2 :: l2' ->
           begin match match_ ~subst ~eval t1 t2 with
             | MR_fail -> MR_fail
+            | MR_undefined e -> MR_undefined e (* can stop directly *)
             | MR_blocked blk ->
-              aux expl (Blocking.merge blk block) subst l1' l2'
+              let st = match st with
+                | S_all_ok _ -> S_some_blocked blk
+                | S_some_blocked blk' ->
+                  S_some_blocked (Blocking.merge blk blk')
+              in
+              aux ~st subst l1' l2'
             | MR_ok (expl', subst, ()) ->
-              let expl = Explanation.append expl expl' in
-              aux expl block subst l1' l2'
+              let st = match st with
+                | S_some_blocked _ -> st (* will block anyway *)
+                | S_all_ok expl -> S_all_ok (Explanation.append expl expl')
+              in
+              aux ~st subst l1' l2'
           end
       in
-      aux Explanation.empty Blocking.empty Subst.empty l1 l2
+      aux ~st:(S_all_ok Explanation.empty) Subst.empty l1 l2
   end
 
   (** {2 Clauses} *)
@@ -1627,6 +1669,14 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         | NF_none -> Explanation.empty, t
         | NF_some (new_t,e) -> e, new_t
 
+    type match_st =
+      | M_blocked of Blocking.t
+      | M_undef of Explanation.t (* at least one term is undefined *)
+
+    let pp_match_st out = function
+      | M_blocked b -> Fmt.fprintf out "(@[blocked %a@])" Blocking.pp b
+      | M_undef e -> Fmt.fprintf out "(@[undef %a@])" Explanation.pp e
+
     (* compute the normal form of this term. We know at least one of its
        subterm(s) has been reduced *)
     let rec compute_nf (t:term) : explanation * blocking * term =
@@ -1671,11 +1721,14 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
             | Cst_undef {cst_cur_case=Some (e,new_t); _} ->
               (* c := new_t, we can reduce *)
               compute_nf_add e new_t
+            | Cst_undef _ ->
+              (* blocked by [c] *)
+              Explanation.empty, Blocking.return c, t
             | Cst_defined (lazy (0, r :: _)) ->
               (* nullary rule *)
               assert (r.rule_args=[]);
               compute_nf r.rule_rhs
-            | Cst_defined _ | Cst_undef _ | Cst_cstor _ ->
+            | Cst_defined _ | Cst_cstor _ ->
               Explanation.empty, Blocking.empty, t
           end
         | App ({term_cell=Const {cst_kind=Cst_cstor _; _}; _}, _) ->
@@ -1701,6 +1754,10 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
                     in
                     let expl = Explanation.append e e_f in
                     compute_nf_add expl t'
+                  | MR_undefined e ->
+                    (* evaluates to [undefined] *)
+                    let expl = Explanation.append e e_f in
+                    expl, Blocking.empty, Term.undefined_value (Term.ty t)
                 end
               | _ -> e_f, b_f, t (* normal form *)
             end
@@ -1718,22 +1775,45 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
 
     (* find a rule that applies to the given list of arguments.
        returns the rule that applies and the unused arguments. *)
-    and find_rule (rules: rw_rule list) (args:term list) : (rw_rule * term list) match_res =
-      let rec aux blocking rules = match rules with
+    and find_rule (rules0: rw_rule list) (args:term list) : (rw_rule * term list) match_res =
+      let rec aux ~st rules = match rules with
         | [] ->
-          assert (not (Blocking.is_empty blocking)); (* rules should be total *)
-          MR_blocked blocking
+          (*Format.printf "(@[:rules (@[%a@])@ :args (@[%a@])@ :st %a@])@."
+            (Utils.pp_list pp_rule) rules0 (Utils.pp_list Term.pp) args
+            pp_match_st st;*)
+          begin match st with
+            | M_blocked block ->
+              assert (not (Blocking.is_empty block)); (* rules should be total *)
+              MR_blocked block
+            | M_undef e -> MR_undefined e
+          end
         | rule :: rules_tl ->
           let res = Matching.match_l ~eval:compute_nf rule.rule_args args in
           begin match res with
-            | MR_ok (e,subst,rest) -> MR_ok (e,subst,(rule,rest))
-            | MR_fail -> aux blocking rules_tl (* ignore rule *)
-            | MR_blocked b' ->
-              (* add [b'] to blocking terms and try next rules *)
-              aux (Blocking.merge b' blocking) rules_tl
+            | MR_ok (e,subst,rest) ->
+              (* rule matches, we can ignore the other rules *)
+              MR_ok (e,subst,(rule,rest))
+            | MR_fail -> aux ~st rules_tl (* ignore rule *)
+            | MR_undefined e ->
+              (* there might be several rules which meet an undefined term,
+                 we ought to conflict on all of them *)
+              let st = match st with
+                | M_undef e' -> M_undef (Explanation.or_ e e')
+                | M_blocked _ -> M_undef e
+              in
+              aux ~st rules_tl
+            | MR_blocked block' ->
+              let st = match st with
+                | M_undef _ -> st (* ignore block, will be undefined anyway *)
+                | M_blocked block ->
+                  (* add [block'] to blocking terms and try next rules *)
+                  M_blocked (Blocking.merge block block')
+              in
+              aux ~st rules_tl
           end
       in
-      aux Blocking.empty rules
+      assert (rules0 <> []);
+      aux ~st:(M_blocked Blocking.empty) rules0
 
     (* compute [t1 =?= t2] *)
     and compute_unif old t1 t2 : explanation * blocking * term =
@@ -1920,13 +2000,6 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       Clause.push_new_l cs;
       ()
 
-    let expand_cst_ (t:t)(c:cst) : unit =
-      assert (ty_is_prop (Term.ty t.root));
-      Log.debugf 2
-        (fun k->k "(@[<1>expand_cst@ %a@ :because-of %a@])" Cst.pp c pp t);
-      Expand.expand_cst c;
-      ()
-
     (* evaluate [t] in current partial model, and expand the constants
        that block it *)
     let update (t:t): unit =
@@ -1949,7 +2022,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
                 Term.pp t.root Term.pp new_t Blocking.pp block
                 Explanation.pp e);
           t.block <- block;
-          Blocking.to_seq block (expand_cst_ t);
+          Blocking.to_seq block Expand.expand_cst;
       end;
       ()
 
@@ -2287,10 +2360,11 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
                  let cstors =
                    ID.Map.to_seq data_cstors
                    |> Sequence.map
-                     (fun (id_c, ty_c) ->
+                     (fun (id_c, ty_c0) ->
                         let c = lazy (
-                          let ty_c = conv_ty ty_c in
+                          let ty_c = conv_ty ty_c0 in
                           Cst.make_cstor id_c ty_c
+                            ~from:(A.Cst.mk_cstor id_c ty_c0 |> A.T.const)
                         ) in
                         ID.Tbl.add decl_ty_ id_c c; (* declare *)
                         c)
@@ -2309,14 +2383,14 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         | A.St_def cs ->
           (* define the mutually recursive functions *)
           List.iter
-            (fun {A.cst_id=id; cst_ty=ty; cst_def=d} ->
+            (fun ({A.cst_id=id; cst_ty=ty; cst_def=d} as c) ->
                let rules = match d with
                  | A.Cst_def (lazy l) -> l
                  | A.Cst_cstor _ -> assert false
                in
                let ty = conv_ty ty in
                let cst = lazy (
-                 Cst.make_defined_fix id ty
+                 Cst.make_defined_fix id ty ~from:(A.T.const c)
                    (fun cst ->
                       List.map
                         (fun (args,rhs) ->
@@ -2378,7 +2452,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
               |> A.T.var)
         | Const cst ->
           begin match cst.cst_from, cst.cst_kind with
-            | Some c, _ -> c
+            | Some t, _ -> t
             | None, Cst_cstor _ -> assert false
             | None, Cst_undef _ ->
               let v = fresh_var (Cst.ty cst) in
@@ -2580,10 +2654,10 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         (* restrict depth *)
         match M.solve ~assumptions:[cur_lit] () with
           | M.Sat _ ->
-            let m = compute_model_ () in
             Log.debugf 1
               (fun k->k "@{<Yellow>** found SAT@} at depth %a"
                   ID.pp cur_depth);
+            let m = compute_model_ () in
             do_on_exit ~on_exit;
             if check then model_check ();
             Sat m
