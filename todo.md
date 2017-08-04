@@ -2,13 +2,82 @@
 
 ## Now
 
-- no-hashconsing:
-  * `thunk={mut expl|expl*const|expl*value; mut prgm; mut env:thunk list}`
-    (uniform type, does not change, only mutate fields;
-     return no explanations for partial steps — stores them instead — until
-     it evaluates to a value)
-  * and/eq are just part of programs, and use the environment to store
-    intermediate thunks; ref/lazy are useless and merged with regular thunk type
+## Rewriting
+
+- use a smaller language based on λ-free HO terms and rewrite rules
+
+- decoding: mostly, replace rewrite-defined symbols by a corresponding λ-term
+  and apply SNF to eliminate them totally
+
+- [ ] application should have an additional list of terms that are
+   currently blocking it. See `a ∧ b` in old branch!
+   The list of terms must be accounted for in hashconsing, and defines
+   directly what blocks evaluation.
+  * emulate old "and" behavior
+  * store "blocking" in every term again
+
+- [ ] uninterpreted type τ becomes:
+  * `data n_τ := 0 | S n_τ`
+  * a meta-var `?card_τ : n_τ` that is the cardinal of `n_τ`, with
+    constraint `?card_τ ≠ 0`
+  * `forall x:τ. p x` becomes
+    `forall_τ 0 ?card_τ p`, with rules:
+    + `forall_τ _ 0 _ --> ⊤`
+    + `forall_τ n (S m) p --> p n ∧ forall_τ (S n) m p`
+  * each meta `?n : τ` has the additional constraint
+    `?n ≤ ?card_τ` to ensure it ranges over the proper domain
+  * similar rules for exists
+  * *NOTE* difficult part may be for decoding.
+    If `card_τ = S^k ?c`, we can probably truncate to `S^k 0`;
+    If `?m = S^k ?m'`, same?
+  * [ ] symmetry breaking, again (if two metas `?m, ?n` play same role,
+        add constraint `?m ≤ ?n`)
+  * [ ] symmetry breaking on existential quantification:
+      `∃ m n : τ, p m n` where `m,n` can be swapped in `p`
+      can become `∃ m n : τ, m ≤ n ∧ p m n`
+
+- [ ] quantification on datatypes:
+  * `∀x:nat, p x` becomes `forall_nat ?d_nat p`
+  * new meta `?d_nat : nat` specifies depth of unrolling
+  * `forall_nat` defined by:
+    + `forall_nat 0 _ --> undefined`
+    + `forall_nat (s d) p --> p 0 ∧ forall_nat d (λx. p (s x))`
+      (where the λ should be eliminated into some `g_42`:
+       `g_42 x p --> p (s x)`)
+  * always unroll on some `nat`-typed depth, but should work on any
+    datatype. Do this in a first pass which translate quantification
+    into `?d_nat` + definition of recursive function `forall_nat`;
+    then translate `forall_nat` into rewriting fragment, lifting lambdas, etc.
+
+- [ ] equality on functions:
+    translate `f = g` into `∀x. f x = g x`, then eliminate this quantification.
+  * no translation back needed.
+
+- [ ] synthesis of functions
+  * use set of combinators for each `a -> b`
+    *NOTE*: should we do it on curried funs? or on tuples of arguments?
+  * for `nat -> b`, say, we would have:
+    + `const : b -> nat -> b`, with `const x _ --> x`
+    + `match_nat : b -> (b -> b) -> nat -> b` with
+      `match_nat x f 0 --> x`
+      `match_nat x f (s n) --> f (match_nat x f n)`
+  * then, refine `?f : a -> b` into `{ const ?x, match_nat ?x ?g }`
+
+- [ ] optimization of `leq (s x) 0 --> false, leq 0 0 --> false`
+    into `leq _ 0 --> false`
+
+- [ ] toplevel unif constraints?
+    have `p` become `p =?= ⊤`, then deal with conjunction of `t =?= u`
+    where `u` is either a variable or a constructor-headed term
+  * reduce `(t=u) =?= ⊤` into `t =?= u` and normalize to enforce invariant
+    (if neither `t` nor `u` are cstor-headed, introduce new variable `x`
+     and return `t =?= x, u =?= x`)
+  * upon reducing `t` to `c u_1…u_n` in `t =?= x`, substitute `x` with `c u_1…u_n`
+  * clash if `c … =?= d …` where c,d distinct cstors
+  * in constraint `f t1…tn =?= c u1…uk`, if there is exactly
+    one rule `f l1…ln --> c r1…rk` such that `l1…ln` may match `t1…tn`
+    and `u1…uk` may mach `r1…rk`, then reduce to
+    `t1=l1,…,tn=ln,u1=r1,…,uk=rk` (like E-unif step)
 
 ## Narrowing
 
@@ -193,7 +262,7 @@
 - release
 
 - generic "parallel" operator (to be used by and, or, but also
-  other functions such as +_nat — maybe if they are detected to be symmetric?)
+  other functions such as `+_nat — maybe` if they are detected to be symmetric?)
 
 ### Fix
 
@@ -226,6 +295,14 @@
   for it to return `some`. A builtin `smaller_depth a b` would be used to
   prune early?
 
+- no-hashconsing:
+  * `thunk={mut expl|expl*const|expl*value; mut prgm; mut env:thunk list}`
+    (uniform type, does not change, only mutate fields;
+     return no explanations for partial steps — stores them instead — until
+     it evaluates to a value)
+  * and/eq are just part of programs, and use the environment to store
+    intermediate thunks; ref/lazy are useless and merged with regular thunk type
+
 ## SMT
 
 - reduction rules (if/case/proj/test)
@@ -241,8 +318,9 @@
 - start testing on simple examples
 
 ### FIX
-./smbc.native --backtrace --debug 5 --check examples/uf3.smt2
-(should be unsat)
+
+- `./smbc.native --backtrace --debug 5 --check examples/uf3.smt2`
+  (should be unsat)
 
 ## Done
 
