@@ -1238,8 +1238,10 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         in
         quant q qr body
       | Atomic (_, Uninterpreted uty) -> quant_uty q uty body
-      | Arrow _ ->
-        errorf "cannot quantify on arrow type `%a`" Ty.pp ty_arg (* TODO *)
+      | Arrow _ -> undefined_value_prop (* TODO: improve on that? *)
+
+    let quant_ty_l ~depth q ty_args body : t =
+      List.fold_right (quant_ty ~depth q) ty_args body
   end
 
   let pp_lit out l =
@@ -2196,7 +2198,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
                    in
                    List.fold_right
                      (fun ty body ->
-                        Term.quant_ty ~depth:d.q_data_depth q ty body)
+                        Term.quant_ty ~depth:(d.q_data_depth+1) q ty body)
                      args body')
                 d.q_data_cstor
             in
@@ -3142,7 +3144,16 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           | Ast.And -> Term.and_ a b
           | Ast.Or -> Term.or_ a b
           | Ast.Imply -> Term.imply a b
-          | Ast.Eq -> Term.eq a b
+          | Ast.Eq ->
+            let args, _ = Ty.unfold a.term_ty in
+            begin match args with
+              | [] -> Term.eq a b (* normal equality *)
+              | _::_ ->
+                (* equality on functions: becomes a forall *)
+                let db_l = List.mapi (fun i ty -> Term.db (i,ty)) args in
+                let body = Term.eq (Term.app a db_l) (Term.app b db_l) in
+                Term.quant_ty_l ~depth:0 Forall args body
+            end
         end
       | Ast.Undefined_value ->
         Term.undefined_value (conv_ty t.Ast.ty)
