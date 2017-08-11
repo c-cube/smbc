@@ -22,7 +22,7 @@ module type CONFIG = sig
   (** Depth increases uniformly *)
 
   val quant_unfold_depth : int
-  (** Depth for quantifier unfolding *)
+  (** Initial depth for quantifier unfolding *)
 
   val progress: bool
   (** progress display progress bar *)
@@ -62,21 +62,35 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
   If true, it means that "unsat" might be wrong, so we'll answer "unknown" *)
   let incomplete_expansion : bool ref = ref false
 
-  (* if [true], it means that at least once, a goal was reduced to
-     [Undefined_value], meaning we lost precision.
-     This means that we are not refutationnally complete. *)
-  let has_met_undefined : bool ref = ref false
-
   (* for objects that are expanded on demand only *)
   type 'a lazily_expanded =
     | Lazy_some of 'a
     | Lazy_none
 
+  type undefined_cause =
+    | Undef_absolute (* only undefined functions such as projectors or tailcall *)
+    | Undef_quant of int (* caused by bound on quantifier unrolling *)
+
+  (* if not [None], it means that at least once in the current call
+     to [solve()], a goal was reduced to [Undefined_value], meaning we lost
+     precision.
+     This means that we are not refutationnally complete, or that we
+     have to increase unrolling depth of quantifiers. *)
+  let has_met_undefined : undefined_cause option ref = ref None
+
+  (* did we lose at least one model because some goal evaluated
+     to [undefined] with an absolute cause (i.e. not because of
+     quantification approximation) *)
+  let has_lost_models : bool ref = ref false
+
+  (* current level of depth unrolling *)
+  let quant_unroll_depth : int option ref = ref None
+
   (* option with a special case for "Undefined_value" *)
   type 'a option_or_fail =
     | OF_some of 'a
     | OF_none
-    | OF_undefined_value
+    | OF_undefined_value of undefined_cause
 
   (* main term cell *)
   type term = {
@@ -109,7 +123,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     | Builtin of builtin
     | Check_assign of cst * term (* check a literal *)
     | Check_empty_uty of ty_uninterpreted_slice (* check it's empty *)
-    | Undefined_value of ty_h
+    | Undefined_value of ty_h * undefined_cause
     (* Value that is not defined. On booleans it corresponds to
        the middle case of https://en.wikipedia.org/wiki/Three-valued_logic.
        The [ty] argument is needed for typing *)
@@ -137,6 +151,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       (* blocked by non-refined constant *)
     | Dep_uty of ty_uninterpreted_slice
       (* blocked because this type is not expanded enough *)
+    | Dep_quant_depth
 
   and builtin =
     | B_not of term
@@ -186,6 +201,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     | Lit_atom of term
     | Lit_assign of cst * term
     | Lit_uty_empty of ty_uninterpreted_slice
+    | Lit_quant_unroll of int
 
   and cst = {
     cst_id: ID.t;
@@ -270,7 +286,6 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     | QR_data of quant_data
     | QR_bool
 
-  (* TODO: add a "context" to account for path under quantifier *)
   and quant_data = {
     q_data_ty: ty_h; (* type *)
     q_data_cstor: cstor_list; (* constructors *)
@@ -280,6 +295,25 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
   let pp_quant out = function
     | Forall -> CCFormat.string out "forall"
     | Exists -> CCFormat.string out "exists"
+
+  let merge_undef_cause (a:undefined_cause)(b:undefined_cause) : undefined_cause =
+    match a, b with
+      | Undef_quant l1, Undef_quant l2 -> Undef_quant (max l1 l2)
+      | Undef_quant l, _
+      | _, Undef_quant l -> Undef_quant l
+      | Undef_absolute, Undef_absolute -> Undef_absolute
+
+  (* some toplevel term evaluated to [undefined] with cause [c] *)
+  let add_top_undefined (c:undefined_cause): unit =
+    begin match c with
+      | Undef_absolute -> has_lost_models := true; (* precision lost *)
+      | Undef_quant _ -> ()
+    end;
+    has_met_undefined :=
+      begin match !has_met_undefined with
+        | None -> Some c
+        | Some c' -> Some (merge_undef_cause c c')
+      end
 
   module Ty = struct
     type t = ty_h
@@ -459,6 +493,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         | Lit_atom _ -> 1
         | Lit_assign _ -> 2
         | Lit_uty_empty _ -> 3
+        | Lit_quant_unroll _ -> 4
       in
       match a.lit_view, b.lit_view with
         | Lit_fresh i1, Lit_fresh i2 -> ID.compare i1 i2
@@ -466,11 +501,13 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         | Lit_assign (c1,t1), Lit_assign (c2,t2) ->
           CCOrd.(Typed_cst.compare c1 c2 <?> (term_cmp_, t1, t2))
         | Lit_uty_empty u1, Lit_uty_empty u2 -> cmp_uty u1 u2
+        | Lit_quant_unroll l1, Lit_quant_unroll l2 -> CCInt.compare l1 l2
         | Lit_fresh _, _
         | Lit_atom _, _
         | Lit_assign _, _
-        | Lit_uty_empty _, _ ->
-          CCInt.compare (int_of_cell_ a.lit_view) (int_of_cell_ b.lit_view)
+        | Lit_uty_empty _, _
+        | Lit_quant_unroll _, _
+          -> CCInt.compare (int_of_cell_ a.lit_view) (int_of_cell_ b.lit_view)
 
   let hash_lit a =
     let sign = a.lit_sign in
@@ -480,6 +517,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       | Lit_assign (c,t) ->
         Hash.combine4 3 (Hash.bool sign) (Typed_cst.hash c) (term_hash_ t)
       | Lit_uty_empty uty -> Hash.combine3 4 (Hash.bool sign) (hash_uty uty)
+      | Lit_quant_unroll l -> Hash.combine2 5 (Hash.int l)
 
   let pp_uty out uty =
     let n = uty.uty_offset in
@@ -495,6 +533,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
   let pp_dep out = function
     | Dep_cst c -> Typed_cst.pp out c
     | Dep_uty uty -> pp_uty out uty
+    | Dep_quant_depth -> CCFormat.string out "(quant-depth)"
 
   let hash_q_range = function
     | QR_unin u -> hash_uty u
@@ -523,18 +562,9 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
 
     let dummy_level = -1
 
-    type stack_cell =
-      | S_set_nf of
-          term * term_nf
-          (* t1.nf <- t2 *)
-      | S_set_cst_case of
-          cst_info * (explanation * term) option
-          (* c1.cst_case <- t2 *)
-      | S_set_uty of
-          ty_uninterpreted_slice * (explanation * ty_uninterpreted_status) option
-          (* uty1.uty_status <- status2 *)
+    type undo_op = unit -> unit
 
-    type stack = stack_cell CCVector.vector
+    type stack = undo_op CCVector.vector
 
     (* the global stack *)
     let st_ : stack = CCVector.create()
@@ -543,10 +573,8 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       Log.debugf 2
         (fun k->k "@{<Yellow>** now at level %d (backtrack)@}" l);
       while CCVector.length st_ > l do
-        match CCVector.pop_exn st_ with
-          | S_set_nf (t, nf) -> t.term_nf <- nf;
-          | S_set_cst_case (info, c) -> info.cst_cur_case <- c;
-          | S_set_uty (uty, s) -> uty.uty_status <- s;
+        let f = CCVector.pop_exn st_ in
+        f ();
       done;
       ()
 
@@ -557,14 +585,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       Log.debugf 2 (fun k->k "@{<Yellow>** now at level %d (push)@}" l);
       ()
 
-    let push_set_nf_ (t:term) =
-      CCVector.push st_ (S_set_nf (t, t.term_nf))
-
-    let push_set_cst_case_ (i:cst_info) =
-      CCVector.push st_ (S_set_cst_case (i, i.cst_cur_case))
-
-    let push_uty_status (uty:ty_uninterpreted_slice) =
-      CCVector.push st_ (S_set_uty (uty, uty.uty_status))
+    let push (f:undo_op) : unit = CCVector.push st_ f
   end
 
   let new_switch_id_ =
@@ -616,7 +637,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           | Select (sel,t) ->
             Hash.combine4 35 (Typed_cst.hash sel.select_cstor)
               sel.select_i (sub_hash t)
-          | Undefined_value ty -> Hash.combine2 36 (Ty.hash ty)
+          | Undefined_value (ty,_) -> Hash.combine2 36 (Ty.hash ty)
 
         (* equality that relies on physical equality of subterms *)
         let equal t1 t2 : bool = match t1.term_cell, t2.term_cell with
@@ -663,7 +684,8 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
             Typed_cst.equal c1 c2 && term_equal_ t1 t2
           | Check_empty_uty u1, Check_empty_uty u2 ->
             equal_uty u1 u2
-          | Undefined_value ty1, Undefined_value ty2 -> Ty.equal ty1 ty2
+          | Undefined_value (ty1,c1), Undefined_value (ty2,c2) ->
+            Ty.equal ty1 ty2 && c1=c2
           | True, _
           | False, _
           | DB _, _
@@ -705,6 +727,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       | Term_dep_sub of term
       | Term_dep_sub2 of term * term
       | Term_dep_uty of ty_uninterpreted_slice
+      | Term_dep_quant_depth
 
     type delayed_ty =
       | DTy_direct of ty_h
@@ -714,6 +737,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       let to_int_ = function
         | Dep_cst _ -> 0
         | Dep_uty _ -> 1
+        | Dep_quant_depth -> 2
       in
       match a, b with
       | Dep_cst c1, Dep_cst c2 -> Typed_cst.compare c1 c2
@@ -721,8 +745,10 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         let (<?>) = CCOrd.(<?>) in
         Ty.compare (Lazy.force u1.uty_self) (Lazy.force u2.uty_self)
         <?> (CCInt.compare, u1.uty_offset, u2.uty_offset)
+      | Dep_quant_depth, Dep_quant_depth -> 0
       | Dep_cst _, _
       | Dep_uty _, _
+      | Dep_quant_depth, _
         -> CCInt.compare (to_int_ a) (to_int_ b)
 
     (* build a term. If it's new, add it to the watchlist
@@ -752,6 +778,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
             CCList.sorted_merge_uniq
               ~cmp:cmp_term_dep_ a.term_deps b.term_deps
           | Term_dep_uty uty -> [Dep_uty uty]
+          | Term_dep_quant_depth -> [Dep_quant_depth]
         in
         t'.term_deps <- deps
       );
@@ -856,8 +883,8 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       mk_term_ (Check_empty_uty uty)
         ~deps:(Term_dep_uty uty) ~ty:(DTy_direct Ty.prop)
 
-    let undefined_value ty =
-      mk_term_ (Undefined_value ty)
+    let undefined_value ty cause =
+      mk_term_ (Undefined_value (ty,cause))
         ~deps:Term_dep_none ~ty:(DTy_direct ty)
 
     let undefined_value_prop = undefined_value Ty.prop
@@ -874,7 +901,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     let not_ t = match t.term_cell with
       | True -> false_
       | False -> true_
-      | Undefined_value _ -> undefined_value_prop (* shortcut *)
+      | Undefined_value (_,c) -> undefined_value_prop c (* shortcut *)
       | Builtin (B_not t') -> t'
       | _ -> builtin_ ~deps:(Term_dep_sub t) (B_not t)
 
@@ -889,7 +916,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       (* evaluation is blocked by the uninterpreted type *)
       let deps = match qr with
         | QR_unin uty -> Term_dep_uty uty
-        | QR_data _ | QR_bool -> Term_dep_none
+        | QR_data _ | QR_bool -> Term_dep_quant_depth
       in
       mk_term_ ~deps ~ty:(DTy_direct Ty.prop) (Quant (q,qr,body))
 
@@ -1002,7 +1029,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       (cst * Ty.t * cst_info * ty_uninterpreted_slice option) option_or_fail
       =
       match t.term_cell with
-        | Undefined_value _ -> OF_undefined_value
+        | Undefined_value (_,c) -> OF_undefined_value c
         | Const c ->
           begin match Typed_cst.as_undefined c with
             | Some res -> OF_some res
@@ -1014,7 +1041,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
        applied to some arguments *)
     let as_cstor_app (t:term): (cst * Ty.t * term list) option_or_fail =
       match t.term_cell with
-        | Undefined_value _ -> OF_undefined_value
+        | Undefined_value (_,c) -> OF_undefined_value c
         | Const ({cst_kind=Cst_cstor; _} as c) -> OF_some (c,c.cst_ty,[])
         | App (f, l) ->
           begin match f.term_cell with
@@ -1025,7 +1052,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
 
     let as_domain_elt (t:term): (cst * Ty.t * ty_uninterpreted_slice) option_or_fail =
       match t.term_cell with
-        | Undefined_value _ -> OF_undefined_value
+        | Undefined_value (_,c) -> OF_undefined_value c
         | Const ({cst_kind=Cst_uninterpreted_dom_elt uty; _} as c) ->
           OF_some (c,c.cst_ty,uty)
         | _ -> OF_none
@@ -1035,11 +1062,11 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       | Unif_cst of cst * Ty.t * cst_info * ty_uninterpreted_slice option
       | Unif_cstor of cst * Ty.t * term list
       | Unif_dom_elt  of cst * Ty.t * ty_uninterpreted_slice
-      | Unif_fail
+      | Unif_undef of undefined_cause
       | Unif_none
 
     let as_unif (t:term): unif_form = match t.term_cell with
-      | Undefined_value _ -> Unif_fail
+      | Undefined_value (_,c) -> Unif_undef c
       | Const ({cst_kind=Cst_uninterpreted_dom_elt uty; _} as c) ->
         Unif_dom_elt (c,c.cst_ty,uty)
       | Const ({cst_kind=Cst_undef (info,slice); _} as c) ->
@@ -1107,7 +1134,9 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         | Check_assign (c,t) ->
           fpf out "(@[<hv1>:=?@ %a@ %a@])" Typed_cst.pp c pp t
         | Check_empty_uty uty -> fpf out "(@[check_empty %a@])" pp_uty uty
-        | Undefined_value _ -> fpf out "(assert-false)"
+        | Undefined_value (_, Undef_absolute) -> fpf out "(assert-false)"
+        | Undefined_value (_, (Undef_quant l)) ->
+          fpf out "(assert-false :reason-quant-unroll %d)" l
       in
       pp out t
 
@@ -1238,8 +1267,10 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         in
         quant q qr body
       | Atomic (_, Uninterpreted uty) -> quant_uty q uty body
-      | Arrow _ ->
-        errorf "cannot quantify on arrow type `%a`" Ty.pp ty_arg (* TODO *)
+      | Arrow _ -> undefined_value_prop Undef_absolute (* TODO: improve on that? *)
+
+    let quant_ty_l ~depth q ty_args body : t =
+      List.fold_right (quant_ty ~depth q) ty_args body
   end
 
   let pp_lit out l =
@@ -1249,6 +1280,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       | Lit_assign (c,t) ->
         Format.fprintf out "(@[:= %a@ %a@])" Typed_cst.pp c Term.pp t
       | Lit_uty_empty u -> Format.fprintf out "(empty %a)" pp_uty u
+      | Lit_quant_unroll l -> Format.fprintf out "(quant-unroll %d)" l
     in
     if l.lit_sign then pp_lit_view out l.lit_view
     else Format.fprintf out "(@[@<1>¬@ %a@])" pp_lit_view l.lit_view
@@ -1266,6 +1298,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     val cst_choice : cst -> term -> t
     val uty_choice_empty : ty_uninterpreted_slice -> t
     val uty_choice_nonempty : ty_uninterpreted_slice -> t
+    val quant_unroll : ?sign:bool -> int -> t
     val hash : t -> int
     val compare : t -> t -> int
     val equal : t -> t -> bool
@@ -1304,6 +1337,8 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     let cst_choice c t = make ~sign:true (Lit_assign (c, t))
     let uty_choice_empty uty = make ~sign:true (Lit_uty_empty uty)
     let uty_choice_nonempty uty : t = make ~sign:false (Lit_uty_empty uty)
+
+    let quant_unroll ?(sign=true) d : t = make ~sign (Lit_quant_unroll d)
 
     let as_atom (lit:t) : (term * bool) option = match lit.lit_view with
       | Lit_atom t -> Some (t, lit.lit_sign)
@@ -2066,7 +2101,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           else (
             Term.Tbl.add tbl_ u ();
             match Term.as_cstor_app u with
-              | OF_undefined_value | OF_none -> false
+              | OF_undefined_value _ | OF_none -> false
               | OF_some (_, _, l) -> List.exists aux l
           )
         end
@@ -2077,7 +2112,8 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     let set_nf_ t new_t (e:explanation) : unit =
       if Term.equal t new_t then ()
       else (
-        Backtrack.push_set_nf_ t;
+        let old_nf = t.term_nf in
+        Backtrack.push (fun () -> t.term_nf <- old_nf);
         t.term_nf <- NF_some (new_t, e);
         Log.debugf 5
           (fun k->k
@@ -2097,7 +2133,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         (* [t] is already being evaluated, this means there is
              an evaluation in the loop.
              We must approximate and return [Undefined_value] *)
-        Explanation.empty, Term.undefined_value t.term_ty
+        Explanation.empty, Term.undefined_value t.term_ty Undef_absolute
       ) else (
         (* follow the "normal form" pointer *)
         match t.term_nf with
@@ -2147,6 +2183,8 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
             | Forall -> compute_nf (Term.and_ b_true b_false)
             | Exists -> compute_nf (Term.or_ b_true b_false)
           end
+        | Quant (Forall, _, ({term_cell=(True|False); _} as bod)) ->
+          Explanation.empty, bod (* optim: [forall x. bool --> bool] *)
         | Quant (q,QR_unin uty,body) ->
           begin match uty.uty_status with
             | None -> Explanation.empty, t
@@ -2176,9 +2214,16 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
               end
           end
         | Quant (q,QR_data d,body) ->
-          if d.q_data_depth >= Config.quant_unfold_depth then (
-            (* just give up and return undefined *)
-            Explanation.empty, Term.undefined_value_prop
+          (* TODO: first, try to evaluate body (might become true/false/undefined) *)
+          if CCOpt.is_none !quant_unroll_depth then (
+            Explanation.empty, t (* blocked for now *)
+          ) else if d.q_data_depth >= CCOpt.get_exn !quant_unroll_depth then (
+            (* just give up and return undefined, because of depth *)
+            let depth = CCOpt.get_exn !quant_unroll_depth in
+            let e = Explanation.return (Lit.quant_unroll depth) in
+            let nf = Term.undefined_value_prop (Undef_quant depth) in
+            set_nf_ t nf e;
+            e, nf
           ) else (
             (* turn [forall x:nat. P[x]] into
                [p 0 && forall x:nat. P[s x]] *)
@@ -2186,8 +2231,9 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
               List.map
                 (fun (lazy cstor) ->
                    let args, _ = Ty.unfold (Typed_cst.ty cstor) in
+                   let n = List.length args in
                    let db_l =
-                     List.mapi (fun i ty -> Term.db (i,ty)) args
+                     List.mapi (fun i ty -> Term.db (n-i-1,ty)) args
                    in
                    (* replace [x] with [cstor args] in [body] *)
                    let arg = Term.app_cst cstor db_l in
@@ -2196,7 +2242,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
                    in
                    List.fold_right
                      (fun ty body ->
-                        Term.quant_ty ~depth:d.q_data_depth q ty body)
+                        Term.quant_ty ~depth:(d.q_data_depth+1) q ty body)
                      args body')
                 d.q_data_cstor
             in
@@ -2204,7 +2250,9 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
               | Forall -> Term.and_l l
               | Exists -> Term.or_l l
             in
-            compute_nf new_t
+            let e, nf = compute_nf new_t in
+            set_nf_ t nf e;
+            e, nf
           )
         | Builtin b ->
           (* try boolean reductions *)
@@ -2219,9 +2267,9 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           let e_branch, t' = match a'.term_cell with
             | True -> compute_nf b
             | False -> compute_nf c
-            | Undefined_value _ ->
+            | Undefined_value (_,c) ->
               (* [if fail _ _ ---> fail] *)
-              compute_nf (Term.undefined_value t.term_ty)
+              compute_nf (Term.undefined_value t.term_ty c)
             | _ -> Explanation.empty, default()
           in
           (* merge evidence from [a]'s normal form and [b/c]'s
@@ -2251,9 +2299,9 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
                   else Explanation.empty, Term.match_ u' m
                 with Not_found -> assert false
               end
-            | OF_undefined_value ->
+            | OF_undefined_value c ->
               (* [match fail with _ end ---> fail] *)
-              compute_nf (Term.undefined_value t.term_ty)
+              compute_nf (Term.undefined_value t.term_ty c)
             | OF_none ->
               Explanation.empty, default()
           in
@@ -2274,11 +2322,11 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
                 compute_nf arg
               ) else (
                 (* not defined in this model *)
-                Explanation.empty, Term.undefined_value t.term_ty
+                Explanation.empty, Term.undefined_value t.term_ty Undef_absolute
               )
-            | OF_undefined_value ->
+            | OF_undefined_value c ->
               (* [select fail _ ---> fail] *)
-              Explanation.empty, Term.undefined_value t.term_ty
+              Explanation.empty, Term.undefined_value t.term_ty c
             | OF_none ->
               Explanation.empty, default() (* does not reduce *)
           in
@@ -2302,9 +2350,9 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
               in
               (* continue evaluation *)
               compute_nf_add e_u rhs
-            | OF_undefined_value ->
+            | OF_undefined_value c ->
               (* [switch fail _ ---> fail] *)
-              compute_nf (Term.undefined_value t.term_ty)
+              compute_nf (Term.undefined_value t.term_ty c)
             | OF_none ->
               (* block again *)
               let t' = if u==u' then t else Term.switch u' m in
@@ -2351,10 +2399,10 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
 
     (* apply [f] to [l], until no beta-redex is found *)
     and compute_nf_app env e f l = match f.term_cell, l with
-      | Undefined_value _, _ ->
+      | Undefined_value (_,c), _ ->
         (* applying [fail] just fails *)
         let ty = (Term.app f l).term_ty in
-        compute_nf (Term.undefined_value ty)
+        compute_nf (Term.undefined_value ty c)
       | Const {cst_kind=Cst_defined (lazy def_f); _}, l ->
         (* reduce [f l] into [def_f l] when [f := def_f] *)
         compute_nf_app env e def_f l
@@ -2410,10 +2458,10 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         let e_b, b' = compute_nf b in
         let e_ab = Explanation.append e_a e_b in
         begin match a'.term_cell, b'.term_cell with
-          | Undefined_value _, Undefined_value _ ->
-            Explanation.or_ e_a e_b, Term.undefined_value_prop
-          | Undefined_value _, _ -> e_a, Term.undefined_value_prop
-          | _, Undefined_value _ -> e_b, Term.undefined_value_prop
+          | Undefined_value (_,c1), Undefined_value (_,c2) ->
+            Explanation.or_ e_a e_b, Term.undefined_value_prop (merge_undef_cause c1 c2)
+          | Undefined_value (_,c), _ -> e_a, Term.undefined_value_prop c
+          | _, Undefined_value (_,c) -> e_b, Term.undefined_value_prop c
           | True, True
           | False, False -> e_ab, Term.true_
           | True, False
@@ -2441,10 +2489,10 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           | True, True ->
             let e_ab = Explanation.append e_a e_b in
             e_ab, Term.true_
-          | Undefined_value _, Undefined_value _ ->
-            Explanation.or_ e_a e_b, Term.undefined_value_prop
-          | Undefined_value _, _ -> e_a, Term.undefined_value_prop
-          | _, Undefined_value _ -> e_b, Term.undefined_value_prop
+          | Undefined_value (_,c1), Undefined_value (_,c2) ->
+            Explanation.or_ e_a e_b, Term.undefined_value_prop (merge_undef_cause c1 c2)
+          | Undefined_value (_,c), _ -> e_a, Term.undefined_value_prop c
+          | _, Undefined_value (_,c) -> e_b, Term.undefined_value_prop c
           | _ ->
             let t' =
               if c==c' && d==d' then old else Term.and_par a b c' d'
@@ -2462,10 +2510,10 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         in
         (* check first for failures, then try to unify *)
         begin match Term.as_unif a', Term.as_unif b' with
-          | Term.Unif_fail, Term.Unif_fail ->
-            Explanation.or_ e_a e_b, Term.undefined_value_prop
-          | Term.Unif_fail, _ -> e_a, Term.undefined_value_prop
-          | _, Term.Unif_fail -> e_b, Term.undefined_value_prop
+          | Term.Unif_undef c1, Term.Unif_undef c2 ->
+            Explanation.or_ e_a e_b, Term.undefined_value_prop (merge_undef_cause c1 c2)
+          | Term.Unif_undef c, _ -> e_a, Term.undefined_value_prop c
+          | _, Term.Unif_undef c -> e_b, Term.undefined_value_prop c
           | _ when Term.equal a' b' ->
             e_ab, Term.true_ (* physical equality *)
           | Term.Unif_cstor (c1,ty1,l1), Term.Unif_cstor (c2,_,l2) ->
@@ -2515,7 +2563,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
                          if Typed_cst.equal cstor cstor'
                          then Some (t,sub_metas)
                          else None
-                       | OF_undefined_value | OF_none -> assert false)
+                       | OF_undefined_value _ | OF_none -> assert false)
                     cases
                   |> (function | Some x->x | None -> assert false)
                 in
@@ -2607,7 +2655,9 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       match Lit.view lit with
         | Lit_fresh _
         | Lit_assign (_,_)
-        | Lit_uty_empty _ -> Explanation.empty, lit
+        | Lit_uty_empty _
+        | Lit_quant_unroll _
+          -> Explanation.empty, lit
         | Lit_atom t ->
           let e, t' = compute_nf t in
           e, Lit.atom ~sign:(Lit.sign lit) t'
@@ -2623,13 +2673,9 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     val size : unit -> int
     val update_all : unit -> unit (** update all top terms *)
   end = struct
-    type t = term
-    (* actually, the watched lit is [Lit.atom t], but we link
-       [t] directly because this way we have direct access to its
-       normal form *)
 
-    let to_lit = Lit.atom ~sign:true
-    let pp = Term.pp
+    let to_lit term = Lit.atom ~sign:true term
+    let pp out term = Term.pp out term
 
     (* clauses for [e => l] *)
     let clause_imply (l:lit) (e:explanation): Clause.t Sequence.t =
@@ -2637,7 +2683,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       |> Sequence.map
         (fun guard -> l :: guard |> Clause.make)
 
-    let propagate_lit_ (l:t) (e:explanation): unit =
+    let propagate_lit_ (l:term) (e:explanation): unit =
       let cs = clause_imply (to_lit l) e |> Sequence.to_rev_list in
       Log.debugf 4
         (fun k->k
@@ -2661,37 +2707,41 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       Clause.push_new_l cs;
       ()
 
-    let expand_cst_ (t:t)(c:cst) : unit =
+    let expand_cst_ (t:term)(c:cst) : unit =
       assert (Ty.is_prop t.term_ty);
       Log.debugf 3
         (fun k->k "(@[<1>expand_cst@ %a@ :because-of %a@])" Typed_cst.pp c Term.pp t);
       Expand.expand_cst c;
       ()
 
-    let expand_uty_ (t:t)(uty:ty_uninterpreted_slice) : unit =
+    let expand_uty_ (t:term)(uty:ty_uninterpreted_slice) : unit =
       assert (Ty.is_prop t.term_ty);
       Log.debugf 2
         (fun k->k "(@[<1>expand_uty@ %a@ %a@])" pp_uty uty Term.pp t);
       Expand.expand_uty uty;
       ()
 
-    let expand_dep (t:t) (d:term_dep) : unit = match d with
+    let expand_dep (t:term) (d:term_dep) : unit = match d with
       | Dep_cst c -> expand_cst_ t c
       | Dep_uty uty -> expand_uty_ t uty
+      | Dep_quant_depth -> ()
 
     (* evaluate [t] in current partial model, and expand the constants
        that block it *)
-    let update (t:t): unit =
+    let update (t:term): unit =
       assert (Ty.is_prop t.term_ty);
       let e, new_t = Reduce.compute_nf t in
+      Log.debugf 5
+        (fun k->k "(@[update@ :term %a@ :nf %a@ :exp %a@])"
+            Term.pp t Term.pp new_t Explanation.pp e);
       (* if [new_t = true/false], propagate literal *)
       begin match new_t.term_cell with
         | True -> propagate_lit_ t e
         | False -> propagate_lit_ (Term.not_ t) e
-        | Undefined_value _ ->
+        | Undefined_value (_,c) ->
           (* there is no chance that this goal evaluates to a boolean anymore,
              we must try something else *)
-          has_met_undefined := true;
+          add_top_undefined c;
           trigger_conflict e
         | _ ->
           Log.debugf 4
@@ -2733,15 +2783,18 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       | Dep_cst _ -> assert false
       | Dep_uty uty ->
         CCOpt.is_some uty.uty_status
+      | Dep_quant_depth -> CCOpt.is_some !quant_unroll_depth
 
-    (* update all top terms (whose dependencies have been changed) *)
-    let update_all () =
-      to_seq
-      |> Sequence.filter
-        (fun t ->
-           let _, nf = Reduce.get_nf t in
-           List.exists dep_updated nf.term_deps)
-      |> Sequence.iter update
+    (* if [t] needs updating, then update it *)
+    let update_maybe (t:term): unit =
+      (* check if there are reasons to (re-)evaluate this term *)
+      let _, nf = Reduce.get_nf t in
+      let should_update = List.exists dep_updated nf.term_deps in
+      if should_update then (
+        update t;
+      )
+
+    let update_all () = List.iter update_maybe !top_
   end
 
   (** {2 Sat Solver} *)
@@ -2812,6 +2865,9 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
                  Format.fprintf out
                    "(@[%a@ :expanded %B@])"
                    pp_uty uty (uty.uty_pair<>Lazy_none)
+               | Dep_quant_depth ->
+                 Format.fprintf out "(@quand-depth@ :current %a@])"
+                   CCFormat.Dump.(option int) !quant_unroll_depth
              in
              let pp_lit out l =
                let e, nf = Reduce.get_nf l in
@@ -2866,7 +2922,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       begin match info.cst_cur_case with
         | None ->
           let e = Explanation.return lit in
-          Backtrack.push_set_cst_case_ info;
+          Backtrack.push (fun () -> info.cst_cur_case <- None);
           info.cst_cur_case <- Some (e, new_t);
         | Some (_,new_t') ->
           Log.debugf 1
@@ -2886,7 +2942,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       begin match uty.uty_status with
         | None ->
           let e = Explanation.return lit in
-          Backtrack.push_uty_status uty;
+          Backtrack.push (fun () -> uty.uty_status <- None);
           uty.uty_status <- Some (e, status);
         | Some (_, ((Uty_empty | Uty_nonempty) as s)) ->
           Log.debugf 1
@@ -2916,13 +2972,18 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         | Lit_atom {term_cell=False; _} ->
           (* conflict, the goal reduces to [false]! *)
           trigger_conflict lit e
-        | Lit_atom {term_cell=Undefined_value ty; _} ->
+        | Lit_atom {term_cell=Undefined_value (ty,c); _} ->
           (* the literal will never be a boolean, we must try
              something else *)
           assert (Ty.equal Ty.prop ty);
-          has_met_undefined := true; (* incomplete *)
+          add_top_undefined c;
           trigger_conflict lit e
-        | Lit_atom _ -> ()
+        | Lit_quant_unroll l when Lit.sign lit ->
+          (* locally assume quantifier depth *)
+          assert (CCOpt.is_none !quant_unroll_depth);
+          Backtrack.push (fun () -> quant_unroll_depth := None);
+          quant_unroll_depth := Some l;
+        | Lit_atom _ | Lit_quant_unroll _ -> ()
         | Lit_assign(c, t) ->
           if Lit.sign lit then assert_choice ~lit c t
         | Lit_uty_empty uty ->
@@ -2943,13 +3004,14 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         assume_lit lit;
       done;
       if !active then (
-        Top_terms.update_all();
+        Top_terms.update_all ();
       );
       flush_new_clauses_into_slice slice;
       TI.Sat
 
-    (* TODO: move checking code from Main_loop here? *)
-    let if_sat _slice = TI.Sat
+    let if_sat slice =
+      Log.debugf 3 (fun k->k "(if-sat)");
+      TI.Sat
   end
 
   module M = Msat.Solver.Make(M_expr)(M_th)(struct end)
@@ -3142,15 +3204,25 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           | Ast.And -> Term.and_ a b
           | Ast.Or -> Term.or_ a b
           | Ast.Imply -> Term.imply a b
-          | Ast.Eq -> Term.eq a b
+          | Ast.Eq ->
+            let args, _ = Ty.unfold a.term_ty in
+            begin match args with
+              | [] -> Term.eq a b (* normal equality *)
+              | _::_ ->
+                (* equality on functions: becomes a forall *)
+                let n = List.length args in
+                let db_l = List.mapi (fun i ty -> Term.db (n-i-1,ty)) args in
+                let body = Term.eq (Term.app a db_l) (Term.app b db_l) in
+                Term.quant_ty_l ~depth:0 Forall args body
+            end
         end
       | Ast.Undefined_value ->
-        Term.undefined_value (conv_ty t.Ast.ty)
+        Term.undefined_value (conv_ty t.Ast.ty) Undef_absolute
       | Ast.Asserting (t, g) ->
         (* [t asserting g] becomes  [if g t fail] *)
         let t = conv_term_rec env t in
         let g = conv_term_rec env g in
-        Term.if_ g t (Term.undefined_value t.term_ty)
+        Term.if_ g t (Term.undefined_value t.term_ty Undef_absolute)
 
     let conv_term ?(env=empty_env) t =
       let u = conv_term_rec env t in
@@ -3562,6 +3634,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     | PS_complete
     | PS_undefined_values
     | PS_incomplete
+    | PS_unroll_quant
 
   let pp_proof_status out = function
     | PS_depth_limited lit ->
@@ -3569,14 +3642,15 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     | PS_complete -> CCFormat.string out "complete"
     | PS_undefined_values -> CCFormat.string out "undefined_values"
     | PS_incomplete -> CCFormat.string out "incomplete"
+    | PS_unroll_quant -> CCFormat.string out "unroll-quant"
 
   (* precondition: solving under assumption [depth_lit] returned unsat *)
-  let proof_status depth_lit : proof_status =
+  let proof_status depth_lit quant_lit : proof_status =
     let sat_res =
       M_th.set_active false; (* no propagation, just check the boolean formula *)
       CCFun.finally
         ~h:(fun () -> M_th.set_active true)
-        ~f:(fun () -> M.solve ~assumptions:[] ())
+        ~f:(fun () -> M.solve ~assumptions:[quant_lit] ())
     in
     begin match sat_res with
       | M.Sat _ ->
@@ -3587,11 +3661,14 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
            incomplete choices *)
         let p = us.SI.get_proof () in
         if Config.check_proof then M.Proof.check p;
-        if !has_met_undefined
-        then PS_undefined_values
-        else if !incomplete_expansion
-        then PS_incomplete
-        else PS_complete
+        begin match !has_met_undefined with
+          | Some Undef_absolute -> PS_undefined_values
+          | Some (Undef_quant _) -> PS_unroll_quant
+          | None ->
+            if !has_lost_models then PS_undefined_values
+            else if !incomplete_expansion then PS_incomplete
+            else PS_complete
+        end
     end
 
   let dump_dimacs () = match Config.dimacs_file with
@@ -3605,26 +3682,34 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
 
   let solve ?(on_exit=[]) ?(check=true) () =
     let on_exit = dump_dimacs :: on_exit in
+    Msat.Log.set_debug_out Format.std_formatter; Msat.Log.set_debug 50;
     let module ID = Iterative_deepening in
     (* iterated deepening *)
-    let rec iter state = match state with
+    let rec iter state q_depth = match state with
       | ID.Exhausted ->
         do_on_exit ~on_exit;
         Unknown U_max_depth
-      | ID.At (cur_depth, cur_lit) ->
-        (* restrict depth *)
-        match M.solve ~assumptions:[cur_lit] () with
+      | ID.At (cur_depth, depth_lit) ->
+        Log.debugf 2
+          (fun k->k "@{<Yellow>start solving@} at depth %a, quant-depth %d"
+              ID.pp cur_depth q_depth);
+        (* restrict unfolding of quantifiers *)
+        let q_lit = Lit.quant_unroll q_depth in
+        has_met_undefined := None; (* reset this *)
+        match M.solve ~assumptions:[depth_lit; q_lit] () with
           | M.Sat _ ->
             let m = compute_model_ () in
             Log.debugf 1
-              (fun k->k "@{<Yellow>** found SAT@} at depth %a"
-                  ID.pp cur_depth);
+              (fun k->k "@{<Yellow>** found SAT@} at depth %a, quant-depth %d"
+                  ID.pp cur_depth q_depth);
             do_on_exit ~on_exit;
             if check then model_check ();
             Sat m
           | M.Unsat us ->
             (* check if [max depth] literal involved in proof;
                - if yes, try next level
+               - if not but some goal evaluated to [undefined] because of
+                 quantifier unrolling limit, then try again with higher limit
                - if not but [has_met_undefined=true] or some expansion
                  was not exhaustive (e.g. functions), UNKNOWN
                - else, truly UNSAT
@@ -3632,7 +3717,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
             let p = us.SI.get_proof () in
             Log.debugf 4 (fun k->k "proof: @[%a@]@." pp_proof p);
             if Config.check_proof then M.Proof.check p;
-            let status = proof_status cur_lit in
+            let status = proof_status depth_lit q_lit in
             Log.debugf 1
               (fun k->k
                   "@{<Yellow>** found Unsat@} at depth %a;@ \
@@ -3641,20 +3726,28 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
             begin match status with
               | PS_depth_limited _ ->
                 (* negation of the previous limit *)
-                push_clause (Clause.make [Lit.neg cur_lit]);
-                iter (ID.next ()) (* deeper! *)
+                push_clause (Clause.make [Lit.neg depth_lit]);
+                iter (ID.next ()) q_depth (* deeper! *)
               | PS_undefined_values ->
                 do_on_exit ~on_exit;
                 Unknown U_undefined_values
               | PS_incomplete ->
                 do_on_exit ~on_exit;
                 Unknown U_incomplete
+              | PS_unroll_quant ->
+                (* increase quantifier unrolling depth *)
+                let q_depth = q_depth + 1 in
+                Log.debugf 1
+                  (fun k->k "@{<Yellow>increase quantifier unroll depth@} :to %d"
+                      q_depth);
+                iter state q_depth
               | PS_complete ->
                 do_on_exit ~on_exit;
                 Unsat
              end
     in
+    Top_terms.update_all ();
     ID.reset ();
-    iter (ID.current ())
+    iter (ID.current ()) Config.quant_unfold_depth
 end
 

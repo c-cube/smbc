@@ -656,31 +656,17 @@ and conv_term_aux ctx t : term = match t with
          let body = conv_term ctx body in
          fun_ var body)
   | A.Forall ((v,ty), body) ->
-    let ty, ty_k = conv_ty ctx ty in
-    begin match ty_k with
-      | Ctx.K_ty Ctx.K_uninterpreted
-      | Ctx.K_ty Ctx.K_data
-      | Ctx.K_ty Ctx.K_prop ->
-        Ctx.with_var ctx v ty
-          (fun var ->
-             let body = conv_term ctx body in
-             forall var body)
-      | _ ->
-        Ty.ill_typed "unexpected quantification over @[%a]" Ty.pp ty;
-    end
+    let ty, _ty_k = conv_ty ctx ty in
+    Ctx.with_var ctx v ty
+      (fun var ->
+         let body = conv_term ctx body in
+         forall var body)
   | A.Exists ((v,ty), body) ->
-    let ty, ty_k = conv_ty ctx ty in
-    begin match ty_k with
-      | Ctx.K_ty Ctx.K_uninterpreted
-      | Ctx.K_ty Ctx.K_data
-      | Ctx.K_ty Ctx.K_prop ->
-        Ctx.with_var ctx v ty
-          (fun var ->
-             let body = conv_term ctx body in
-             exists var body)
-      | _ ->
-        Ty.ill_typed "unexpected quantification over @[%a]" Ty.pp ty;
-    end
+    let ty, _ = conv_ty ctx ty in
+    Ctx.with_var ctx v ty
+      (fun var ->
+         let body = conv_term ctx body in
+         exists var body)
   | A.Let (v,t,u) ->
     let t = conv_term ctx t in
     Ctx.with_var ctx v t.ty
