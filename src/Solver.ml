@@ -21,9 +21,6 @@ module type CONFIG = sig
   val uniform_depth : bool
   (** Depth increases uniformly *)
 
-  val quant_unfold_depth : int
-  (** Depth for quantifier unfolding *)
-
   val progress: bool
   (** progress display progress bar *)
 
@@ -109,6 +106,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     | Builtin of builtin
     | Check_assign of cst * term (* check a literal *)
     | Check_empty_uty of ty_uninterpreted_slice (* check it's empty *)
+    | Check_lit_depth of lit_depth
     | Undefined_value of ty_h
     (* Value that is not defined. On booleans it corresponds to
        the middle case of https://en.wikipedia.org/wiki/Three-valued_logic.
@@ -137,6 +135,8 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       (* blocked by non-refined constant *)
     | Dep_uty of ty_uninterpreted_slice
       (* blocked because this type is not expanded enough *)
+    | Dep_depth of lit_depth
+      (* blocked because this lit is not set yet *)
 
   and builtin =
     | B_not of term
@@ -186,6 +186,13 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     | Lit_atom of term
     | Lit_assign of cst * term
     | Lit_uty_empty of ty_uninterpreted_slice
+    | Lit_depth of lit_depth
+
+  (* a depth limit *)
+  and lit_depth = {
+    ld_depth: int;
+    mutable ld_value: bool option;
+  }
 
   and cst = {
     cst_id: ID.t;
@@ -270,11 +277,11 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     | QR_data of quant_data
     | QR_bool
 
-  (* TODO: add a "context" to account for path under quantifier *)
   and quant_data = {
     q_data_ty: ty_h; (* type *)
     q_data_cstor: cstor_list; (* constructors *)
     q_data_depth: int; (* depth, for limiting *)
+    q_data_lit_depth: lit_depth option; (* blocking *)
   }
 
   let pp_quant out = function
@@ -459,6 +466,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         | Lit_atom _ -> 1
         | Lit_assign _ -> 2
         | Lit_uty_empty _ -> 3
+        | Lit_depth _ -> 4
       in
       match a.lit_view, b.lit_view with
         | Lit_fresh i1, Lit_fresh i2 -> ID.compare i1 i2
@@ -466,10 +474,13 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         | Lit_assign (c1,t1), Lit_assign (c2,t2) ->
           CCOrd.(Typed_cst.compare c1 c2 <?> (term_cmp_, t1, t2))
         | Lit_uty_empty u1, Lit_uty_empty u2 -> cmp_uty u1 u2
+        | Lit_depth d1, Lit_depth d2 -> CCInt.compare d1.ld_depth d2.ld_depth
         | Lit_fresh _, _
         | Lit_atom _, _
         | Lit_assign _, _
-        | Lit_uty_empty _, _ ->
+        | Lit_uty_empty _, _
+        | Lit_depth _, _
+          ->
           CCInt.compare (int_of_cell_ a.lit_view) (int_of_cell_ b.lit_view)
 
   let hash_lit a =
@@ -480,6 +491,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       | Lit_assign (c,t) ->
         Hash.combine4 3 (Hash.bool sign) (Typed_cst.hash c) (term_hash_ t)
       | Lit_uty_empty uty -> Hash.combine3 4 (Hash.bool sign) (hash_uty uty)
+      | Lit_depth d -> Hash.combine2 10 (Hash.int d.ld_depth)
 
   let pp_uty out uty =
     let n = uty.uty_offset in
@@ -492,9 +504,13 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     | Uty_empty -> CCFormat.string out "empty"
     | Uty_nonempty -> CCFormat.string out "non_empty"
 
+  let pp_lit_depth out (d:lit_depth): unit =
+    Format.fprintf out "(<= depth %d)" d.ld_depth
+
   let pp_dep out = function
     | Dep_cst c -> Typed_cst.pp out c
     | Dep_uty uty -> pp_uty out uty
+    | Dep_depth d -> pp_lit_depth out d
 
   let hash_q_range = function
     | QR_unin u -> hash_uty u
@@ -505,7 +521,8 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     | QR_unin u1, QR_unin u2 -> equal_uty u1 u2
     | QR_data d1, QR_data d2 ->
       Ty.equal d1.q_data_ty d2.q_data_ty &&
-      d1.q_data_depth = d2.q_data_depth
+      d1.q_data_depth = d2.q_data_depth &&
+      (CCOpt.equal (==) d1.q_data_lit_depth d2.q_data_lit_depth)
     | QR_bool, QR_bool -> true
     | QR_unin _, _
     | QR_data _, _
@@ -533,6 +550,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       | S_set_uty of
           ty_uninterpreted_slice * (explanation * ty_uninterpreted_status) option
           (* uty1.uty_status <- status2 *)
+      | S_clear_depth of lit_depth
 
     type stack = stack_cell CCVector.vector
 
@@ -547,6 +565,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           | S_set_nf (t, nf) -> t.term_nf <- nf;
           | S_set_cst_case (info, c) -> info.cst_cur_case <- c;
           | S_set_uty (uty, s) -> uty.uty_status <- s;
+          | S_clear_depth r -> r.ld_value <- None
       done;
       ()
 
@@ -563,9 +582,73 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     let push_set_cst_case_ (i:cst_info) =
       CCVector.push st_ (S_set_cst_case (i, i.cst_cur_case))
 
+    let push_clear_depth_ r =
+      CCVector.push st_ (S_clear_depth r)
+
     let push_uty_status (uty:ty_uninterpreted_slice) =
       CCVector.push st_ (S_set_uty (uty, uty.uty_status))
   end
+
+  let pp_term_ ~ids =
+    let fpf = Format.fprintf in
+    let rec pp out t =
+      pp_rec out t;
+      if Config.pp_hashcons then Format.fprintf out "/%d" t.term_id;
+      ()
+    and pp_rec out t = match t.term_cell with
+      | True -> CCFormat.string out "true"
+      | False -> CCFormat.string out "false"
+      | DB d -> DB.pp out d
+      | Const c ->
+        if ids then Typed_cst.pp out c else ID.pp_name out c.cst_id
+      | App (f,l) ->
+        fpf out "(@[<1>%a@ %a@])" pp f (Utils.pp_list pp) l
+      | Fun (ty,f) ->
+        fpf out "(@[fun %a@ %a@])" Ty.pp ty pp f
+      | Quant (q,qr,f) ->
+        fpf out "(@[%a %a@ %a@])" pp_quant q pp_q_range qr pp f
+      | Mu sub -> fpf out "(@[mu@ %a@])" pp sub
+      | If (a, b, c) ->
+        fpf out "(@[if %a@ %a@ %a@])" pp a pp b pp c
+      | Match (t,m) ->
+        let pp_bind out (id,(_tys,rhs)) =
+          fpf out "(@[<1>%a@ %a@])" ID.pp id pp rhs
+        in
+        let print_map =
+          CCFormat.(seq ~sep:(return "@ ")) pp_bind
+        in
+        fpf out "(@[match %a@ (@[<hv>%a@])@])"
+          pp t print_map (ID.Map.to_seq m)
+      | Switch (t, m) ->
+        let pp_case out (lhs,rhs) =
+          fpf out "(@[<1>case@ %a@ %a@])" ID.pp lhs pp rhs
+        in
+        let print_map =
+          CCFormat.(seq ~sep:(return "@ ")) pp_case
+        in
+        fpf out "(@[switch %a@ (@[<hv>%a@])@])"
+          pp t print_map (ID.Tbl.to_seq m.switch_tbl)
+      | Select (sel,u) ->
+        fpf out "(@[select-%a-%d@ %a@])" ID.pp_name sel.select_cstor.cst_id
+          sel.select_i pp u
+      | Builtin (B_not t) -> fpf out "(@[<hv1>not@ %a@])" pp t
+      | Builtin (B_and (_, _, a,b)) ->
+        fpf out "(@[<hv1>and@ %a@ %a@])" pp a pp b
+      | Builtin (B_or (a,b)) ->
+        fpf out "(@[<hv1>or@ %a@ %a@])" pp a pp b
+      | Builtin (B_imply (a,b)) ->
+        fpf out "(@[<hv1>=>@ %a@ %a@])" pp a pp b
+      | Builtin (B_eq (a,b)) ->
+        fpf out "(@[<hv1>=@ %a@ %a@])" pp a pp b
+      | Check_assign (c,t) ->
+        fpf out "(@[<hv1>:=?@ %a@ %a@])" Typed_cst.pp c pp t
+      | Check_empty_uty uty -> fpf out "(@[check_empty %a@])" pp_uty uty
+      | Undefined_value _ -> fpf out "(assert-false)"
+      | Check_lit_depth d -> pp_lit_depth out d
+    in
+    pp
+
+  let pp_term = pp_term_ ~ids:true
 
   let new_switch_id_ =
     let n = ref 0 in
@@ -617,6 +700,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
             Hash.combine4 35 (Typed_cst.hash sel.select_cstor)
               sel.select_i (sub_hash t)
           | Undefined_value ty -> Hash.combine2 36 (Ty.hash ty)
+          | Check_lit_depth d -> Hash.combine2 30 (Hash.int d.ld_depth)
 
         (* equality that relies on physical equality of subterms *)
         let equal t1 t2 : bool = match t1.term_cell, t2.term_cell with
@@ -664,6 +748,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           | Check_empty_uty u1, Check_empty_uty u2 ->
             equal_uty u1 u2
           | Undefined_value ty1, Undefined_value ty2 -> Ty.equal ty1 ty2
+          | Check_lit_depth l1, Check_lit_depth l2 -> l1.ld_depth=l2.ld_depth
           | True, _
           | False, _
           | DB _, _
@@ -680,6 +765,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           | Check_assign _, _
           | Check_empty_uty _, _
           | Undefined_value _, _
+          | Check_lit_depth _, _
             -> false
 
         let set_id t i = t.term_id <- i
@@ -705,6 +791,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       | Term_dep_sub of term
       | Term_dep_sub2 of term * term
       | Term_dep_uty of ty_uninterpreted_slice
+      | Term_dep_depth of lit_depth
 
     type delayed_ty =
       | DTy_direct of ty_h
@@ -714,6 +801,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       let to_int_ = function
         | Dep_cst _ -> 0
         | Dep_uty _ -> 1
+        | Dep_depth _ -> 2
       in
       match a, b with
       | Dep_cst c1, Dep_cst c2 -> Typed_cst.compare c1 c2
@@ -721,8 +809,10 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         let (<?>) = CCOrd.(<?>) in
         Ty.compare (Lazy.force u1.uty_self) (Lazy.force u2.uty_self)
         <?> (CCInt.compare, u1.uty_offset, u2.uty_offset)
+      | Dep_depth d1, Dep_depth d2 -> CCInt.compare d1.ld_depth d2.ld_depth
       | Dep_cst _, _
       | Dep_uty _, _
+      | Dep_depth _, _
         -> CCInt.compare (to_int_ a) (to_int_ b)
 
     (* build a term. If it's new, add it to the watchlist
@@ -746,6 +836,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         (* compute evaluation dependencies *)
         let deps = match deps with
           | Term_dep_none -> []
+          | Term_dep_depth l -> [Dep_depth l]
           | Term_dep_cst c -> [Dep_cst c]
           | Term_dep_sub t -> t.term_deps
           | Term_dep_sub2 (a,b) ->
@@ -889,7 +980,12 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       (* evaluation is blocked by the uninterpreted type *)
       let deps = match qr with
         | QR_unin uty -> Term_dep_uty uty
-        | QR_data _ | QR_bool -> Term_dep_none
+        | QR_data qr ->
+          begin match qr.q_data_lit_depth with
+            | None -> Term_dep_none
+            | Some ld -> Term_dep_depth ld
+          end
+        | QR_bool -> Term_dep_none
       in
       mk_term_ ~deps ~ty:(DTy_direct Ty.prop) (Quant (q,qr,body))
 
@@ -903,6 +999,9 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     let or_ a b = builtin_ ~deps:(Term_dep_sub2 (a,b)) (B_or (a,b))
     let imply a b = builtin_ ~deps:(Term_dep_sub2 (a,b)) (B_imply (a,b))
     let eq a b = builtin_ ~deps:(Term_dep_sub2 (a,b)) (B_eq (a,b))
+
+    let check_lit_depth (d:lit_depth) =
+      mk_term_ (Check_lit_depth d) ~deps:(Term_dep_depth d) ~ty:(DTy_direct Ty.prop)
 
     let and_par a b c d =
       builtin_ ~deps:(Term_dep_sub2 (c,d)) (B_and (a,b,c,d))
@@ -991,7 +1090,9 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           | Fun (_, body) -> aux (k+1) body
           | Undefined_value _
           | Check_assign _
-          | Check_empty_uty _ -> ()
+          | Check_empty_uty _
+          | Check_lit_depth _
+            -> ()
       in
       aux 0 t
 
@@ -1054,64 +1155,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
 
     let fpf = Format.fprintf
 
-    let pp_top ~ids out t =
-      let rec pp out t =
-        pp_rec out t;
-        if Config.pp_hashcons then Format.fprintf out "/%d" t.term_id;
-        ()
-      and pp_rec out t = match t.term_cell with
-        | True -> CCFormat.string out "true"
-        | False -> CCFormat.string out "false"
-        | DB d -> DB.pp out d
-        | Const c ->
-          if ids then Typed_cst.pp out c else ID.pp_name out c.cst_id
-        | App (f,l) ->
-          fpf out "(@[<1>%a@ %a@])" pp f (Utils.pp_list pp) l
-        | Fun (ty,f) ->
-          fpf out "(@[fun %a@ %a@])" Ty.pp ty pp f
-        | Quant (q,qr,f) ->
-          fpf out "(@[%a %a@ %a@])" pp_quant q pp_q_range qr pp f
-        | Mu sub -> fpf out "(@[mu@ %a@])" pp sub
-        | If (a, b, c) ->
-          fpf out "(@[if %a@ %a@ %a@])" pp a pp b pp c
-        | Match (t,m) ->
-          let pp_bind out (id,(_tys,rhs)) =
-            fpf out "(@[<1>%a@ %a@])" ID.pp id pp rhs
-          in
-          let print_map =
-            CCFormat.(seq ~sep:(return "@ ")) pp_bind
-          in
-          fpf out "(@[match %a@ (@[<hv>%a@])@])"
-            pp t print_map (ID.Map.to_seq m)
-        | Switch (t, m) ->
-          let pp_case out (lhs,rhs) =
-            fpf out "(@[<1>case@ %a@ %a@])" ID.pp lhs pp rhs
-          in
-          let print_map =
-            CCFormat.(seq ~sep:(return "@ ")) pp_case
-          in
-          fpf out "(@[switch %a@ (@[<hv>%a@])@])"
-            pp t print_map (ID.Tbl.to_seq m.switch_tbl)
-        | Select (sel,u) ->
-          fpf out "(@[select-%a-%d@ %a@])" ID.pp_name sel.select_cstor.cst_id
-            sel.select_i pp u
-        | Builtin (B_not t) -> fpf out "(@[<hv1>not@ %a@])" pp t
-        | Builtin (B_and (_, _, a,b)) ->
-          fpf out "(@[<hv1>and@ %a@ %a@])" pp a pp b
-        | Builtin (B_or (a,b)) ->
-          fpf out "(@[<hv1>or@ %a@ %a@])" pp a pp b
-        | Builtin (B_imply (a,b)) ->
-          fpf out "(@[<hv1>=>@ %a@ %a@])" pp a pp b
-        | Builtin (B_eq (a,b)) ->
-          fpf out "(@[<hv1>=@ %a@ %a@])" pp a pp b
-        | Check_assign (c,t) ->
-          fpf out "(@[<hv1>:=?@ %a@ %a@])" Typed_cst.pp c pp t
-        | Check_empty_uty uty -> fpf out "(@[check_empty %a@])" pp_uty uty
-        | Undefined_value _ -> fpf out "(assert-false)"
-      in
-      pp out t
-
-    let pp = pp_top ~ids:true
+    let pp = pp_term
 
     (* environment for evaluation: not-yet-evaluated terms *)
     type eval_env = term DB_env.t
@@ -1163,6 +1207,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           | Undefined_value _
           | Check_assign _
           | Check_empty_uty _
+          | Check_lit_depth _
             -> t (* closed *)
         and aux_l d l =
           List.map (aux d) l
@@ -1222,6 +1267,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           | Undefined_value _
           | Check_assign _
           | Check_empty_uty _
+          | Check_lit_depth _
             -> t (* closed *)
         and aux_l d env l =
           List.map (aux d env) l
@@ -1230,30 +1276,43 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       )
 
     (* quantify on variable of given type *)
-    let quant_ty ~depth q (ty_arg:Ty.t) (body:t): t = match Ty.view ty_arg with
+    let quant_ty ~depth_fun q (ty_arg:Ty.t) (body:t): t = match Ty.view ty_arg with
       | Prop -> quant q QR_bool body
       | Atomic (_, Data cstors) ->
+        let depth, lit_depth = depth_fun() in
         let qr =
-          QR_data {q_data_depth=depth; q_data_cstor=cstors; q_data_ty=ty_arg}
+          QR_data {
+            q_data_depth=depth;
+            q_data_cstor=cstors;
+            q_data_ty=ty_arg;
+            q_data_lit_depth=lit_depth;
+          }
         in
         quant q qr body
       | Atomic (_, Uninterpreted uty) -> quant_uty q uty body
       | Arrow _ -> undefined_value_prop (* TODO: improve on that? *)
 
-    let quant_ty_l ~depth q ty_args body : t =
-      List.fold_right (quant_ty ~depth q) ty_args body
+    let quant_ty_l ~depth_fun q ty_args body : t =
+      List.fold_right (quant_ty ~depth_fun q) ty_args body
   end
 
   let pp_lit out l =
     let pp_lit_view out = function
       | Lit_fresh i -> Format.fprintf out "#%a" ID.pp i
-      | Lit_atom t -> Term.pp out t
+      | Lit_atom t -> pp_term out t
       | Lit_assign (c,t) ->
-        Format.fprintf out "(@[:= %a@ %a@])" Typed_cst.pp c Term.pp t
+        Format.fprintf out "(@[:= %a@ %a@])" Typed_cst.pp c pp_term t
       | Lit_uty_empty u -> Format.fprintf out "(empty %a)" pp_uty u
+      | Lit_depth d -> pp_lit_depth out d
     in
     if l.lit_sign then pp_lit_view out l.lit_view
     else Format.fprintf out "(@[@<1>¬@ %a@])" pp_lit_view l.lit_view
+
+  let mk_lit_depth : int -> lit_depth =
+    let d_tbl_ : (int,lit_depth) Hashtbl.t = Hashtbl.create 12 in
+    fun d ->
+      CCHashtbl.get_or_add d_tbl_ ~k:d
+        ~f:(fun d-> { ld_depth=d; ld_value=None; })
 
   (** {2 Literals} *)
   module Lit : sig
@@ -1262,9 +1321,10 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     val sign : t -> bool
     val view : t -> lit_view
     val as_atom : t -> (term * bool) option
-    val fresh_with : ID.t -> t
     val dummy : t
     val atom : ?sign:bool -> term -> t
+    val depth : ?sign:bool -> int -> t
+    val of_depth : ?sign:bool -> lit_depth -> t
     val cst_choice : cst -> term -> t
     val uty_choice_empty : ty_uninterpreted_slice -> t
     val uty_choice_nonempty : ty_uninterpreted_slice -> t
@@ -1287,6 +1347,13 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
 
     (* assume the ID is fresh *)
     let fresh_with id = make ~sign:true (Lit_fresh id)
+
+    let d_tbl_ : (int,lit_depth) Hashtbl.t = Hashtbl.create 12
+
+    let of_depth ?(sign=true) (ld:lit_depth): t =
+      make ~sign (Lit_depth ld)
+
+    let depth ?(sign=true) d = of_depth ~sign (mk_lit_depth d)
 
     (* fresh boolean literal *)
     let fresh: unit -> t =
@@ -1451,14 +1518,14 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     type t = private int
 
     type state =
-      | At of t * Lit.t
+      | At of t * lit_depth
       | Exhausted
 
     val reset : unit -> unit
     val current : unit -> state
     val current_depth : unit -> t
     val next : unit -> state
-    val lit_of_depth : int -> Lit.t option
+    val lit_of_depth : int -> lit_depth option
     val lit_max_smaller_than : int -> int * Lit.t
     (** maximal literal strictly smaller than the given depth *)
 
@@ -1486,36 +1553,34 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       res
 
     type state =
-      | At of t * Lit.t
+      | At of t * lit_depth
       | Exhausted
 
-    (* create a literal standing for [max_depth = d] *)
-    let mk_lit_ d : Lit.t =
-      let id = ID.makef "max_depth_leq_%d" d in
-      Lit.fresh_with id
-
-    let lits_ : (int, Lit.t) Hashtbl.t = Hashtbl.create 32
+    let lits_ : (int, lit_depth) Hashtbl.t = Hashtbl.create 32
 
     (* get the literal correspond to depth [d], if any *)
-    let rec lit_of_depth d : Lit.t option =
+    let rec lit_of_depth d : lit_depth option =
       if d < step_ || (d mod step_ <> 0)
       then None
-      else match CCHashtbl.get lits_ d with
-        | Some l -> Some l
-        | None ->
-          let lit = mk_lit_ d in
-          Hashtbl.add lits_ d lit;
-          (* relation with previous lit: [prev_lit => lit] *)
-          begin match prev d with
-            | None -> assert (d=step_); ()
-            | Some prev_lit ->
-              let c = Clause.make [Lit.neg prev_lit; lit] in
-              Clause.push_new c;
-          end;
-          Some lit
+      else
+        CCHashtbl.get_or_add lits_ ~k:d
+          ~f:(fun d ->
+            let lit = mk_lit_depth d in
+            Hashtbl.add lits_ d lit;
+            (* relation with previous lit: [prev_lit => lit] *)
+            begin match prev d with
+              | None -> assert (d=step_); ()
+              | Some prev_lit ->
+                let c =
+                  Clause.make [Lit.of_depth ~sign:false prev_lit; Lit.of_depth lit]
+                in
+                Clause.push_new c;
+            end;
+            lit)
+        |> CCOpt.return
 
     (* previous literal *)
-    and prev d : Lit.t option =
+    and prev d : lit_depth option =
       assert (d mod step_ = 0);
       lit_of_depth (d - step_)
 
@@ -1526,7 +1591,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       let prev_depth = d_prev - (d_prev mod step_) in
       assert (prev_depth >= 0 && (prev_depth mod step_ = 0));
       match lit_of_depth prev_depth with
-        | Some lit -> prev_depth, lit
+        | Some lit -> prev_depth, Lit.of_depth lit
         | None ->
           assert (prev_depth = 0);
           prev_depth, Lit.atom Term.true_
@@ -1562,13 +1627,21 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
             in
             Log.debugf 2
               (fun k->k
-                  "(@[<1>iterative_deepening :level %d :lit %a@])" l Lit.pp lit);
+                  "(@[<1>iterative_deepening :level %d :lit %a@])" l pp_lit_depth lit);
             At (l, lit)
           )
         in
         cur_ := st;
         st
   end
+
+  let depth_fun ~depth () = depth, Iterative_deepening.lit_of_depth depth
+
+  let quant_ty ~depth q ty body : term =
+    Term.quant_ty ~depth_fun:(depth_fun ~depth) q ty body
+
+  let quant_ty_l ~depth q tys body =
+    Term.quant_ty_l ~depth_fun:(depth_fun ~depth) q tys body
 
   (** {2 Case Expansion} *)
 
@@ -1611,7 +1684,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       and cs_limit = match guard with
         | None -> []
         | Some g ->
-          [[Lit.neg lit_nonempty; Lit.neg g] |> Clause.make]
+          [[Lit.neg lit_nonempty; Lit.of_depth ~sign:false g] |> Clause.make]
       in
       c_inherit :: cs_limit
 
@@ -2177,13 +2250,10 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
                   compute_nf_add e t'
               end
           end
-        | Quant (q,QR_data d,body) ->
-          if d.q_data_depth >= Config.quant_unfold_depth then (
-            (* just give up and return undefined *)
-            Explanation.empty, Term.undefined_value_prop
-          ) else (
-            (* turn [forall x:nat. P[x]] into
-               [p 0 && forall x:nat. P[s x]] *)
+        | Quant (q,QR_data qr,body) ->
+          (* turn [forall x:nat. P[x]] into
+                 [p 0 && forall x:nat. P[s x]] *)
+          let expansion =
             let l =
               List.map
                 (fun (lazy cstor) ->
@@ -2198,16 +2268,23 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
                    in
                    List.fold_right
                      (fun ty body ->
-                        Term.quant_ty ~depth:(d.q_data_depth+1) q ty body)
+                        quant_ty ~depth:(qr.q_data_depth+1) q ty body)
                      args body')
-                d.q_data_cstor
+                qr.q_data_cstor
             in
-            let new_t = match q with
+            begin match q with
               | Forall -> Term.and_l l
               | Exists -> Term.or_l l
-            in
-            compute_nf new_t
-          )
+            end
+          in
+          (* depth guard *)
+          let new_t = match qr.q_data_lit_depth with
+            | None -> expansion
+            | Some ld ->
+              (* [if depth<=d then undefined else expansion] *)
+              Term.if_ (Term.check_lit_depth ld) Term.undefined_value_prop expansion
+          in
+          compute_nf new_t
         | Builtin b ->
           (* try boolean reductions *)
           let e, t' = compute_builtin ~old:t b in
@@ -2347,6 +2424,12 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
             | None -> Explanation.empty, t
             | Some (e, Uty_empty) -> e, Term.true_
             | Some (e, Uty_nonempty) -> e, Term.false_
+          end
+        | Check_lit_depth d ->
+          begin match d.ld_value with
+            | Some true -> Explanation.return (Lit.of_depth d), Term.true_
+            | Some false -> Explanation.return (Lit.of_depth ~sign:false d), Term.false_
+            | None -> Explanation.empty, t
           end
         | Undefined_value _ ->
           Explanation.empty, t (* already a normal form *)
@@ -2609,6 +2692,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       match Lit.view lit with
         | Lit_fresh _
         | Lit_assign (_,_)
+        | Lit_depth _
         | Lit_uty_empty _ -> Explanation.empty, lit
         | Lit_atom t ->
           let e, t' = compute_nf t in
@@ -2677,9 +2761,16 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       Expand.expand_uty uty;
       ()
 
+    let expand_depth ld =
+      Log.debugf 2
+        (fun k->k "(@[<1>expand_depth %a@])" pp_lit_depth ld);
+      (* force decision *)
+      Clause.push_new (Clause.make [Lit.of_depth ld; Lit.of_depth ~sign:false ld])
+
     let expand_dep (t:t) (d:term_dep) : unit = match d with
       | Dep_cst c -> expand_cst_ t c
       | Dep_uty uty -> expand_uty_ t uty
+      | Dep_depth ld -> expand_depth ld
 
     (* evaluate [t] in current partial model, and expand the constants
        that block it *)
@@ -2733,16 +2824,19 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       | Dep_cst {cst_kind=Cst_undef (i, _); _} ->
         CCOpt.is_some i.cst_cur_case
       | Dep_cst _ -> assert false
-      | Dep_uty uty ->
-        CCOpt.is_some uty.uty_status
+      | Dep_uty uty -> CCOpt.is_some uty.uty_status
+      | Dep_depth d -> CCOpt.is_some d.ld_value
 
     (* update all top terms (whose dependencies have been changed) *)
     let update_all () =
+      Log.debugf 5 (fun k->k "(update_all)");
       to_seq
+(*
       |> Sequence.filter
         (fun t ->
            let _, nf = Reduce.get_nf t in
            List.exists dep_updated nf.term_deps)
+*)
       |> Sequence.iter update
   end
 
@@ -2814,6 +2908,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
                  Format.fprintf out
                    "(@[%a@ :expanded %B@])"
                    pp_uty uty (uty.uty_pair<>Lazy_none)
+               | Dep_depth d -> pp_lit_depth out d
              in
              let pp_lit out l =
                let e, nf = Reduce.get_nf l in
@@ -2897,6 +2992,15 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           assert (s = status)
       end
 
+    let assert_depth ~lit (d:lit_depth): unit =
+      let sign = Lit.sign lit in
+      Log.debugf 2
+        (fun k->k "(@[<1>@{<green>assume_depth@}@ @[%a@] sign %B@])"
+            pp_lit_depth d sign);
+      assert (d.ld_value = None);
+      Backtrack.push_clear_depth_ d;
+      d.ld_value <- Some sign
+
     (* signal to the SAT solver that [lit --e--> false] *)
     let trigger_conflict (lit:lit) (e:explanation): unit =
       let cs =
@@ -2925,6 +3029,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           has_met_undefined := true; (* incomplete *)
           trigger_conflict lit e
         | Lit_atom _ -> ()
+        | Lit_depth d -> assert_depth ~lit d
         | Lit_assign(c, t) ->
           if Lit.sign lit then assert_choice ~lit c t
         | Lit_uty_empty uty ->
@@ -3075,7 +3180,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         let body = conv_term_rec env' body in
         let q = if q=Ast.Forall then Forall else Exists in
         let ty = Ast.Var.ty v |> conv_ty in
-        Term.quant_ty ~depth:0 q ty body
+        quant_ty ~depth:0 q ty body
       | Ast.Bind (Ast.Mu,v,body) ->
         let env' = add_bound env v in
         let body = conv_term_rec env' body in
@@ -3152,7 +3257,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
                 (* equality on functions: becomes a forall *)
                 let db_l = List.mapi (fun i ty -> Term.db (i,ty)) args in
                 let body = Term.eq (Term.app a db_l) (Term.app b db_l) in
-                Term.quant_ty_l ~depth:0 Forall args body
+                quant_ty_l ~depth:0 Forall args body
             end
         end
       | Ast.Undefined_value ->
@@ -3377,6 +3482,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           aux env (Term.eq (Term.const c) t) (* becomes a mere equality *)
         | Check_empty_uty _ -> assert false
         | Undefined_value _ -> assert false
+        | Check_lit_depth _ -> assert false
       in aux DB_env.empty t
   end
 
@@ -3467,6 +3573,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         | Undefined_value _ -> t
         | Check_assign _
         | Check_empty_uty _
+        | Check_lit_depth _
           -> assert false
       end
     in
@@ -3624,7 +3731,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         Unknown U_max_depth
       | ID.At (cur_depth, cur_lit) ->
         (* restrict depth *)
-        match M.solve ~assumptions:[cur_lit] () with
+        match M.solve ~assumptions:[Lit.of_depth cur_lit] () with
           | M.Sat _ ->
             let m = compute_model_ () in
             Log.debugf 1
@@ -3643,7 +3750,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
             let p = us.SI.get_proof () in
             Log.debugf 4 (fun k->k "proof: @[%a@]@." pp_proof p);
             if Config.check_proof then M.Proof.check p;
-            let status = proof_status cur_lit in
+            let status = proof_status (Lit.of_depth cur_lit) in
             Log.debugf 1
               (fun k->k
                   "@{<Yellow>** found Unsat@} at depth %a;@ \
@@ -3652,7 +3759,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
             begin match status with
               | PS_depth_limited _ ->
                 (* negation of the previous limit *)
-                push_clause (Clause.make [Lit.neg cur_lit]);
+                push_clause (Clause.make [Lit.of_depth ~sign:false cur_lit]);
                 iter (ID.next ()) (* deeper! *)
               | PS_undefined_values ->
                 do_on_exit ~on_exit;
