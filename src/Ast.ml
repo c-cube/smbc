@@ -658,44 +658,28 @@ and conv_term_aux ctx t : term = match t with
   | A.Forall ((v,ty), body) ->
     let ty, ty_k = conv_ty ctx ty in
     begin match ty_k with
-      | Ctx.K_ty Ctx.K_uninterpreted ->
+      | Ctx.K_ty Ctx.K_uninterpreted
+      | Ctx.K_ty Ctx.K_data
+      | Ctx.K_ty Ctx.K_prop ->
         Ctx.with_var ctx v ty
           (fun var ->
              let body = conv_term ctx body in
              forall var body)
-      | Ctx.K_ty Ctx.K_prop ->
-        (* [forall x:bool. F] -> [F[true] && F[false]] *)
-        Ctx.with_var ctx v ty
-          (fun var ->
-             let body = conv_term ctx body in
-             and_ (app (fun_ var body) [true_]) (app (fun_ var body) [false_])
-          )
       | _ ->
-        Ty.ill_typed
-          "unexpected quantification over @[%a@];@ only quantification \
-           over uninterpreted types is supported"
-          Ty.pp ty;
+        Ty.ill_typed "unexpected quantification over @[%a]" Ty.pp ty;
     end
   | A.Exists ((v,ty), body) ->
     let ty, ty_k = conv_ty ctx ty in
     begin match ty_k with
-      | Ctx.K_ty Ctx.K_uninterpreted ->
+      | Ctx.K_ty Ctx.K_uninterpreted
+      | Ctx.K_ty Ctx.K_data
+      | Ctx.K_ty Ctx.K_prop ->
         Ctx.with_var ctx v ty
           (fun var ->
              let body = conv_term ctx body in
              exists var body)
-      | Ctx.K_ty Ctx.K_prop ->
-        (* [exists x:bool. F] -> [F[true] || F[false]] *)
-        Ctx.with_var ctx v ty
-          (fun var ->
-             let body = conv_term ctx body in
-             or_ (app (fun_ var body) [true_]) (app (fun_ var body) [false_])
-          )
       | _ ->
-        Ty.ill_typed
-          "unexpected quantification over @[%a@];@ only quantification \
-           over uninterpreted types is supported"
-          Ty.pp ty;
+        Ty.ill_typed "unexpected quantification over @[%a]" Ty.pp ty;
     end
   | A.Let (v,t,u) ->
     let t = conv_term ctx t in
