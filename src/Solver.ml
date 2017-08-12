@@ -2188,8 +2188,9 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
               List.map
                 (fun (lazy cstor) ->
                    let args, _ = Ty.unfold (Typed_cst.ty cstor) in
+                   let n = List.length args in
                    let db_l =
-                     List.mapi (fun i ty -> Term.db (i,ty)) args
+                     List.mapi (fun i ty -> Term.db (n-i-1,ty)) args
                    in
                    (* replace [x] with [cstor args] in [body] *)
                    let arg = Term.app_cst cstor db_l in
@@ -3150,7 +3151,8 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
               | [] -> Term.eq a b (* normal equality *)
               | _::_ ->
                 (* equality on functions: becomes a forall *)
-                let db_l = List.mapi (fun i ty -> Term.db (i,ty)) args in
+                let n = List.length args in
+                let db_l = List.mapi (fun i ty -> Term.db (n-i-1,ty)) args in
                 let body = Term.eq (Term.app a db_l) (Term.app b db_l) in
                 Term.quant_ty_l ~depth:0 Forall args body
             end
