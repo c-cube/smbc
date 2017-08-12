@@ -2149,6 +2149,8 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
             | Forall -> compute_nf (Term.and_ b_true b_false)
             | Exists -> compute_nf (Term.or_ b_true b_false)
           end
+        | Quant (Forall, _, ({term_cell=(True|False); _} as bod)) ->
+          Explanation.empty, bod (* optim: [forall x. bool --> bool] *)
         | Quant (q,QR_unin uty,body) ->
           begin match uty.uty_status with
             | None -> Explanation.empty, t
