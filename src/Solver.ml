@@ -2626,7 +2626,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
   module Top_terms : sig
     val add : term -> unit
     val size : unit -> int
-    val update_all : unit -> unit (** update all top terms *)
+    val update_all : force:bool -> unit -> unit (** update all top terms *)
   end = struct
     type t = term
     (* actually, the watched lit is [Lit.atom t], but we link
@@ -2740,12 +2740,12 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         CCOpt.is_some uty.uty_status
 
     (* update all top terms (whose dependencies have been changed) *)
-    let update_all () =
+    let update_all ~force () =
       to_seq
       |> Sequence.filter
         (fun t ->
            let _, nf = Reduce.get_nf t in
-           List.exists dep_updated nf.term_deps)
+           force || List.exists dep_updated nf.term_deps)
       |> Sequence.iter update
   end
 
@@ -2819,7 +2819,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
                    pp_uty uty (uty.uty_pair<>Lazy_none)
              in
              let pp_lit out l =
-               let e, nf = Reduce.get_nf l in
+               let e, nf = Reduce.compute_nf l in
                Format.fprintf out
                  "(@[<hv1>%a@ nf: %a@ exp: %a@ deps: (@[<hv>%a@])@])"
                  Term.pp l Term .pp nf Explanation.pp e
@@ -2948,13 +2948,15 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         assume_lit lit;
       done;
       if !active then (
-        Top_terms.update_all();
+        Top_terms.update_all ~force:false ();
       );
       flush_new_clauses_into_slice slice;
       TI.Sat
 
-    (* TODO: move checking code from Main_loop here? *)
-    let if_sat _slice = TI.Sat
+    let if_sat slice =
+      Top_terms.update_all ~force:true ();
+      flush_new_clauses_into_slice slice;
+      TI.Sat
   end
 
   module M = Msat.Solver.Make(M_expr)(M_th)(struct end)
