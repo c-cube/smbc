@@ -2819,7 +2819,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
                    pp_uty uty (uty.uty_pair<>Lazy_none)
              in
              let pp_lit out l =
-               let e, nf = Reduce.compute_nf l in
+               let e, nf = Reduce.get_nf l in
                Format.fprintf out
                  "(@[<hv1>%a@ nf: %a@ exp: %a@ deps: (@[<hv>%a@])@])"
                  Term.pp l Term .pp nf Explanation.pp e
@@ -2953,9 +2953,8 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       flush_new_clauses_into_slice slice;
       TI.Sat
 
-    let if_sat slice =
-      Top_terms.update_all ~force:true ();
-      flush_new_clauses_into_slice slice;
+    let if_sat _slice =
+      Log.debugf 3 (fun k->k "(if-sat)");
       TI.Sat
   end
 
@@ -3671,6 +3670,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
                 Unsat
              end
     in
+    Top_terms.update_all ~force:true ();
     ID.reset ();
     iter (ID.current ())
 end
