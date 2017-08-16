@@ -1,5 +1,5 @@
 
-; all factorials are smaller than 100
+; all factorials are smaller than 100×100
 ; expect: unsat
 
 (declare-datatypes () ((nat (s (select_s_0 nat)) 
