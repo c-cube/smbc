@@ -2569,7 +2569,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
 
     let expand_cst_ (t:t)(c:cst) : unit =
       assert (Ty.is_prop t.term_ty);
-      Log.debugf 2
+      Log.debugf 3
         (fun k->k "(@[<1>expand_cst@ %a@ :because-of %a@])" Typed_cst.pp c Term.pp t);
       Expand.expand_cst c;
       ()
