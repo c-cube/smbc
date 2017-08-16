@@ -286,7 +286,6 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     | QR_data of quant_data
     | QR_bool
 
-  (* TODO: add a "context" to account for path under quantifier *)
   and quant_data = {
     q_data_ty: ty_h; (* type *)
     q_data_cstor: cstor_list; (* constructors *)
