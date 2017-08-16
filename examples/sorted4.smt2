@@ -1,8 +1,7 @@
-; expect: UNSAT
+; expect: SAT
 
-; find a sorted list of length 3, that is a palindrome, and has sum 1
-; this is impossible because the 1 should be in the middle (palindrome),
-; but then the list is not sorted anymore
+; find a sorted list that is has length 10 and sum 2.
+; by iterative deepening, smbc should find [2,2,…,2]
 
 (declare-datatypes () ((nat (s (select_s_0 nat)) 
                             (z))))
@@ -49,10 +48,10 @@
            (case (cons y_4 l3) (and (leq x_7 y_4) (sorted (cons y_4 l3)))) 
            (case nil true))) 
       (case nil true))))
-(define-funs-rec ((num_3 () nat)) ((s (s (s z)))))
+(define-funs-rec ((num_5 () nat)) ((s (s (s (s (s z)))))))
+(define-funs-rec ((num_10 () nat)) ((plus num_5 num_5)))
+(define-funs-rec ((num_20 () nat)) ((plus num_10 num_10)))
 (assert-not
  (forall
     ((l_5 list))
-    (not (and
-          (and (and (sorted l_5) (= l_5 (rev l_5))) (= (sum l_5) (s z))) 
-          (= (length l_5) num_3)))))(check-sat)
+    (not (and (and (sorted l_5) (= (sum l_5) num_20)) (= (length l_5) num_10)))))(check-sat)

@@ -1,8 +1,6 @@
-; expect: UNSAT
+; expect: SAT
 
-; find a sorted list of length 3, that is a palindrome, and has sum 1
-; this is impossible because the 1 should be in the middle (palindrome),
-; but then the list is not sorted anymore
+; find a sorted list of length in [3,5] with sum 15
 
 (declare-datatypes () ((nat (s (select_s_0 nat)) 
                             (z))))
@@ -50,9 +48,12 @@
            (case nil true))) 
       (case nil true))))
 (define-funs-rec ((num_3 () nat)) ((s (s (s z)))))
+(define-funs-rec ((num_5 () nat)) ((s (s (s (s (s z)))))))
 (assert-not
  (forall
     ((l_5 list))
     (not (and
-          (and (and (sorted l_5) (= l_5 (rev l_5))) (= (sum l_5) (s z))) 
-          (= (length l_5) num_3)))))(check-sat)
+          (and
+           (and (sorted l_5) (= (sum l_5) (mult num_3 num_5))) 
+           (leq (s num_3) (length l_5))) 
+          (leq (length l_5) (s num_5))))))(check-sat)
