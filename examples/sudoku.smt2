@@ -1,4 +1,4 @@
-; SAT
+; expect: SAT
 
 ; courtesy of Koen Classen and Dan Rosen
 
