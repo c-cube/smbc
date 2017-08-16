@@ -2214,8 +2214,15 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
               end
           end
         | Quant (q,QR_data d,body) ->
-          (* TODO: first, try to evaluate body (might become true/false/undefined) *)
-          if CCOpt.is_none !quant_unroll_depth then (
+          (* first, try to evaluate body (might become true/false/undefined) *)
+          let e_body, body_nf = compute_nf body in
+          let body_is_value = match body_nf.term_cell with
+            | True | False | Undefined_value (_,Undef_absolute) -> true
+            | _ -> false
+          in
+          if body_is_value then (
+            e_body, body_nf
+          ) else if CCOpt.is_none !quant_unroll_depth then (
             Explanation.empty, t (* blocked for now *)
           ) else if d.q_data_depth >= CCOpt.get_exn !quant_unroll_depth then (
             (* just give up and return undefined, because of depth *)
