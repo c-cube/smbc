@@ -2220,6 +2220,8 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
             | True | False | Undefined_value (_,Undef_absolute) -> true
             | _ -> false
           in
+          (* NOTE: we can simplify [exists x. true] and [forall x. false]
+             because we assume there are no empty types. *)
           if body_is_value then (
             e_body, body_nf
           ) else if CCOpt.is_none !quant_unroll_depth then (
