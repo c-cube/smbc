@@ -1,5 +1,12 @@
 # Change Log
 
+## 0.4
+
+- quantification on datatypes/bool
+
+- remove limited checking of models
+- some bugfixes and regression tests
+
 ## 0.3.1
 
 - compatibility with containers 1.0
