@@ -1,5 +1,9 @@
 # Change Log
 
+## 0.4.1
+
+- bugfix related to De Bruijn indices and function extensionality
+
 ## 0.4
 
 - quantification on datatypes/bool
