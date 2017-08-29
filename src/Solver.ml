@@ -59,7 +59,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
 
   (* did we perform at least one expansion on an unknown that is
      of a type that cannot support exhaustive expansion (e.g. functions)?
-  If true, it means that "unsat" might be wrong, so we'll answer "unknown" *)
+     If true, it means that "unsat" might be wrong, so we'll answer "unknown" *)
   let incomplete_expansion : bool ref = ref false
 
   (* for objects that are expanded on demand only *)
@@ -99,7 +99,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     mutable term_being_evaled: bool; (* true if currently being evaluated *)
     term_cell: term_cell;
     mutable term_nf: term_nf;
-      (* normal form + explanation of why *)
+    (* normal form + explanation of why *)
     mutable term_deps: term_dep list;
     (* set of undefined constants
        that can make evaluation go further *)
@@ -119,7 +119,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     | Match of term * (ty_h list * term) ID.Map.t
     | Switch of term * switch_cell (* function table *)
     | Quant of quant * quant_range * term
-      (* quantification on finite types or datatypes *)
+    (* quantification on finite types or datatypes *)
     | Builtin of builtin
     | Check_assign of cst * term (* check a literal *)
     | Check_empty_uty of ty_uninterpreted_slice (* check it's empty *)
@@ -148,9 +148,9 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
   (* what can block evaluation of a term *)
   and term_dep =
     | Dep_cst of cst
-      (* blocked by non-refined constant *)
+    (* blocked by non-refined constant *)
     | Dep_uty of ty_uninterpreted_slice
-      (* blocked because this type is not expanded enough *)
+    (* blocked because this type is not expanded enough *)
     | Dep_quant_depth
 
   and builtin =
@@ -740,16 +740,16 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         | Dep_quant_depth -> 2
       in
       match a, b with
-      | Dep_cst c1, Dep_cst c2 -> Typed_cst.compare c1 c2
-      | Dep_uty u1, Dep_uty u2 ->
-        let (<?>) = CCOrd.(<?>) in
-        Ty.compare (Lazy.force u1.uty_self) (Lazy.force u2.uty_self)
-        <?> (CCInt.compare, u1.uty_offset, u2.uty_offset)
-      | Dep_quant_depth, Dep_quant_depth -> 0
-      | Dep_cst _, _
-      | Dep_uty _, _
-      | Dep_quant_depth, _
-        -> CCInt.compare (to_int_ a) (to_int_ b)
+        | Dep_cst c1, Dep_cst c2 -> Typed_cst.compare c1 c2
+        | Dep_uty u1, Dep_uty u2 ->
+          let (<?>) = CCOrd.(<?>) in
+          Ty.compare (Lazy.force u1.uty_self) (Lazy.force u2.uty_self)
+          <?> (CCInt.compare, u1.uty_offset, u2.uty_offset)
+        | Dep_quant_depth, Dep_quant_depth -> 0
+        | Dep_cst _, _
+        | Dep_uty _, _
+        | Dep_quant_depth, _
+          -> CCInt.compare (to_int_ a) (to_int_ b)
 
     (* build a term. If it's new, add it to the watchlist
        of every member of [watching] *)
@@ -981,6 +981,10 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       let (), b = fold_map_builtin (fun () t -> (), f t) () b in
       b
 
+    let iter_builtin f b =
+      let (), _ = fold_map_builtin (fun () t -> f t, t) () b in
+      ()
+
     let builtin_to_seq b yield = match b with
       | B_not t -> yield t
       | B_or (a,b)
@@ -993,9 +997,9 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     let compare a b = CCInt.compare a.term_id b.term_id
 
     module As_key = struct
-        type t = term
-        let equal = equal
-        let hash = hash
+      type t = term
+      let equal = equal
+      let hash = hash
     end
 
     module Tbl = CCHashtbl.Make(As_key)
@@ -1146,7 +1150,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     type eval_env = term DB_env.t
 
     (* shift open De Bruijn indices by [k] *)
-    let shift_db k (t:term) : term =
+    let shift_db ?(depth=0) k (t:term) : term =
       if k=0 then t
       else (
         let rec aux depth t : term = match t.term_cell with
@@ -1196,62 +1200,110 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         and aux_l d l =
           List.map (aux d) l
         in
-        aux 0 t
+        aux depth t
       )
+
+    (* check well-typedness of DB indices. Call only on closed terms. *)
+    let check_db t : unit =
+      let fail_ u env =
+        errorf "(@[check_db :in `%a`@ :sub %a@ :ty %a@ :env %a@])"
+          pp t pp u Ty.pp u.term_ty
+          CCFormat.(Dump.list @@ Dump.option @@ Ty.pp) env.db_st
+      in
+      let rec aux (env:Ty.t DB_env.t) t = match t.term_cell with
+        | DB (n,nty) ->
+          if n<0 || n >= DB_env.size env then fail_ t env;
+          begin match DB_env.get (n,nty) env with
+            | None -> fail_ t env
+            | Some ty -> if not (Ty.equal ty t.term_ty) then fail_ t env
+          end
+        | Const _ | True | False -> ()
+        | Fun (ty, body) -> aux (DB_env.push ty env) body
+        | Mu body -> aux (DB_env.push t.term_ty env) body
+        | Quant (_, QR_bool, body) -> aux (DB_env.push Ty.prop env) body
+        | Quant (_, QR_unin u, body) ->
+          aux (DB_env.push (Lazy.force u.uty_self) env) body
+        | Quant (_, QR_data qr, body) -> aux (DB_env.push qr.q_data_ty env) body
+        | Match (u, m) ->
+          aux env u;
+          ID.Map.iter
+            (fun _ (tys,rhs) -> aux (DB_env.push_l tys env) rhs)
+            m;
+        | Switch (u, m) ->
+          aux env u;
+          ID.Tbl.iter (fun _ rhs -> aux env rhs) m.switch_tbl
+        | Select (_, u) -> aux env u
+        | If (a,b,c) -> aux env a; aux env b; aux env c
+        | App (_,[]) -> assert false
+        | App (f, l) -> aux env f; List.iter (aux env) l
+        | Builtin b -> iter_builtin (aux env) b
+        | Undefined_value _
+        | Check_assign _
+        | Check_empty_uty _
+          -> () (* closed *)
+      in
+      aux DB_env.empty t
 
     (* just evaluate the De Bruijn indices, and return
        the explanations used to evaluate subterms *)
-    let eval_db (env:eval_env) (t:term) : term =
-      if DB_env.size env = 0
-      then t (* trivial *)
+    let eval_db ?shift_by:(shift=0) (env:eval_env) (t:term) : term =
+      if DB_env.size env = 0 && shift=0 then t (* trivial *)
+      else if DB_env.size env = 0 then shift_db shift t
       else (
-        let rec aux depth env t : term = match t.term_cell with
-          | DB d ->
-            begin match DB_env.get d env with
-              | None -> t
-              | Some t' -> shift_db depth t'
-            end
-          | Const _ -> t
-          | True
-          | False -> t
-          | Fun (ty, body) ->
-            let body' = aux (depth+1) (DB_env.push_none env) body in
-            if body==body' then t else fun_ ty body'
-          | Mu body ->
-            let body' = aux (depth+1) (DB_env.push_none env) body in
-            if body==body' then t else mu body'
-          | Quant (q, uty, body) ->
-            let body' = aux (depth+1) (DB_env.push_none env) body in
-            if body==body' then t else quant q uty body'
-          | Match (u, m) ->
-            let u = aux depth env u in
-            let m =
-              ID.Map.map
-                (fun (tys,rhs) ->
-                   tys, aux (depth+List.length tys) (DB_env.push_none_l tys env) rhs)
-                m
-            in
-            match_ u m
-          | Switch (u, m) ->
-            let u = aux depth env u in
-            (* NOTE: [m] should not contain De Bruijn indices at all *)
-            switch u m
-          | Select (sel, u) -> select sel (aux depth env u)
-          | If (a,b,c) ->
-            let a' = aux depth env a in
-            let b' = aux depth env b in
-            let c' = aux depth env c in
-            if a==a' && b==b' && c==c' then t else if_ a' b' c'
-          | App (_,[]) -> assert false
-          | App (f, l) ->
-            let f' = aux depth env f in
-            let l' = aux_l depth env l in
-            if f==f' && CCList.equal (==) l l' then t else app f' l'
-          | Builtin b -> builtin (map_builtin (aux depth env) b)
-          | Undefined_value _
-          | Check_assign _
-          | Check_empty_uty _
-            -> t (* closed *)
+        (* Format.printf "(@[<2>eval_db@ :term %a@ :env %a@])@."
+           pp t CCFormat.(Dump.list @@ Dump.option @@ pp) env.db_st; *)
+        let rec aux depth env t : term =
+          (* Format.printf "(@[<2>eval_db_rec@ :term %a@ :depth %d :env %a@])@."
+             pp t depth CCFormat.(Dump.list @@ Dump.option @@ pp) env.db_st; *)
+          match t.term_cell with
+            | DB d ->
+              begin match DB_env.get d env with
+                | None -> shift_db ~depth shift t
+                | Some t' ->
+                  assert (Ty.equal t.term_ty t'.term_ty);
+                  shift_db depth t'
+              end
+            | Const _
+            | True
+            | False -> t
+            | Fun (ty, body) ->
+              let body' = aux (depth+1) (DB_env.push_none env) body in
+              if body==body' then t else fun_ ty body'
+            | Mu body ->
+              let body' = aux (depth+1) (DB_env.push_none env) body in
+              if body==body' then t else mu body'
+            | Quant (q, uty, body) ->
+              let body' = aux (depth+1) (DB_env.push_none env) body in
+              if body==body' then t else quant q uty body'
+            | Match (u, m) ->
+              let u = aux depth env u in
+              let m =
+                ID.Map.map
+                  (fun (tys,rhs) ->
+                     tys, aux (depth+List.length tys) (DB_env.push_none_l tys env) rhs)
+                  m
+              in
+              match_ u m
+            | Switch (u, m) ->
+              let u = aux depth env u in
+              (* NOTE: [m] should not contain De Bruijn indices at all *)
+              switch u m
+            | Select (sel, u) -> select sel (aux depth env u)
+            | If (a,b,c) ->
+              let a' = aux depth env a in
+              let b' = aux depth env b in
+              let c' = aux depth env c in
+              if a==a' && b==b' && c==c' then t else if_ a' b' c'
+            | App (_,[]) -> assert false
+            | App (f, l) ->
+              let f' = aux depth env f in
+              let l' = aux_l depth env l in
+              if f==f' && CCList.equal (==) l l' then t else app f' l'
+            | Builtin b -> builtin (map_builtin (aux depth env) b)
+            | Undefined_value _
+            | Check_assign _
+            | Check_empty_uty _
+              -> t (* closed *)
         and aux_l d env l =
           List.map (aux d env) l
         in
@@ -1875,7 +1927,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
          typically a new meta variable, in each "case" of the deconstruction.
        @param fresh [fresh ty] is called to obtain an unrelated meta-variable
        @param depth depth of meta variables that are created
-      *)
+    *)
     let deconstruct_ty
         (st:state)
         ~(depth:int)
@@ -1885,7 +1937,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         ~(fresh:depth:int -> Ty.t -> cst) =
       (* recursive function to deconstruct [ty_arg] and build a body
          of type [ty_ret]
-       @param shift_by number of intermediate binders in the tree
+         @param shift_by number of intermediate binders in the tree
       *)
       let rec aux
           ~(depth:int)
@@ -1894,7 +1946,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           (ty_arg:Ty.t)
           (ty_ret:Ty.t)
           ~(k:depth:int -> shift_by:int -> Ty.t -> term): term
-      =
+        =
         let res = match Ty.view ty_arg with
           | Prop ->
             (* make a test on [the_param] *)
@@ -2012,7 +2064,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         (cst:cst)
         (ty:Ty.t)
         (info:cst_info)
-        : term list * Clause.t list  =
+      : term list * Clause.t list  =
       assert (info.cst_cases = Lazy_none);
       (* expand constant depending on its type *)
       let st = mk_state cst ty info in
@@ -2129,6 +2181,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     (* compute the normal form of this term. We know at least one of its
        subterm(s) has been reduced *)
     let rec compute_nf (t:term) : explanation * term =
+      (*Format.printf "(@[compute_nf %a@])@." Term.pp t;*)
       if t.term_being_evaled then (
         (* [t] is already being evaluated, this means there is
              an evaluation in the loop.
@@ -2246,9 +2299,15 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
                    in
                    (* replace [x] with [cstor args] in [body] *)
                    let arg = Term.app_cst cstor db_l in
+                   (* need to shift open variables because we
+                      remove 1 quantifier and add n quantifiers *)
+                   let shift_by = if n>0 then n-1 else 0 in
                    let body' =
-                     Term.eval_db (DB_env.singleton arg) body
+                     Term.eval_db ~shift_by (DB_env.singleton arg) body
                    in
+                   (*Format.printf
+                     "(@[eval_quant@ :old %a@ :arg %a@ :shift_by %d@ :body' %a@])@."
+                     Term.pp t Term.pp arg n Term.pp body';*)
                    List.fold_right
                      (fun ty body ->
                         Term.quant_ty ~depth:(d.q_data_depth+1) q ty body)
@@ -2947,7 +3006,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       : unit =
       Log.debugf 2
         (fun k->k "(@[<1>@{<green>assume_uty@}@ @[%a@] %a@])"
-        pp_uty uty pp_uty_status status);
+            pp_uty uty pp_uty_status status);
       begin match uty.uty_status with
         | None ->
           let e = Explanation.return lit in
@@ -3018,7 +3077,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       flush_new_clauses_into_slice slice;
       TI.Sat
 
-    let if_sat slice =
+    let if_sat _slice =
       Log.debugf 3 (fun k->k "(if-sat)");
       TI.Sat
   end
@@ -3031,10 +3090,12 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     Log.debugf 2 (fun k->k "(@[<1>push_clause@ @[%a@]@])" Clause.pp c);
     (* reduce to normal form the literals, ensure they
          are added to the proper constant watchlist(s) *)
-    Clause.to_seq c
+    begin
+      Clause.to_seq c
       |> Sequence.filter_map Lit.as_atom
       |> Sequence.map fst
-      |> Sequence.iter Top_terms.add;
+      |> Sequence.iter Top_terms.add
+    end;
     incr stat_num_clause_push;
     M.assume [Clause.lits c]
 
@@ -3064,26 +3125,12 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     (* environment for variables *)
     type conv_env = {
       let_bound: (term * int) ID.Map.t; (* let-bound variables, to be replaced. int=depth at binding position *)
-      bound: int ID.Map.t; (* set of bound variables. int=depth at binding position *)
+      bound: (int * Ty.t) ID.Map.t; (* set of bound variables. int=depth at binding position *)
       depth: int;
     }
 
     let empty_env : conv_env =
       {let_bound=ID.Map.empty; bound=ID.Map.empty; depth=0}
-
-    let add_bound env v =
-      { env with
-        depth=env.depth+1;
-        bound=ID.Map.add (Ast.Var.id v) env.depth env.bound }
-
-    (* add [v := t] to bindings. Depth is not increment (there will be no binders) *)
-    let add_let_bound env v t =
-      { env with
-        let_bound=ID.Map.add (Ast.Var.id v) (t,env.depth) env.let_bound }
-
-    let find_env env v =
-      let id = Ast.Var.id v in
-      ID.Map.get id env.let_bound, ID.Map.get id env.bound
 
     let rec conv_ty (ty:Ast.Ty.t): Ty.t = match ty with
       | Ast.Ty.Prop -> Ty.prop
@@ -3092,6 +3139,22 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           with Not_found -> errorf "type %a not in ty_tbl" ID.pp id
         end
       | Ast.Ty.Arrow (a,b) -> Ty.arrow (conv_ty a) (conv_ty b)
+
+    let add_bound env v =
+      let ty = Ast.Var.ty v |> conv_ty in
+      { env with
+          depth=env.depth+1;
+          bound=ID.Map.add (Ast.Var.id v) (env.depth,ty) env.bound; }
+
+    (* add [v := t] to bindings. Depth is not incremented
+       (there will be no binders) *)
+    let add_let_bound env v t =
+      { env with
+          let_bound=ID.Map.add (Ast.Var.id v) (t,env.depth) env.let_bound }
+
+    let find_env env v =
+      let id = Ast.Var.id v in
+      ID.Map.get id env.let_bound, ID.Map.get id env.bound
 
     let rec conv_term_rec
         (env: conv_env)
@@ -3112,14 +3175,23 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       | Ast.Var v ->
         begin match find_env env v with
           | Some (t', depth_t'), _ ->
+            (* replace [v] by [t'], but need to shift [t'] by the number
+               of levels added between binding point
+               and call point (here). *)
             assert (env.depth >= depth_t');
             let t' = Term.shift_db (env.depth - depth_t') t' in
             t'
-          | None, Some d ->
+          | None, Some (n,db_ty) ->
+            (* some bound variable *)
             let ty = Ast.Var.ty v |> conv_ty in
-            let level = env.depth - d - 1 in
+            let level = env.depth - n - 1 in
+            if not (Ty.equal ty db_ty) then (
+              errorf "(@[type error :var %a@ :index %d@ type %a / %a@])"
+                Ast.Var.pp v level Ty.pp ty Ty.pp db_ty
+            );
             Term.db (DB.make level ty)
-          | None, None -> errorf "could not find var `%a`" Ast.Var.pp v
+          | None, None ->
+            errorf "(@[could not find var `%a`@])" Ast.Var.pp v
         end
       | Ast.Bind (Ast.Fun,v,body) ->
         let env' = add_bound env v in
@@ -3221,14 +3293,18 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
                 (* equality on functions: becomes a forall *)
                 let n = List.length args in
                 let db_l = List.mapi (fun i ty -> Term.db (n-i-1,ty)) args in
-                let body = Term.eq (Term.app a db_l) (Term.app b db_l) in
+                let body =
+                  Term.eq
+                    (Term.app (Term.shift_db n a) db_l)
+                    (Term.app (Term.shift_db n b) db_l)
+                in
                 Term.quant_ty_l ~depth:0 Forall args body
             end
         end
       | Ast.Undefined_value ->
         Term.undefined_value (conv_ty t.Ast.ty) Undef_absolute
       | Ast.Asserting (t, g) ->
-        (* [t asserting g] becomes  [if g t fail] *)
+        (* [t asserting g] becomes [if g t fail] *)
         let t = conv_term_rec env t in
         let g = conv_term_rec env g in
         Term.if_ g t (Term.undefined_value t.term_ty Undef_absolute)
@@ -3237,6 +3313,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       let u = conv_term_rec env t in
       Log.debugf 2
         (fun k->k "(@[conv_term@ @[%a@]@ yields: %a@])" Ast.pp_term t Term.pp u);
+      Term.check_db u; (* ensure DB indices are fine *)
       u
 
     (* simple prefix skolemization: if [t = exists x1...xn. u],
@@ -3753,7 +3830,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
               | PS_complete ->
                 do_on_exit ~on_exit;
                 Unsat
-             end
+            end
     in
     Top_terms.update_all ();
     ID.reset ();
