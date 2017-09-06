@@ -24,6 +24,9 @@ module type CONFIG = sig
   val quant_unfold_depth : int
   (** Initial depth for quantifier unfolding *)
 
+  val eval_under_quant : bool
+  (** Evaluate under quantifiers to see if the body is a value *)
+
   val progress: bool
   (** progress display progress bar *)
 

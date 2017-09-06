@@ -12,6 +12,7 @@ type config = {
   deepening_step: int option;
   uniform_depth: bool;
   quant_depth : int;
+  eval_under_quant: bool;
   check: bool;
   check_proof: bool;
 }
@@ -41,6 +42,7 @@ let solve ~config (ast:Ast.statement list) : unit =
     let dimacs_file = config.dimacs
     let quant_unfold_depth = config.quant_depth
     let check_proof = config.check_proof
+    let eval_under_quant = config.eval_under_quant
   end in
   let module S = Solver.Make(Conf)(struct end) in
   let on_exit = [] in
@@ -72,6 +74,7 @@ let timeout_ = ref ~-1
 let syntax_ = ref Ast.Auto
 let uniform_depth_ = ref false
 let quant_depth_ = ref 3
+let eval_under_quant_ = ref true
 let version_ = ref false
 let dimacs_ = ref "" (* file to put sat problem in *)
 let check_proof_ = ref false
@@ -124,6 +127,8 @@ let options =
     "--dimacs", Arg.Set_string dimacs_, " file to output dimacs problem into";
     "--check-proof", Arg.Set check_proof_, " check propositional proofs";
     "--no-check-proof", Arg.Clear check_proof_, " do not check propositional proofs";
+    "--eval-under-quant", Arg.Set eval_under_quant_, " evaluate under quantifiers";
+    "--no-eval-under-quant", Arg.Clear eval_under_quant_, " evaluate under quantifiers";
     "-t", Arg.Set_int timeout_, " alias to --timeout";
     "--version", Arg.Set version_, " display version info";
   ]
@@ -168,6 +173,7 @@ let () =
     progress = !progress_;
     pp_hashcons = !pp_hashcons_;
     quant_depth= !quant_depth_;
+    eval_under_quant= !eval_under_quant_;
     uniform_depth = !uniform_depth_;
     dimacs = (if !dimacs_ = "" then None else Some !dimacs_);
     deepening_step =
