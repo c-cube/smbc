@@ -55,6 +55,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
   let stat_num_clause_push = ref 0
   let stat_num_clause_tautology = ref 0
   let stat_num_propagations = ref 0
+  let stat_num_undefined = ref 0
   let stat_num_unif = ref 0
 
   (* did we perform at least one expansion on an unknown that is
@@ -309,6 +310,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       | Undef_absolute -> has_lost_models := true; (* precision lost *)
       | Undef_quant _ -> ()
     end;
+    incr stat_num_undefined;
     has_met_undefined :=
       begin match !has_met_undefined with
         | None -> Some c
@@ -3677,6 +3679,8 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
        :num_lits %d@ \
        :num_propagations %d@ \
        :num_unif %d@ \
+       :num_undefined %d@ \
+       :has_lost_model %B\
        @])"
       !stat_num_cst_expanded
       !stat_num_uty_expanded
@@ -3685,6 +3689,8 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       (Top_terms.size())
       !stat_num_propagations
       !stat_num_unif
+      !stat_num_undefined
+      !has_lost_models
 
   let do_on_exit ~on_exit =
     List.iter (fun f->f()) on_exit;
@@ -3806,9 +3812,9 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
             let status = proof_status depth_lit q_lit in
             Log.debugf 1
               (fun k->k
-                  "@{<Yellow>** found Unsat@} at depth %a;@ \
+                  "@{<Yellow>** found Unsat@} at depth %a, quand-depth %d;@ \
                    status: %a"
-                  ID.pp cur_depth pp_proof_status status);
+                  ID.pp cur_depth q_depth pp_proof_status status);
             begin match status with
               | PS_depth_limited _ ->
                 (* negation of the previous limit *)
