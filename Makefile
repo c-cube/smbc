@@ -18,7 +18,9 @@ install: build
 	cp smbc.native $(BINDIR)/smbc
 
 test: build
-	$(TESTTOOL) run -c test.toml $(TESTOPTS) --meta `git rev-parse HEAD`
+	@mkdir -p snapshots
+	$(TESTTOOL) run -c test.toml $(TESTOPTS) \
+	  --meta `git rev-parse HEAD` --summary snapshots/`date -I`.txt
 
 watch:
 	while find src/ -print0 | xargs -0 inotifywait -e delete_self -e modify ; do \
