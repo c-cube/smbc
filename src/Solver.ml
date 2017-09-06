@@ -931,10 +931,13 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     let forall = quant Forall
     let exists = quant Exists
 
-    let and_ a b = builtin_ ~deps:(Term_dep_sub2 (a,b)) (B_and (a,b,a,b))
-    let or_ a b = builtin_ ~deps:(Term_dep_sub2 (a,b)) (B_or (a,b))
+    let and_ a b =
+      if a==b then a else builtin_ ~deps:(Term_dep_sub2 (a,b)) (B_and (a,b,a,b))
+    let or_ a b =
+      if a==b then a else builtin_ ~deps:(Term_dep_sub2 (a,b)) (B_or (a,b))
     let imply a b = builtin_ ~deps:(Term_dep_sub2 (a,b)) (B_imply (a,b))
-    let eq a b = builtin_ ~deps:(Term_dep_sub2 (a,b)) (B_eq (a,b))
+    let eq a b =
+      if a==b then true_ else builtin_ ~deps:(Term_dep_sub2 (a,b)) (B_eq (a,b))
 
     let and_par a b c d =
       builtin_ ~deps:(Term_dep_sub2 (c,d)) (B_and (a,b,c,d))
