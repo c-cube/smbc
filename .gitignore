@@ -9,3 +9,6 @@ TAGS
 setup.*
 qtest*
 *.html
+.merlin
+*.install
+jbuild

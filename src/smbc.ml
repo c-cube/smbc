@@ -154,7 +154,7 @@ let () =
     Usage: smbc [options] (file | --stdin).\n";
   CCFormat.set_color_default !color_;
   if !version_ then (
-    Format.printf "version: %s@." GitVersion.id;
+    Format.printf "version: %s@." Const.version;
     exit 0;
   );
   if !timeout_ >= 1 then setup_timeout_ !timeout_;

@@ -1,19 +1,20 @@
 opam-version: "1.2"
 version: "0.4.1"
-maintainer: "simon.cruanes@inria.fr"
+maintainer: "simon.cruanes.2007@m4x.org"
 author: "Simon Cruanes"
 homepage: "https://github.com/c-cube/smbc"
 build: [
-    [make]
+    ["jbuilder" "build" "@install"]
 ]
 install: [
-  make "BINDIR=%{bin}%" "install"
+    ["jbuilder" "install"]
 ]
 remove: [
     ["rm" "%{bin}%/smbc"]
 ]
 depends: [
   "ocamlfind" { build }
+  "jbuilder" { build }
   "base-bytes"
   "containers" { >= "1.0" }
   "sequence" { >= "0.4" }
@@ -22,7 +23,7 @@ depends: [
   "menhir"
 ]
 available: [
-    ocaml-version >= "4.01"
+    ocaml-version >= "4.03"
 ]
 tags: [ "logic" "narrowing" "model" "smt" ]
 bug-reports: "https://github.com/c-cube/smbc/issues"

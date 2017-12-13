@@ -1,9 +1,0 @@
-S src
-B _build/src
-PKG containers
-PKG containers.sexp
-PKG containers.data
-PKG sequence
-PKG tip_parser
-PKG msat
-FLG -w +a-4-44-58-60@8

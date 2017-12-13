@@ -1,21 +1,19 @@
 
-OCAMLBUILD=ocamlbuild -use-ocamlfind -tag debug
-TARGETS=src/smbc.byte src/smbc.native
-BINDIR ?= /usr/bin/
+J?=3
 
 all: build
 
 build:
-	$(OCAMLBUILD) $(TARGETS)
+	jbuilder build @install -j $J
+
+install:
+	jbuilder install
 
 clean:
-	$(OCAMLBUILD) -clean
+	jbuilder clean
 
 TESTOPTS ?= -j 3
 TESTTOOL=logitest
-
-install: build
-	cp smbc.native $(BINDIR)/smbc
 
 test: build
 	@mkdir -p snapshots
