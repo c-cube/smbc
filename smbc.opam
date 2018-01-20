@@ -6,14 +6,7 @@ homepage: "https://github.com/c-cube/smbc"
 build: [
     ["jbuilder" "build" "@install"]
 ]
-install: [
-    ["jbuilder" "install"]
-]
-remove: [
-    ["rm" "%{bin}%/smbc"]
-]
 depends: [
-  "ocamlfind" { build }
   "jbuilder" { build }
   "base-bytes"
   "containers" { >= "1.0" }
