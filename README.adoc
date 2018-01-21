@@ -44,7 +44,7 @@ opam install smbc
 Or manually, using
 
 ----
-opam install msat containers sequence tip-parser menhir
+opam install msat containers sequence tip-parser
 make
 ----
 

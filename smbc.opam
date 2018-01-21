@@ -1,5 +1,5 @@
 opam-version: "1.2"
-version: "0.4.1"
+version: "0.4.2"
 maintainer: "simon.cruanes.2007@m4x.org"
 author: "Simon Cruanes"
 homepage: "https://github.com/c-cube/smbc"
@@ -13,7 +13,6 @@ depends: [
   "sequence" { >= "0.4" }
   "msat" { >= "0.5" & < "0.8" }
   "tip-parser" { >= "0.3" }
-  "menhir"
 ]
 available: [
     ocaml-version >= "4.03"
