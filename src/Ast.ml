@@ -7,6 +7,7 @@ type 'a or_error = ('a, string) CCResult.t
 type sexp = CCSexp.t
 type 'a to_sexp = 'a -> sexp
 
+module Fmt = CCFormat
 module S = CCSexp
 
 exception Error of string
@@ -19,7 +20,7 @@ let () = Printexc.register_printer
       | _ -> None)
 
 let errorf msg =
-  CCFormat.ksprintf ~f:(fun e -> raise (Error e)) msg
+  Fmt.ksprintf ~f:(fun e -> raise (Error e)) msg
 
 (** {2 Types} *)
 
@@ -31,7 +32,7 @@ module Var = struct
 
   let make id ty = {id;ty}
   let makef ~ty fmt =
-    CCFormat.ksprintf fmt ~f:(fun s -> make (ID.make s) ty)
+    Fmt.ksprintf fmt ~f:(fun s -> make (ID.make s) ty)
   let copy {id;ty} = {ty; id=ID.copy id}
   let id v = v.id
   let ty v = v.ty
@@ -119,7 +120,7 @@ module Ty = struct
     end)
 
   let ill_typed fmt =
-    CCFormat.ksprintf
+    Fmt.ksprintf
       ~f:(fun s -> raise (Ill_typed s))
       fmt
 end
@@ -599,7 +600,7 @@ module Ctx = struct
 
   let pp out t =
     Format.fprintf out "ctx {@[%a@]}"
-      (ID.Tbl.print ID.pp pp_kind) t.kinds
+      Fmt.(seq ~sep:(return "@ ") @@ pair ID.pp pp_kind) (ID.Tbl.to_seq t.kinds)
 end
 
 let errorf_ctx ctx msg =
