@@ -294,7 +294,11 @@ module Tip = struct
         let vars, t = open_forall (conv_term t) in
         let g = not_ t in (* negate *)
         goal ?loc vars g |> CCOpt.return
-      | A.Stmt_assert_not (_::_, _) ->
+      | A.Stmt_prove ([], t) ->
+        let vars, t = open_forall (conv_term t) in
+        let g = not_ t in (* negate *)
+        goal ?loc vars g |> CCOpt.return
+      | A.Stmt_assert_not (_::_, _) | A.Stmt_prove _ ->
         tip_errorf ?loc "cannot convert polymorphic goal@ `@[%a@]`"
           A.pp_stmt st
       | A.Stmt_lemma _ ->
