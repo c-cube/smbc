@@ -14,7 +14,7 @@
 (executable
   ((name smbc)
    (public_name smbc)
-   (libraries (containers containers.data containers.sexp sequence msat tip_parser unix))
+   (libraries (containers containers.data containers.sexp sequence msat tip-parser unix))
    (flags (:standard -w +a-4-44-58-60@8 -color always))
    (ocamlopt_flags (:standard -O3 -color always
                     -unbox-closures -unbox-closures-factor 20))
