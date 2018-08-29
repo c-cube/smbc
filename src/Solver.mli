@@ -69,6 +69,8 @@ module Make(C:CONFIG)(Dummy : sig end) : sig
 
   val add_statement_l : Ast.statement list -> unit
 
+  val is_prove : unit -> bool
+
   val solve :
     ?on_exit:(unit -> unit) list ->
     ?check:bool ->

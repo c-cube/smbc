@@ -50,7 +50,11 @@ and stmt =
   | Stmt_def of (string * ty * term) list
   | Stmt_data of (string * (string * (string option * ty) list) list) list
   | Stmt_assert of term
-  | Stmt_goal of typed_var list * term (* satisfy this *)
+  | Stmt_goal of {
+      prove: bool;
+      vars: typed_var list;
+      body: term;
+    } (* satisfy/prove this *)
 
 let ty_prop = Ty_bool
 let ty_const s = Ty_const s
@@ -88,7 +92,7 @@ let decl ?loc f ty = _mk ?loc (Stmt_decl (f, ty))
 let def ?loc l = _mk ?loc (Stmt_def l)
 let data ?loc l = _mk ?loc (Stmt_data l)
 let assert_ ?loc t = _mk ?loc (Stmt_assert t)
-let goal ?loc vars t = _mk ?loc (Stmt_goal (vars, t))
+let goal ?loc ~prove vars t = _mk ?loc (Stmt_goal {prove;vars;body=t})
 
 let loc t = t.loc
 let view t = t.stmt
@@ -135,8 +139,9 @@ and pp_typed_var out (v,ty) =
 let pp_stmt out (st:statement) = match view st with
   | Stmt_include s -> fpf out "(include %S)" s
   | Stmt_assert t -> fpf out "(@[assert@ %a@])" pp_term t
-  | Stmt_goal (vars,t) ->
-    fpf out "(@[goal@ (@[%a@])@ %a@])" (Utils.pp_list pp_typed_var) vars pp_term t
+  | Stmt_goal {prove;vars;body=t} ->
+    fpf out "(@[goal@ :prove %B (@[%a@])@ %a@])"
+      prove (Utils.pp_list pp_typed_var) vars pp_term t
   | Stmt_ty_decl s ->
     fpf out "(@[declare-sort@ %s 0@])" s
   | Stmt_decl (s, ty) ->
@@ -293,11 +298,10 @@ module Tip = struct
       | A.Stmt_assert_not ([], t) ->
         let vars, t = open_forall (conv_term t) in
         let g = not_ t in (* negate *)
-        goal ?loc vars g |> CCOpt.return
+        goal ~prove:false ?loc vars g |> CCOpt.return
       | A.Stmt_prove ([], t) ->
         let vars, t = open_forall (conv_term t) in
-        let g = not_ t in (* negate *)
-        goal ?loc vars g |> CCOpt.return
+        goal ~prove:true ?loc vars t |> CCOpt.return
       | A.Stmt_assert_not (_::_, _) | A.Stmt_prove _ ->
         tip_errorf ?loc "cannot convert polymorphic goal@ `@[%a@]`"
           A.pp_stmt st

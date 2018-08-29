@@ -49,15 +49,25 @@ let solve ~config (ast:Ast.statement list) : unit =
   (* solve *)
   S.add_statement_l ast;
   let res = S.solve ~on_exit ~check:config.check () in
+  let is_prove = S.is_prove() in
   if config.print_stat then Format.printf "%a@." S.pp_stats ();
   match res with
-    | S.Sat m ->
+  | S.Sat m ->
+    if is_prove then (
+      Format.printf "(@[<1>result @{<Yellow>COUNTERSAT@}@ :model @[%a@]@])@."
+        (Model.pp_syn config.syntax) m;
+    ) else (
       Format.printf "(@[<1>result @{<Green>SAT@}@ :model @[%a@]@])@."
         (Model.pp_syn config.syntax) m;
-    | S.Unsat ->
+    )
+  | S.Unsat ->
+    if is_prove then (
+      Format.printf "(result @{<Green>THEOREM@})@."
+    ) else (
       Format.printf "(result @{<Yellow>UNSAT@})@."
-    | S.Unknown u  ->
-      Format.printf "(result @{<blue>UNKNOWN@} :reason %a)@." S.pp_unknown u
+    )
+  | S.Unknown u  ->
+    Format.printf "(result @{<blue>UNKNOWN@} :reason %a)@." S.pp_unknown u
 
 (** {2 Main} *)
 

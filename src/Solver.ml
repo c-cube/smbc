@@ -3340,6 +3340,8 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       in
       aux empty_env t
 
+    let is_prove_ = ref false
+
     let add_statement st =
       Log.debugf 2
         (fun k->k "(@[add_statement@ @[%a@]@])" Ast.pp_statement st);
@@ -3350,7 +3352,8 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           let t = conv_term ~env t in
           Top_goals.push t;
           push_clause (Clause.make [Lit.atom t])
-        | Ast.Goal (vars, t) ->
+        | Ast.Goal {prove;vars;body=t} ->
+          is_prove_ := !is_prove_ || prove;
           (* skolemize *)
           let env, consts =
             CCList.fold_map
@@ -3364,6 +3367,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           (* model should contain values of [consts] *)
           List.iter add_cst_support_ consts;
           let t = conv_term_rec env t in
+          let t = if prove then Term.not_ t else t in
           Top_goals.push t;
           push_clause (Clause.make [Lit.atom t])
         | Ast.TyDecl id ->
@@ -3534,6 +3538,8 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         | Undefined_value _ -> assert false
       in aux DB_env.empty t
   end
+
+  let is_prove() = !Conv.is_prove_
 
   (** {2 Main} *)
 

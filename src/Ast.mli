@@ -120,7 +120,11 @@ type statement =
   | Decl of ID.t * Ty.t
   | Define of definition list
   | Assert of term
-  | Goal of var list * term
+  | Goal of {
+      prove: bool;
+      vars: var list;
+      body: term;
+    }
 
 (** {2 Constructors} *)
 

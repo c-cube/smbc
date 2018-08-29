@@ -174,7 +174,11 @@ type statement =
   | Decl of ID.t * Ty.t
   | Define of definition list
   | Assert of term
-  | Goal of var list * term
+  | Goal of {
+      prove: bool;
+      vars: var list;
+      body: term;
+    }
 
 (** {2 Helper} *)
 
@@ -337,12 +341,14 @@ let statement_to_tip (t:statement) : TA.statement list = match t with
     [TA.funs_rec decls bodies]
   | Assert t ->
     [TA.assert_ (term_to_tip t)]
-  | Goal (vars,e) ->
+  | Goal {prove;vars;body=e} ->
     let vars = List.map typed_var_to_tip vars in
     let e = term_to_tip e in
-    [TA.assert_not ~ty_vars:[] (TA.forall vars (TA.not_ e));
-     TA.check_sat ();
-    ]
+    let t =
+      if prove
+      then TA.prove ~ty_vars:[] (TA.forall vars e)
+      else TA.assert_not ~ty_vars:[] (TA.forall vars (TA.not_ e)) in
+    [t; TA.check_sat ()]
 
 let pp_term_tip out t = TA.pp_term out (term_to_tip t)
 let pp_term = pp_term_tip
@@ -887,7 +893,7 @@ and conv_statement_aux ctx syn (t:A.statement) : statement list = match A.view t
     let t = conv_term ctx t in
     check_prop_ t;
     [Assert t]
-  | A.Stmt_goal (vars, t) ->
+  | A.Stmt_goal {prove;vars;body=t} ->
     let vars =
       List.map
         (fun (s,ty) ->
@@ -898,7 +904,7 @@ and conv_statement_aux ctx syn (t:A.statement) : statement list = match A.view t
     Ctx.with_vars ctx vars
       (fun vars ->
          let t = conv_term ctx t in
-         [Goal (vars, t)])
+         [Goal {prove;vars;body=t}])
 
 and parse_file_exn ctx (syn:syntax) ~file : statement list =
   let syn = match syn with
