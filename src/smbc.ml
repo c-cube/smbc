@@ -127,6 +127,7 @@ let options =
     "-i", Arg.String set_syntax_, " alias to --input";
     "--pp-hashcons", Arg.Set pp_hashcons_, " print hashconsing IDs";
     "--debug", Arg.Int set_debug_, " set debug level";
+    "-d", Arg.Int set_debug_, " set debug level";
     "--stats", Arg.Set stats_, " print stats";
     "--backtrace", Arg.Unit (fun () -> Printexc.record_backtrace true), " enable backtrace";
     "--depth-step", Arg.Set_int depth_step_, " increment for iterative deepening";

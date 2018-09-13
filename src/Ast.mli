@@ -94,7 +94,7 @@ and term_cell =
   | App of term * term list
   | If of term * term * term
   | Select of select * term
-  | Match of term * (var list * term) ID.Map.t
+  | Match of term * (var list * term) ID.Map.t * (ID.Set.t * term) option
   | Switch of term * term ID.Map.t (* switch on constants *)
   | Bind of binder * var * term
   | Let of var * term * term
@@ -138,7 +138,7 @@ val app : term -> term list -> term
 val app_a : term -> term array -> term
 val select : select -> term -> Ty.t -> term
 val if_ : term -> term -> term -> term
-val match_ : term -> (var list * term) ID.Map.t -> term
+val match_ : term -> (var list * term) ID.Map.t -> default:(ID.Set.t * term) option -> term
 val switch : term -> term ID.Map.t -> term
 val let_ : var -> term -> term -> term
 val bind : ty:Ty.t -> binder -> var -> term -> term

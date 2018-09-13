@@ -150,7 +150,7 @@ and term_cell =
   | App of term * term list
   | If of term * term * term
   | Select of select * term
-  | Match of term * (var list * term) ID.Map.t
+  | Match of term * (var list * term) ID.Map.t * (ID.Set.t * term) option
   | Switch of term * term ID.Map.t (* switch on constants *)
   | Bind of binder * var * term
   | Let of var * term * term
@@ -241,7 +241,7 @@ let rec term_to_tip (t:term): TA.term = match t.term with
       | _ -> List.fold_left TA.ho_app f l
     end
   | If (a,b,c) -> TA.if_ (term_to_tip a)(term_to_tip b)(term_to_tip c)
-  | Match (t,m) ->
+  | Match (t,m,o) ->
     let m =
       ID.Map.to_list m
        |> List.map
@@ -250,8 +250,11 @@ let rec term_to_tip (t:term): TA.term = match t.term with
               id_to_tip c,
               List.map var_to_tip vars,
               term_to_tip rhs))
+    and o = match o with
+      | None -> []
+      | Some (_,rhs) -> [TA.Match_default (term_to_tip rhs)]
     in
-    TA.match_ (term_to_tip t) m
+    TA.match_ (term_to_tip t) (m @ o)
   | Switch (t,m) ->
     let t = term_to_tip t in
     begin match ID.Map.to_list m with
@@ -414,17 +417,21 @@ let if_ a b c =
       Ty.pp b.ty Ty.pp c.ty;
   mk_ (If (a,b,c)) b.ty
 
-let match_ t m =
+let match_ t m ~default =
   let c1, (_, rhs1) = ID.Map.choose m in
+  let check_ty what rhs =
+    if not (Ty.equal rhs1.ty rhs.ty) then (
+      Ty.ill_typed
+        "match: cases %a and %s disagree on return type,@ \
+         between %a and %a"
+        ID.pp c1 what Ty.pp rhs1.ty Ty.pp rhs.ty
+    )
+  in
   ID.Map.iter
-    (fun c (_, rhs) ->
-       if not (Ty.equal rhs1.ty rhs.ty)
-       then Ty.ill_typed
-           "match: cases %a and %a disagree on return type,@ \
-           between %a and %a"
-           ID.pp c1 ID.pp c Ty.pp rhs1.ty Ty.pp rhs.ty)
+    (fun c (_, rhs) -> check_ty (ID.to_string c) rhs)
     m;
-  mk_ (Match (t,m)) rhs1.ty
+  CCOpt.iter (fun (_,rhs) -> check_ty "default" rhs) default;
+  mk_ (Match (t,m,default)) rhs1.ty
 
 let switch u m =
   try
@@ -748,20 +755,25 @@ and conv_term_aux ctx t : term = match t with
     in
     (* now fill the blanks, check exhaustiveness *)
     let all_cstors = Ctx.as_data ctx lhs.ty in
-    let cases = match default with
+    (* check exhaustiveness *)
+    let missing =
+      all_cstors
+      |> List.filter (fun (cstor,_) -> not (ID.Map.mem cstor cases))
+      |> List.rev_map fst |> ID.Set.of_list
+    in
+    let cases, default = match default with
       | None ->
-        (* check exhaustiveness *)
-        let missing =
-          all_cstors
-          |> List.filter (fun (cstor,_) -> not (ID.Map.mem cstor cases))
-          |> List.map fst
-        in
-        if missing<>[]
-        then errorf_ctx ctx
-            "missing cases in `@[%a@]`: @[%a@]"
-            A.pp_term t (Utils.pp_list ID.pp) missing;
-        cases
+        if not @@ ID.Set.is_empty missing then (
+          errorf_ctx ctx
+            "missing cases in `@[%a@]`:@ {@[%a@]}"
+            A.pp_term t (Utils.pp_seq ID.pp) (ID.Set.to_seq missing);
+        );
+        cases, None
+      | Some def_rhs when ID.Set.cardinal missing > ID.Map.cardinal cases ->
+        (* keep [default], gives smaller explanations *)
+        cases, Some (missing, def_rhs)
       | Some def_rhs ->
+        (* complete explicitely *)
         List.fold_left
           (fun cases (cstor,ty_cstor) ->
              if ID.Map.mem cstor cases then cases
@@ -770,9 +782,9 @@ and conv_term_aux ctx t : term = match t with
                let vars = List.mapi (fun i ty -> Var.makef ~ty "_%d" i) args in
                ID.Map.add cstor (vars, def_rhs) cases
              ))
-          cases all_cstors
+          cases all_cstors, None
     in
-    match_ lhs cases
+    match_ lhs cases ~default
   | A.App (A.Const s, args) ->
     let id = find_id_ ctx s in
     let args = List.map (conv_term ctx) args in

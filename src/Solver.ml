@@ -120,7 +120,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     | Mu of term
     | If of term * term * term
     | Select of select * term
-    | Match of term * (ty_h list * term) ID.Map.t
+    | Match of term * (ty_h list * term) ID.Map.t * (ID.Set.t * term) option
     | Switch of term * switch_cell (* function table *)
     | Quant of quant * quant_range * term
     (* quantification on finite types or datatypes *)
@@ -616,14 +616,16 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
             Hash.combine3 5 f.term_id (Hash.list sub_hash l)
           | Fun (ty, f) -> Hash.combine3 6 (Ty.hash ty) f.term_id
           | If (a,b,c) -> Hash.combine4 7 a.term_id b.term_id c.term_id
-          | Match (u,m) ->
+          | Match (u,m,default) ->
             let hash_case (tys,rhs) =
               Hash.combine2 (Hash.list Ty.hash tys) rhs.term_id
+            and hash_default =
+              function None -> 1 | Some (_,rhs) -> sub_hash rhs
             in
             let hash_m =
               Hash.seq (Hash.pair ID.hash hash_case) (ID.Map.to_seq m)
             in
-            Hash.combine3 8 u.term_id hash_m
+            Hash.combine4 8 u.term_id hash_m (hash_default default)
           | Builtin (B_not a) -> Hash.combine2 20 a.term_id
           | Builtin (B_and (t1,t2,t3,t4)) ->
             Hash.list sub_hash [t1;t2;t3;t4]
@@ -656,7 +658,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           | Fun (ty1,f1), Fun (ty2,f2) -> Ty.equal ty1 ty2 && f1 == f2
           | If (a1,b1,c1), If (a2,b2,c2) ->
             a1 == a2 && b1 == b2 && c1 == c2
-          | Match (u1, m1), Match (u2, m2) ->
+          | Match (u1, m1, d1), Match (u2, m2, d2) ->
             u1 == u2 &&
             ID.Map.for_all
               (fun k1 (_,rhs1) ->
@@ -665,6 +667,8 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
               m1
             &&
             ID.Map.for_all (fun k2 _ -> ID.Map.mem k2 m1) m2
+            &&
+            CCOpt.equal (fun (_,t1)(_,t2) -> t1==t2) d1 d2
           | Switch (t1,m1), Switch (t2,m2) ->
             t1==t2 && m1.switch_id = m2.switch_id
           | Builtin b1, Builtin b2 ->
@@ -835,10 +839,10 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
 
     (* TODO: check types *)
 
-    let match_ u m =
+    let match_ u m ~default =
       (* propagate only from [u] *)
       let t =
-        mk_term_ ~deps:(Term_dep_sub u) (Match (u,m))
+        mk_term_ ~deps:(Term_dep_sub u) (Match (u,m,default))
           ~ty:(DTy_lazy (fun () ->
               let _, (_,rhs) = ID.Map.choose m in
               rhs.term_ty
@@ -1019,9 +1023,10 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           | DB _ | Const _ | True | False -> ()
           | App (f,l) -> aux k f; List.iter (aux k) l
           | If (a,b,c) -> aux k a; aux k b; aux k c
-          | Match (t, m) ->
+          | Match (t, m, d) ->
             aux k t;
-            ID.Map.iter (fun _ (tys,rhs) -> aux (k+List.length tys) rhs) m
+            ID.Map.iter (fun _ (tys,rhs) -> aux (k+List.length tys) rhs) m;
+            CCOpt.iter (fun (_,t) -> aux k t) d;
           | Select (_,u)
           | Switch (u,_) -> aux k u (* ignore the table *)
           | Builtin b -> builtin_to_seq b (aux k)
@@ -1113,15 +1118,18 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         | Mu sub -> fpf out "(@[mu@ %a@])" pp sub
         | If (a, b, c) ->
           fpf out "(@[if %a@ %a@ %a@])" pp a pp b pp c
-        | Match (t,m) ->
+        | Match (t,m, default) ->
           let pp_bind out (id,(_tys,rhs)) =
             fpf out "(@[<1>%a@ %a@])" ID.pp id pp rhs
+          and pp_default out = function
+            | None -> ()
+            | Some (_,rhs) -> fpf out "@ :default %a" pp rhs
           in
           let print_map =
             CCFormat.(seq ~sep:(return "@ ")) pp_bind
           in
-          fpf out "(@[match %a@ (@[<hv>%a@])@])"
-            pp t print_map (ID.Map.to_seq m)
+          fpf out "(@[match %a@ (@[<hv>%a@])%a@])"
+            pp t print_map (ID.Map.to_seq m) pp_default default
         | Switch (t, m) ->
           let pp_case out (lhs,rhs) =
             fpf out "(@[<1>case@ %a@ %a@])" ID.pp lhs pp rhs
@@ -1176,7 +1184,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           | Quant (q, uty, body) ->
             let body' = aux (depth+1) body in
             if body==body' then t else quant q uty body'
-          | Match (u, m) ->
+          | Match (u, m, d) ->
             let u = aux depth u in
             let m =
               ID.Map.map
@@ -1184,7 +1192,8 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
                    tys, aux (depth + List.length tys) rhs)
                 m
             in
-            match_ u m
+            let d = CCOpt.map (fun (set,t) -> set, aux depth t) d in
+            match_ u m ~default:d
           | Switch (u, m) ->
             let u = aux depth u in
             (* NOTE: [m] should not contain De Bruijn indices at all *)
@@ -1232,11 +1241,12 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         | Quant (_, QR_unin u, body) ->
           aux (DB_env.push (Lazy.force u.uty_self) env) body
         | Quant (_, QR_data qr, body) -> aux (DB_env.push qr.q_data_ty env) body
-        | Match (u, m) ->
+        | Match (u, m, d) ->
           aux env u;
           ID.Map.iter
             (fun _ (tys,rhs) -> aux (DB_env.push_l tys env) rhs)
             m;
+          CCOpt.iter (fun (_,t) -> aux env t) d;
         | Switch (u, m) ->
           aux env u;
           ID.Tbl.iter (fun _ rhs -> aux env rhs) m.switch_tbl
@@ -1283,15 +1293,17 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
             | Quant (q, uty, body) ->
               let body' = aux (depth+1) (DB_env.push_none env) body in
               if body==body' then t else quant q uty body'
-            | Match (u, m) ->
+            | Match (u, m, d) ->
               let u = aux depth env u in
               let m =
                 ID.Map.map
                   (fun (tys,rhs) ->
                      tys, aux (depth+List.length tys) (DB_env.push_none_l tys env) rhs)
                   m
+              and d =
+                CCOpt.map (fun (set, t) -> set, aux depth env t) d
               in
-              match_ u m
+              match_ u m ~default:d
             | Switch (u, m) ->
               let u = aux depth env u in
               (* NOTE: [m] should not contain De Bruijn indices at all *)
@@ -1991,7 +2003,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
                 )
               |> ID.Map.of_list
             in
-            Term.match_ arg m
+            Term.match_ arg m ~default:None
           | Atomic (_, Uninterpreted _) ->
             (* by case. We make a flat table from values to new
                meta-variables of type [ty_ret] *)
@@ -2353,16 +2365,15 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           let e = Explanation.append e_a e_branch in
           set_nf_ t t' e;
           e, t'
-        | Match (u, m) ->
+        | Match (u, m, d) ->
           let e_u, u' = compute_nf u in
           let default() =
-            if u==u' then t else Term.match_ u' m
+            if u==u' then t else Term.match_ u' m ~default:d
           in
           let e_branch, t' = match Term.as_cstor_app u' with
             | OF_some (c, _, l) ->
-              begin
-                try
-                  let tys, rhs = ID.Map.find (Typed_cst.id c) m in
+              begin match ID.Map.find (Typed_cst.id c) m with
+                | tys, rhs ->
                   if List.length tys = List.length l
                   then (
                     (* evaluate arguments *)
@@ -2371,9 +2382,14 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
                     let rhs = Term.eval_db env rhs in
                     (* evaluate new [rhs] *)
                     compute_nf rhs
+                  ) else (
+                    Explanation.empty, Term.match_ u' m ~default:d
                   )
-                  else Explanation.empty, Term.match_ u' m
-                with Not_found -> assert false
+                | exception Not_found ->
+                  begin match d with
+                    | Some (_,rhs) -> compute_nf rhs
+                    | None -> assert false
+                  end
               end
             | OF_undefined_value c ->
               (* [match fail with _ end ---> fail] *)
@@ -3229,7 +3245,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         let env' = add_bound env v in
         let body = conv_term_rec env' body in
         Term.mu body
-      | Ast.Match (u,m) ->
+      | Ast.Match (u,m,default) ->
         let any_rhs_depends_vars = ref false in (* some RHS depends on matched arg? *)
         let m =
           ID.Map.map
@@ -3252,6 +3268,8 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
                if depends_on_vars then any_rhs_depends_vars := true;
                tys, rhs)
             m
+        and default =
+          CCOpt.map (fun (set,t) -> set, conv_term_rec env t) default
         in
         (* optim: check whether all branches return the same term, that
            does not depend on matched variables *)
@@ -3259,6 +3277,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         let rhs_l =
           ID.Map.values m
           |> Sequence.map snd
+          |> Sequence.append (default |> CCOpt.map snd |> Sequence.of_opt)
           |> Sequence.sort_uniq ~cmp:Term.compare
           |> Sequence.to_rev_list
         in
@@ -3269,7 +3288,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
             x
           | _ ->
             let u = conv_term_rec env u in
-            Term.match_ u m
+            Term.match_ u m ~default
         end
       | Ast.Switch _ ->
         errorf "cannot convert switch %a" Ast.pp_term t
@@ -3485,15 +3504,17 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         | If (g,t,{term_cell=Undefined_value _;_}) ->
           A.asserting (aux env t) (aux env g)
         | If (a,b,c) -> A.if_ (aux env a)(aux env b) (aux env c)
-        | Match (u,m) ->
+        | Match (u,m,default) ->
           let u = aux env u in
           let m =
             ID.Map.map
               (fun (tys,rhs) ->
                  with_vars tys env ~f:(fun vars env -> vars, aux env rhs))
               m
+          and default =
+            CCOpt.map (fun (set,t) -> set, aux env t) default
           in
-          A.match_ u m
+          A.match_ u m ~default
         | Select (sel, u) ->
           let u' = aux env u in
           let sel' = {
@@ -3584,9 +3605,10 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         | App (f,l) ->
           Term.app (aux f) (List.map aux l)
         | If (a,b,c) -> Term.if_ (aux a)(aux b)(aux c)
-        | Match (u,m) ->
+        | Match (u,m,d) ->
           let m = ID.Map.map (fun (tys,rhs) -> tys, aux rhs) m in
-          Term.match_ (aux u) m
+          let d = CCOpt.map (fun (s,t) -> s, aux t) d in
+          Term.match_ (aux u) m ~default:d
         | Select (sel,u) -> Term.select sel (aux u)
         | Switch (u,m) ->
           let dom =

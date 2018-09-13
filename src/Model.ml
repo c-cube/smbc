@@ -127,12 +127,14 @@ let apply_subst (subst:subst) t =
     | A.Select (sel, t) -> A.select sel (aux subst t) t.A.ty
     | A.App (f,l) -> A.app (aux subst f) (List.map (aux subst) l)
     | A.If (a,b,c) -> A.if_ (aux subst a) (aux subst b) (aux subst c)
-    | A.Match (u,m) ->
+    | A.Match (u,m,default) ->
+      let default = CCOpt.map(fun (set,t) -> set,aux subst t) default in
       A.match_ (aux subst u)
         (ID.Map.map
            (fun (vars,rhs) ->
               let subst, vars = rename_vars subst vars in
               vars, aux subst rhs) m)
+        ~default
     | A.Switch (u,m) ->
       A.switch (aux subst u) (ID.Map.map (aux subst) m)
     | A.Let (x,t,u) ->
@@ -239,7 +241,7 @@ and eval_whnf_rec m st subst t = match A.term_view t with
           A.undefined_value t.A.ty
         )
     end
-  | A.Match (u, branches) ->
+  | A.Match (u, branches,default) ->
     let u = eval_whnf m st subst u in
     begin match as_cstor_app m.env u with
       | None ->
@@ -249,12 +251,15 @@ and eval_whnf_rec m st subst t = match A.term_view t with
                let subst, vars = rename_vars subst vars in
                vars, apply_subst subst rhs)
             branches
+        and default =
+          CCOpt.map (fun (set,rhs) -> set, apply_subst subst rhs) default
         in
-        A.match_ u branches
+        A.match_ u branches ~default
       | Some (c, _, cstor_args) ->
-        match ID.Map.get c branches with
-          | None -> assert false
-          | Some (vars, rhs) ->
+        match ID.Map.get c branches, default with
+          | None, None -> assert false
+          | None, Some (_,rhs) -> eval_whnf m st subst rhs (* default case *)
+          | Some (vars, rhs), _ ->
             assert (List.length vars = List.length cstor_args);
             let subst' =
               List.fold_left2
