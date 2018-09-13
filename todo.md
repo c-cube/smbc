@@ -2,9 +2,15 @@
 
 ## Now
 
+
 ## Rewriting
 
-- use a smaller language based on λ-free HO terms and rewrite rules
+- use a smaller language based on λ-free HO terms and rewrite rules,
+  where terms are only variables, constructors/domain elt, or function application
+  * function def: list of cases (with matching against several cstors)
+  * HO variables: use type-dependent combinators (const/match/if)
+  * unin-types: use a `if-first-dom-elt_[n..]` combinator (parametrized
+    on subrange) to test first dom-elt or continue
 
 - decoding: mostly, replace rewrite-defined symbols by a corresponding λ-term
   and apply SNF to eliminate them totally
@@ -78,6 +84,12 @@
     one rule `f l1…ln --> c r1…rk` such that `l1…ln` may match `t1…tn`
     and `u1…uk` may mach `r1…rk`, then reduce to
     `t1=l1,…,tn=ln,u1=r1,…,uk=rk` (like E-unif step)
+
+- think again about how to check models efficiently… 
+  * maybe do it directly with original terms?
+    (but with separate map for model itself, ignoring mutable assignments + caching links)
+  `./smbc.native --check examples/regression/bad_model2.smt2`
+  `./smbc.native --check examples/regression/bad_model3.smt2`
 
 ## Narrowing
 
@@ -324,6 +336,7 @@
 
 ## Done
 
+- [x] have a default case in `match` (test it on sudoku).
 - [x] remove `lisp` format, its parser, and convert the examples (careful with comments)
 - [x] add a `Undefined` term (poison pill) that propagates through application
     and builtins, and makes the solver backtrack immediately
