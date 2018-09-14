@@ -40,7 +40,7 @@ let pp_syn (syn:A.syntax) out (m:t) =
   let pp_entry out = function
     | E_ty (ty,l) ->
       Format.fprintf out "(@[<1>type@ %a@ (@[<hv>%a@])@])"
-        pp_ty ty (Utils.pp_list pp_cst_name) l
+        pp_ty ty (Util.pp_list pp_cst_name) l
     | E_const (c,t) ->
       Format.fprintf out "(@[<1>val@ %a@ %a@])"
         ID.pp_name c pp_term t
@@ -50,7 +50,7 @@ let pp_syn (syn:A.syntax) out (m:t) =
       (A.Ty.Map.to_list m.domains |> List.map (fun (ty,dom) -> E_ty (ty,dom)))
       (ID.Map.to_list m.consts |> List.map (fun (c,t) -> E_const (c,t)))
   in
-  Format.fprintf out "(@[<v>%a@])" (Utils.pp_list pp_entry) es
+  Format.fprintf out "(@[<v>%a@])" (Util.pp_list pp_entry) es
 
 let pp = pp_syn A.Tip
 

@@ -378,7 +378,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       | Arrow _ ->
         let args, ret = unfold t in
         Format.fprintf out "(@[->@ %a@ %a@])"
-          (Utils.pp_list pp) args pp ret
+          (Util.pp_list pp) args pp ret
 
     (* representation as a single identifier *)
     let rec mangle t : string = match t.ty_cell with
@@ -1110,7 +1110,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         | Const c ->
           if ids then Typed_cst.pp out c else ID.pp_name out c.cst_id
         | App (f,l) ->
-          fpf out "(@[<1>%a@ %a@])" pp f (Utils.pp_list pp) l
+          fpf out "(@[<1>%a@ %a@])" pp f (Util.pp_list pp) l
         | Fun (ty,f) ->
           fpf out "(@[fun %a@ %a@])" Ty.pp ty pp f
         | Quant (q,qr,f) ->
@@ -1464,14 +1464,14 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     let pp out e =
       let pp1 out l =
         Format.fprintf out "(@[%a@])"
-          (Utils.pp_list Lit.pp) l
+          (Util.pp_list Lit.pp) l
       in
       match to_lists_uniq_l e with
         | [] -> assert false
         | [e] -> pp1 out e
         | l ->
           Format.fprintf out "(@[<hv2>or@ %a@])"
-            (Utils.pp_list pp1) l
+            (Util.pp_list pp1) l
   end
 
   (** {2 Clauses} *)
@@ -1501,7 +1501,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       | [lit] -> Lit.pp out lit
       | _ ->
         Format.fprintf out "(@[<hv1>or@ %a@ id: %d@])"
-          (Utils.pp_list Lit.pp) c.lits c.id
+          (Util.pp_list Lit.pp) c.lits c.id
 
     (* canonical form: sorted list *)
     let make =
@@ -2120,7 +2120,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           let l, clauses = expand_cases c ty info in
           Log.debugf 2
             (fun k->k "(@[<1>expand_cst@ `@[%a:@,%a@]`@ :into (@[%a@])@ :depth %d@])"
-                Typed_cst.pp c Ty.pp ty (Utils.pp_list Term.pp) l depth);
+                Typed_cst.pp c Ty.pp ty (Util.pp_list Term.pp) l depth);
           info.cst_cases <- Lazy_some l;
           incr stat_num_cst_expanded;
           Clause.push_new_l clauses
@@ -2780,7 +2780,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       Log.debugf 4
         (fun k->k
             "(@[<hv1>@{<green>propagate_lit@}@ %a@ nf: %a@ clauses: (@[%a@])@])"
-            pp l pp (snd (Reduce.compute_nf l)) (Utils.pp_list Clause.pp) cs);
+            pp l pp (snd (Reduce.compute_nf l)) (Util.pp_list Clause.pp) cs);
       incr stat_num_propagations;
       Clause.push_new_l cs;
       ()
@@ -2794,7 +2794,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       Log.debugf 4
         (fun k->k
             "(@[<hv1>@{<green>conflict@}@ clauses: (@[%a@])@])"
-            (Utils.pp_list Clause.pp) cs);
+            (Util.pp_list Clause.pp) cs);
       incr stat_num_propagations;
       Clause.push_new_l cs;
       ()
@@ -2841,7 +2841,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
                 "(@[<1>update@ %a@ @[<1>:normal_form@ %a@]@ \
                  :deps (@[%a@])@ :exp @[<hv>%a@]@])"
                 Term.pp t Term.pp new_t
-                (Utils.pp_list pp_dep) new_t.term_deps
+                (Util.pp_list pp_dep) new_t.term_deps
                 Explanation.pp e);
           List.iter (expand_dep t) new_t.term_deps;
       end;
@@ -2966,10 +2966,10 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
                Format.fprintf out
                  "(@[<hv1>%a@ nf: %a@ exp: %a@ deps: (@[<hv>%a@])@])"
                  Term.pp l Term .pp nf Explanation.pp e
-                 (Utils.pp_list pp_dep) nf.term_deps
+                 (Util.pp_list pp_dep) nf.term_deps
              in
              k "(@[<hv1>status_watched_lit@ (@[<v>%a@])@])"
-               (Utils.pp_list pp_lit) !toplevel_goals_);
+               (Util.pp_list pp_lit) !toplevel_goals_);
         assert false;
       )
   end

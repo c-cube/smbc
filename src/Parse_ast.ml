@@ -103,13 +103,13 @@ let rec pp_ty out (ty:ty) = match ty with
   | Ty_bool -> CCFormat.string out "prop"
   | Ty_const s -> CCFormat.string out s
   | Ty_arrow (args,ret) ->
-    fpf out "(@[=>@ %a@ %a@])" (Utils.pp_list pp_ty) args pp_ty ret
+    fpf out "(@[=>@ %a@ %a@])" (Util.pp_list pp_ty) args pp_ty ret
 
 let rec pp_term out (t:term) = match t with
   | True -> CCFormat.string out "true"
   | False -> CCFormat.string out "false"
   | Const s -> CCFormat.string out s
-  | App (f,l) -> fpf out "(@[<1>%a@ %a@])" pp_term f (Utils.pp_list pp_term) l
+  | App (f,l) -> fpf out "(@[<1>%a@ %a@])" pp_term f (Util.pp_list pp_term) l
   | Match (lhs,cases) ->
     let pp_case out = function
       | Match_default rhs -> fpf out "(@[<2>case default@ %a@])" pp_term rhs
@@ -117,10 +117,10 @@ let rec pp_term out (t:term) = match t with
         fpf out "(@[<2>case %s@ %a@])" c pp_term rhs
       | Match_case (c,vars,rhs) ->
         fpf out "(@[<2>case@ (@[%s@ %a@])@ %a@])"
-          c (Utils.pp_list CCFormat.string) vars pp_term rhs
+          c (Util.pp_list CCFormat.string) vars pp_term rhs
     in
     fpf out "(@[<1>match %a@ (@[<hv>%a@])@])" pp_term lhs
-      (Utils.pp_list pp_case) cases
+      (Util.pp_list pp_case) cases
   | Let (v,t,u) -> fpf out "(@[<hv1>let %s@ %a@ %a@])" v pp_term t pp_term u
   | If (a,b,c) -> fpf out "(@[<hv1>ite %a@ %a@ %a@])" pp_term a pp_term b pp_term c
   | Fun (v,body) -> fpf out "(@[<1>lambda@ (%a)@ %a@])" pp_typed_var v pp_term body
@@ -129,8 +129,8 @@ let rec pp_term out (t:term) = match t with
   | Mu (v,body) -> fpf out "(@[<1>mu@ (%a)@ %a@])" pp_typed_var v pp_term body
   | Eq (a,b) -> fpf out "(@[=@ %a@ %a@])" pp_term a pp_term b
   | Imply (a,b) -> fpf out "(@[=>@ %a@ %a@])" pp_term a pp_term b
-  | And l -> fpf out "(@[<hv>and@ %a@])" (Utils.pp_list pp_term) l
-  | Or l -> fpf out "(@[<hv>or@ %a@])" (Utils.pp_list pp_term) l
+  | And l -> fpf out "(@[<hv>and@ %a@])" (Util.pp_list pp_term) l
+  | Or l -> fpf out "(@[<hv>or@ %a@])" (Util.pp_list pp_term) l
   | Not t -> fpf out "(not %a)" pp_term t
   | Asserting (t,g) -> fpf out "(@[:asserting@ %a@ %a@])" pp_term t pp_term g
 and pp_typed_var out (v,ty) =
@@ -141,7 +141,7 @@ let pp_stmt out (st:statement) = match view st with
   | Stmt_assert t -> fpf out "(@[assert@ %a@])" pp_term t
   | Stmt_goal {prove;vars;body=t} ->
     fpf out "(@[goal@ :prove %B (@[%a@])@ %a@])"
-      prove (Utils.pp_list pp_typed_var) vars pp_term t
+      prove (Util.pp_list pp_typed_var) vars pp_term t
   | Stmt_ty_decl s ->
     fpf out "(@[declare-sort@ %s 0@])" s
   | Stmt_decl (s, ty) ->
@@ -150,7 +150,7 @@ let pp_stmt out (st:statement) = match view st with
     let pp_def out (s,ty,rhs) =
       fpf out "(@[<1>%s@ %a@ %a@])" s pp_ty ty pp_term rhs
     in
-    fpf out "(@[<hv1>define@ %a@])" (Utils.pp_list pp_def) l
+    fpf out "(@[<hv1>define@ %a@])" (Util.pp_list pp_def) l
   | Stmt_data l ->
     let pp_arg out (name_opt,ty) = match name_opt with
       | None -> pp_ty out ty
@@ -158,12 +158,12 @@ let pp_stmt out (st:statement) = match view st with
     in
     let pp_cstor out (s,ty_args) =
       if ty_args=[] then CCFormat.string out s
-      else fpf out "(@[<1>%s@ %a@])" s (Utils.pp_list pp_arg) ty_args
+      else fpf out "(@[<1>%s@ %a@])" s (Util.pp_list pp_arg) ty_args
     in
     let pp_data out (s,cstors) =
-      fpf out "(@[<hv1>%s@ (@[<v>%a@]@])" s (Utils.pp_list pp_cstor) cstors
+      fpf out "(@[<hv1>%s@ (@[<v>%a@]@])" s (Util.pp_list pp_cstor) cstors
     in
-    fpf out "(@[<hv>data@ @[<v>%a@]@])" (Utils.pp_list pp_data) l
+    fpf out "(@[<hv>data@ @[<v>%a@]@])" (Util.pp_list pp_data) l
 
 (** {2 Conversion from {!Tip_ast}} *)
 

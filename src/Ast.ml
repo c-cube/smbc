@@ -766,7 +766,7 @@ and conv_term_aux ctx t : term = match t with
         if not @@ ID.Set.is_empty missing then (
           errorf_ctx ctx
             "missing cases in `@[%a@]`:@ {@[%a@]}"
-            A.pp_term t (Utils.pp_seq ID.pp) (ID.Set.to_seq missing);
+            A.pp_term t (Util.pp_seq ID.pp) (ID.Set.to_seq missing);
         );
         cases, None
       | Some def_rhs when ID.Set.cardinal missing > ID.Map.cardinal cases ->
