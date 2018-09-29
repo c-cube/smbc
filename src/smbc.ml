@@ -54,20 +54,20 @@ let solve ~config (ast:Ast.statement list) : unit =
   match res with
   | S.Sat m ->
     if is_prove then (
-      Format.printf "(@[<1>result @{<Yellow>COUNTERSAT@}@ :model @[%a@]@])@."
+      Format.printf "\r(@[<1>result @{<Yellow>COUNTERSAT@}@ :model @[%a@]@])@."
         (Model.pp_syn config.syntax) m;
     ) else (
-      Format.printf "(@[<1>result @{<Green>SAT@}@ :model @[%a@]@])@."
+      Format.printf "\r(@[<1>result @{<Green>SAT@}@ :model @[%a@]@])@."
         (Model.pp_syn config.syntax) m;
     )
   | S.Unsat ->
     if is_prove then (
-      Format.printf "(result @{<Green>THEOREM@})@."
+      Format.printf "\r(result @{<Green>THEOREM@})@."
     ) else (
-      Format.printf "(result @{<Yellow>UNSAT@})@."
+      Format.printf "\r(result @{<Yellow>UNSAT@})@."
     )
   | S.Unknown u  ->
-    Format.printf "(result @{<blue>UNKNOWN@} :reason %a)@." S.pp_unknown u
+    Format.printf "\r(result @{<blue>UNKNOWN@} :reason %a)@." S.pp_unknown u
 
 (** {2 Main} *)
 
