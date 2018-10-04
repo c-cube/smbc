@@ -21,6 +21,7 @@ type term =
   | Const of string
   | App of term * term list
   | Match of term * match_branch list
+  | Is_a of string * term
   | Let of var * term * term
   | If of term * term * term
   | Fun of typed_var * term
@@ -69,6 +70,7 @@ let app f l = match f, l with
   | App (f1, l1), _ -> App (f1, l1 @ l)
   | _ -> App (f, l)
 let match_ u l = Match (u,l)
+let is_a c t = Is_a(c,t)
 let let_ v t u = Let (v,t,u)
 let if_ a b c = If(a,b,c)
 let fun_ v t = Fun (v,t)
@@ -121,6 +123,7 @@ let rec pp_term out (t:term) = match t with
     in
     fpf out "(@[<1>match %a@ (@[<hv>%a@])@])" pp_term lhs
       (Util.pp_list pp_case) cases
+  | Is_a(c,t) -> fpf out "(@[is-%s@ %a@])" c pp_term t
   | Let (v,t,u) -> fpf out "(@[<hv1>let %s@ %a@ %a@])" v pp_term t pp_term u
   | If (a,b,c) -> fpf out "(@[<hv1>ite %a@ %a@ %a@])" pp_term a pp_term b pp_term c
   | Fun (v,body) -> fpf out "(@[<1>lambda@ (%a)@ %a@])" pp_typed_var v pp_term body
@@ -207,6 +210,9 @@ module Tip = struct
             l
         in
         match_ (aux lhs) l
+      | A.Is_a (c,t) ->
+        let t = aux t in
+        is_a c t
       | A.Fun (vars,body) -> fun_ (conv_typed_var vars) (aux body)
       | A.Or l -> or_ (List.map aux l)
       | A.And l -> and_ (List.map aux l)

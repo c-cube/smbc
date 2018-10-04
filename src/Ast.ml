@@ -433,6 +433,8 @@ let match_ t m ~default =
   CCOpt.iter (fun (_,rhs) -> check_ty "default" rhs) default;
   mk_ (Match (t,m,default)) rhs1.ty
 
+let match_l t l ~default = match_ t ~default (ID.Map.of_list l)
+
 let switch u m =
   try
     let _, t1 = ID.Map.choose m in
@@ -687,6 +689,19 @@ and conv_term_aux ctx t : term = match t with
       (fun var ->
          let u = conv_term ctx u in
          let_ var t u)
+  | A.Is_a (c,t) ->
+    (* transform into [match t with c _ -> true | default -> false] *)
+    let t = conv_term ctx t in
+    let c = find_id_ ctx c in
+    let all_cstors = Ctx.as_data ctx t.ty in
+    let missing = List.rev_map fst all_cstors |> ID.Set.of_list |> ID.Set.remove c in
+    begin match Ctx.find_kind ctx c with
+      | Ctx.K_cstor ty ->
+        let ty_args, _ = Ty.unfold ty in
+        let vars = List.mapi (fun i ty -> Var.makef ~ty "x_%d" i) ty_args in
+        match_l t [c, (vars,true_)] ~default:(Some (missing,false_))
+      | _ -> errorf "expected %a to be a constructor" ID.pp c
+    end
   | A.Mu ((x,ty), body) ->
     let ty, _ = conv_ty ctx ty in
     Ctx.with_var ctx x ty
@@ -741,8 +756,9 @@ and conv_term_aux ctx t : term = match t with
            | A.Match_case (c,vars,rhs) ->
              let c, vars, rhs = conv_case c vars rhs in
              (* no duplicate *)
-             if ID.Map.mem c cases
-             then errorf_ctx ctx "constructor %a occurs twice" ID.pp c;
+             if ID.Map.mem c cases then (
+               errorf_ctx ctx "constructor %a occurs twice" ID.pp c;
+             );
              def, ID.Map.add c (vars,rhs) cases
           | A.Match_default rhs ->
             (* check there is only one "default" case *)
