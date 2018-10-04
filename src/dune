@@ -1,0 +1,17 @@
+
+(rule
+  (targets const.ml)
+  (action
+    (with-stdout-to %{targets}
+      (echo "let version = \"%{version:smbc}\"\n")))
+  )
+
+; main binary
+(executable
+  (name smbc)
+  (public_name smbc)
+  (libraries containers containers.data containers.sexp sequence msat tip-parser unix)
+  (flags :standard -w +a-4-44-58-60@8 -color always -safe-string -warn-error -a+8)
+  (ocamlopt_flags :standard -O3 -color always
+                  -unbox-closures -unbox-closures-factor 20)
+  )

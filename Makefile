@@ -4,13 +4,13 @@ J?=3
 all: build
 
 build:
-	jbuilder build @install -j $J
+	@dune build @install -j $J
 
 install:
-	jbuilder install
+	@dune install
 
 clean:
-	jbuilder clean
+	@dune clean
 
 TESTOPTS ?= -j 3
 TESTTOOL=logitest
