@@ -1,0 +1,16 @@
+language: c
+install: wget https://raw.githubusercontent.com/ocaml/ocaml-ci-scripts/master/.travis-docker.sh
+script: bash -ex .travis-docker.sh
+services:
+- docker
+env:
+  global:
+  - PINS="smbc:."
+  - DISTRO="ubuntu-16.04"
+  matrix:
+    #- PACKAGE="logitest" OCAML_VERSION="4.02"
+  - PACKAGE="smbc" OCAML_VERSION="4.03"
+  - PACKAGE="smbc" OCAML_VERSION="4.04"
+  - PACKAGE="smbc" OCAML_VERSION="4.05"
+  - PACKAGE="smbc" OCAML_VERSION="4.06"
+

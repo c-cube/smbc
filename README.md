@@ -1,5 +1,8 @@
 # SMBC
 
+
+[![build status](https://travis-ci.org/c-cube/smbc.svg?branch=master "build status")](https://travis-ci.org/c-cube/smbc)
+
 Experimental model finder/SMT solver for functional programming.
 
 The underlying algorithm is described in [a 2016 paper](https://hal.inria.fr/hal-01572531).
