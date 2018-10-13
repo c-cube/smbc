@@ -370,10 +370,12 @@ let term_view t = t.term
 let rec app_ty_ ty l : Ty.t = match ty, l with
   | _, [] -> ty
   | Ty.Arrow (ty_a,ty_rest), a::tail ->
-    if Ty.equal ty_a a.ty
-    then app_ty_ ty_rest tail
-    else Ty.ill_typed "expected `@[%a@]`,@ got `@[%a : %a@]`"
+    if Ty.equal ty_a a.ty then (
+      app_ty_ ty_rest tail
+    ) else (
+      Ty.ill_typed "expected `@[%a@]`,@ got `@[%a : %a@]`"
         Ty.pp ty_a pp_term a Ty.pp a.ty
+    )
   | (Ty.Prop | Ty.Const _), a::_ ->
     Ty.ill_typed "cannot apply ty `@[%a@]`@ to `@[%a@]`" Ty.pp ty pp_term a
 
@@ -443,10 +445,11 @@ let switch u m =
     invalid_arg "Ast.switch: empty list of cases"
 
 let let_ v t u =
-  if not (Ty.equal (Var.ty v) t.ty)
-  then Ty.ill_typed
+  if not (Ty.equal (Var.ty v) t.ty) then (
+    Ty.ill_typed
       "let: variable %a : @[%a@]@ and bounded term : %a@ should have same type"
       Var.pp v Ty.pp (Var.ty v) Ty.pp t.ty;
+  );
   mk_ (Let (v,t,u)) u.ty
 
 let bind ~ty b v t = mk_ (Bind(b,v,t)) ty
@@ -468,9 +471,10 @@ let forall = quant_ (fun v t -> Bind (Forall,v,t))
 let exists = quant_ (fun v t -> Bind (Exists,v,t))
 
 let mu v t =
-  if not (Ty.equal (Var.ty v) t.ty)
-  then Ty.ill_typed "mu-term: var has type %a,@ body %a"
+  if not (Ty.equal (Var.ty v) t.ty) then (
+    Ty.ill_typed "mu-term: var has type %a,@ body %a"
       Ty.pp (Var.ty v) Ty.pp t.ty;
+  );
   let ty = Ty.arrow (Var.ty v) t.ty in
   mk_ (Bind (Fun,v,t)) ty
 
@@ -480,14 +484,16 @@ let forall_l = List.fold_right forall
 let exists_l = List.fold_right exists
 
 let eq a b =
-  if not (Ty.equal a.ty b.ty)
-  then Ty.ill_typed "eq: `@[%a@]` and `@[%a@]` do not have the same type"
+  if not (Ty.equal a.ty b.ty) then (
+    Ty.ill_typed "eq: `@[%a@]` and `@[%a@]` do not have the same type"
       pp_term a pp_term b;
+  );
   mk_ (Binop (Eq,a,b)) Ty.prop
 
 let check_prop_ t =
-  if not (Ty.equal t.ty Ty.prop)
-  then Ty.ill_typed "expected prop, got `@[%a : %a@]`" pp_term t Ty.pp t.ty
+  if not (Ty.equal t.ty Ty.prop) then (
+    Ty.ill_typed "expected prop, got `@[%a : %a@]`" pp_term t Ty.pp t.ty
+  )
 
 let binop op a b = mk_ (Binop (op, a, b)) Ty.prop
 let binop_prop op a b =
