@@ -3691,7 +3691,12 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     let domains =
       Ty.Tbl.to_seq doms
       |> Sequence.map
-        (fun (ty,dom) -> Conv.ty_to_ast ty, List.map Typed_cst.id dom)
+        (fun (ty,dom) ->
+           let dom = match dom with
+             | [] -> [ID.make (Printf.sprintf "$%s_0" (Ty.mangle ty))]
+             | l -> List.map Typed_cst.id l
+           in
+           Conv.ty_to_ast ty, dom)
       |> Ast.Ty.Map.of_seq
     in
     Model.make ~env ~consts ~domains
