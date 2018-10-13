@@ -2,6 +2,10 @@
 
 Experimental model finder/SMT solver for functional programming.
 
+The underlying algorithm is described in [a 2016 paper](https://hal.inria.fr/hal-01572531).
+
+The code is under the BSD license.
+
 ## Use
 
 - run on a problem (timeout 30s)
@@ -48,7 +52,7 @@ make
 
 We show a few example input files for smbc, along with the result.
 
-### `examples/append.smt2`
+### examples/append.smt2
 
 A wrong conjecture stating that `append l1 l2 = append l2 l1`
 holds for every lists `l1` and `l2`.
@@ -81,7 +85,7 @@ $ smbc examples/append.smt2
                     (val l1 (cons (s ?nat_8) nil))))
 ```
 
-### `examples/pigeon4.smt2`
+### examples/pigeon4.smt2
 
 An instance of the classic
 [pigeon-hole problem](https://en.wikipedia.org/wiki/Pigeonhole_principle)
