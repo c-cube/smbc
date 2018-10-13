@@ -1,71 +1,59 @@
-= SMBC
-:toc: macro
-:toclevels: 4
-:source-highlighter: pygments
+# SMBC
 
 Experimental model finder/SMT solver for functional programming.
 
-== Use
+## Use
 
-run on a problem (timeout 30s)::
-+
-----
-smbc examples/regex_2.smt2 -t 30
-----
-+
-get a list of options::
-+
-----
-smbc --help
-----
-+
-verbose mode::
-+
-----
-smbc examples/regex_0.smt2 --debug 2
-----
-+
-specify depth/depth-step::
-+
-----
-smbc examples/regex_0.smt2 --depth-step 3 --max-depth 200
-----
+- run on a problem (timeout 30s)
 
+  ```
+  smbc examples/regex_2.smt2 -t 30
+  ```
 
-== Build
+- get a list of options:
 
-The recommended way is to use http://opam.ocaml.org/[opam].
+  ```
+  smbc --help
+  ```
 
-----
-opam pin add smbc 'https://github.com/c-cube/smbc.git#master'
+- verbose mode:
+
+  ```
+  smbc examples/regex_0.smt2 --debug 2
+  ```
+
+- specify depth/depth-step:
+
+  ```
+  smbc examples/regex_0.smt2 --depth-step 3 --max-depth 200
+  ```
+
+## Build
+
+The recommended way is to use [opam](http://opam.ocaml.org/)
+
+```sh
+opam pin 'https://github.com/c-cube/smbc.git#master'
 opam install smbc
-----
+```
 
 Or manually, using
 
-----
+```sh
 opam install msat containers sequence tip-parser
 make
-----
+```
 
-=== Memory Profiling
-
-----
-opam sw 4.04.0+spacetime
-make
-OCAML_SPACETIME_INTERVAL=100 ./smbc.native --debug 1 --check examples/ty_infer.lisp
-prof_spacetime serve spacetime-<PID> -e smbc.native
-----
-
-== A Few Examples
+## A Few Examples
 
 We show a few example input files for smbc, along with the result.
 
-examples/append.smt::
+### `examples/append.smt2`
+
 A wrong conjecture stating that `append l1 l2 = append l2 l1`
 holds for every lists `l1` and `l2`.
-+
-----
+
+```smt2
 (declare-datatypes ()
  ((nat (s (select_s_0 nat)) (z))))
 (declare-datatypes
@@ -80,25 +68,26 @@ holds for every lists `l1` and `l2`.
  (forall ((l1 list) (l2 list)) (= (append l1 l2) (append l2 l1))))
 
 (check-sat)
-----
-+
+```
+
 Running smbc gives us a counter-example, the lists `l1 = [s _]` and `l2 = [0]`.
 Note that `l1` is not fully defined, the `?nat_8` object is an unknown
 that can take any value of type `nat`. Whatever its value is,
 the counter-example holds because `append l1 l2 != append l2 l1`.
-+
-----
+
+```
 $ smbc examples/append.smt2
 (result SAT :model ((val l2 (cons z nil))
                     (val l1 (cons (s ?nat_8) nil))))
-----
+```
 
-examples/pigeon4.smt::
-The instance of the classic
-https://en.wikipedia.org/wiki/Pigeonhole_principle[pigeon-hole problem]
+### `examples/pigeon4.smt2`
+
+An instance of the classic
+[pigeon-hole problem](https://en.wikipedia.org/wiki/Pigeonhole_principle)
 with 4 holes and 5 pigeons
-+
-----
+
+```smt2
 (declare-sort hole 0)
 (declare-fun h1 () hole)
 (declare-fun h2 () hole)
@@ -126,16 +115,23 @@ with 4 holes and 5 pigeons
 (assert
   (forall ((p hole)) (or (= p h1) (= p h2) (= p h3) (= p h4))))
 (check-sat)
-----
-+
+```
+
 We obtain `(result UNSAT)` since there is no way of satisfying
 the constraints.
 
-
-== Why the name?
+## Why the name?
 
 "Sat Modulo Bounded Checking"
 
-(and a reference to http://smbc-comics.com[the awesome webcomics])
+(and a reference to [the awesome webcomics](http://smbc-comics.com))
 
 
+## Note: Memory Profiling
+
+```sh
+opam sw 4.04.0+spacetime
+make
+OCAML_SPACETIME_INTERVAL=100 ./smbc.native --debug 1 --check examples/ty_infer.lisp
+prof_spacetime serve spacetime-<PID> -e smbc.native
+```
