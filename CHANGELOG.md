@@ -1,5 +1,27 @@
 # Change Log
 
+
+## 0.5
+
+- fix(model): add a constant to unin types with empty domains
+- adapt to tip-parser 0.5
+- handle new `Stmt_prove` from TIP
+- cleaner display of result in presence of progress bar
+- add `default` case in match (makes smaller terms)
+- display `theorem/countersat` if the goal is a `prove` goal
+
+- refactor a bit AST
+- add travis support
+- modernize metatada: opam2 and dune
+
+## 0.4.2
+
+- support containers 2.0
+- move to jbuilder
+- small optims
+- add option `--eval-under-quant`
+- more stats
+
 ## 0.4.1
 
 - bugfix related to De Bruijn indices and function extensionality

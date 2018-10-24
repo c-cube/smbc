@@ -3,6 +3,7 @@ version: "0.5"
 maintainer: "simon.cruanes.2007@m4x.org"
 author: "Simon Cruanes"
 homepage: "https://github.com/c-cube/smbc"
+synopsis: "Experimental model finder/SMT solver for functional programming"
 build: [
   ["dune" "build" "@install"]
 ]
