@@ -10,20 +10,20 @@
    ()
    ((form_1
        (~_1 (select_~_1_0 form_1)) 
-       (|_1 (select_|_1_0 form_1) (select_|_1_1 form_1)) 
+       (or__1 (select_or_1_0 form_1) (select_or_1_1 form_1)) 
        (&_1 (select_&_1_0 form_1) (select_&_1_1 form_1)) 
        (at_1 (select_at_1_0 atom_1)))))
 (define-funs-rec
    ((eval_1 ((v_1 (=> atom_1 Bool)) (e_1 form_1)) Bool))
    ((match e_1
       (case (~_1 a_6) (not (eval_1 v_1 a_6))) 
-      (case (|_1 a_7 b_4) (or (eval_1 v_1 a_7) (eval_1 v_1 b_4))) 
+      (case (or__1 a_7 b_4) (or (eval_1 v_1 a_7) (eval_1 v_1 b_4))) 
       (case (&_1 a_8 b_5) (and (eval_1 v_1 a_8) (eval_1 v_1 b_5))) 
       (case (at_1 a_9) (v_1 a_9)))))
 ; (not (a & (b | c))) | (not c & not d)
 (define-funs-rec
    ((f1_1 () form_1))
-   ((|_1 (~_1 (&_1 (at_1 a_5) (|_1 (at_1 b_3) (at_1 c_1)))) 
+   ((or__1 (~_1 (&_1 (at_1 a_5) (or__1 (at_1 b_3) (at_1 c_1)))) 
       (&_1 (~_1 (at_1 c_1)) (~_1 (at_1 d_1))))))
 (define-funs-rec
    ((v1_1 ((x_1 atom_1)) Bool))

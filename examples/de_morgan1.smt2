@@ -12,25 +12,25 @@
    ()
    ((form
        (~ (select_~_0 form)) 
-       (| (select_|_0 form) (select_|_1 form)) 
+       (or_ (select_or_0 form) (select_or_1 form)) 
        (& (select_&_0 form) (select_&_1 form)) 
        (at (select_at_0 atom)))))
 (define-funs-rec
    ((eval ((v (=> atom Bool)) (e form)) Bool))
    ((match e
       (case (~ a_1) (not (eval v a_1))) 
-      (case (| a_2 b_1) (or (eval v a_2) (eval v b_1))) 
+      (case (or_ a_2 b_1) (or (eval v a_2) (eval v b_1))) 
       (case (& a_3 b_2) (and (eval v a_3) (eval v b_2))) 
       (case (at a_4) (v a_4)))))
 ; (not (a & (b | c))) | (not c & not d)
 (define-funs-rec
    ((f1 () form))
-   ((| (~ (& (at a) (| (at b) (at c)))) (& (~ (at c)) (~ (at d))))))
+   ((or_ (~ (& (at a) (or_ (at b) (at c)))) (& (~ (at c)) (~ (at d))))))
 ; ((not a | not b) & (not a | not c)) | (not (c | d))
 (define-funs-rec
    ((f2 () form))
-   ((| (& (| (~ (at a)) (~ (at b))) (| (~ (at a)) (~ (at c)))) 
-      (~ (| (at c) (at d))))))
+   ((or_ (& (or_ (~ (at a)) (~ (at b))) (or_ (~ (at a)) (~ (at c)))) 
+      (~ (or_ (at c) (at d))))))
 ; valuation
 (define-funs-rec
    ((v1 ((x atom)) Bool))

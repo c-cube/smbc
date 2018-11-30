@@ -16,10 +16,10 @@
    intrel ((prod_0 prod) (prod_1 prod)) Bool
      (@
        (match prod_0
-         (case (Pair _ __0)
+         (case (Pair x __0)
             (lambda  ((uu2 prod))
               (match uu2
-                (case (Pair __1 __2) (= (plus __1 __2) (plus _ __0)))))))
+                (case (Pair __1 __2) (= (plus __1 __2) (plus x __0)))))))
        prod_1))
 (assert (forall ((a_0 int)) (intrel (RepInteg a_0) (RepInteg a_0))))
 (define-fun-rec

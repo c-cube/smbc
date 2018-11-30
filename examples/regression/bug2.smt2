@@ -18,9 +18,9 @@
 (define-fun-rec
    zip ((xs_0 list) (ys_0 list)) plist
      (match xs_0
-       (case (Cons _ __1)
+       (case (Cons x __1)
           (match ys_0
-            (case (Cons __0 __2) (PCons (Pair _ __0) (zip __1 __2))) 
+            (case (Cons __0 __2) (PCons (Pair x __0) (zip __1 __2))) 
             (case Nil PNil))) 
        (case Nil PNil)))
 (define-fun-rec
