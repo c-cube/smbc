@@ -4,7 +4,7 @@ J?=3
 all: build
 
 build:
-	@dune build @install -j $J
+	@dune build @install -j $J --profile=release
 
 install:
 	@dune install
