@@ -6,8 +6,6 @@ let get_time : unit -> float =
   fun () ->
     Unix.gettimeofday() -. start
 
-module FI = Msat.Formula_intf
-module TI = Msat.Theory_intf
 module SI = Msat.Solver_intf
 
 (** {1 Solver} *)
@@ -564,8 +562,6 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
   module Backtrack = struct
     type _level = level
     type level = _level
-
-    let dummy_level = -1
 
     type undo_op = unit -> unit
 
@@ -1376,7 +1372,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     val equal : t -> t -> bool
     val print : t CCFormat.printer
     val pp : t CCFormat.printer
-    val norm : t -> t * FI.negated
+    val norm : t -> t * SI.negated
     module Set : CCSet.S with type elt = t
   end = struct
     type t = lit
@@ -1423,7 +1419,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     let print = pp
 
     let norm l =
-      if l.lit_sign then l, FI.Same_sign else neg l, FI.Negated
+      if l.lit_sign then l, SI.Same_sign else neg l, SI.Negated
 
     module Set = CCSet.Make(struct type t = lit let compare=compare end)
   end
@@ -2864,8 +2860,6 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         update lit;
       )
 
-    let to_seq yield = List.iter yield !top_
-
     let size () = List.length !top_
 
     (* is the dependency updated, i.e. decided by the SAT solver? *)
@@ -2890,16 +2884,6 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
   end
 
   (** {2 Sat Solver} *)
-
-  (* formulas for msat *)
-  module M_expr
-    : Msat.Formula_intf.S
-      with type t = Lit.t
-       and type proof = unit
-  = struct
-    include Lit
-    type proof = unit (* TODO later *)
-  end
 
   let print_progress () : unit =
     Printf.printf "\r[%.2f] depth %d | expanded %d | clauses %d | lemmas %d | lits %d%!"
@@ -2977,16 +2961,16 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
   (* the "theory" part: propagations *)
   module M_th : sig
     val set_active: bool -> unit
-    include Msat.Theory_intf.S
-      with type formula = M_expr.t
-       and type proof = M_expr.proof
+    include Msat.PLUGIN_CDCL_T
+      with module Formula = Lit
+       and type proof = unit
+       and type t = unit
   end = struct
-    type formula = M_expr.t
-    type proof = M_expr.proof
+    module Formula = Lit
+    type t = unit (* TODO make it less stateful *)
+    type proof = unit
 
     type level = Backtrack.level
-
-    let dummy = Backtrack.dummy_level
 
     (* if true, perform theory propagation; otherwise do nothing *)
     let active = ref true
@@ -2997,7 +2981,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       Backtrack.push_level ();
       Backtrack.cur_level ()
 
-    let backtrack = Backtrack.backtrack
+    let[@inline] backtrack () lvl = Backtrack.backtrack lvl
 
     (* push clauses from {!lemma_queue} into the slice *)
     let flush_new_clauses_into_slice slice =
@@ -3005,7 +2989,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         let c = Queue.pop Clause.lemma_queue in
         Log.debugf 5 (fun k->k "(@[<2>push_lemma@ %a@])" Clause.pp c);
         let lits = Clause.lits c in
-        slice.TI.push lits ();
+        slice.SI.push lits ();
       done
 
     (* assert [c := new_t] (which is, [lit]), or conflict *)
@@ -3084,29 +3068,31 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       end
 
     (* propagation from the bool solver *)
-    let assume slice =
-      let start = slice.TI.start in
-      assert (slice.TI.length > 0);
+    let assume (_:t) slice =
+      let start = slice.SI.start in
+      assert (slice.SI.length > 0);
       (* do the propagations in a local frame *)
       if Config.progress then print_progress();
       (* first, empty the tautology queue *)
       flush_new_clauses_into_slice slice;
-      for i = start to start + slice.TI.length - 1 do
-        let lit = slice.TI.get i in
-        assume_lit lit;
+      for i = start to start + slice.SI.length - 1 do
+        match slice.SI.get i with
+        | SI.Lit lit -> assume_lit lit
+        | SI.Assign (_, _) -> ()
       done;
       if !active then (
         Top_terms.update_all ();
       );
       flush_new_clauses_into_slice slice;
-      TI.Sat
+      SI.Th_sat
 
-    let if_sat _slice =
+    let if_sat _ _slice =
       Log.debugf 3 (fun k->k "(if-sat)");
-      TI.Sat
+      SI.Th_sat
   end
 
-  module M = Msat.Solver.Make(M_expr)(M_th)(struct end)
+  module M = Msat.Make_cdcl_t(M_th)
+  let msat = M.create ~size:`Big ()
 
   (* push one clause into [M], in the current level (not a lemma but
      an axiom) *)
@@ -3121,7 +3107,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       |> Sequence.iter Top_terms.add
     end;
     incr stat_num_clause_push;
-    M.assume [Clause.lits c]
+    M.assume msat [Clause.lits c]
 
   (** {2 Conversion} *)
 
@@ -3705,8 +3691,8 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     Log.debugf 1 (fun k->k "checking model…");
     Top_goals.check()
 
-  let clause_of_mclause (c:M.St.clause): Clause.t =
-    M.Proof.to_list c |> List.map (fun a -> a.M.St.lit) |> Clause.make
+  let clause_of_mclause (c:M.Clause.t): Clause.t =
+    M.Clause.atoms_l c |> List.map M.Atom.formula |> Clause.make
 
   let pp_stats out () : unit =
     Format.fprintf out
@@ -3781,7 +3767,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       M_th.set_active false; (* no propagation, just check the boolean formula *)
       CCFun.finally
         ~h:(fun () -> M_th.set_active true)
-        ~f:(fun () -> M.solve ~assumptions:[quant_lit] ())
+        ~f:(fun () -> M.solve ~assumptions:[quant_lit] msat ())
     in
     begin match sat_res with
       | M.Sat _ ->
@@ -3806,14 +3792,18 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     | None -> ()
     | Some file ->
       Log.debugf 2 (fun k->k "dump SAT problem into file `%s`" file);
+      assert false
+        (* TODO
       CCIO.with_out file
         (fun oc ->
            let out = Format.formatter_of_out_channel oc in
            Format.fprintf out "@[<v>%a@]@." M.export_dimacs ())
+           *)
 
   let solve ?(on_exit=[]) ?(check=true) () =
     let on_exit = dump_dimacs :: on_exit in
-    Msat.Log.set_debug_out Format.std_formatter; Msat.Log.set_debug 50;
+    Msat.Log.set_debug_out Format.std_formatter;
+    (* Msat.Log.set_debug 50; *)
     let module ID = Iterative_deepening in
     (* iterated deepening *)
     let rec iter state q_depth = match state with
@@ -3825,9 +3815,9 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           (fun k->k "@{<Yellow>start solving@} at depth %a, quant-depth %d"
               ID.pp cur_depth q_depth);
         (* restrict unfolding of quantifiers *)
-        let q_lit = Lit.quant_unroll q_depth in
+        let q_lit = M.make_atom msat @@ Lit.quant_unroll q_depth in
         has_met_undefined := None; (* reset this *)
-        match M.solve ~assumptions:[depth_lit; q_lit] () with
+        match M.solve ~assumptions:[M.make_atom msat depth_lit; q_lit] msat () with
           | M.Sat _ ->
             let m = compute_model_ () in
             Log.debugf 1
