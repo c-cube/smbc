@@ -21,11 +21,7 @@ test: build
 	  --meta `git rev-parse HEAD` --summary snapshots/`date -I`.txt
 
 watch:
-	while find src/ -print0 | xargs -0 inotifywait -e delete_self -e modify ; do \
-		echo "============ at `date` ==========" ; \
-		sleep 0.1; \
-		make all; \
-	done
+	@dune build -w
 
 PERF_CONF = test_perf.toml
 perf_compare: build $(PERF_CONF)
