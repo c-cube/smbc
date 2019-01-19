@@ -33,7 +33,7 @@ version = "git:."
 
 [test]
 
-timeout=30
+timeout=10
 problems = ".*.smt2"
 provers = [ "smbc-1", "smbc-5", "smbc-30" ]
 dir = [ "examples" ]
