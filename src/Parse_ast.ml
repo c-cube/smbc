@@ -313,7 +313,9 @@ module Tip = struct
           A.pp_stmt st
       | A.Stmt_lemma _ ->
         tip_error ?loc "smbc does not know how to handle `lemma` statements"
-      | A.Stmt_check_sat -> None
+      | A.Stmt_set_info _ | A.Stmt_set_logic _
+      | A.Stmt_check_sat | A.Stmt_exit
+        -> None
 end
 
 (** {2 Errors} *)
