@@ -2970,16 +2970,13 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     type t = unit (* TODO make it less stateful *)
     type proof = unit
 
-    type level = Backtrack.level
-
     (* if true, perform theory propagation; otherwise do nothing *)
     let active = ref true
     let set_active b = active := b
 
-    (* increment and return level *)
-    let current_level () =
-      Backtrack.push_level ();
-      Backtrack.cur_level ()
+    let push_level = Backtrack.push_level
+    let n_levels = Backtrack.cur_level
+    let pop_levels n = Backtrack.backtrack (Backtrack.cur_level() - n)
 
     let[@inline] backtrack () lvl = Backtrack.backtrack lvl
 
@@ -3068,27 +3065,24 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       end
 
     (* propagation from the bool solver *)
-    let assume (_:t) slice =
-      let start = slice.SI.start in
-      assert (slice.SI.length > 0);
+    let partial_check (_:t) acts =
       (* do the propagations in a local frame *)
       if Config.progress then print_progress();
       (* first, empty the tautology queue *)
-      flush_new_clauses_into_slice slice;
-      for i = start to start + slice.SI.length - 1 do
-        match slice.SI.get i with
+      flush_new_clauses_into_slice acts;
+      acts.SI.acts_iter_assumptions
+        (function
         | SI.Lit lit -> assume_lit lit
-        | SI.Assign (_, _) -> ()
-      done;
+        | SI.Assign (_, _) -> ());
       if !active then (
         Top_terms.update_all ();
       );
-      flush_new_clauses_into_slice slice;
-      SI.Th_sat
+      flush_new_clauses_into_slice acts;
+      ()
 
-    let if_sat _ _slice =
-      Log.debugf 3 (fun k->k "(if-sat)");
-      SI.Th_sat
+    let final_check _ _acts =
+      Log.debugf 3 (fun k->k "(final-check)");
+      ()
   end
 
   module M = Msat.Make_cdcl_t(M_th)
