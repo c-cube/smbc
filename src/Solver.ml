@@ -1,4 +1,3 @@
-
 (* This file is free software. See file "license" for more details. *)
 
 let get_time : unit -> float =
@@ -560,33 +559,39 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     | QR_bool -> CCFormat.string out "bool"
 
   module Backtrack = struct
-    type _level = level
-    type level = _level
-
+    type nonrec level = level
     type undo_op = unit -> unit
-
-    type stack = undo_op CCVector.vector
+    type t = {
+      ops: undo_op CCVector.vector;
+      levels: int CCVector.vector;
+    }
 
     (* the global stack *)
-    let st_ : stack = CCVector.create()
+    let st_ : t = { ops=CCVector.create(); levels=CCVector.create() }
 
-    let backtrack (l:level): unit =
-      Log.debugf 2
-        (fun k->k "@{<Yellow>** now at level %d (backtrack)@}" l);
-      while CCVector.length st_ > l do
-        let f = CCVector.pop_exn st_ in
+    let[@inline] cur_level () = CCVector.length st_.levels
+
+    let backtrack (n:int): unit =
+      let new_lvl = cur_level () - n in
+      let offset = CCVector.get st_.levels new_lvl in
+      while CCVector.length st_.ops > offset do
+        let f = CCVector.pop_exn st_.ops in
         f ();
       done;
+      CCVector.shrink st_.levels new_lvl;
+      Log.debugf 2
+        (fun k->k "@{<Yellow>** now at level %d (backtrack)@}" (cur_level()));
       ()
-
-    let cur_level () = CCVector.length st_
 
     let push_level () : unit =
-      let l = cur_level() in
-      Log.debugf 2 (fun k->k "@{<Yellow>** now at level %d (push)@}" l);
+      CCVector.push st_.levels (CCVector.length st_.ops);
+      Log.debugf 2 (fun k->k "@{<Yellow>** now at level %d (push)@}" (cur_level()));
       ()
 
-    let push (f:undo_op) : unit = CCVector.push st_ f
+    let[@inline] push (f:undo_op) : unit =
+      if not (CCVector.is_empty st_.levels) then (
+        CCVector.push st_.ops f
+      );
   end
 
   let new_switch_id_ =
@@ -2976,9 +2981,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
 
     let push_level = Backtrack.push_level
     let n_levels = Backtrack.cur_level
-    let pop_levels n = Backtrack.backtrack (Backtrack.cur_level() - n)
-
-    let[@inline] backtrack () lvl = Backtrack.backtrack lvl
+    let pop_levels () n = Backtrack.backtrack n
 
     (* push clauses from {!lemma_queue} into the slice *)
     let flush_new_clauses_into_slice slice =
@@ -2986,7 +2989,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         let c = Queue.pop Clause.lemma_queue in
         Log.debugf 5 (fun k->k "(@[<2>push_lemma@ %a@])" Clause.pp c);
         let lits = Clause.lits c in
-        slice.SI.push lits ();
+        slice.SI.acts_add_clause lits ();
       done
 
     (* assert [c := new_t] (which is, [lit]), or conflict *)
@@ -3101,7 +3104,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       |> Sequence.iter Top_terms.add
     end;
     incr stat_num_clause_push;
-    M.assume msat [Clause.lits c]
+    M.assume msat [Clause.lits c] ()
 
   (** {2 Conversion} *)
 
@@ -3725,9 +3728,9 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     in
     let pp_step out = function
       | M.Proof.Lemma () -> Format.fprintf out "(@[<1>lemma@ ()@])"
-      | M.Proof.Resolution (p1, p2, _) ->
-        Format.fprintf out "(@[<1>resolution@ %a@ %a@])"
-          pp_step_res p1 pp_step_res p2
+      | M.Proof.Hyper_res {M.Proof.hr_init=p1; hr_steps} ->
+        Format.fprintf out "(@[<1>hyper-res@ %a@])"
+          (CCFormat.list pp_step_res) (p1 :: List.map snd hr_steps)
       | _ -> CCFormat.string out "<other>"
     in
     Format.fprintf out "(@[<v>";
@@ -3761,7 +3764,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       M_th.set_active false; (* no propagation, just check the boolean formula *)
       CCFun.finally
         ~h:(fun () -> M_th.set_active true)
-        ~f:(fun () -> M.solve ~assumptions:[quant_lit] msat ())
+        ~f:(fun () -> M.solve ~assumptions:[quant_lit] msat)
     in
     begin match sat_res with
       | M.Sat _ ->
@@ -3811,7 +3814,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         (* restrict unfolding of quantifiers *)
         let q_lit = M.make_atom msat @@ Lit.quant_unroll q_depth in
         has_met_undefined := None; (* reset this *)
-        match M.solve ~assumptions:[M.make_atom msat depth_lit; q_lit] msat () with
+        match M.solve ~assumptions:[M.make_atom msat depth_lit; q_lit] msat with
           | M.Sat _ ->
             let m = compute_model_ () in
             Log.debugf 1
