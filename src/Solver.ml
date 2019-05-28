@@ -2989,7 +2989,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         let c = Queue.pop Clause.lemma_queue in
         Log.debugf 5 (fun k->k "(@[<2>push_lemma@ %a@])" Clause.pp c);
         let lits = Clause.lits c in
-        slice.SI.acts_add_clause lits ();
+        slice.SI.acts_add_clause ~keep:true lits ();
       done
 
     (* assert [c := new_t] (which is, [lit]), or conflict *)
