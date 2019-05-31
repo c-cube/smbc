@@ -1,5 +1,12 @@
 # Change Log
 
+## 0.6
+
+- upgrade to msat 0.8
+- upgrade to tip-parser 0.6
+- remove some dead code
+- make tests faster (timeout=10)
+- use release mode
 
 ## 0.5
 
