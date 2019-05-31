@@ -1012,7 +1012,7 @@ let env_add_statement env st =
     | Assert _ -> env
 
 let env_of_statements seq =
-  Sequence.fold env_add_statement env_empty seq
+  Iter.fold env_add_statement env_empty seq
 
 let env_find_def env id =
   try Some (ID.Map.find id env.defs)

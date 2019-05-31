@@ -8,7 +8,7 @@ end
 
 module Make(A : ARG): sig
   val hashcons : A.t -> A.t
-  val to_seq : A.t Sequence.t
+  val to_seq : A.t Iter.t
 end = struct
   module W = Weak.Make(A)
 

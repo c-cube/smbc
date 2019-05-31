@@ -47,7 +47,7 @@ opam install smbc
 Or manually, using
 
 ```sh
-opam install msat containers sequence tip-parser
+opam install msat containers iter tip-parser
 make
 ```
 

@@ -1033,7 +1033,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       in
       aux 0 t
 
-    let to_seq t : t Sequence.t = to_seq_depth t |> Sequence.map fst
+    let to_seq t : t Iter.t = to_seq_depth t |> Iter.map fst
 
     (* return [Some] iff the term is an undefined constant *)
     let as_cst_undef (t:term):
@@ -1435,25 +1435,25 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       | _, E_empty -> s1
       | _ -> E_append (s1, s2)
 
-    let to_lists e: lit list Sequence.t =
-      let open Sequence.Infix in
+    let to_lists e: lit list Iter.t =
+      let open Iter.Infix in
       let rec aux acc = function
-        | E_empty -> Sequence.return acc
-        | E_leaf x -> Sequence.return (x::acc)
+        | E_empty -> Iter.return acc
+        | E_leaf x -> Iter.return (x::acc)
         | E_append (a,b) ->
           aux acc a >>= fun acc ->
           aux acc b
         | E_or (a,b) ->
-          Sequence.append (aux acc a)(aux acc b)
+          Iter.append (aux acc a)(aux acc b)
       in
       aux [] e
 
     let to_lists_uniq e =
       let f l = Lit.Set.of_list l |> Lit.Set.to_list in
-      to_lists e |> Sequence.map f
+      to_lists e |> Iter.map f
 
     let to_lists_uniq_l e =
-      to_lists_uniq e |> Sequence.to_rev_list
+      to_lists_uniq e |> Iter.to_rev_list
 
     let pp out e =
       let pp1 out l =
@@ -1480,7 +1480,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     val lemma_queue : t Queue.t
     val push_new : t -> unit
     val push_new_l : t list -> unit
-    val to_seq : t -> Lit.t Sequence.t
+    val to_seq : t -> Lit.t Iter.t
     val pp : t CCFormat.printer
   end = struct
     type t = {
@@ -1541,7 +1541,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
 
     let push_new_l = List.iter push_new
 
-    let to_seq c = Sequence.of_list c.lits
+    let to_seq c = Iter.of_list c.lits
   end
 
   (** {2 Iterative Deepening} *)
@@ -1754,7 +1754,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
 
     let depth_of_term (t:term): int option =
       Term.to_seq t
-      |> Sequence.filter_map
+      |> Iter.filter_map
         (fun sub -> match sub.term_cell with
            | Const {cst_kind=Cst_undef (info,_); _} -> Some info.cst_depth
            | Switch (_,{switch_cst={cst_kind=Cst_undef (info,_); _}; _}) ->
@@ -1763,7 +1763,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
                 exist already *)
              Some (info.cst_depth + 1)
            | _ -> None)
-      |> Sequence.max ~lt:(fun a b ->a<b)
+      |> Iter.max ~lt:(fun a b ->a<b)
 
     (* build clause(s) that explains that [c] must be one of its
        cases *)
@@ -2142,9 +2142,9 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
   (* for each explanation [e1, e2, ..., en] build the guard
          [e1 & e2 & ... & en => …], that is, the clause
          [not e1 | not e2 | ... | not en] *)
-  let clause_guard_of_exp_ (e:explanation): Lit.t list Sequence.t =
+  let clause_guard_of_exp_ (e:explanation): Lit.t list Iter.t =
     let l = Explanation.to_lists e in
-    Sequence.map
+    Iter.map
       (fun e ->
          List.map Lit.neg e (* this is a guard! *)
          |> CCList.sort_uniq ~cmp:Lit.compare)
@@ -2764,13 +2764,13 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     let pp out term = Term.pp out term
 
     (* clauses for [e => l] *)
-    let clause_imply (l:lit) (e:explanation): Clause.t Sequence.t =
+    let clause_imply (l:lit) (e:explanation): Clause.t Iter.t =
       clause_guard_of_exp_ e
-      |> Sequence.map
+      |> Iter.map
         (fun guard -> l :: guard |> Clause.make)
 
     let propagate_lit_ (l:term) (e:explanation): unit =
-      let cs = clause_imply (to_lit l) e |> Sequence.to_rev_list in
+      let cs = clause_imply (to_lit l) e |> Iter.to_rev_list in
       Log.debugf 4
         (fun k->k
             "(@[<hv1>@{<green>propagate_lit@}@ %a@ nf: %a@ clauses: (@[%a@])@])"
@@ -2782,8 +2782,8 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     let trigger_conflict (e:explanation): unit =
       let cs =
         clause_guard_of_exp_ e
-        |> Sequence.map Clause.make
-        |> Sequence.to_rev_list
+        |> Iter.map Clause.make
+        |> Iter.to_rev_list
       in
       Log.debugf 4
         (fun k->k
@@ -3023,10 +3023,10 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     let trigger_conflict (lit:lit) (e:explanation): unit =
       let cs =
         clause_guard_of_exp_ e
-        |> Sequence.map
+        |> Iter.map
           (fun guard -> Lit.neg lit :: guard |> Clause.make)
       in
-      Sequence.iter Clause.push_new cs
+      Iter.iter Clause.push_new cs
 
     (* handle a literal assumed by the SAT solver *)
     let assume_lit (lit:Lit.t) : unit =
@@ -3091,9 +3091,9 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
          are added to the proper constant watchlist(s) *)
     begin
       Clause.to_seq c
-      |> Sequence.filter_map Lit.as_atom
-      |> Sequence.map fst
-      |> Sequence.iter Top_terms.add
+      |> Iter.filter_map Lit.as_atom
+      |> Iter.map fst
+      |> Iter.iter Top_terms.add
     end;
     incr stat_num_clause_push;
     M.assume msat [Clause.lits c] ()
@@ -3234,7 +3234,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
                let rhs = conv_term_rec env' rhs in
                let depends_on_vars =
                  Term.to_seq_depth rhs
-                 |> Sequence.exists
+                 |> Iter.exists
                    (fun (t,k) -> match t.term_cell with
                       | DB db ->
                         DB.level db < n_vars + k (* [k]: number of intermediate binders *)
@@ -3251,10 +3251,10 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         (* TODO: do the closedness check during conversion, above *)
         let rhs_l =
           ID.Map.values m
-          |> Sequence.map snd
-          |> Sequence.append (default |> CCOpt.map snd |> Sequence.of_opt)
-          |> Sequence.sort_uniq ~cmp:Term.compare
-          |> Sequence.to_rev_list
+          |> Iter.map snd
+          |> Iter.append (default |> CCOpt.map snd |> Iter.of_opt)
+          |> Iter.sort_uniq ~cmp:Term.compare
+          |> Iter.to_rev_list
         in
         begin match rhs_l with
           | [x] when not (!any_rhs_depends_vars) ->
@@ -3391,7 +3391,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
                let ty = lazy (
                  let cstors =
                    ID.Map.to_seq data_cstors
-                   |> Sequence.map
+                   |> Iter.map
                      (fun (id_c, ty_c) ->
                         let c = lazy (
                           let ty_c = conv_ty ty_c in
@@ -3399,7 +3399,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
                         ) in
                         ID.Tbl.add decl_ty_ id_c c; (* declare *)
                         c)
-                   |> Sequence.to_rev_list
+                   |> Iter.to_rev_list
                  in
                  Ty.atomic data_id (Data cstors)
                ) in
@@ -3504,7 +3504,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           let u = aux env u in
           let m =
             ID.Tbl.to_seq m.switch_tbl
-            |> Sequence.map (fun (c,rhs) -> c, aux env rhs)
+            |> Iter.map (fun (c,rhs) -> c, aux env rhs)
             |> ID.Map.of_seq
           in
           A.switch u m
@@ -3593,7 +3593,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           in
           let switch_tbl=
             ID.Tbl.to_seq m.switch_tbl
-            |> Sequence.filter_map
+            |> Iter.filter_map
               (fun (id,rhs) ->
                  (* only keep this case if [member id dom] *)
                  if List.exists (fun c -> ID.equal id c.cst_id) dom
@@ -3643,8 +3643,8 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     (* compute domains of uninterpreted types *)
     let doms =
       !model_utys
-      |> Sequence.of_list
-      |> Sequence.map
+      |> Iter.of_list
+      |> Iter.map
         (fun ty -> match ty.ty_cell with
            | Atomic (_, Uninterpreted uty) -> ty, find_domain_ uty
            | _ -> assert false)
@@ -3653,8 +3653,8 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     (* compute values of meta variables *)
     let consts =
       !model_support_
-      |> Sequence.of_list
-      |> Sequence.map
+      |> Iter.of_list
+      |> Iter.map
         (fun c ->
            (* find normal form of [c] *)
            let t = Term.const c in
@@ -3665,7 +3665,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     (* now we can convert domains *)
     let domains =
       Ty.Tbl.to_seq doms
-      |> Sequence.map
+      |> Iter.map
         (fun (ty,dom) ->
            let dom = match dom with
              | [] -> [ID.make (Printf.sprintf "$%s_0" (Ty.mangle ty))]

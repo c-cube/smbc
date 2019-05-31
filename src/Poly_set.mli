@@ -17,7 +17,7 @@ val mem : 'a t -> 'a -> bool
 val add : 'a t -> 'a -> unit
 (** Add an element *)
 
-val to_seq : 'a t -> 'a Sequence.t
+val to_seq : 'a t -> 'a Iter.t
 (** Iterate on elements that are alive *)
 
 val iter : ('a -> unit) -> 'a t -> unit
