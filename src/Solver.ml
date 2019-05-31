@@ -48,8 +48,6 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
 
   let errorf msg = CCFormat.ksprintf msg ~f:(fun s -> raise (Error s))
 
-  type level = int
-
   let stat_num_cst_expanded = ref 0
   let stat_num_uty_expanded = ref 0
   let stat_num_clause_push = ref 0
@@ -559,7 +557,6 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     | QR_bool -> CCFormat.string out "bool"
 
   module Backtrack = struct
-    type nonrec level = level
     type undo_op = unit -> unit
     type t = {
       ops: undo_op CCVector.vector;
@@ -931,10 +928,6 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       mk_term_ ~deps ~ty:(DTy_direct Ty.prop) (Quant (q,qr,body))
 
     let quant_uty q uty body = quant q (QR_unin uty) body
-    let quant_data q d body = quant q (QR_data d) body
-
-    let forall = quant Forall
-    let exists = quant Exists
 
     let and_ a b =
       if a==b then a else builtin_ ~deps:(Term_dep_sub2 (a,b)) (B_and (a,b,a,b))
@@ -2980,7 +2973,6 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     let set_active b = active := b
 
     let push_level = Backtrack.push_level
-    let n_levels = Backtrack.cur_level
     let pop_levels () n = Backtrack.backtrack n
 
     (* push clauses from {!lemma_queue} into the slice *)
