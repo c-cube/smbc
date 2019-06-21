@@ -1,4 +1,3 @@
-
 (* This file is free software. See file "license" for more details. *)
 
 (** {1 Trivial AST for parsing} *)
@@ -182,7 +181,7 @@ module Tip = struct
     | A.Ty_bool -> ty_prop
     | A.Ty_app (a, []) -> ty_const a
     | A.Ty_app (_, _::_) ->
-      tip_errorf "cannot convert polymorphic type@ `@[%@]`" A.pp_ty ty
+      tip_errorf "cannot convert polymorphic type@ `@[%a@]`" A.pp_ty ty
     | A.Ty_arrow (args, ret) ->
       ty_arrow_l (List.map conv_ty args) (conv_ty ret)
 
