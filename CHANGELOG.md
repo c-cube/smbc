@@ -1,5 +1,9 @@
 # Change Log
 
+## 0.6.1
+
+- fixes: format error, compat with containers 2.7
+
 ## 0.6
 
 - upgrade to msat 0.8

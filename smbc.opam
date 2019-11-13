@@ -1,5 +1,5 @@
 opam-version: "2.0"
-version: "0.6"
+version: "0.6.1"
 maintainer: "simon.cruanes.2007@m4x.org"
 author: "Simon Cruanes"
 homepage: "https://github.com/c-cube/smbc"
@@ -8,12 +8,12 @@ build: [
   ["dune" "build" "@install" "-p" name "-j" jobs]
 ]
 depends: [
-  "dune" { build }
+  "dune" { >= "1.0" }
   "base-bytes"
-  "containers" { >= "1.0" }
+  "containers" { >= "2.0" }
   "iter" { >= "1.0" }
   "msat" { >= "0.8" & < "0.9" }
-  "tip-parser" { >= "0.6" < "0.7" }
+  "tip-parser" { >= "0.6" & < "0.7" }
   "ocaml" { >= "4.03" }
 ]
 tags: [ "logic" "narrowing" "model" "smt" ]
