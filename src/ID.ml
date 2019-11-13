@@ -1,4 +1,3 @@
-
 (* This file is free software. See file "license" for more details. *)
 
 type t = {
@@ -19,7 +18,7 @@ let copy {name;_} = make name
 
 let id {id;_} = id
 let to_string id = id.name
-let to_sexp id = CCSexp.atom id.name
+let to_sexp id = `Atom id.name
 
 let equal a b = a.id=b.id
 let compare a b = CCInt.compare a.id b.id

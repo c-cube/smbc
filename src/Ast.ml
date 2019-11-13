@@ -1,4 +1,3 @@
-
 (* This file is free software. See file "license" for more details. *)
 
 (** {1 Preprocessing AST} *)
@@ -40,7 +39,7 @@ module Var = struct
   let equal a b = ID.equal a.id b.id
   let compare a b = ID.compare a.id b.id
   let pp out v = ID.pp out v.id
-  let to_sexp v = S.atom (ID.to_string_full v.id)
+  let to_sexp v = `Atom (ID.to_string_full v.id)
   (* let Var.to_sexp v = ID.to_sexp v.Var.id *)
   let to_sexp_typed f v = S.of_list [to_sexp v; f v.ty]
 end
@@ -84,11 +83,11 @@ module Ty = struct
     aux [] ty
 
   let rec to_sexp = function
-    | Prop -> S.atom "prop"
-    | Const id -> S.atom (ID.to_string id)
+    | Prop -> `Atom "prop"
+    | Const id -> `Atom (ID.to_string id)
     | Arrow _ as ty ->
       let args, ret = unfold ty in
-      S.of_list (S.atom "->":: List.map to_sexp args @ [to_sexp ret])
+      S.of_list (`Atom "->":: List.map to_sexp args @ [to_sexp ret])
 
   let pp out t = CCSexp.pp out (to_sexp t)
 
