@@ -2873,7 +2873,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     let update_maybe (t:term): unit =
       (* check if there are reasons to (re-)evaluate this term *)
       let _, nf = Reduce.get_nf t in
-      let should_update = List.exists dep_updated nf.term_deps in
+      let should_update = nf.term_deps = [] || List.exists dep_updated nf.term_deps in
       if should_update then (
         update t;
       )
