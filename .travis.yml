@@ -10,7 +10,6 @@ env:
   matrix:
     #- PACKAGE="logitest" OCAML_VERSION="4.02"
   - PACKAGE="smbc" OCAML_VERSION="4.03"
-  - PACKAGE="smbc" OCAML_VERSION="4.04"
-  - PACKAGE="smbc" OCAML_VERSION="4.05"
-  - PACKAGE="smbc" OCAML_VERSION="4.06"
+  - PACKAGE="smbc" OCAML_VERSION="4.08"
+  - PACKAGE="smbc" OCAML_VERSION="4.10"
 
