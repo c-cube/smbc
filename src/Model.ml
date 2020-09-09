@@ -21,7 +21,7 @@ type t = {
 let make ~env ~consts ~domains =
   (* also add domains to [env] *)
   let env =
-    A.Ty.Map.to_seq domains
+    A.Ty.Map.to_iter domains
     |> Iter.flat_map_l (fun (ty,l) -> List.map (CCPair.make ty) l)
     |> Iter.fold
       (fun env (_,cst) -> A.env_add_def env cst A.E_uninterpreted_cst)

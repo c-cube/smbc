@@ -289,12 +289,6 @@ let rec term_to_tip (t:term): TA.term = match t.term with
   | Undefined_value -> failwith "cannot translate `undefined-value` to TIP"
   | Bind (Mu,_,_) -> assert false (* TODO? *)
 
-let mk_tip_decl id ty =
-  let args, ret = Ty.unfold ty in
-  let args = List.map ty_to_tip args in
-  let ret = ty_to_tip ret in
-  TA.mk_fun_decl ~ty_vars:[] (id_to_tip id) args ret
-
 let mk_tip_def id ty rhs =
   let args, body = unfold_fun rhs in
   let ty_args, ty_ret = Ty.unfold ty in
@@ -356,7 +350,6 @@ let pp_term_tip out t = TA.pp_term out (term_to_tip t)
 let pp_term = pp_term_tip
 
 let pp_ty_tip out ty = TA.pp_ty out (ty_to_tip ty)
-let pp_ty = pp_ty_tip
 
 let pp_statement_tip out stmt =
   List.iter (TA.pp_stmt out) (statement_to_tip stmt)
@@ -620,7 +613,7 @@ module Ctx = struct
 
   let pp out t =
     Format.fprintf out "ctx {@[%a@]}"
-      Fmt.(seq ~sep:(return "@ ") @@ pair ID.pp pp_kind) (ID.Tbl.to_seq t.kinds)
+      Fmt.(iter ~sep:(return "@ ") @@ pair ID.pp pp_kind) (ID.Tbl.to_iter t.kinds)
 end
 
 let errorf_ctx ctx msg =
@@ -787,7 +780,7 @@ and conv_term_aux ctx t : term = match t with
         if not @@ ID.Set.is_empty missing then (
           errorf_ctx ctx
             "missing cases in `@[%a@]`:@ {@[%a@]}"
-            A.pp_term t (Util.pp_seq ID.pp) (ID.Set.to_seq missing);
+            A.pp_term t (Util.pp_iter ID.pp) (ID.Set.to_iter missing);
         );
         cases, None
       | Some def_rhs when ID.Set.cardinal missing > ID.Map.cardinal cases ->

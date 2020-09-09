@@ -575,7 +575,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         let f = CCVector.pop_exn st_.ops in
         f ();
       done;
-      CCVector.shrink st_.levels new_lvl;
+      CCVector.truncate st_.levels new_lvl;
       Log.debugf 2
         (fun k->k "@{<Yellow>** now at level %d (backtrack)@}" (cur_level()));
       ()
@@ -621,7 +621,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
               function None -> 1 | Some (_,rhs) -> sub_hash rhs
             in
             let hash_m =
-              Hash.seq (Hash.pair ID.hash hash_case) (ID.Map.to_seq m)
+              Hash.seq (Hash.pair ID.hash hash_case) (ID.Map.to_iter m)
             in
             Hash.combine4 8 u.term_id hash_m (hash_default default)
           | Builtin (B_not a) -> Hash.combine2 20 a.term_id
@@ -991,7 +991,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       let (), _ = fold_map_builtin (fun () t -> f t, t) () b in
       ()
 
-    let builtin_to_seq b yield = match b with
+    let builtin_to_iter b yield = match b with
       | B_not t -> yield t
       | B_or (a,b)
       | B_imply (a,b)
@@ -1010,7 +1010,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
 
     module Tbl = CCHashtbl.Make(As_key)
 
-    let to_seq_depth t (yield:t*int ->unit): unit =
+    let to_iter_depth t (yield:t*int ->unit): unit =
       let rec aux k t =
         yield (t,k);
         match t.term_cell with
@@ -1023,7 +1023,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
             CCOpt.iter (fun (_,t) -> aux k t) d;
           | Select (_,u)
           | Switch (u,_) -> aux k u (* ignore the table *)
-          | Builtin b -> builtin_to_seq b (aux k)
+          | Builtin b -> builtin_to_iter b (aux k)
           | Quant (_, _, body)
           | Mu body
           | Fun (_, body) -> aux (k+1) body
@@ -1033,7 +1033,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       in
       aux 0 t
 
-    let to_seq t : t Iter.t = to_seq_depth t |> Iter.map fst
+    let to_iter t : t Iter.t = to_iter_depth t |> Iter.map fst
 
     (* return [Some] iff the term is an undefined constant *)
     let as_cst_undef (t:term):
@@ -1120,19 +1120,19 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
             | Some (_,rhs) -> fpf out "@ :default %a" pp rhs
           in
           let print_map =
-            CCFormat.(seq ~sep:(return "@ ")) pp_bind
+            CCFormat.(iter ~sep:(return "@ ")) pp_bind
           in
           fpf out "(@[match %a@ (@[<hv>%a@])%a@])"
-            pp t print_map (ID.Map.to_seq m) pp_default default
+            pp t print_map (ID.Map.to_iter m) pp_default default
         | Switch (t, m) ->
           let pp_case out (lhs,rhs) =
             fpf out "(@[<1>case@ %a@ %a@])" ID.pp lhs pp rhs
           in
           let print_map =
-            CCFormat.(seq ~sep:(return "@ ")) pp_case
+            CCFormat.(iter ~sep:(return "@ ")) pp_case
           in
           fpf out "(@[switch %a@ (@[<hv>%a@])@])"
-            pp t print_map (ID.Tbl.to_seq m.switch_tbl)
+            pp t print_map (ID.Tbl.to_iter m.switch_tbl)
         | Select (sel,u) ->
           fpf out "(@[select-%a-%d@ %a@])" ID.pp_name sel.select_cstor.cst_id
             sel.select_i pp u
@@ -1480,7 +1480,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     val lemma_queue : t Queue.t
     val push_new : t -> unit
     val push_new_l : t list -> unit
-    val to_seq : t -> Lit.t Iter.t
+    val to_iter : t -> Lit.t Iter.t
     val pp : t CCFormat.printer
   end = struct
     type t = {
@@ -1541,7 +1541,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
 
     let push_new_l = List.iter push_new
 
-    let to_seq c = Iter.of_list c.lits
+    let to_iter c = Iter.of_list c.lits
   end
 
   (** {2 Iterative Deepening} *)
@@ -1753,7 +1753,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           hd, tl, [] (* already expanded *)
 
     let depth_of_term (t:term): int option =
-      Term.to_seq t
+      Term.to_iter t
       |> Iter.filter_map
         (fun sub -> match sub.term_cell with
            | Const {cst_kind=Cst_undef (info,_); _} -> Some info.cst_depth
@@ -3090,7 +3090,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     (* reduce to normal form the literals, ensure they
          are added to the proper constant watchlist(s) *)
     begin
-      Clause.to_seq c
+      Clause.to_iter c
       |> Iter.filter_map Lit.as_atom
       |> Iter.map fst
       |> Iter.iter Top_terms.add
@@ -3233,7 +3233,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
                in
                let rhs = conv_term_rec env' rhs in
                let depends_on_vars =
-                 Term.to_seq_depth rhs
+                 Term.to_iter_depth rhs
                  |> Iter.exists
                    (fun (t,k) -> match t.term_cell with
                       | DB db ->
@@ -3390,7 +3390,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
             (fun {Ast.Ty.data_id; data_cstors} ->
                let ty = lazy (
                  let cstors =
-                   ID.Map.to_seq data_cstors
+                   ID.Map.to_iter data_cstors
                    |> Iter.map
                      (fun (id_c, ty_c) ->
                         let c = lazy (
@@ -3503,9 +3503,9 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         | Switch (u,m) ->
           let u = aux env u in
           let m =
-            ID.Tbl.to_seq m.switch_tbl
+            ID.Tbl.to_iter m.switch_tbl
             |> Iter.map (fun (c,rhs) -> c, aux env rhs)
-            |> ID.Map.of_seq
+            |> ID.Map.of_iter
           in
           A.switch u m
         | Quant (q,qr,bod) ->
@@ -3592,14 +3592,14 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
               errorf "could not find domain of type %a" Ty.pp m.switch_ty_arg
           in
           let switch_tbl=
-            ID.Tbl.to_seq m.switch_tbl
+            ID.Tbl.to_iter m.switch_tbl
             |> Iter.filter_map
               (fun (id,rhs) ->
                  (* only keep this case if [member id dom] *)
                  if List.exists (fun c -> ID.equal id c.cst_id) dom
                  then Some (id, aux rhs)
                  else None)
-            |> ID.Tbl.of_seq
+            |> ID.Tbl.of_iter
           in
           if ID.Tbl.length switch_tbl = 0
           then (
@@ -3648,7 +3648,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         (fun ty -> match ty.ty_cell with
            | Atomic (_, Uninterpreted uty) -> ty, find_domain_ uty
            | _ -> assert false)
-      |> Ty.Tbl.of_seq
+      |> Ty.Tbl.of_iter
     in
     (* compute values of meta variables *)
     let consts =
@@ -3660,11 +3660,11 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
            let t = Term.const c in
            let t = deref_deep doms t |> Conv.term_to_ast in
            c.cst_id, t)
-      |> ID.Map.of_seq
+      |> ID.Map.of_iter
     in
     (* now we can convert domains *)
     let domains =
-      Ty.Tbl.to_seq doms
+      Ty.Tbl.to_iter doms
       |> Iter.map
         (fun (ty,dom) ->
            let dom = match dom with
@@ -3672,7 +3672,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
              | l -> List.map Typed_cst.id l
            in
            Conv.ty_to_ast ty, dom)
-      |> Ast.Ty.Map.of_seq
+      |> Ast.Ty.Map.of_iter
     in
     Model.make ~env ~consts ~domains
 

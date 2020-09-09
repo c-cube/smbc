@@ -26,7 +26,7 @@ let mem (type a) (set:a t) x =
 let add (type a) (set:a t) x =
   if not (mem set x) then CCVector.push set.vec x
 
-let to_seq (type a) (set:a t) =
-  CCVector.to_seq set.vec
+let to_iter (type a) (set:a t) =
+  CCVector.to_iter set.vec
 
-let iter f s = to_seq s f
+let iter f s = to_iter s f

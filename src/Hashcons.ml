@@ -8,7 +8,7 @@ end
 
 module Make(A : ARG): sig
   val hashcons : A.t -> A.t
-  val to_seq : A.t Iter.t
+  val to_iter : A.t Iter.t
 end = struct
   module W = Weak.Make(A)
 
@@ -24,6 +24,6 @@ end = struct
     );
     t'
 
-  let to_seq yield =
+  let to_iter yield =
     W.iter yield tbl_
 end
