@@ -47,11 +47,6 @@
            (case (cons y_4 l3) (and (leq x_7 y_4) (sorted (cons y_4 l3)))) 
            (case nil true))) 
       (case nil true))))
-(define-funs-rec
-   ((map ((f (=> nat nat)) (l_4 list)) list))
-   ((match l_4
-      (case (cons x_8 tail_3) (cons (f x_8) (map f tail_3))) 
-      (case nil nil))))
 (define-funs-rec ((num_1 () nat)) ((s z)))
 (define-funs-rec ((num_2 () nat)) ((s (s z))))
 (define-funs-rec ((num_5 () nat)) ((s (s (s (s (s z)))))))
