@@ -1,5 +1,7 @@
 (* This file is free software. See file "license" for more details. *)
 
+open Common_
+
 let get_time : unit -> float =
   let start = Unix.gettimeofday() in
   fun () ->
@@ -217,8 +219,6 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
   and cst_info = {
     cst_depth: int;
     (* refinement depth, used for iterative deepening *)
-    cst_parent: cst option;
-    (* if const was created as a parameter to some cases of some other constant *)
     mutable cst_exist_conds: cond_list;
     (* disjunction of possible conditions for cst to exist/be relevant *)
     mutable cst_cases: term list lazily_expanded;
@@ -437,7 +437,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       | _ -> assert false
 
     let make_undef ?parent ?(exist_if=[]) ?slice ~depth:cst_depth id ty =
-      assert (CCOpt.for_all (fun p -> cst_depth > depth p) parent);
+      assert (Option.for_all (fun p -> cst_depth > depth p) parent);
       (* undefined on an uninterpreted type always have a slice *)
       let slice = match slice, ty.ty_cell with
         | Some _ as s, _ -> s
@@ -446,7 +446,6 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
       in
       let info =
         { cst_depth;
-          cst_parent=parent;
           cst_exist_conds=exist_if;
           cst_cases=Lazy_none;
           cst_cur_case=None;
@@ -666,7 +665,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
             &&
             ID.Map.for_all (fun k2 _ -> ID.Map.mem k2 m1) m2
             &&
-            CCOpt.equal (fun (_,t1)(_,t2) -> t1==t2) d1 d2
+            Option.equal (fun (_,t1)(_,t2) -> t1==t2) d1 d2
           | Switch (t1,m1), Switch (t2,m2) ->
             t1==t2 && m1.switch_id = m2.switch_id
           | Builtin b1, Builtin b2 ->
@@ -1020,7 +1019,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           | Match (t, m, d) ->
             aux k t;
             ID.Map.iter (fun _ (tys,rhs) -> aux (k+List.length tys) rhs) m;
-            CCOpt.iter (fun (_,t) -> aux k t) d;
+            Option.iter (fun (_,t) -> aux k t) d;
           | Select (_,u)
           | Switch (u,_) -> aux k u (* ignore the table *)
           | Builtin b -> builtin_to_iter b (aux k)
@@ -1186,7 +1185,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
                    tys, aux (depth + List.length tys) rhs)
                 m
             in
-            let d = CCOpt.map (fun (set,t) -> set, aux depth t) d in
+            let d = Option.map (fun (set,t) -> set, aux depth t) d in
             match_ u m ~default:d
           | Switch (u, m) ->
             let u = aux depth u in
@@ -1240,7 +1239,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           ID.Map.iter
             (fun _ (tys,rhs) -> aux (DB_env.push_l tys env) rhs)
             m;
-          CCOpt.iter (fun (_,t) -> aux env t) d;
+          Option.iter (fun (_,t) -> aux env t) d;
         | Switch (u, m) ->
           aux env u;
           ID.Tbl.iter (fun _ rhs -> aux env rhs) m.switch_tbl
@@ -1295,7 +1294,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
                      tys, aux (depth+List.length tys) (DB_env.push_none_l tys env) rhs)
                   m
               and d =
-                CCOpt.map (fun (set, t) -> set, aux depth env t) d
+                Option.map (fun (set, t) -> set, aux depth env t) d
               in
               match_ u m ~default:d
             | Switch (u, m) ->
@@ -2291,11 +2290,11 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
              because we assume there are no empty types. *)
           if body_is_value then (
             e_body, body_nf
-          ) else if CCOpt.is_none !quant_unroll_depth then (
+          ) else if Option.is_none !quant_unroll_depth then (
             Explanation.empty, t (* blocked for now *)
-          ) else if d.q_data_depth >= CCOpt.get_exn !quant_unroll_depth then (
+          ) else if d.q_data_depth >= Option.get_exn_or "quant-unroll-depth" !quant_unroll_depth then (
             (* just give up and return undefined, because of depth *)
-            let depth = CCOpt.get_exn !quant_unroll_depth in
+            let depth = Option.get_exn_or "quant-unroll-depth" !quant_unroll_depth in
             let e = Explanation.return (Lit.quant_unroll depth) in
             let nf = Term.undefined_value_prop (Undef_quant depth) in
             set_nf_ t nf e;
@@ -2863,11 +2862,11 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
     (* is the dependency updated, i.e. decided by the SAT solver? *)
     let dep_updated (d:term_dep): bool = match d with
       | Dep_cst {cst_kind=Cst_undef (i, _); _} ->
-        CCOpt.is_some i.cst_cur_case
+        Option.is_some i.cst_cur_case
       | Dep_cst _ -> assert false
       | Dep_uty uty ->
-        CCOpt.is_some uty.uty_status
-      | Dep_quant_depth -> CCOpt.is_some !quant_unroll_depth
+        Option.is_some uty.uty_status
+      | Dep_quant_depth -> Option.is_some !quant_unroll_depth
 
     (* if [t] needs updating, then update it *)
     let update_maybe (t:term): unit =
@@ -3048,7 +3047,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
           trigger_conflict lit e
         | Lit_quant_unroll l when Lit.sign lit ->
           (* locally assume quantifier depth *)
-          assert (CCOpt.is_none !quant_unroll_depth);
+          assert (Option.is_none !quant_unroll_depth);
           Backtrack.push (fun () -> quant_unroll_depth := None);
           quant_unroll_depth := Some l;
         | Lit_atom _ | Lit_quant_unroll _ -> ()
@@ -3244,7 +3243,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
                tys, rhs)
             m
         and default =
-          CCOpt.map (fun (set,t) -> set, conv_term_rec env t) default
+          Option.map (fun (set,t) -> set, conv_term_rec env t) default
         in
         (* optim: check whether all branches return the same term, that
            does not depend on matched variables *)
@@ -3252,7 +3251,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         let rhs_l =
           ID.Map.values m
           |> Iter.map snd
-          |> Iter.append (default |> CCOpt.map snd |> Iter.of_opt)
+          |> Iter.append (default |> Option.map snd |> Iter.of_opt)
           |> Iter.sort_uniq ~cmp:Term.compare
           |> Iter.to_rev_list
         in
@@ -3487,7 +3486,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
                  with_vars tys env ~f:(fun vars env -> vars, aux env rhs))
               m
           and default =
-            CCOpt.map (fun (set,t) -> set, aux env t) default
+            Option.map (fun (set,t) -> set, aux env t) default
           in
           A.match_ u m ~default
         | Select (sel, u) ->
@@ -3582,7 +3581,7 @@ module Make(Config : CONFIG)(Dummy : sig end) = struct
         | If (a,b,c) -> Term.if_ (aux a)(aux b)(aux c)
         | Match (u,m,d) ->
           let m = ID.Map.map (fun (tys,rhs) -> tys, aux rhs) m in
-          let d = CCOpt.map (fun (s,t) -> s, aux t) d in
+          let d = Option.map (fun (s,t) -> s, aux t) d in
           Term.match_ (aux u) m ~default:d
         | Select (sel,u) -> Term.select sel (aux u)
         | Switch (u,m) ->

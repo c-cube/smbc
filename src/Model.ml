@@ -3,6 +3,8 @@
 
 (** {1 Model} *)
 
+open Common_
+
 module A = Ast
 
 type term = A.term
@@ -101,7 +103,7 @@ let rec as_cstor_app env t = match A.term_view t with
       | _ -> None
     end
   | A.App (f, l) ->
-    CCOpt.map (fun (id,ty,l') -> id,ty,l'@l) (as_cstor_app env f)
+    Option.map (fun (id,ty,l') -> id,ty,l'@l) (as_cstor_app env f)
   | _ -> None
 
 let as_domain_elt env t = match A.term_view t with
@@ -128,7 +130,7 @@ let apply_subst (subst:subst) t =
     | A.App (f,l) -> A.app (aux subst f) (List.map (aux subst) l)
     | A.If (a,b,c) -> A.if_ (aux subst a) (aux subst b) (aux subst c)
     | A.Match (u,m,default) ->
-      let default = CCOpt.map(fun (set,t) -> set,aux subst t) default in
+      let default = Option.map(fun (set,t) -> set,aux subst t) default in
       A.match_ (aux subst u)
         (ID.Map.map
            (fun (vars,rhs) ->
@@ -252,7 +254,7 @@ and eval_whnf_rec m st subst t = match A.term_view t with
                vars, apply_subst subst rhs)
             branches
         and default =
-          CCOpt.map (fun (set,rhs) -> set, apply_subst subst rhs) default
+          Option.map (fun (set,rhs) -> set, apply_subst subst rhs) default
         in
         A.match_ u branches ~default
       | Some (c, _, cstor_args) ->

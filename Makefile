@@ -1,10 +1,10 @@
 
 J?=3
-
+OPTS ?= --profile=release
 all: build
 
 build:
-	@dune build @install -j $J --profile=release
+	@dune build @install -j $J $(OPTS)
 
 install:
 	@dune install
@@ -19,7 +19,8 @@ test: build
 	$(TESTTOOL) run -c examples/benchpress.sexp $(TESTOPTS) \
 	  -t 30 --meta `git rev-parse HEAD` --progress -p smbc examples/
 
+WATCH ?= @all
 watch:
-	@dune build -w
+	@dune build $(WATCH) $(OPTS) -w
 
 .PHONY: watch benchs clean build test

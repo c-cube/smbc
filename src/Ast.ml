@@ -2,11 +2,11 @@
 
 (** {1 Preprocessing AST} *)
 
+open Common_
 type 'a or_error = ('a, string) CCResult.t
 type sexp = CCSexp.t
 type 'a to_sexp = 'a -> sexp
 
-module Fmt = CCFormat
 module S = CCSexp
 
 exception Error of string
@@ -424,7 +424,7 @@ let match_ t m ~default =
   ID.Map.iter
     (fun c (_, rhs) -> check_ty (ID.to_string c) rhs)
     m;
-  CCOpt.iter (fun (_,rhs) -> check_ty "default" rhs) default;
+  Option.iter (fun (_,rhs) -> check_ty "default" rhs) default;
   mk_ (Match (t,m,default)) rhs1.ty
 
 let match_l t l ~default = match_ t ~default (ID.Map.of_list l)
