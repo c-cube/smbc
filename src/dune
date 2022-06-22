@@ -3,14 +3,13 @@
   (targets const.ml)
   (action
     (with-stdout-to %{targets}
-      (echo "let version = \"%{version:smbc}\"\n")))
-  )
+      (echo "let version = \"%{version:smbc}\"\n"))))
 
 ; main binary
 (executable
   (name smbc)
   (public_name smbc)
-  (libraries containers iter msat tip-parser unix)
+  (libraries containers iter msat smtlib-utils unix)
   (flags :standard -w +a-4-44-58-60-70@8
          -strict-sequence -color always -safe-string -warn-error -a+8)
   (ocamlopt_flags :standard -O3 -color always

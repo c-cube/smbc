@@ -3,7 +3,10 @@
 (** {1 Trivial AST for parsing} *)
 
 open Common_
-module Loc = Tip_loc
+
+module A = Smtlib_utils.V_2_6.Ast
+module Loc = Smtlib_utils.V_2_6.Loc
+
 
 type var = string
 
@@ -176,7 +179,6 @@ let tip_error ?loc msg = raise (Tip_error (loc, msg))
 let tip_errorf ?loc msg = CCFormat.ksprintf msg ~f:(tip_error ?loc)
 
 module Tip = struct
-  module A = Tip_ast
 
   let rec conv_ty (ty:A.ty): ty = match ty with
     | A.Ty_bool -> ty_prop
@@ -185,6 +187,8 @@ module Tip = struct
       tip_errorf "cannot convert polymorphic type@ `@[%a@]`" A.pp_ty ty
     | A.Ty_arrow (args, ret) ->
       ty_arrow_l (List.map conv_ty args) (conv_ty ret)
+    | A.Ty_real ->
+      tip_errorf "cannot handle Real`"
 
   let conv_typed_var (v,ty) = v, conv_ty ty
   let conv_typed_vars = List.map conv_typed_var
@@ -196,6 +200,9 @@ module Tip = struct
       | A.Const s -> const s
       | A.App ((":asserting" | "asserting"), [t;g]) ->
         asserting (aux t) (aux g)
+      | A.Arith _ ->
+          tip_errorf "cannot handle arithmetic expression"
+      | A.Attr (t, _) -> aux t
       | A.App (f, l) ->
         app (aux (A.Const f)) (List.map aux l)
       | A.HO_app (a,b) -> app (aux a) [aux b]
@@ -274,8 +281,10 @@ module Tip = struct
         decl ?loc f ty |> Option.return
       | A.Stmt_assert t ->
         assert_ ?loc (conv_term t) |> Option.return
-      | A.Stmt_data ([], l) ->
-        let conv_data (s, cstors) =
+      | A.Stmt_data l ->
+        let conv_data ((s,n), cstors) =
+          if n<>0 then
+            tip_errorf ?loc "cannot convert polymorphic data@ `@[%a@]`" A.pp_stmt st;
           let cstors =
             List.map
               (fun c ->
@@ -289,8 +298,6 @@ module Tip = struct
         in
         let l = List.map conv_data l in
         data ?loc l |> Option.return
-      | A.Stmt_data (_::_, _) ->
-        tip_errorf ?loc "cannot convert polymorphic data@ `@[%a@]`" A.pp_stmt st
       | A.Stmt_fun_def f
       | A.Stmt_fun_rec f ->
         let id, ty, t = conv_fun_def ?loc f.A.fr_decl f.A.fr_body in
@@ -301,20 +308,12 @@ module Tip = struct
         then tip_errorf ?loc "declarations and bodies should have same length";
         let l = List.map2 (conv_fun_def ?loc) decls bodies in
         def ?loc l |> Option.return
-      | A.Stmt_assert_not ([], t) ->
-        let vars, t = open_forall (conv_term t) in
-        let g = not_ t in (* negate *)
-        goal ~prove:false ?loc vars g |> Option.return
-      | A.Stmt_prove ([], t) ->
-        let vars, t = open_forall (conv_term t) in
-        goal ~prove:true ?loc vars t |> Option.return
-      | A.Stmt_assert_not (_::_, _) | A.Stmt_prove _ ->
-        tip_errorf ?loc "cannot convert polymorphic goal@ `@[%a@]`"
-          A.pp_stmt st
-      | A.Stmt_lemma _ ->
-        tip_error ?loc "smbc does not know how to handle `lemma` statements"
-      | A.Stmt_set_info _ | A.Stmt_set_logic _
-      | A.Stmt_check_sat | A.Stmt_exit
+      | A.Stmt_set_info _ | A.Stmt_set_logic _ | A.Stmt_check_sat | A.Stmt_exit
+      | A.Stmt_get_option _ | A.Stmt_get_info _| A.Stmt_get_value _|
+      A.Stmt_check_sat_assuming _|A.Stmt_pop _| A.Stmt_push _ |
+      A.Stmt_get_unsat_assumptions | A.Stmt_get_unsat_core | A.Stmt_reset |
+      A.Stmt_set_option _ | A.Stmt_reset_assertions | A.Stmt_get_proof |
+      A.Stmt_get_model |A.Stmt_get_assignment |A.Stmt_get_assertions
         -> None
 end
 

@@ -190,7 +190,7 @@ let unfold_fun t =
 
 (** {2 To TIP} *)
 
-module TA = Tip_ast
+module TA = Smtlib_utils.V_2_6.Ast
 
 let id_to_tip : ID.t -> string =
   let id_to_tip_tbl = ID.Tbl.create 64 in
@@ -321,12 +321,12 @@ let statement_to_tip (t:statement) : TA.statement list = match t with
                          Printf.sprintf "select_%s_%d" c i, ty_to_tip ty_arg)
                       ty_args
                   in
-                  TA.mk_cstor c ty_args)
+                  TA.mk_cstor c ~vars:[] ty_args)
            in
-           id_to_tip data_id, cstors)
+           (id_to_tip data_id, 0), cstors)
         l
     in
-    [TA.data [] l]
+    [TA.data l]
   | Define l ->
     let l =
       List.map
@@ -342,8 +342,8 @@ let statement_to_tip (t:statement) : TA.statement list = match t with
     let e = term_to_tip e in
     let t =
       if prove
-      then TA.prove ~ty_vars:[] (TA.forall vars e)
-      else TA.assert_not ~ty_vars:[] (TA.forall vars (TA.not_ e)) in
+      then TA.assert_ (TA.forall vars e)
+      else TA.assert_ (TA.not_ (TA.forall vars (TA.not_ e))) in
     [t; TA.check_sat ()]
 
 let pp_term_tip out t = TA.pp_term out (term_to_tip t)
@@ -942,7 +942,7 @@ and parse_file_exn ctx (syn:syntax) ~file : statement list =
     | Auto -> assert false
     | Tip ->
       (* delegate parsing to [Tip_parser] *)
-      Tip_util.parse_file_exn file
+      Smtlib_utils.V_2_6.parse_file_exn file
       |> CCList.filter_map A.Tip.conv_stmt
   in
   CCList.flat_map (conv_statement ctx syn) l
@@ -957,7 +957,7 @@ let parse_stdin syn = match syn with
   | Tip ->
     let ctx = Ctx.create ~include_dir:"." () in
     try
-      Tip_util.parse_chan_exn ~filename:"<stdin>" stdin
+      Smtlib_utils.V_2_6.parse_chan_exn ~filename:"<stdin>" stdin
       |> CCList.filter_map A.Tip.conv_stmt
       |> CCList.flat_map (conv_statement ctx syn)
       |> CCResult.return
